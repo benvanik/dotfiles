@@ -1,0 +1,23 @@
+# Global gitignore - patterns to ignore in all repositories
+
+# Claude Code local settings.
+**/.claude/settings.local.json
+**/CLAUDE.local.md
+
+# direnv local overrides (machine-specific).
+.envrc.local
+
+# OS artifacts.
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Editor directories.
+.idea/
+.vscode/
+
+# Python.
+__pycache__/
+*.pyc

@@ -1,0 +1,108 @@
+#!/bin/bash
+# Build IREE targets with Bazel.
+#
+# Usage: iree-bazel-build [target] [bazel-args...]
+#
+# Examples:
+#   iree-bazel-build                      # Build all tools
+#   iree-bazel-build //compiler/...       # Build compiler
+#   iree-bazel-build --config=debug       # Debug build
+
+set -e
+
+# Colors.
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+info() { printf "${GREEN}[iree-bazel]${NC} %s\n" "$1"; }
+warn() { printf "${YELLOW}[iree-bazel]${NC} %s\n" "$1"; }
+error() { printf "${RED}[iree-bazel]${NC} %s\n" "$1" >&2; }
+
+show_help() {
+    cat << 'EOF'
+iree-bazel-build - Build IREE with Bazel
+
+USAGE
+    iree-bazel-build [target] [bazel-args...]
+
+ARGUMENTS
+    target       Bazel target (default: tools/...)
+    bazel-args   Additional arguments passed to bazel build
+
+EXAMPLES
+    iree-bazel-build                      # Build all tools
+    iree-bazel-build //compiler/...       # Build compiler
+    iree-bazel-build --config=debug       # Debug build
+    iree-bazel-build -c dbg               # Bazel debug mode
+
+COMMON TARGETS
+    tools/...                All tools
+    //compiler/...           Compiler components
+    //runtime/...            Runtime components
+    //tools:iree-compile     Main compiler tool
+    //tools:iree-run-module  Module runner
+
+CONFIGURATIONS
+    --config=debug           No optimizations, assertions enabled
+    --config=asserts         Optimized with assertions
+    --config=asan            Address Sanitizer
+    --config=msan            Memory Sanitizer
+    --config=tsan            Thread Sanitizer
+
+SEE ALSO
+    iree-bazel-configure, iree-bazel-test
+EOF
+}
+
+case "${1:-}" in
+    -h|--help) show_help; exit 0 ;;
+esac
+
+# Find the IREE worktree root (directory with .git and .bazelversion).
+find_worktree_root() {
+    local dir="$PWD"
+    while [ "$dir" != "/" ]; do
+        if [ -e "$dir/.git" ] && [ -f "$dir/.bazelversion" ]; then
+            echo "$dir"
+            return 0
+        fi
+        dir=$(dirname "$dir")
+    done
+    return 1
+}
+
+# Find worktree root.
+WORKTREE_DIR=$(find_worktree_root)
+if [ -z "$WORKTREE_DIR" ]; then
+    error "Not in an IREE worktree (no .bazelversion found)"
+    error "Run from within ~/src/iree/<worktree>/"
+    exit 1
+fi
+
+cd "$WORKTREE_DIR"
+
+# Check configuration exists.
+if [ ! -f "configured.bazelrc" ]; then
+    warn "configured.bazelrc not found, running iree-bazel-configure..."
+    iree-bazel-configure
+fi
+
+# Parse arguments: first non-flag arg is target, rest are bazel args.
+TARGET=""
+BAZEL_ARGS=()
+
+for arg in "$@"; do
+    if [ -z "$TARGET" ] && [[ "$arg" != -* ]]; then
+        TARGET="$arg"
+    else
+        BAZEL_ARGS+=("$arg")
+    fi
+done
+
+# Default target.
+TARGET="${TARGET:-tools/...}"
+
+info "Building $TARGET..."
+exec bazel build "$TARGET" "${BAZEL_ARGS[@]}"

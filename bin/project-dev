@@ -1,0 +1,103 @@
+#!/bin/bash
+# Create or attach to a project tmux/byobu session.
+
+set -e
+
+show_help() {
+    cat << 'EOF'
+project-dev - Create or attach to a project tmux/byobu session
+
+USAGE
+    project-dev [session_name] [directory]
+
+ARGUMENTS
+    session_name    Name for the tmux session (default: current directory name)
+    directory       Working directory for the session (default: current directory)
+
+BEHAVIOR
+    - If not in a tmux session: creates or attaches to the named session
+    - If already in a tmux session: switches to the named session
+    - Prefers byobu if installed, falls back to tmux
+
+EXAMPLES
+    project-dev
+        Create session named after current directory
+
+    project-dev myproject
+        Create or attach to session named 'myproject'
+
+    project-dev myproject ~/src/myproject
+        Create session in specific directory
+
+SEE ALSO
+    project-init      Initialize project with .envrc
+    project-deinit    Cleanup project configuration
+EOF
+}
+
+case "${1:-}" in
+    -h|--help) show_help; exit 0 ;;
+esac
+
+# Colors.
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+info() { printf "${GREEN}[project-dev]${NC} %s\n" "$1"; }
+warn() { printf "${YELLOW}[project-dev]${NC} %s\n" "$1"; }
+error() { printf "${RED}[project-dev]${NC} %s\n" "$1" >&2; }
+
+# Prefer byobu over tmux if available.
+if command -v byobu &>/dev/null; then
+    MUX=byobu
+elif command -v tmux &>/dev/null; then
+    MUX=tmux
+else
+    error "Neither byobu nor tmux found. Install with: sudo apt install byobu"
+    exit 1
+fi
+info "Using $MUX"
+
+# Parse arguments.
+session_name="${1:-$(basename "$PWD")}"
+target_dir="${2:-$PWD}"
+
+# Ensure target directory exists.
+if [ ! -d "$target_dir" ]; then
+    error "Directory not found: $target_dir"
+    exit 1
+fi
+
+# Convert to absolute path.
+target_dir=$(cd "$target_dir" && pwd)
+
+# Check if we're already in a session.
+if [ -n "$TMUX" ]; then
+    # Already in tmux/byobu - check if session has this directory.
+    current_session=$($MUX display-message -p '#S')
+    if [ "$current_session" = "$session_name" ]; then
+        info "Already in session: $session_name"
+        exit 0
+    fi
+
+    # Switch to existing session or create new window.
+    if $MUX has-session -t "$session_name" 2>/dev/null; then
+        info "Switching to existing session: $session_name"
+        $MUX switch-client -t "$session_name"
+    else
+        info "Creating new session: $session_name"
+        $MUX new-session -d -s "$session_name" -c "$target_dir"
+        $MUX switch-client -t "$session_name"
+    fi
+else
+    # Not in tmux/byobu - attach or create.
+    if $MUX has-session -t "$session_name" 2>/dev/null; then
+        info "Attaching to existing session: $session_name"
+        exec $MUX attach-session -t "$session_name"
+    else
+        info "Creating new session: $session_name"
+        exec $MUX new-session -s "$session_name" -c "$target_dir"
+    fi
+fi

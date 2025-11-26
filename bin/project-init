@@ -1,0 +1,913 @@
+#!/bin/bash
+# Initialize a project directory with direnv configuration.
+#
+# Usage: project-init [options] [directory]
+#
+# Examples:
+#   project-init                  # Interactive selection
+#   project-init --build          # Build tools preset
+#   project-init --build --gpu    # Build + GPU tools
+#   project-init -by              # Build tools, no confirm
+
+set -e
+
+# Colors.
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+info() { printf "${GREEN}[project-init]${NC} %s\n" "$1"; }
+warn() { printf "${YELLOW}[project-init]${NC} %s\n" "$1"; }
+error() { printf "${RED}[project-init]${NC} %s\n" "$1" >&2; }
+
+# ============================================================================
+# Tool Definitions
+# ============================================================================
+
+# Tool metadata: name:version_spec:platform:description
+# Platform: all, linux, darwin
+# version_spec: "system" means check command -v instead of ~/tools/
+# Prefix with _PI_ to avoid environment variable conflicts.
+_PI_TOOLS=(
+    "cmake:>=3.28.0:all:CMake build system"
+    "ninja:latest:all:Ninja build tool"
+    "llvm:>=21.0.0:all:LLVM/Clang toolchain"
+    "mold:latest:linux:Fast linker"
+    "bazel:latest:all:Bazel build system"
+    "nvm:latest:all:Node.js version manager"
+    "ccache:system:all:Compiler cache (3-4x faster rebuilds)"
+    "rocm:>=6.0.0:linux:AMD ROCm/HIP"
+    "vulkan:latest:linux:Vulkan SDK"
+)
+
+# Group definitions: id:name:tools (comma-separated tool names)
+_PI_TOOL_GROUPS=(
+    "build:Build Tools:cmake,ninja,llvm,mold,bazel,nvm,ccache"
+    "gpu:ML/GPU Tools:rocm,vulkan"
+)
+
+# Build preset tools (ccache is opt-in, not included in preset).
+_PI_BUILD_TOOLS=(cmake ninja llvm mold bazel)
+
+# GPU preset tools.
+_PI_GPU_TOOLS=(rocm vulkan)
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+# Get platform (linux/darwin).
+get_platform() {
+    case "$(uname -s)" in
+        Linux*)  echo "linux" ;;
+        Darwin*) echo "darwin" ;;
+        *)       echo "unknown" ;;
+    esac
+}
+
+# Check if tool is available (installed in ~/tools/ OR system command).
+tool_installed() {
+    local tool="$1"
+
+    # Get the tool spec to check if it's a system tool.
+    local spec
+    spec=$(get_tool_info "$tool") || return 1
+    local version="${spec#*:}"
+    version="${version%%:*}"
+
+    if [ "$version" = "system" ]; then
+        # System tool: check via command -v.
+        command -v "$tool" &>/dev/null
+    else
+        # Versioned tool: check ~/tools/.
+        [ -d "$HOME/tools/$tool/latest" ] || \
+            { [ -d "$HOME/tools/$tool" ] && [ "$(ls -A "$HOME/tools/$tool" 2>/dev/null)" ]; }
+    fi
+}
+
+# Check if tool is available on current platform.
+tool_available_on_platform() {
+    local platform="$1"
+    local current
+    current=$(get_platform)
+    [ "$platform" = "all" ] || [ "$platform" = "$current" ]
+}
+
+# Get tool metadata by name.
+get_tool_info() {
+    local name="$1"
+    for spec in "${_PI_TOOLS[@]}"; do
+        if [[ "$spec" == "$name:"* ]]; then
+            echo "$spec"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Parse existing .envrc to find selected tools.
+parse_envrc() {
+    local envrc="$1"
+    [ -f "$envrc" ] || return
+    # Match use_<tool> but not use_project_history or source_local_envrc.
+    grep -oE 'use_[a-z_]+' "$envrc" 2>/dev/null | \
+        grep -v 'use_project_history' | \
+        sed 's/use_//' || true
+}
+
+# Check if history is enabled in existing .envrc.
+envrc_has_history() {
+    local envrc="$1"
+    [ -f "$envrc" ] && grep -q 'use_project_history' "$envrc" 2>/dev/null
+}
+
+# Get list of available (installed + platform-compatible) tools.
+get_available_tools() {
+    local available=()
+    for spec in "${_PI_TOOLS[@]}"; do
+        local name="${spec%%:*}"
+        local rest="${spec#*:}"
+        local version="${rest%%:*}"
+        rest="${rest#*:}"
+        local platform="${rest%%:*}"
+
+        if tool_installed "$name" && tool_available_on_platform "$platform"; then
+            available+=("$name")
+        fi
+    done
+    printf '%s\n' "${available[@]}"
+}
+
+# ============================================================================
+# fzf Selection
+# ============================================================================
+
+# Build fzf input for a group of tools.
+# Args: group_tools (comma-separated names)
+# Output: tab-separated lines: name<tab>description
+build_fzf_items() {
+    local group_tools="$1"
+    local IFS=','
+    for tool_name in $group_tools; do
+        local spec
+        spec=$(get_tool_info "$tool_name") || continue
+
+        local name="${spec%%:*}"
+        local rest="${spec#*:}"
+        local version="${rest%%:*}"
+        rest="${rest#*:}"
+        local platform="${rest%%:*}"
+        local desc="${rest#*:}"
+
+        # Skip if not installed or not available on platform.
+        tool_installed "$name" || continue
+        tool_available_on_platform "$platform" || continue
+
+        printf '%s\t%s\n' "$name" "$desc"
+    done
+}
+
+# Run fzf with output to file to avoid capturing terminal escape sequences.
+# Args: all fzf arguments
+# Stdin: items to select from
+# Stdout: selected items
+run_fzf() {
+    local outfile
+    outfile=$(mktemp)
+
+    # Run fzf with stdout to file.
+    fzf "$@" > "$outfile" 2>/dev/null </dev/stdin || true
+
+    # Filter out any numeric-only lines (terminal escape responses from fzf 0.60).
+    if [ -s "$outfile" ]; then
+        grep -v '^[0-9][0-9]*$' "$outfile" 2>/dev/null || true
+    fi
+
+    rm -f "$outfile"
+}
+
+# Multi-select tools using fzf.
+# Args: group_name, group_tools (comma-separated), preselected (newline-separated)
+# Returns: selected tools (newline-separated)
+select_tools_fzf() {
+    local group_name="$1"
+    local group_tools="$2"
+    local preselected="$3"
+
+    local items
+    items=$(build_fzf_items "$group_tools")
+
+    # No tools available in this group.
+    [ -z "$items" ] && return 0
+
+    # Count items for height calculation.
+    local count
+    count=$(echo "$items" | wc -l)
+    local height=$((count + 4))
+    [ "$height" -lt 6 ] && height=6
+
+    local infile
+    infile=$(mktemp)
+    echo "$items" > "$infile"
+
+    # Build pre-selection bind command.
+    # fzf uses pos(N)+toggle to select specific items (1-indexed).
+    # Items start unselected, so toggle selects them.
+    local bind_cmd=""
+    if [ -n "$preselected" ]; then
+        local idx=1
+        while IFS=$'\t' read -r tool_name _; do
+            # Check if this tool is in preselected list.
+            if echo "$preselected" | grep -qxF "$tool_name"; then
+                if [ -n "$bind_cmd" ]; then
+                    bind_cmd="$bind_cmd+pos($idx)+toggle"
+                else
+                    bind_cmd="pos($idx)+toggle"
+                fi
+            fi
+            idx=$((idx + 1))
+        done < "$infile"
+        # Return cursor to first position after pre-selecting.
+        [ -n "$bind_cmd" ] && bind_cmd="$bind_cmd+first"
+    fi
+
+    # Run fzf with optional pre-selection.
+    local result
+    if [ -n "$bind_cmd" ]; then
+        result=$(run_fzf --multi \
+            --height "$height" \
+            --border \
+            --prompt "Select $group_name: " \
+            --header "Tab: toggle, Enter: confirm" \
+            --marker "✓" \
+            --pointer "▶" \
+            --delimiter $'\t' \
+            --with-nth "1,2" \
+            --tabstop 12 \
+            --sync \
+            --bind "load:$bind_cmd" \
+            < "$infile")
+    else
+        result=$(run_fzf --multi \
+            --height "$height" \
+            --border \
+            --prompt "Select $group_name: " \
+            --header "Tab: toggle, Enter: confirm" \
+            --marker "✓" \
+            --pointer "▶" \
+            --delimiter $'\t' \
+            --with-nth "1,2" \
+            --tabstop 12 \
+            < "$infile")
+    fi
+
+    rm -f "$infile"
+
+    # Extract just the tool names (first column).
+    if [ -n "$result" ]; then
+        echo "$result" | cut -f1
+    fi
+}
+
+# Interactive selection of history option.
+select_history_fzf() {
+    local current="$1"
+
+    local items
+    if [ "$current" = "true" ]; then
+        items=$'yes\tEnable per-project shell history (current)\nno\tDisable per-project shell history'
+    else
+        items=$'yes\tEnable per-project shell history\nno\tDisable per-project shell history (current)'
+    fi
+
+    local infile
+    infile=$(mktemp)
+    echo "$items" > "$infile"
+
+    # Pre-select current value (yes=1, no=2).
+    local bind_cmd=""
+    if [ "$current" = "true" ]; then
+        bind_cmd="pos(1)+toggle+first"
+    else
+        bind_cmd="pos(2)+toggle+first"
+    fi
+
+    local choice
+    choice=$(run_fzf --height 5 \
+        --border \
+        --prompt "Per-project history: " \
+        --header "Enter to select" \
+        --delimiter $'\t' \
+        --with-nth "1,2" \
+        --sync \
+        --bind "load:$bind_cmd" \
+        < "$infile" | cut -f1)
+
+    rm -f "$infile"
+    [ "$choice" = "yes" ] && echo "true" || echo "false"
+}
+
+# ============================================================================
+# .envrc Generation
+# ============================================================================
+
+# Generate .envrc content.
+# Args: tools array, use_history flag
+generate_envrc() {
+    local use_history="$1"
+    shift
+    local tools=("$@")
+
+    echo "# Project environment - managed by direnv."
+    echo "# Edit tool versions as needed. Run 'direnv allow' after changes."
+    echo ""
+
+    if [ "$use_history" = "true" ]; then
+        echo "# Per-project shell history (shared across subdirectories)."
+        if [ -n "$HISTORY_PATH" ]; then
+            echo "use_project_history \"$HISTORY_PATH\""
+        else
+            echo "use_project_history"
+        fi
+        echo ""
+    fi
+
+    for tool in "${tools[@]}"; do
+        local spec
+        spec=$(get_tool_info "$tool") || continue
+
+        local version="${spec#*:}"
+        version="${version%%:*}"
+
+        case "$tool" in
+            llvm)   echo "use_llvm \"$version\"" ;;
+            cmake)  echo "use_cmake \"$version\"" ;;
+            ninja)  echo "use_ninja" ;;
+            mold)   echo "use_mold" ;;
+            bazel)  echo "use_bazel" ;;
+            nvm)    echo "use_nvm" ;;
+            ccache)
+                if [ -n "$CACHE_NAME" ]; then
+                    echo "use_ccache \"$CACHE_NAME\""
+                else
+                    echo "use_ccache"
+                fi
+                ;;
+            rocm)   echo "use_rocm \"$version\"  # Linux only" ;;
+            vulkan) echo "use_vulkan" ;;
+        esac
+    done
+
+    echo ""
+    echo "# Load machine-specific overrides if present."
+    echo "source_local_envrc"
+}
+
+# Create .envrc.local template.
+create_envrc_local() {
+    cat << 'EOF'
+# Machine-specific overrides (not committed to git).
+# Uncomment and modify as needed:
+
+# Override tool versions for this machine:
+# use_llvm "20.1.0"
+
+# Extra environment variables:
+# export MY_VAR="value"
+EOF
+}
+
+# ============================================================================
+# CLI
+# ============================================================================
+
+show_help() {
+    cat << 'EOF'
+project-init - Initialize project with direnv tool configuration
+
+USAGE
+    project-init [options] [directory]
+
+OPTIONS
+    -h, --help          Show this help
+    -b, --build         Select build tools preset (non-interactive)
+    -g, --gpu           Also include GPU/ML tools
+    -a, --all           Select all available tools
+    -y, --yes           Skip confirmation prompt
+    --no-env            Skip .envrc generation (use with --vscode)
+    --no-history        Disable per-project shell history
+    --cache-name NAME   Override ccache cache name (default: directory basename)
+    --history-path PATH Override history directory path
+
+VS CODE WORKSPACE OPTIONS
+    --vscode            Generate <basename>.code-workspace file
+    --cmake [DIR]       Enable CMake settings (default: ./build/)
+    --llvm              Enable LLVM settings (clangd, clang-format, lldb)
+    --bazel             Enable Bazel settings (bazel, buildifier)
+    --no-colors         Disable workspace color scheme generation
+    --vscode-settings FILE  Merge additional settings from JSON file
+    --vscode-name NAME  Override workspace name (default: directory basename)
+
+INTERACTIVE MODE
+    By default, project-init uses fzf for interactive tool selection.
+    Tools are grouped by category (Build Tools, ML/GPU Tools).
+    Only installed tools (present in ~/tools/<tool>/) are shown.
+
+    If .envrc already exists, current tools are pre-selected.
+
+NON-INTERACTIVE PRESETS
+    --build         cmake, ninja, llvm, mold, bazel
+    --build --gpu   Above + rocm, vulkan
+    --all           All available tools
+
+EXAMPLES
+    project-init                  # Interactive selection
+    project-init --build          # Build tools only
+    project-init --build --gpu    # Build + GPU tools
+    project-init -by              # Build tools, no confirm
+    project-init ~/new-project    # Init specific directory
+
+FILES CREATED
+    .envrc              Project tool configuration (commit this)
+    .envrc.local        Machine overrides template (gitignored)
+    .history/           Per-project shell history (if enabled)
+    <name>.code-workspace  VS Code workspace file (if --vscode)
+
+SEE ALSO
+    direnv, use_llvm, use_cmake, use_rocm (in ~/.direnvrc)
+EOF
+}
+
+parse_args() {
+    INTERACTIVE=true
+    AUTO_CONFIRM=false
+    USE_HISTORY=true
+    PRESET_BUILD=false
+    PRESET_GPU=false
+    PRESET_ALL=false
+    TARGET_DIR="."
+    CACHE_NAME=""
+    HISTORY_PATH=""
+
+    # VS Code workspace options.
+    VSCODE_ENABLED=false
+    NO_ENV=false
+    VSCODE_CMAKE=false
+    VSCODE_LLVM=false
+    VSCODE_BAZEL=false
+    VSCODE_COLORS=true
+    VSCODE_EXTRA_SETTINGS=""
+    VSCODE_NAME=""
+    BUILD_DIR="./build"
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -b|--build)
+                INTERACTIVE=false
+                PRESET_BUILD=true
+                ;;
+            -g|--gpu)
+                PRESET_GPU=true
+                ;;
+            -a|--all)
+                INTERACTIVE=false
+                PRESET_ALL=true
+                ;;
+            -y|--yes)
+                AUTO_CONFIRM=true
+                ;;
+            --no-history)
+                USE_HISTORY=false
+                ;;
+            --cache-name)
+                shift
+                CACHE_NAME="$1"
+                ;;
+            --history-path)
+                shift
+                HISTORY_PATH="$1"
+                ;;
+            --vscode)
+                VSCODE_ENABLED=true
+                ;;
+            --no-env)
+                NO_ENV=true
+                ;;
+            --cmake)
+                VSCODE_CMAKE=true
+                # Check if next arg is a directory (not another flag).
+                if [ $# -gt 1 ] && [[ ! "$2" =~ ^- ]]; then
+                    shift
+                    BUILD_DIR="$1"
+                fi
+                ;;
+            --llvm)
+                VSCODE_LLVM=true
+                ;;
+            --bazel)
+                VSCODE_BAZEL=true
+                ;;
+            --no-colors)
+                VSCODE_COLORS=false
+                ;;
+            --vscode-settings)
+                shift
+                VSCODE_EXTRA_SETTINGS="$1"
+                ;;
+            --vscode-name)
+                shift
+                VSCODE_NAME="$1"
+                ;;
+            -*)
+                # Handle combined short flags like -by.
+                if [[ "$1" =~ ^-[a-z]+$ ]]; then
+                    local flags="${1:1}"
+                    for ((i=0; i<${#flags}; i++)); do
+                        case "${flags:$i:1}" in
+                            b) INTERACTIVE=false; PRESET_BUILD=true ;;
+                            g) PRESET_GPU=true ;;
+                            a) INTERACTIVE=false; PRESET_ALL=true ;;
+                            y) AUTO_CONFIRM=true ;;
+                            h) show_help; exit 0 ;;
+                            *) error "Unknown flag: -${flags:$i:1}"; exit 1 ;;
+                        esac
+                    done
+                else
+                    error "Unknown option: $1"
+                    exit 1
+                fi
+                ;;
+            *)
+                TARGET_DIR="$1"
+                ;;
+        esac
+        shift
+    done
+}
+
+# ============================================================================
+# VS Code Workspace Generation
+# ============================================================================
+
+# Color palette for workspace theming (100 curated colors).
+_PI_COLORS=(
+    "#191919" "#2D2D2D" "#464646" "#5C4F4F" "#986565" "#4E1717" "#670F08" "#6B413D" "#A3574E" "#A69E9C"
+    "#913821" "#A8604C" "#8A2B0E" "#A35E47" "#B7410E" "#A0522D" "#9A7E70" "#723E22" "#7E6354" "#8B6853"
+    "#7D5F4B" "#C4621C" "#BE5103" "#885129" "#8B4C1D" "#A45E29" "#664C35" "#8E5A2B" "#A86011" "#6F5C43"
+    "#AE7A33" "#B37E2E" "#836D4B" "#8A6F28" "#807141" "#564A23" "#878571" "#58563B" "#545233" "#807D3F"
+    "#6B6B4F" "#757E2C" "#707649" "#636B2F" "#7E8C54" "#5C7F3F" "#3A552C" "#48872B" "#4F7942" "#4C8F3F"
+    "#4B6E48" "#5E8F5A" "#519754" "#2E6F40" "#243E2C" "#558B70" "#80CFA9" "#0A5C35" "#174C38" "#0B3D30"
+    "#217460" "#006850" "#01796F" "#005C5C" "#507D82" "#4D7074" "#0B2E32" "#225F73" "#48697B" "#7C99AB"
+    "#517992" "#575A5C" "#496580" "#45596D" "#38495A" "#2F3F66" "#373B5F" "#8686AD" "#191970" "#292866"
+    "#5D5C99" "#0F0E47" "#515081" "#272657" "#655892" "#8E59A1" "#514D52" "#93669E" "#723480" "#A47DAC"
+    "#995791" "#8E4585" "#9F5E8A" "#660032" "#845864" "#8C1936" "#380009" "#3D2629"
+)
+
+# Get the installed version/path for a tool.
+get_tool_root() {
+    local tool="$1"
+    local tool_dir="$HOME/tools/$tool"
+
+    if [ -L "$tool_dir/latest" ]; then
+        readlink -f "$tool_dir/latest"
+    elif [ -d "$tool_dir/latest" ]; then
+        echo "$tool_dir/latest"
+    else
+        # Find the first version directory.
+        local version_dir
+        version_dir=$(find "$tool_dir" -maxdepth 1 -type d ! -name "$tool" 2>/dev/null | head -1)
+        [ -n "$version_dir" ] && echo "$version_dir" || echo "$tool_dir"
+    fi
+}
+
+# Generate color scheme based on project name hash.
+generate_color_scheme() {
+    local name="$1"
+    local hash
+    hash=$(echo -n "$name" | cksum | cut -d' ' -f1)
+    local idx=$((hash % ${#_PI_COLORS[@]}))
+    local base="${_PI_COLORS[$idx]}"
+
+    # Inactive: slightly darker (reduce each RGB by ~20%).
+    local inactive
+    inactive=$(printf "#%02x%02x%02x" \
+        $(( (0x${base:1:2} * 4) / 5 )) \
+        $(( (0x${base:3:2} * 4) / 5 )) \
+        $(( (0x${base:5:2} * 4) / 5 )))
+
+    # Dark: much darker (reduce each RGB by ~50%).
+    local dark
+    dark=$(printf "#%02x%02x%02x" \
+        $(( 0x${base:1:2} / 2 )) \
+        $(( 0x${base:3:2} / 2 )) \
+        $(( 0x${base:5:2} / 2 )))
+
+    echo "$base $inactive $dark"
+}
+
+# Generate VS Code workspace file.
+generate_vscode_workspace() {
+    local project_name="$1"
+    # Use VSCODE_NAME override if set.
+    [ -n "$VSCODE_NAME" ] && project_name="$VSCODE_NAME"
+    local workspace_file="$project_name.code-workspace"
+
+    # Start with base settings.
+    local settings='{
+        "terminal.integrated.defaultProfile.linux": "zsh",
+        "terminal.integrated.defaultProfile.osx": "zsh",
+        "terminal.integrated.env.linux": { "DIRENV_LOG_FORMAT": "" },
+        "terminal.integrated.env.osx": { "DIRENV_LOG_FORMAT": "" }
+    }'
+
+    # Add color scheme if enabled.
+    if [ "$VSCODE_COLORS" = "true" ]; then
+        local colors
+        colors=$(generate_color_scheme "$project_name")
+        local base inactive dark
+        read -r base inactive dark <<< "$colors"
+
+        local color_settings
+        color_settings=$(cat << COLOREOF
+{
+    "workbench.colorTheme": "Default Dark Modern",
+    "workbench.colorCustomizations": {
+        "[Default Dark Modern]": {
+            "titleBar.activeBackground": "$base",
+            "titleBar.inactiveBackground": "$inactive",
+            "titleBar.activeForeground": "#cccccc",
+            "titleBar.inactiveForeground": "#9d9d9d",
+            "titleBar.border": "$base",
+            "activityBar.background": "$base",
+            "statusBar.background": "$base",
+            "panel.background": "$dark",
+            "sideBar.background": "$dark"
+        }
+    }
+}
+COLOREOF
+)
+        settings=$(echo "$settings" "$color_settings" | jq -s '.[0] * .[1]')
+    fi
+
+    # Resolve BUILD_DIR to absolute path if relative.
+    local abs_build_dir="$BUILD_DIR"
+    if [[ "$BUILD_DIR" != /* ]]; then
+        abs_build_dir="$(pwd)/${BUILD_DIR#./}"
+    fi
+
+    # Merge tool-specific settings.
+    local tools_dir="$HOME/.dotfiles/tools"
+
+    if [ "$VSCODE_CMAKE" = "true" ] && [ -f "$tools_dir/cmake/vscode-settings.json" ]; then
+        local cmake_settings
+        cmake_settings=$(sed "s|\\\$BUILD_DIR|$abs_build_dir|g" "$tools_dir/cmake/vscode-settings.json")
+        settings=$(echo "$settings" "$cmake_settings" | jq -s '.[0] * .[1]')
+    fi
+
+    if [ "$VSCODE_LLVM" = "true" ] && [ -f "$tools_dir/llvm/vscode-settings.json" ]; then
+        local llvm_root
+        llvm_root=$(get_tool_root "llvm")
+        local llvm_settings
+        llvm_settings=$(sed "s|\\\$TOOL_ROOT|$llvm_root|g; s|\\\$BUILD_DIR|$abs_build_dir|g" "$tools_dir/llvm/vscode-settings.json")
+        settings=$(echo "$settings" "$llvm_settings" | jq -s '.[0] * .[1]')
+    fi
+
+    if [ "$VSCODE_BAZEL" = "true" ] && [ -f "$tools_dir/bazel/vscode-settings.json" ]; then
+        local bazel_root
+        bazel_root=$(get_tool_root "bazel")
+        local bazel_settings
+        bazel_settings=$(sed "s|\\\$TOOL_ROOT|$bazel_root|g" "$tools_dir/bazel/vscode-settings.json")
+        settings=$(echo "$settings" "$bazel_settings" | jq -s '.[0] * .[1]')
+    fi
+
+    # Check for rocm in selected tools and merge its settings.
+    if [ -f "$tools_dir/rocm/vscode-settings.json" ]; then
+        # Check if rocm is in the envrc.
+        if [ -f ".envrc" ] && grep -q "use_rocm" ".envrc"; then
+            local rocm_root
+            rocm_root=$(get_tool_root "rocm")
+            local rocm_settings
+            rocm_settings=$(sed "s|\\\$TOOL_ROOT|$rocm_root|g" "$tools_dir/rocm/vscode-settings.json")
+            settings=$(echo "$settings" "$rocm_settings" | jq -s '.[0] * .[1]')
+        fi
+    fi
+
+    # Merge extra settings if provided.
+    if [ -n "$VSCODE_EXTRA_SETTINGS" ] && [ -f "$VSCODE_EXTRA_SETTINGS" ]; then
+        local extra_settings
+        extra_settings=$(cat "$VSCODE_EXTRA_SETTINGS")
+        settings=$(echo "$settings" "$extra_settings" | jq -s '.[0] * .[1]')
+    fi
+
+    # Write the workspace file.
+    jq -n \
+        --arg name "$project_name" \
+        --argjson settings "$settings" \
+        '{
+            name: $name,
+            folders: [{ path: ".", name: $name }],
+            settings: $settings
+        }' > "$workspace_file"
+
+    info "Created VS Code workspace: $workspace_file"
+}
+
+# ============================================================================
+# Main
+# ============================================================================
+
+main() {
+    parse_args "$@"
+
+    # Create and enter target directory.
+    if [ ! -d "$TARGET_DIR" ]; then
+        mkdir -p "$TARGET_DIR"
+        info "Created directory: $TARGET_DIR"
+    fi
+    cd "$TARGET_DIR"
+
+    # Handle --no-env mode: generate workspace only and exit.
+    if [ "$NO_ENV" = "true" ]; then
+        if [ "$VSCODE_ENABLED" = "true" ]; then
+            local project_name
+            project_name=$(basename "$(pwd)")
+            generate_vscode_workspace "$project_name"
+        fi
+        exit 0
+    fi
+
+    echo -e "${BLUE}Project initialization${NC}"
+    echo "======================"
+    echo ""
+
+    # Check for available tools.
+    local available
+    available=$(get_available_tools)
+    if [ -z "$available" ]; then
+        warn "No tools installed in ~/tools/"
+        warn "Install tools with: ~/.dotfiles/tools/install.sh"
+        echo ""
+    fi
+
+    # Parse existing .envrc if present.
+    local current_tools=()
+    if [ -f ".envrc" ]; then
+        mapfile -t current_tools < <(parse_envrc ".envrc")
+        if envrc_has_history ".envrc"; then
+            USE_HISTORY=true
+        else
+            USE_HISTORY=false
+        fi
+        info "Existing .envrc detected. Current tools: ${current_tools[*]:-none}"
+        echo ""
+    fi
+
+    local selected_tools=()
+
+    if [ "$INTERACTIVE" = "true" ]; then
+        # Interactive fzf selection per group.
+        for group_spec in "${_PI_TOOL_GROUPS[@]}"; do
+            # Parse group spec: id:name:tools
+            local rest="${group_spec#*:}"
+            local group_name="${rest%%:*}"
+            local group_tools="${rest#*:}"
+
+            # Build preselected list for this group.
+            local preselected=""
+            for tool in "${current_tools[@]}"; do
+                if [[ ",$group_tools," == *",$tool,"* ]]; then
+                    preselected+="$tool"$'\n'
+                fi
+            done
+
+            local chosen
+            chosen=$(select_tools_fzf "$group_name" "$group_tools" "$preselected")
+            if [ -n "$chosen" ]; then
+                while IFS= read -r tool; do
+                    [ -n "$tool" ] && selected_tools+=("$tool")
+                done <<< "$chosen"
+            fi
+        done
+
+        # History selection.
+        USE_HISTORY=$(select_history_fzf "$USE_HISTORY")
+    else
+        # Non-interactive: use presets.
+        if [ "$PRESET_ALL" = "true" ]; then
+            # All available tools.
+            while IFS= read -r tool; do
+                [ -n "$tool" ] && selected_tools+=("$tool")
+            done <<< "$available"
+        else
+            # Build preset.
+            if [ "$PRESET_BUILD" = "true" ]; then
+                for tool in "${_PI_BUILD_TOOLS[@]}"; do
+                    if tool_installed "$tool"; then
+                        local spec
+                        spec=$(get_tool_info "$tool") || continue
+                        local platform="${spec#*:}"
+                        platform="${platform#*:}"
+                        platform="${platform%%:*}"
+                        tool_available_on_platform "$platform" && selected_tools+=("$tool")
+                    fi
+                done
+            fi
+
+            # GPU preset.
+            if [ "$PRESET_GPU" = "true" ]; then
+                for tool in "${_PI_GPU_TOOLS[@]}"; do
+                    if tool_installed "$tool"; then
+                        local spec
+                        spec=$(get_tool_info "$tool") || continue
+                        local platform="${spec#*:}"
+                        platform="${platform#*:}"
+                        platform="${platform%%:*}"
+                        tool_available_on_platform "$platform" && selected_tools+=("$tool")
+                    fi
+                done
+            fi
+        fi
+    fi
+
+    # Check for empty selection.
+    if [ ${#selected_tools[@]} -eq 0 ]; then
+        warn "No tools selected."
+        if [ "$AUTO_CONFIRM" != "true" ]; then
+            read -p "Continue with empty .envrc? [y/N] " -n 1 -r
+            echo
+            [[ ! $REPLY =~ ^[Yy]$ ]] && { echo "Aborted."; exit 1; }
+        fi
+    fi
+
+    # Generate preview.
+    local new_envrc
+    new_envrc=$(generate_envrc "$USE_HISTORY" "${selected_tools[@]}")
+
+    # Check if same as existing.
+    if [ -f ".envrc" ]; then
+        local existing
+        existing=$(cat .envrc)
+        if [ "$new_envrc" = "$existing" ]; then
+            info "No changes needed. .envrc is already up to date."
+            exit 0
+        fi
+    fi
+
+    echo "Will generate .envrc:"
+    echo "────────────────────────────────────────"
+    echo "$new_envrc"
+    echo "────────────────────────────────────────"
+    echo ""
+
+    # Confirm unless -y.
+    if [ "$AUTO_CONFIRM" != "true" ]; then
+        read -p "Confirm? [Y/n] " -n 1 -r
+        echo
+        [[ $REPLY =~ ^[Nn]$ ]] && { echo "Aborted."; exit 1; }
+    fi
+
+    # Write .envrc.
+    echo "$new_envrc" > .envrc
+
+    # Create .envrc.local if doesn't exist.
+    if [ ! -f ".envrc.local" ]; then
+        create_envrc_local > .envrc.local
+    fi
+
+    # Create history directory if enabled.
+    if [ "$USE_HISTORY" = "true" ]; then
+        mkdir -p .history
+    fi
+
+    # Generate VS Code workspace if requested.
+    local project_name
+    project_name=$(basename "$(pwd)")
+    if [ "$VSCODE_ENABLED" = "true" ]; then
+        generate_vscode_workspace "$project_name"
+    fi
+
+    echo ""
+    echo -e "${GREEN}Created:${NC}"
+    echo "  .envrc       - Project tool configuration (commit this)"
+    [ ! -f ".envrc.local" ] || echo "  .envrc.local - Machine overrides (gitignored)"
+    [ "$USE_HISTORY" = "true" ] && echo "  .history/    - Per-project shell history (gitignored)"
+    [ "$VSCODE_ENABLED" = "true" ] && echo "  $project_name.code-workspace - VS Code workspace"
+    echo ""
+
+    # Allow direnv.
+    if command -v direnv >/dev/null 2>&1; then
+        direnv allow
+        echo -e "${GREEN}Done! Environment is now active.${NC}"
+    else
+        echo -e "${YELLOW}Note: direnv not found. Install it and run 'direnv allow' to activate.${NC}"
+    fi
+}
+
+main "$@"

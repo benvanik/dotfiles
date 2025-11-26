@@ -1,0 +1,104 @@
+#!/bin/bash
+# Run IREE tests with consistent configuration.
+#
+# Usage: iree-cmake-test [ctest-args...]
+#
+# Examples:
+#   iree-cmake-test                           # Run all tests
+#   iree-cmake-test -R "Dialect"              # Run tests matching regex
+#   iree-cmake-test -N                        # List tests (dry run)
+#   iree-cmake-test --output-on-failure       # Show output on failure
+#
+# This script automatically finds the correct build directory based on the
+# current worktree location:
+#   ~/src/iree/main/   -> ~/src/iree/builds/main/
+#   ~/src/iree/<name>/ -> ~/src/iree/builds/<name>/
+
+set -e
+
+# Colors.
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+info() { printf "${GREEN}[iree-test]${NC} %s\n" "$1"; }
+warn() { printf "${YELLOW}[iree-test]${NC} %s\n" "$1"; }
+error() { printf "${RED}[iree-test]${NC} %s\n" "$1" >&2; }
+
+# Find the IREE worktree root (directory with .git and CMakeLists.txt).
+find_worktree_root() {
+    local dir="$PWD"
+    while [ "$dir" != "/" ]; do
+        if [ -e "$dir/.git" ] && [ -f "$dir/CMakeLists.txt" ]; then
+            if grep -q "project(IREE" "$dir/CMakeLists.txt" 2>/dev/null; then
+                echo "$dir"
+                return 0
+            fi
+        fi
+        dir=$(dirname "$dir")
+    done
+    return 1
+}
+
+# Infer build directory from source directory.
+infer_build_directory() {
+    local source_dir="$1"
+    local iree_root="$HOME/src/iree"
+
+    # Check if we're in the new directory structure.
+    if [[ "$source_dir" == "$iree_root/"* ]]; then
+        local relative="${source_dir#"$iree_root"/}"
+        local worktree_name="${relative%%/*}"
+        if [ "$worktree_name" != "builds" ]; then
+            echo "$iree_root/builds/$worktree_name"
+            return 0
+        fi
+    fi
+
+    # Legacy fallback.
+    local source_name
+    source_name=$(basename "$source_dir")
+    if [[ "$source_name" == iree-* ]] && [[ "$source_name" != *-build ]]; then
+        echo "$(dirname "$source_dir")/${source_name}-build"
+        return 0
+    elif [ "$source_name" = "iree" ]; then
+        echo "$(dirname "$source_dir")/iree-build"
+        return 0
+    fi
+
+    # Default.
+    echo "$source_dir/build"
+}
+
+# Find worktree root.
+SOURCE_DIR=$(find_worktree_root)
+if [ -z "$SOURCE_DIR" ]; then
+    error "Not in an IREE worktree"
+    error "Run from within ~/src/iree/<worktree>/"
+    exit 1
+fi
+
+# Determine build directory.
+BUILD_DIR=$(infer_build_directory "$SOURCE_DIR")
+
+# Check if build directory exists and is configured.
+if [ ! -d "$BUILD_DIR" ]; then
+    error "Build directory not found: $BUILD_DIR"
+    error "Run iree-cmake-configure first"
+    exit 1
+fi
+
+if [ ! -f "$BUILD_DIR/CMakeCache.txt" ]; then
+    error "Build directory not configured: $BUILD_DIR"
+    error "Run iree-cmake-configure first"
+    exit 1
+fi
+
+info "Source: $SOURCE_DIR"
+info "Build:  $BUILD_DIR"
+echo ""
+
+# Run ctest in the build directory.
+cd "$BUILD_DIR"
+exec ctest "$@"

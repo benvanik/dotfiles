@@ -1,0 +1,253 @@
+#!/bin/bash
+# Creates an IREE worktree with shared configuration.
+#
+# Usage: iree-worktree-init <branch-name> [worktree-name]
+#
+# Examples:
+#   iree-worktree-init main                    # Creates ~/src/iree/main/
+#   iree-worktree-init users/me/feature feat   # Creates ~/src/iree/feat/
+#
+# Creates:
+#   - Git worktree at ~/src/iree/<name>/
+#   - Build directory at ~/src/iree/builds/<name>/
+#   - Symlinks for .claude/, .vscode/, CLAUDE*.md
+#   - Per-project shell history via .envrc
+#   - VSCode workspace file with deterministic color scheme
+
+set -e
+
+# Colors.
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+info() { printf "${GREEN}[iree-worktree]${NC} %s\n" "$1"; }
+warn() { printf "${YELLOW}[iree-worktree]${NC} %s\n" "$1"; }
+error() { printf "${RED}[iree-worktree]${NC} %s\n" "$1" >&2; }
+
+show_help() {
+    cat << 'EOF'
+iree-worktree-init - Create an IREE development worktree
+
+USAGE
+    iree-worktree-init <branch> [name]
+
+ARGUMENTS
+    <branch>    Git branch name (e.g., main, users/you/feature)
+                Created from main if it doesn't exist
+    [name]      Optional worktree name (default: basename of branch)
+
+EXAMPLES
+    iree-worktree-init main
+        Creates ~/src/iree/main/ with tmux session iree-main
+
+    iree-worktree-init users/me/feature
+        Creates ~/src/iree/feature/ with tmux session iree-feature
+
+    iree-worktree-init users/me/feature mywork
+        Creates ~/src/iree/mywork/ with tmux session iree-mywork
+
+WHAT IT CREATES
+    ~/src/iree/<name>/           Git worktree
+    ~/src/iree/builds/<name>/    Build directory
+    Symlinks: .claude/, .vscode/, CLAUDE*.md from main/
+    .envrc with direnv integration
+    <name>.code-workspace with color-coded theme
+
+WORKFLOW
+    1. Create worktree:
+         iree-worktree-init users/you/feature
+
+    2. Start tmux session:
+         cd ~/src/iree/feature
+         iree-dev feature
+
+    3. Configure and build:
+         iree-cmake-configure
+         iree-cmake-build
+
+    4. When done:
+         iree-worktree-deinit feature
+
+SEE ALSO
+    iree-worktree-deinit    Remove worktree and build directory
+    iree-dev                Create/attach tmux session
+    iree-cmake-configure    Configure cmake build
+    iree-cmake-build        Build with standard flags
+EOF
+}
+
+# Handle --help early.
+case "${1:-}" in
+    -h|--help)
+        show_help
+        exit 0
+        ;;
+esac
+
+if [ $# -lt 1 ]; then
+    show_help
+    exit 1
+fi
+
+BRANCH=$1
+IREE_ROOT="$HOME/src/iree"
+MAIN_WORKTREE="$IREE_ROOT/main"
+
+# Verify main worktree exists.
+if [ ! -d "$MAIN_WORKTREE/.git" ]; then
+    error "Main IREE worktree not found at $MAIN_WORKTREE"
+    error "Please set up the main worktree first."
+    exit 1
+fi
+
+# Default worktree name: sanitize branch name.
+if [ $# -lt 2 ]; then
+    # Convert users/me/feature -> feature.
+    WORKTREE_NAME=$(basename "$BRANCH")
+else
+    WORKTREE_NAME=$2
+fi
+
+# Prevent overwriting main.
+if [ "$WORKTREE_NAME" = "main" ]; then
+    error "Cannot create worktree named 'main' - reserved for primary worktree"
+    exit 1
+fi
+
+WORKTREE_PATH="$IREE_ROOT/$WORKTREE_NAME"
+BUILD_PATH="$IREE_ROOT/builds/$WORKTREE_NAME"
+
+# Check if worktree already exists.
+if [ -d "$WORKTREE_PATH" ]; then
+    error "Worktree already exists at $WORKTREE_PATH"
+    exit 1
+fi
+
+info "Creating worktree..."
+echo "  Branch: $BRANCH"
+echo "  Location: $WORKTREE_PATH"
+echo "  Build dir: $BUILD_PATH"
+echo ""
+
+# Create the worktree.
+cd "$MAIN_WORKTREE"
+
+# Check if branch exists locally, remotely, or needs to be created.
+if git show-ref --verify --quiet "refs/heads/$BRANCH"; then
+    # Branch exists locally.
+    git worktree add "$WORKTREE_PATH" "$BRANCH"
+elif git show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
+    # Branch exists on remote - track it.
+    git worktree add --track -b "$BRANCH" "$WORKTREE_PATH" "origin/$BRANCH"
+else
+    # Branch doesn't exist - create new branch from main.
+    info "Branch '$BRANCH' doesn't exist, creating from main..."
+    git worktree add -b "$BRANCH" "$WORKTREE_PATH" main
+fi
+
+# Symlink .vscode configuration.
+cd "$WORKTREE_PATH"
+if [ -d .vscode ]; then
+    rm -rf .vscode
+fi
+ln -s ../main/.vscode .vscode
+info "Symlinked: .vscode -> ../main/.vscode"
+
+# Symlink .claude directory (Claude Code settings).
+if [ -d .claude ]; then
+    rm -rf .claude
+fi
+if [ -d "$MAIN_WORKTREE/.claude" ]; then
+    ln -s ../main/.claude .claude
+    info "Symlinked: .claude -> ../main/.claude"
+fi
+
+# Symlink CLAUDE*.md files from main worktree.
+for claude_file in "$MAIN_WORKTREE"/CLAUDE*.md; do
+    if [ -f "$claude_file" ]; then
+        filename=$(basename "$claude_file")
+        [ -e "$filename" ] && rm -f "$filename"
+        ln -s "../main/$filename" "$filename"
+        info "Symlinked: $filename"
+    fi
+done
+
+# Initialize submodules using main worktree as reference (shares objects via alternates).
+info "Initializing submodules (using main worktree as reference)..."
+git submodule update --init --reference "$MAIN_WORKTREE"
+
+# Create build directory.
+mkdir -p "$BUILD_PATH"
+info "Created build directory: $BUILD_PATH"
+
+# Set up per-project shell history via direnv.
+info "Setting up project environment..."
+cat > .envrc << 'EOF'
+# IREE worktree environment.
+# Edit tool versions as needed. Run `direnv allow` after changes.
+
+# Per-project shell history (shared across ~/src/iree/).
+use_project_history "$HOME/src/iree/.history"
+
+# Build tools.
+use_cmake ">=3.28.0"
+use_ninja
+use_llvm ">=21.0.0"
+use_mold
+use_bazel
+
+# Compiler cache (shared across all IREE worktrees).
+use_ccache "iree"
+
+# GPU/runtime tools.
+use_rocm ">=6.0.0"  # Linux only.
+use_vulkan
+
+# Machine-specific overrides.
+source_local_envrc
+EOF
+
+# Create .envrc.local template.
+cat > .envrc.local << 'EOF'
+# Machine-specific overrides (not committed to git).
+# Uncomment and modify as needed:
+
+# Override LLVM version:
+# use_llvm "20.1.0"
+
+# Override ROCm for this worktree:
+# use_rocm "debug"
+EOF
+
+# Create history directory at project root.
+mkdir -p "$IREE_ROOT/.history"
+
+# Allow direnv for this worktree.
+if command -v direnv &>/dev/null; then
+    direnv allow
+fi
+
+# Generate VS Code workspace using project-init.
+project-init --no-env --vscode \
+    --cmake "$BUILD_PATH" \
+    --llvm \
+    --bazel \
+    --vscode-name "iree-$WORKTREE_NAME" \
+    --vscode-settings "$HOME/.dotfiles/projects/iree/vscode-settings.json"
+
+echo ""
+info "Worktree created successfully!"
+echo ""
+echo "Next steps:"
+echo "  cd $WORKTREE_PATH"
+echo "  iree-dev $WORKTREE_NAME"
+echo ""
+echo "Build workflow:"
+echo "  iree-cmake-configure    # Configure CMake build"
+echo "  iree-cmake-build        # Build with ninja"
+echo "  iree-cmake-test         # Run tests"
+echo ""
+echo "Open in VSCode:"
+echo "  iree-code $WORKTREE_NAME"

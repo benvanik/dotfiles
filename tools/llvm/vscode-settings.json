@@ -1,0 +1,11 @@
+{
+  "clangd.path": "$TOOL_ROOT/bin/clangd",
+  "clangd.arguments": [
+    "--compile-commands-dir=$BUILD_DIR",
+    "--background-index",
+    "--completion-style=detailed",
+    "--header-insertion=never"
+  ],
+  "clang-format.executable": "$TOOL_ROOT/bin/clang-format",
+  "lldb.library": "$TOOL_ROOT/lib/liblldb.so"
+}

@@ -1,0 +1,172 @@
+# ~/.shrc - Universal shell configuration
+# Sourced by all shells (bash, zsh, etc) for common environment setup.
+# IMPORTANT: Keep this POSIX sh compatible - no bash/zsh specific syntax.
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+# Add directory to PATH if it exists.
+_add_path() {
+    [ -d "$1" ] && PATH="$1:$PATH"
+}
+
+# Warn about missing tool (called once per session).
+_require_tool() {
+    command -v "$1" >/dev/null 2>&1 || \
+        printf '\033[33m[dotfiles]\033[0m Missing: %s\n' "$1" >&2
+}
+
+# Check if tool exists (no warning).
+_has_tool() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+# Detect platform (linux, darwin, wsl).
+_detect_platform() {
+    case "$(uname -s)" in
+        Linux)
+            if grep -qi microsoft /proc/version 2>/dev/null; then
+                echo "wsl"
+            else
+                echo "linux"
+            fi
+            ;;
+        Darwin) echo "darwin" ;;
+        *) echo "unknown" ;;
+    esac
+}
+
+# ============================================================================
+# Platform-Specific Configuration (synced)
+# ============================================================================
+# Load shared platform settings (darwin.sh, linux.sh, wsl.sh).
+# These are synced in dotfiles - use .shrc.local for machine-specific overrides.
+_platform="$(_detect_platform)"
+if [ -f "$HOME/.dotfiles/shell/platform/${_platform}.sh" ]; then
+    . "$HOME/.dotfiles/shell/platform/${_platform}.sh"
+fi
+unset _platform
+
+# ============================================================================
+# Core PATH Configuration (portable)
+# ============================================================================
+# These directories are common across all machines.
+
+# Dotfiles bin scripts.
+_add_path "$HOME/.dotfiles/bin"
+
+# User local binaries.
+_add_path "$HOME/.local/bin"
+
+# User bin directory.
+_add_path "$HOME/bin"
+
+# Claude CLI.
+_add_path "$HOME/.claude/local"
+
+# Rust cargo binaries.
+_add_path "$HOME/.cargo/bin"
+
+# Go binaries.
+_add_path "$HOME/go/bin"
+
+# NVM default node (so node/npm work in non-interactive shells).
+# Resolve alias (e.g., "24") to actual version directory (e.g., "v24.11.1").
+if [ -d "$HOME/.nvm/versions/node" ] && [ -f "$HOME/.nvm/alias/default" ]; then
+    _nvm_alias=$(cat "$HOME/.nvm/alias/default")
+    # Find matching version directory.
+    for _nvm_dir in "$HOME/.nvm/versions/node/v${_nvm_alias}"*; do
+        if [ -d "$_nvm_dir/bin" ]; then
+            _add_path "$_nvm_dir/bin"
+            break
+        fi
+    done
+    unset _nvm_alias _nvm_dir
+fi
+
+# ============================================================================
+# Versioned Tools
+# ============================================================================
+# Load default tool versions from ~/tools/ (latest symlinks).
+# Per-project overrides use direnv - see tools.sh and direnvrc.
+if [ -f "$HOME/.dotfiles/tools/tools.sh" ]; then
+    . "$HOME/.dotfiles/tools/tools.sh"
+fi
+
+# ============================================================================
+# Machine-Specific Configuration (not synced)
+# ============================================================================
+# Source machine-specific config from ~/.shrc.local.
+# This file is NOT synced - use for paths/settings unique to this machine.
+# Platform-common settings go in shell/platform/<platform>.sh instead.
+#
+# Example ~/.shrc.local contents:
+#   # Machine-specific PATH additions.
+#   _add_path "/opt/vulkan/bin"
+#   _add_path "/opt/cuda/bin"
+#
+#   # Tool version overrides (if not using direnv).
+#   export LLVM_ROOT="$HOME/tools/llvm/20.1.0"
+
+if [ -f "$HOME/.shrc.local" ]; then
+    . "$HOME/.shrc.local"
+fi
+
+# Export PATH after all modifications.
+export PATH
+
+# Source secrets file if it exists (API keys, tokens, etc.).
+# See ~/.dotfiles/secrets.template for expected format.
+if [ -f "$HOME/.secrets" ]; then
+    . "$HOME/.secrets"
+fi
+
+# ============================================================================
+# Tool Verification (interactive shells only)
+# ============================================================================
+# Warn about missing tools once per session.
+
+if [ -n "$PS1" ] && [ -z "$_DOTFILES_TOOLS_CHECKED" ]; then
+    export _DOTFILES_TOOLS_CHECKED=1
+
+    # Required tools - warn if missing.
+    _require_tool fzf
+    _require_tool rg
+    _require_tool jq
+    _require_tool git
+    _require_tool node
+
+    # Recommended tools - subtle hint.
+    if ! _has_tool eza && ! _has_tool exa; then
+        printf '\033[90m[dotfiles]\033[0m Consider: eza (modern ls)\n' >&2
+    fi
+    if ! _has_tool bat && ! _has_tool batcat; then
+        printf '\033[90m[dotfiles]\033[0m Consider: bat (syntax highlighting)\n' >&2
+    fi
+    if ! _has_tool fd && ! _has_tool fdfind; then
+        printf '\033[90m[dotfiles]\033[0m Consider: fd (fast find)\n' >&2
+    fi
+fi
+
+# ============================================================================
+# Environment Variables
+# ============================================================================
+
+# HuggingFace Hub - enable fast transfers and set cache location.
+export HF_HUB_ENABLE_HF_TRANSFER=1
+export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
+
+# ============================================================================
+# direnv Integration
+# ============================================================================
+# Per-project tool versions via .envrc files.
+# See ~/.dotfiles/tools/direnvrc for use_llvm, use_cmake, etc.
+if _has_tool direnv; then
+    # Silence verbose direnv logging; our direnvrc prints a clean summary.
+    export DIRENV_LOG_FORMAT=""
+    eval "$(direnv hook bash 2>/dev/null)" || true
+fi
+
+# ============================================================================
+# End of ~/.shrc

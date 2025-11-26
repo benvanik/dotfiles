@@ -1,0 +1,5 @@
+{
+  "cmake.buildDirectory": "$BUILD_DIR",
+  "cmake.generator": "Ninja",
+  "cmake.preferredGenerators": ["Ninja", "Unix Makefiles"]
+}

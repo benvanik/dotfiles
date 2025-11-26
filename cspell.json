@@ -1,0 +1,18 @@
+{
+  "version": "0.2",
+  "language": "en",
+  "dictionaries": ["dotfiles"],
+  "dictionaryDefinitions": [
+    {
+      "name": "dotfiles",
+      "path": ".cspell/dictionary.txt",
+      "addWords": true
+    }
+  ],
+  "ignorePaths": [
+    ".git",
+    "*.local",
+    "*.local.*",
+    "themes/*.zsh"
+  ]
+}

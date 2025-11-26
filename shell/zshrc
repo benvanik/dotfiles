@@ -1,0 +1,120 @@
+# ~/.zshrc - Main zsh configuration
+# Sourced by interactive zsh shells.
+#
+# ============================================================================
+# WARNING: DO NOT ADD PATH OR ENVIRONMENT VARIABLES HERE
+# ============================================================================
+# This file is a symlink to ~/.dotfiles/shell/zshrc (version controlled).
+# Installers that modify ~/.zshrc will pollute the dotfiles repo.
+#
+# Add PATH/env modifications to:
+#   ~/.shrc.local    - Machine-specific (not committed, for local tools)
+#   ~/.shrc          - Shared across machines (committed to dotfiles)
+#
+# If an installer modified this file:
+#   dotfiles doctor  - Check for uncommitted changes
+#   dotfiles fixup   - Move additions to ~/.shrc.local
+# ============================================================================
+#
+# Organization:
+#   ~/.shrc              - Universal shell config (PATH, env vars)
+#   ~/.shrc.local        - Machine-specific overrides (not committed)
+#   ~/.aliases           - Shared aliases across all shells
+#   ~/.zshrc.d/*.zsh     - Modular zsh-specific configurations
+#   ~/.p10k.zsh          - Powerlevel10k theme customization
+#
+# To add zsh-specific features:
+#   Create a new file in ~/.zshrc.d/ (auto-sourced alphabetically)
+#
+# To customize your prompt:
+#   Run: p10k configure
+
+# ============================================================================
+# Powerlevel10k Instant Prompt (must be first)
+# ============================================================================
+# Source p10k early for instant prompt feature.
+[[ -f ~/.zshrc.d/p10k.zsh ]] && source ~/.zshrc.d/p10k.zsh
+
+# ============================================================================
+# Universal Shell Configuration
+# ============================================================================
+# Source common config shared across all shells (bash, zsh, etc.).
+[[ -f ~/.shrc ]] && source ~/.shrc
+
+# Source shared aliases.
+[[ -f ~/.aliases ]] && source ~/.aliases
+
+# ============================================================================
+# Zsh-Specific Options
+# ============================================================================
+
+# Emacs-style keybindings by default (Ctrl-A, Ctrl-E, etc.).
+# (Individual keys are configured in ~/.zshrc.d/keybindings.zsh)
+bindkey -e
+
+# Globbing and expansion.
+setopt NO_NOMATCH                   # don't error on unmatched globs, pass through
+setopt EXTENDED_GLOB                # enable advanced glob patterns (#, ~, ^)
+setopt INTERACTIVE_COMMENTS         # allow comments in interactive shell
+
+# Regex matching compatibility.
+setopt BASH_REMATCH                 # ${BASH_REMATCH[@]} in [[ str =~ regex ]]
+
+# Don't let cd wander during tab completion.
+unset CDPATH
+
+# ============================================================================
+# History Configuration
+# ============================================================================
+
+HISTFILE=${HISTFILE:-$HOME/.zsh_history}
+HISTSIZE=100000
+SAVEHIST=100000
+
+setopt EXTENDED_HISTORY             # save timestamp and duration (required for SHARE_HISTORY)
+setopt INC_APPEND_HISTORY           # write each command as it's entered
+setopt SHARE_HISTORY                # share history across all sessions
+setopt HIST_IGNORE_DUPS             # don't record duplicate consecutive commands
+setopt HIST_IGNORE_ALL_DUPS         # remove older duplicates when saving
+setopt HIST_REDUCE_BLANKS           # normalize whitespace in history
+setopt HIST_IGNORE_SPACE            # commands starting with space aren't saved
+setopt HIST_EXPIRE_DUPS_FIRST       # expire duplicate entries first
+
+# ============================================================================
+# Completion System
+# ============================================================================
+
+autoload -Uz compinit
+
+# Cache completion data for faster loading.
+: ${XDG_CACHE_HOME:=$HOME/.cache}
+mkdir -p "$XDG_CACHE_HOME/zsh"
+compinit -d "$XDG_CACHE_HOME/zsh/zcompdump"
+
+# ============================================================================
+# Modular Configuration
+# ============================================================================
+# Automatically source all .zsh files in ~/.zshrc.d/ for organized configs.
+# Files are sourced in alphabetical order.
+#
+# Current modules:
+#   - fzf.zsh:         fuzzy finder integration (Ctrl-R, Ctrl-T, Alt-C)
+#   - keybindings.zsh: VSCode/Windows-style keyboard shortcuts
+#   - p10k.zsh:        Powerlevel10k theme (already sourced above)
+
+if [[ -d ~/.zshrc.d ]]; then
+    for config_file in ~/.zshrc.d/*.zsh(N); do
+        # Skip p10k.zsh since we already sourced it early.
+        [[ $config_file == ~/.zshrc.d/p10k.zsh ]] && continue
+        source "$config_file"
+    done
+    unset config_file
+fi
+
+# ============================================================================
+# Custom Configuration
+# ============================================================================
+# Add your personal zsh-specific settings below this line.
+# For tool-specific configs, prefer creating a new file in ~/.zshrc.d/
+
+# End of ~/.zshrc

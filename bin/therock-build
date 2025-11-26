@@ -1,0 +1,57 @@
+#!/bin/bash
+# Build TheRock with a clean environment.
+# Usage: therock-build [debug|release] [extra cmake args...]
+#
+# Clears environment variables that can contaminate the build:
+# - CC/CXX: Let TheRock use system compiler, not our LLVM
+# - LDFLAGS: Prevent mold from leaking into amdgcn cross-compilation (needs LLD)
+# - LLVM_*: Let TheRock use its own built LLVM
+
+set -e
+
+THEROCK_DIR="${THEROCK_DIR:-$HOME/src/rocm/TheRock}"
+if [ ! -d "$THEROCK_DIR" ]; then
+    echo "Error: TheRock not found at $THEROCK_DIR"
+    echo "Set THEROCK_DIR or run therock-setup first."
+    exit 1
+fi
+cd "$THEROCK_DIR"
+
+# Default to debug build.
+BUILD_TYPE="${1:-debug}"
+shift 2>/dev/null || true
+
+case "$BUILD_TYPE" in
+    debug)   BUILD_DIR="build-debug" ;;
+    release) BUILD_DIR="build-release" ;;
+    *)
+        echo "Usage: $0 [debug|release] [extra cmake args...]"
+        echo "  debug   - Build with CMAKE_BUILD_TYPE=Debug (default)"
+        echo "  release - Build with CMAKE_BUILD_TYPE=Release"
+        exit 1
+        ;;
+esac
+
+# Activate venv for build tools.
+source .venv/bin/activate
+
+# Clear environment variables that contaminate the build.
+unset LDFLAGS
+unset LLVM_ROOT LLVM_DIR CLANG_DIR MLIR_DIR
+
+# Use GCC 14 (GCC 15 has abseil compatibility issues).
+export CC=/usr/bin/gcc-14
+export CXX=/usr/bin/g++-14
+
+# Limit parallelism for ALL cmake --build calls (including subprojects).
+# Debug builds use ~2-3GB RAM per compile job.
+export CMAKE_BUILD_PARALLEL_LEVEL=4
+
+# Build.
+echo "=== Building TheRock ($BUILD_TYPE) ==="
+echo "Build directory: $BUILD_DIR"
+echo ""
+
+# Limit parallelism - debug builds use ~2-3GB RAM per compile job.
+# TheRock runs 3 subprojects in parallel, each with this -j value.
+cmake --build "$BUILD_DIR" -j4 "$@"

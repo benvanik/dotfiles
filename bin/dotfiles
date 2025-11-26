@@ -1,0 +1,711 @@
+#!/bin/bash
+# ~/.dotfiles/bin/dotfiles - Unified dotfiles management CLI
+# Provides testing and installation commands.
+set -e
+
+DOTFILES="${DOTFILES:-$HOME/.dotfiles}"
+
+# Colors.
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[0;33m'
+BOLD=$'\033[1m'
+NC=$'\033[0m'
+
+info() { printf "${GREEN}[dotfiles]${NC} %s\n" "$1"; }
+warn() { printf "${YELLOW}[dotfiles]${NC} %s\n" "$1"; }
+error() { printf "${RED}[dotfiles]${NC} %s\n" "$1" >&2; }
+
+# ============================================================================
+# Help
+# ============================================================================
+show_help() {
+    cat << EOF
+${BOLD}dotfiles${NC} - Unified dotfiles management CLI
+
+${BOLD}USAGE${NC}
+    dotfiles <command> [options]
+
+${BOLD}COMMANDS${NC}
+    ${BOLD}test${NC}              Run Tier 1 fast tests (<5 seconds)
+    ${BOLD}test --full${NC}       Run Tier 1 + Tier 2 Docker tests
+    ${BOLD}doctor${NC}            Health check (tools, symlinks, configs)
+    ${BOLD}fixup${NC}             Integrate installer changes to shell configs
+    ${BOLD}update${NC}            Pull latest changes from git
+    ${BOLD}install${NC}           Set up dotfiles (deps check, symlinks, identity)
+    ${BOLD}deps${NC}              Run install-deps.sh (install packages)
+    ${BOLD}setup${NC}             Configure git SSH signing
+    ${BOLD}help${NC}              Show this help
+
+${BOLD}EXAMPLES${NC}
+    dotfiles test             # Quick validation after editing
+    dotfiles test --full      # Full Docker-based integration test
+
+${BOLD}TESTING${NC}
+    Tier 1 (fast, local):
+      - Shell syntax validation (bash, zsh, POSIX)
+      - Symlink target verification
+      - POSIX compliance checks
+      - Secret detection
+      - shellcheck (if installed)
+
+    Tier 2 (Docker, comprehensive):
+      - Full install on pristine Alpine/Ubuntu
+      - Package installation validation
+      - Interactive shell startup tests
+EOF
+}
+
+# ============================================================================
+# Test Command
+# ============================================================================
+cmd_test() {
+    local full=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --full) full=true; shift ;;
+            *) error "Unknown option: $1"; exit 1 ;;
+        esac
+    done
+
+    # Always run Tier 1.
+    if ! "$DOTFILES/test/run-tier1.sh"; then
+        error "Tier 1 tests failed"
+        exit 1
+    fi
+
+    # Run Tier 2 if requested.
+    if $full; then
+        echo ""
+        if command -v docker &>/dev/null; then
+            "$DOTFILES/test/run-tier2.sh"
+        else
+            warn "Docker not available - skipping Tier 2 tests"
+            warn "Install Docker for full integration testing"
+        fi
+    fi
+}
+
+# ============================================================================
+# Install Command
+# ============================================================================
+cmd_install() {
+    # Step 1: Check dependencies (no sudo from here).
+    info "Checking dependencies..."
+    if ! "$DOTFILES/install-deps.sh" --verify 2>/dev/null; then
+        echo ""
+        error "Missing required packages. Install them first:"
+        echo ""
+        echo "    sudo ~/.dotfiles/install-deps.sh"
+        echo ""
+        exit 1
+    fi
+    echo ""
+
+    # Step 2: Check shell components.
+    _check_shell_components
+
+    # Step 3: Create ~/.shrc.local template if missing.
+    _ensure_shrc_local
+
+    # Step 4: Prompt for identity if needed and interactive.
+    if _needs_identity && _is_interactive; then
+        echo ""
+        _prompt_identity
+    fi
+
+    # Step 5: Create symlinks.
+    _create_symlinks
+
+    # Step 6: Generate ~/.gitconfig.local.
+    _generate_gitconfig_local
+
+    # Step 7: Set up git SSH signing.
+    _setup_git_signing
+
+    # Step 8: Create ~/.secrets template if missing.
+    _ensure_secrets
+
+    # Step 9: Show summary.
+    _show_summary
+}
+
+# Backup directory for existing files (XDG-compliant location).
+# Only non-symlink files are backed up (first install only).
+BACKUP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/dotfiles/backups/$(date +%Y%m%d-%H%M%S)"
+
+# Create symlink, backing up existing files.
+_link() {
+    local src="$DOTFILES/$1"
+    local dst="$HOME/$2"
+
+    # Backup existing non-symlink files.
+    if [ -e "$dst" ] && [ ! -L "$dst" ]; then
+        mkdir -p "$BACKUP_DIR"
+        mv "$dst" "$BACKUP_DIR/"
+        warn "Backed up $dst"
+    fi
+
+    # Remove existing symlink.
+    [ -L "$dst" ] && rm "$dst"
+
+    # Create parent directory if needed.
+    mkdir -p "$(dirname "$dst")"
+
+    ln -sf "$src" "$dst"
+    info "Linked $dst -> $src"
+}
+
+# Create all symlinks.
+_create_symlinks() {
+    info "Setting up shell configuration..."
+    _link shell/zshrc .zshrc
+    _link shell/zshrc.d .zshrc.d
+    _link shell/shrc .shrc
+    _link shell/aliases .aliases
+    _link shell/bashrc .bashrc
+    _link shell/profile .profile
+
+    info "Setting up prompt themes..."
+    _link themes/p10k.zsh .p10k.zsh
+    for theme in "$DOTFILES"/themes/p10k-*.zsh; do
+        [ -f "$theme" ] && _link "themes/$(basename "$theme")" ".$(basename "$theme")"
+    done
+
+    info "Setting up git configuration..."
+    _link git/config .gitconfig
+    _link git/ignore_global .gitignore_global
+
+    # Set up pre-commit hook if this is a git repo.
+    if [ -d "$DOTFILES/.git" ]; then
+        info "Setting up pre-commit hook..."
+        ln -sf ../../git/hooks/pre-commit "$DOTFILES/.git/hooks/pre-commit"
+    fi
+
+    info "Setting up Claude configuration..."
+    mkdir -p "$HOME/.claude"
+    _link claude/settings.json .claude/settings.json
+    _link claude/settings-admin.json .claude/settings-admin.json
+    _link claude/statusline.sh .claude/statusline.sh
+    _link claude/CLAUDE.md .claude/CLAUDE.md
+
+    info "Setting up tmux configuration..."
+    _link tmux.conf .tmux.conf
+
+    info "Setting up versioned tools..."
+    mkdir -p "$HOME/tools"
+    ln -sf "$DOTFILES/tools/CLAUDE.md" "$HOME/tools/CLAUDE.md"
+    ln -sf "$DOTFILES/tools/README.md" "$HOME/tools/README.md"
+    ln -sf "$DOTFILES/tools/direnvrc" "$HOME/.direnvrc"
+    info "Linked ~/.direnvrc -> $DOTFILES/tools/direnvrc"
+}
+
+# Generate ~/.gitconfig.local from identity in ~/.shrc.local.
+_generate_gitconfig_local() {
+    if [ -f "$HOME/.gitconfig.local" ]; then
+        return  # Already exists.
+    fi
+
+    # Source .shrc.local to get user identity if it exists.
+    if [ -f "$HOME/.shrc.local" ]; then
+        # shellcheck source=/dev/null
+        . "$HOME/.shrc.local"
+    fi
+
+    # Generate .gitconfig.local with user identity.
+    if [ -n "$USER_NAME" ] && [ "$USER_NAME" != "Your Name" ]; then
+        info "Creating ~/.gitconfig.local with user identity..."
+        cat > "$HOME/.gitconfig.local" << EOF
+# ~/.gitconfig.local - Machine-specific git configuration (NOT synced)
+# Generated from USER_NAME and USER_EMAIL in ~/.shrc.local
+
+[user]
+    name = $USER_NAME
+    email = $USER_EMAIL
+EOF
+    else
+        # No identity configured yet - create placeholder.
+        info "Creating ~/.gitconfig.local template..."
+        cat > "$HOME/.gitconfig.local" << 'EOF'
+# ~/.gitconfig.local - Machine-specific git configuration (NOT synced)
+# Edit ~/.shrc.local with your identity, then re-run 'dotfiles install'.
+
+[user]
+    name = Your Name
+    email = you@example.com
+EOF
+        warn "Set USER_NAME/USER_EMAIL in ~/.shrc.local, then re-run 'dotfiles install'"
+    fi
+}
+
+# Set up git SSH signing if not already configured.
+_setup_git_signing() {
+    if ! git config --global user.signingkey &>/dev/null; then
+        if [ -d "$HOME/.ssh" ] && ls "$HOME/.ssh"/*.pub &>/dev/null; then
+            info "Setting up git SSH signing..."
+            "$DOTFILES/bin/git-setup-signing"
+        else
+            warn "No SSH keys found - run 'dotfiles setup' after creating keys"
+        fi
+    fi
+}
+
+# Create ~/.secrets template if it doesn't exist.
+_ensure_secrets() {
+    if [ ! -f "$HOME/.secrets" ]; then
+        info "Creating ~/.secrets template..."
+        cp "$DOTFILES/secrets.template" "$HOME/.secrets"
+        chmod 600 "$HOME/.secrets"
+        warn "Created ~/.secrets - edit with your API keys"
+    fi
+}
+
+# Show install summary.
+_show_summary() {
+    echo ""
+    info "====================================="
+    info "Dotfiles installation complete!"
+    info "====================================="
+    echo ""
+
+    # Show initial setup steps only if identity not configured.
+    if _needs_identity; then
+        info "Initial setup:"
+        info "  1. Edit ~/.shrc.local with your identity (USER_NAME, USER_EMAIL)"
+        info "  2. Re-run 'dotfiles install' to generate ~/.gitconfig.local"
+        info "  3. Run 'dotfiles setup' to configure SSH commit signing"
+        info "  4. Edit ~/.secrets with your API keys"
+        info "  5. Restart your shell or run: source ~/.zshrc"
+        echo ""
+    else
+        info "Restart your shell or run: source ~/.zshrc"
+        echo ""
+    fi
+
+    info "Project workflow:"
+    info "  project-init      Initialize project .envrc"
+    info "  project-dev       Create/attach to project tmux session"
+    info "  project-code      Launch VS Code for project"
+    info "  project-deinit    Remove project .envrc"
+    echo ""
+
+    info "IREE development:"
+    info "  iree-worktree-init <branch>   Create IREE worktree with shared config"
+    info "  iree-dev <name>               Create/attach to IREE tmux session"
+    info "  iree-code <name>              Launch VS Code for IREE worktree"
+    info "  iree-cmake-configure          Configure CMake build"
+    info "  iree-cmake-build              Build with ninja"
+    info "  iree-cmake-test               Run tests"
+    info "  iree-worktree-deinit <name>   Remove worktree and build directory"
+    echo ""
+
+    if [ -d "$BACKUP_DIR" ]; then
+        warn "Existing files backed up to: $BACKUP_DIR"
+    fi
+}
+
+# Check if shell components are installed.
+_check_shell_components() {
+    local missing=()
+
+    [ -d "$HOME/.oh-my-zsh" ] || missing+=("Oh My Zsh")
+    [ -d "$HOME/.local/p10k" ] || missing+=("Powerlevel10k")
+    [ -d "$HOME/.tmux/plugins/tpm" ] || missing+=("TPM (Tmux Plugin Manager)")
+    [ -d "$HOME/.nvm" ] || missing+=("NVM")
+
+    if [ ${#missing[@]} -gt 0 ]; then
+        warn "Shell components not installed:"
+        for component in "${missing[@]}"; do
+            echo "  - $component"
+        done
+        echo ""
+        warn "Run: sudo ~/.dotfiles/install-deps.sh"
+        echo ""
+    fi
+}
+
+# Ensure ~/.shrc.local exists (create template if missing).
+_ensure_shrc_local() {
+    if [ ! -f "$HOME/.shrc.local" ]; then
+        info "Creating ~/.shrc.local template..."
+        cat > "$HOME/.shrc.local" << 'EOF'
+# ~/.shrc.local - Machine-specific shell configuration (NOT synced)
+#
+# ============================================================================
+# User Identity (REQUIRED - used by git and scripts)
+# ============================================================================
+export USER_NAME="Your Name"
+export USER_EMAIL="you@example.com"
+export USER_GITHUB_ID="yourusername"
+
+# ============================================================================
+# Machine-Specific Paths
+# ============================================================================
+# _add_path "/opt/custom-tool/bin"
+# _add_path "/opt/homebrew/bin"  # macOS
+
+# ============================================================================
+# Hardware-Specific Settings
+# ============================================================================
+# export ROCM_GPU_TARGET=gfx1100  # RDNA3
+EOF
+    fi
+}
+
+# Check if identity needs to be configured.
+_needs_identity() {
+    if [ ! -f "$HOME/.shrc.local" ]; then
+        return 0  # Needs setup.
+    fi
+    # Check for placeholder values.
+    grep -q 'USER_NAME="Your Name"' "$HOME/.shrc.local" 2>/dev/null
+}
+
+# Check if running interactively.
+_is_interactive() {
+    [ -t 0 ]  # stdin is a terminal.
+}
+
+# Prompt for user identity.
+_prompt_identity() {
+    info "Setting up user identity..."
+    echo ""
+    echo "This information is used for git commits and is stored locally."
+    echo ""
+
+    local name email github_id
+
+    read -rp "Full name (for git commits): " name
+    read -rp "Email address: " email
+    read -rp "GitHub username: " github_id
+
+    # Validate required fields.
+    if [ -z "$name" ] || [ -z "$email" ]; then
+        warn "Name and email are required."
+        warn "Edit ~/.shrc.local manually to set your identity."
+        return
+    fi
+
+    # Update ~/.shrc.local with sed.
+    sed -i.bak \
+        -e "s/USER_NAME=\"Your Name\"/USER_NAME=\"$name\"/" \
+        -e "s/USER_EMAIL=\"you@example.com\"/USER_EMAIL=\"$email\"/" \
+        -e "s/USER_GITHUB_ID=\"yourusername\"/USER_GITHUB_ID=\"${github_id:-$USER}\"/" \
+        "$HOME/.shrc.local"
+    rm -f "$HOME/.shrc.local.bak"
+
+    info "Updated ~/.shrc.local with your identity"
+    echo ""
+}
+
+# ============================================================================
+# Deps Command
+# ============================================================================
+cmd_deps() {
+    info "Running install-deps.sh..."
+    "$DOTFILES/install-deps.sh"
+}
+
+# ============================================================================
+# Setup Command
+# ============================================================================
+cmd_setup() {
+    info "Configuring git SSH signing..."
+    "$DOTFILES/bin/git-setup-signing"
+}
+
+# ============================================================================
+# Doctor Command
+# ============================================================================
+cmd_doctor() {
+    # Source package definitions.
+    source "$DOTFILES/lib/packages.sh"
+
+    echo ""
+    printf "%b=== Dotfiles Health Check ===%b\n" "$BOLD" "$NC"
+    echo ""
+
+    local all_ok=true
+
+    # Check packages using shared verification.
+    if ! _pkg_verify_all "$GREEN" "$YELLOW" "$RED" "$NC" "$BOLD"; then
+        all_ok=false
+    fi
+    echo ""
+
+    # Check symlinks.
+    printf "%bSymlinks:%b\n" "$BOLD" "$NC"
+    for link in ~/.zshrc ~/.bashrc ~/.gitconfig ~/.tmux.conf ~/.direnvrc; do
+        if [ -L "$link" ] && [ -e "$link" ]; then
+            printf "  %b[OK]%b %s\n" "$GREEN" "$NC" "$link"
+        elif [ -L "$link" ]; then
+            printf "  %b[BROKEN]%b %s -> %s\n" "$RED" "$NC" "$link" "$(readlink "$link")"
+            all_ok=false
+        elif [ -e "$link" ]; then
+            printf "  %b[FILE]%b %s (not a symlink)\n" "$YELLOW" "$NC" "$link"
+        else
+            printf "  %b[MISSING]%b %s\n" "$YELLOW" "$NC" "$link"
+        fi
+    done
+    echo ""
+
+    # Check machine-specific files.
+    printf "%bMachine-specific files:%b\n" "$BOLD" "$NC"
+    for localfile in ~/.shrc.local ~/.gitconfig.local ~/.secrets; do
+        if [ -f "$localfile" ]; then
+            printf "  %b[OK]%b %s\n" "$GREEN" "$NC" "$localfile"
+        else
+            printf "  %b[MISSING]%b %s (run 'dotfiles install' to create)\n" "$YELLOW" "$NC" "$localfile"
+        fi
+    done
+    echo ""
+
+    # Check for broken symlinks.
+    printf "%bBroken symlinks:%b\n" "$BOLD" "$NC"
+    local broken_count=0
+    for link in ~/.zshrc ~/.bashrc ~/.gitconfig ~/.tmux.conf ~/.direnvrc ~/.shrc \
+                ~/.aliases ~/.profile ~/.p10k.zsh ~/.gitignore_global; do
+        if [ -L "$link" ] && [ ! -e "$link" ]; then
+            printf "  %b[BROKEN]%b %s -> %s\n" "$RED" "$NC" "$link" "$(readlink "$link")"
+            ((++broken_count))
+            all_ok=false
+        fi
+    done
+    if [ $broken_count -eq 0 ]; then
+        printf "  %b[OK]%b No broken symlinks\n" "$GREEN" "$NC"
+    fi
+    echo ""
+
+    # Check ~/tools/ setup.
+    printf "%bVersioned tools (~/tools/):%b\n" "$BOLD" "$NC"
+    if [ -d "$HOME/tools" ]; then
+        local found_tools=false
+        for tool in llvm cmake ninja mold bazel rocm vulkan; do
+            if [ -L "$HOME/tools/$tool/latest" ]; then
+                local version
+                version=$(basename "$(readlink "$HOME/tools/$tool/latest")")
+                printf "  %b[OK]%b %s: %s\n" "$GREEN" "$NC" "$tool" "$version"
+                found_tools=true
+            fi
+        done
+        if ! $found_tools; then
+            printf "  %b[INFO]%b No versioned tools installed yet\n" "$YELLOW" "$NC"
+        fi
+    else
+        printf "  %b[INFO]%b ~/tools/ not set up (optional)\n" "$YELLOW" "$NC"
+    fi
+    echo ""
+
+    # Check for uncommitted shell config changes (installer pollution).
+    printf "%bShell config status:%b\n" "$BOLD" "$NC"
+    local shell_files=(shell/zshrc shell/bashrc shell/profile shell/shrc)
+    local dirty_files=()
+    for f in "${shell_files[@]}"; do
+        if [ -f "$DOTFILES/$f" ] && ! git -C "$DOTFILES" diff --quiet -- "$f" 2>/dev/null; then
+            dirty_files+=("$f")
+        fi
+    done
+    if [ ${#dirty_files[@]} -gt 0 ]; then
+        printf "  %b[WARN]%b Uncommitted changes detected:\n" "$YELLOW" "$NC"
+        for f in "${dirty_files[@]}"; do
+            printf "         %s\n" "$f"
+        done
+        printf "         Run 'dotfiles fixup' to review and integrate\n"
+        all_ok=false
+    else
+        printf "  %b[OK]%b Shell configs are clean\n" "$GREEN" "$NC"
+    fi
+    echo ""
+
+    # Summary.
+    if $all_ok; then
+        printf "%bAll required checks passed!%b\n" "$GREEN" "$NC"
+    else
+        printf "%bSome issues found - see above%b\n" "$RED" "$NC"
+        return 1
+    fi
+}
+
+# ============================================================================
+# Fixup Command
+# ============================================================================
+cmd_fixup() {
+    cd "$DOTFILES"
+
+    # Find shell config files with uncommitted changes.
+    local shell_files=(shell/zshrc shell/bashrc shell/profile shell/shrc)
+    local dirty_files=()
+    for f in "${shell_files[@]}"; do
+        if [ -f "$f" ] && ! git diff --quiet -- "$f" 2>/dev/null; then
+            dirty_files+=("$f")
+        fi
+    done
+
+    if [ ${#dirty_files[@]} -eq 0 ]; then
+        info "Shell configs are clean - nothing to fix"
+        return 0
+    fi
+
+    echo ""
+    printf "%bUncommitted shell config changes detected%b\n" "$BOLD" "$NC"
+    echo ""
+    warn "Installers often append to ~/.bashrc or ~/.zshrc."
+    warn "Since these are symlinks to dotfiles, changes show as git diffs."
+    echo ""
+
+    for f in "${dirty_files[@]}"; do
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        printf "%bFile: %s%b\n" "$BOLD" "$f" "$NC"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        git diff --color=always -- "$f"
+        echo ""
+
+        if ! _is_interactive; then
+            warn "Non-interactive mode - showing diff only"
+            continue
+        fi
+
+        echo "Options:"
+        echo "  [m] Move additions to ~/.shrc.local (recommended for machine-specific)"
+        echo "  [r] Revert changes (discard installer additions)"
+        echo "  [k] Keep changes (leave for manual review)"
+        echo "  [s] Skip this file"
+        echo ""
+        read -rp "Choice [m/r/k/s]: " choice
+
+        case "$choice" in
+            m|M)
+                _fixup_move_to_shrc_local "$f"
+                ;;
+            r|R)
+                git checkout -- "$f"
+                info "Reverted $f"
+                ;;
+            k|K)
+                info "Keeping changes in $f"
+                ;;
+            s|S|*)
+                info "Skipping $f"
+                ;;
+        esac
+        echo ""
+    done
+
+    # Show remaining status.
+    local remaining=0
+    for f in "${shell_files[@]}"; do
+        if [ -f "$f" ] && ! git diff --quiet -- "$f" 2>/dev/null; then
+            ((++remaining))
+        fi
+    done
+    if [ $remaining -eq 0 ]; then
+        info "All shell configs are now clean"
+    else
+        warn "$remaining file(s) still have uncommitted changes"
+    fi
+}
+
+# Move git diff additions to ~/.shrc.local.
+_fixup_move_to_shrc_local() {
+    local file="$1"
+
+    # Extract only added lines (excluding diff metadata).
+    local additions
+    additions=$(git diff -- "$file" | grep '^+[^+]' | sed 's/^+//')
+
+    if [ -z "$additions" ]; then
+        warn "No additions found to move"
+        return
+    fi
+
+    # Append to ~/.shrc.local with a header.
+    {
+        echo ""
+        echo "# ============================================================================"
+        echo "# Added by installer (moved from $file on $(date +%Y-%m-%d))"
+        echo "# ============================================================================"
+        echo "$additions"
+    } >> "$HOME/.shrc.local"
+
+    # Revert the original file.
+    git checkout -- "$file"
+
+    info "Moved additions to ~/.shrc.local and reverted $file"
+    info "Review ~/.shrc.local to ensure correctness"
+}
+
+# ============================================================================
+# Update Command
+# ============================================================================
+cmd_update() {
+    cd "$DOTFILES"
+
+    # Check for uncommitted changes.
+    if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
+        error "Uncommitted changes in $DOTFILES"
+        error "Please commit or stash before updating"
+        return 1
+    fi
+
+    # Check if we're on a branch that tracks a remote.
+    local branch
+    branch=$(git symbolic-ref --short HEAD 2>/dev/null)
+    if [ -z "$branch" ]; then
+        error "Not on a branch - cannot update"
+        return 1
+    fi
+
+    local upstream
+    upstream=$(git rev-parse --abbrev-ref "$branch@{upstream}" 2>/dev/null)
+    if [ -z "$upstream" ]; then
+        warn "Branch '$branch' has no upstream - skipping pull"
+        return 0
+    fi
+
+    info "Updating dotfiles from $upstream..."
+    if git pull --ff-only; then
+        echo ""
+        info "Update complete!"
+        echo ""
+        echo "To apply changes, run:"
+        echo "  source ~/.zshrc"
+    else
+        error "Update failed - merge conflict or non-fast-forward"
+        error "Resolve manually with: cd $DOTFILES && git pull"
+        return 1
+    fi
+}
+
+# ============================================================================
+# Main
+# ============================================================================
+main() {
+    # Default to help if no command.
+    if [[ $# -eq 0 ]]; then
+        show_help
+        exit 0
+    fi
+
+    local cmd="$1"
+    shift
+
+    case "$cmd" in
+        test)    cmd_test "$@" ;;
+        doctor)  cmd_doctor "$@" ;;
+        fixup)   cmd_fixup "$@" ;;
+        update)  cmd_update "$@" ;;
+        install) cmd_install "$@" ;;
+        deps)    cmd_deps "$@" ;;
+        setup)   cmd_setup "$@" ;;
+        help|--help|-h) show_help ;;
+        *)
+            error "Unknown command: $cmd"
+            echo ""
+            show_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

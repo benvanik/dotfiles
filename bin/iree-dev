@@ -1,0 +1,58 @@
+#!/bin/bash
+# Create or attach to an IREE project tmux session.
+# This is a wrapper around project-dev that adds the "iree-" prefix to session
+# names, keeping all IREE tmux sessions consistently namespaced.
+
+set -e
+
+show_help() {
+    cat << 'EOF'
+iree-dev - Create or attach to IREE tmux session
+
+USAGE
+    iree-dev [name] [directory]
+
+ARGUMENTS
+    [name]       Session name (default: basename of current directory)
+    [directory]  Working directory (default: current directory)
+
+EXAMPLES
+    cd ~/src/iree/feature && iree-dev
+        Session: iree-feature, directory: current
+
+    iree-dev main ~/src/iree/main
+        Session: iree-main, directory: ~/src/iree/main
+
+BUILD WORKFLOW
+    iree-cmake-configure    Configure CMake build
+    iree-cmake-build        Build with ninja
+    iree-cmake-test         Run tests
+
+NOTES
+    Session names are prefixed with "iree-" automatically.
+    Use tmux attach to reconnect after disconnect.
+
+SEE ALSO
+    iree-worktree-init      Create new worktree
+    iree-worktree-deinit    Remove worktree
+EOF
+}
+
+# Handle --help early.
+case "${1:-}" in
+    -h|--help)
+        show_help
+        exit 0
+        ;;
+esac
+
+# Determine session name with iree- prefix.
+if [ -n "$1" ]; then
+    SESSION_NAME="iree-$1"
+    shift
+else
+    SESSION_NAME="iree-$(basename "$PWD")"
+fi
+
+# Delegate to project-dev with the prefixed name.
+exec project-dev "$SESSION_NAME" "$@"

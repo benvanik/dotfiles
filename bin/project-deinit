@@ -1,0 +1,162 @@
+#!/bin/bash
+# Cleanup project directory configuration.
+
+set -e
+
+show_help() {
+    cat << 'EOF'
+project-deinit - Cleanup project directory configuration
+
+USAGE
+    project-deinit [options] [directory]
+
+OPTIONS
+    -h, --help       Show this help
+    --session NAME   Override tmux session name (default: directory basename)
+    --tmux-only      Only kill tmux session, skip file cleanup
+    -y, --yes        Skip confirmation prompts
+
+ARGUMENTS
+    directory        Project directory to cleanup (default: current directory)
+
+WHAT IT REMOVES
+    - Associated tmux session (if any)
+    - .envrc and .envrc.local files
+    - .history directory (with confirmation)
+
+EXAMPLES
+    project-deinit
+        Cleanup current directory
+
+    project-deinit ~/src/myproject
+        Cleanup specific project
+
+    project-deinit --tmux-only
+        Only kill tmux session, keep files
+
+    project-deinit -y
+        Cleanup without confirmation prompts
+
+SEE ALSO
+    project-init    Initialize project with .envrc
+    project-dev     Create/attach tmux session
+EOF
+}
+
+case "${1:-}" in
+    -h|--help) show_help; exit 0 ;;
+esac
+
+# Colors.
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+info() { printf "${GREEN}[project-deinit]${NC} %s\n" "$1"; }
+warn() { printf "${YELLOW}[project-deinit]${NC} %s\n" "$1"; }
+error() { printf "${RED}[project-deinit]${NC} %s\n" "$1" >&2; }
+
+# Defaults.
+SESSION_NAME=""
+TMUX_ONLY=false
+YES=false
+TARGET_DIR=""
+
+# Parse arguments.
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --session)
+            SESSION_NAME="$2"
+            shift 2
+            ;;
+        --tmux-only)
+            TMUX_ONLY=true
+            shift
+            ;;
+        -y|--yes)
+            YES=true
+            shift
+            ;;
+        -*)
+            error "Unknown option: $1"
+            exit 1
+            ;;
+        *)
+            TARGET_DIR="$1"
+            shift
+            ;;
+    esac
+done
+
+# Target directory defaults to current.
+TARGET_DIR="${TARGET_DIR:-.}"
+if [ ! -d "$TARGET_DIR" ]; then
+    error "Directory not found: $TARGET_DIR"
+    exit 1
+fi
+cd "$TARGET_DIR"
+
+# Session name defaults to directory basename.
+if [ -z "$SESSION_NAME" ]; then
+    SESSION_NAME=$(basename "$PWD")
+fi
+
+# Helper to confirm action.
+confirm() {
+    if $YES; then
+        return 0
+    fi
+    read -p "$1 [y/N] " -n 1 -r
+    echo
+    [[ $REPLY =~ ^[Yy]$ ]]
+}
+
+# Kill associated tmux session if exists.
+if command -v tmux &>/dev/null; then
+    if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+        if confirm "Kill tmux session '$SESSION_NAME'?"; then
+            tmux kill-session -t "$SESSION_NAME"
+            info "Killed tmux session: $SESSION_NAME"
+        fi
+    fi
+fi
+
+# Exit early if tmux-only mode.
+if $TMUX_ONLY; then
+    exit 0
+fi
+
+echo "Project cleanup: $(basename "$PWD")"
+echo "========================="
+echo ""
+
+# Remove direnv files.
+if [ -f ".envrc" ]; then
+    if confirm "Remove .envrc?"; then
+        # Deny first to avoid direnv errors.
+        if command -v direnv &>/dev/null; then
+            direnv deny 2>/dev/null || true
+        fi
+        rm -f .envrc
+        info "Removed .envrc"
+    fi
+fi
+
+if [ -f ".envrc.local" ]; then
+    if confirm "Remove .envrc.local?"; then
+        rm -f .envrc.local
+        info "Removed .envrc.local"
+    fi
+fi
+
+# Remove history directory.
+if [ -d ".history" ]; then
+    if confirm "Remove .history directory?"; then
+        rm -rf .history
+        info "Removed .history/"
+    fi
+fi
+
+echo ""
+info "Cleanup complete."

@@ -1,0 +1,57 @@
+# SSH Configuration Template
+# Copy to ~/.ssh/config and customize for your environment.
+#
+# This file is a template - the actual ~/.ssh/config is machine-specific
+# and should NOT be synced between machines (contains host-specific settings).
+
+# Global defaults - applies to all hosts.
+Host *
+    # Add keys to ssh-agent automatically.
+    AddKeysToAgent yes
+
+    # Only use explicitly configured identity files.
+    IdentitiesOnly yes
+
+    # Keep connections alive.
+    ServerAliveInterval 60
+    ServerAliveCountMax 3
+
+    # Reuse connections for faster subsequent logins.
+    ControlMaster auto
+    ControlPath ~/.ssh/sockets/%r@%h-%p
+    ControlPersist 600
+
+# GitHub - use SSH key for authentication.
+Host github.com
+    HostName github.com
+    User git
+    IdentityFile ~/.ssh/id_ed25519
+
+# GitLab (example).
+# Host gitlab.com
+#     HostName gitlab.com
+#     User git
+#     IdentityFile ~/.ssh/id_ed25519
+
+# Jump host example - access internal servers through a bastion.
+# Host internal-*
+#     ProxyJump bastion.example.com
+#     User admin
+#
+# Host bastion.example.com
+#     User jumpuser
+#     IdentityFile ~/.ssh/id_ed25519_work
+
+# Short alias example - type "ssh dev" instead of full hostname.
+# Host dev
+#     HostName dev-server.example.com
+#     User myuser
+#     IdentityFile ~/.ssh/id_ed25519
+#     ForwardAgent yes
+
+# Remote development server with port forwarding.
+# Host devbox
+#     HostName 192.168.1.100
+#     User developer
+#     LocalForward 8080 localhost:8080
+#     LocalForward 3000 localhost:3000

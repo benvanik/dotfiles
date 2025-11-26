@@ -1,0 +1,129 @@
+#!/bin/bash
+# Removes an IREE worktree and its associated build directory.
+#
+# Usage: iree-worktree-deinit <worktree-name>
+#
+# Examples:
+#   iree-worktree-deinit feature
+#   iree-worktree-deinit my-wt
+#
+# This removes:
+#   - Git worktree at ~/src/iree/<name>/
+#   - Build directory at ~/src/iree/builds/<name>/
+#   - Associated tmux session (if any)
+
+set -e
+
+# Colors.
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+info() { printf "${GREEN}[iree-worktree]${NC} %s\n" "$1"; }
+warn() { printf "${YELLOW}[iree-worktree]${NC} %s\n" "$1"; }
+error() { printf "${RED}[iree-worktree]${NC} %s\n" "$1" >&2; }
+
+show_help() {
+    cat << 'EOF'
+iree-worktree-deinit - Remove an IREE worktree
+
+USAGE
+    iree-worktree-deinit <name>
+
+ARGUMENTS
+    <name>      Worktree name (directory basename under ~/src/iree/)
+
+EXAMPLES
+    iree-worktree-deinit feature1
+    iree-worktree-deinit mywork
+
+WHAT IT REMOVES
+    ~/src/iree/<name>/           Git worktree (via git worktree remove)
+    ~/src/iree/builds/<name>/    Build directory
+    iree-<name> tmux session     If running
+
+SEE ALSO
+    iree-worktree-init    Create new worktree
+    iree-dev              Create/attach tmux session
+EOF
+}
+
+# Handle --help early.
+case "${1:-}" in
+    -h|--help)
+        show_help
+        exit 0
+        ;;
+esac
+
+if [ $# -lt 1 ]; then
+    show_help
+    exit 1
+fi
+
+IREE_ROOT="$HOME/src/iree"
+MAIN_WORKTREE="$IREE_ROOT/main"
+INPUT=$1
+
+# Determine the worktree name and path.
+if [[ "$INPUT" == /* ]]; then
+    # Absolute path provided - extract name.
+    WORKTREE_PATH="$INPUT"
+    WORKTREE_NAME=$(basename "$WORKTREE_PATH")
+elif [[ "$INPUT" == */* ]]; then
+    # Relative path - error.
+    error "Please provide just the worktree name, not a path"
+    error "Example: iree-worktree-deinit feature"
+    exit 1
+else
+    # Name provided.
+    WORKTREE_NAME="$INPUT"
+    WORKTREE_PATH="$IREE_ROOT/$WORKTREE_NAME"
+fi
+
+BUILD_PATH="$IREE_ROOT/builds/$WORKTREE_NAME"
+
+# Verify the worktree exists.
+if [ ! -d "$WORKTREE_PATH" ]; then
+    error "Worktree not found at $WORKTREE_PATH"
+    exit 1
+fi
+
+# Prevent removing main worktree.
+if [ "$WORKTREE_NAME" = "main" ]; then
+    error "Cannot remove the main IREE worktree"
+    exit 1
+fi
+
+# Verify it's actually a git worktree (not a regular directory).
+if [ ! -f "$WORKTREE_PATH/.git" ]; then
+    error "$WORKTREE_PATH does not appear to be a git worktree"
+    exit 1
+fi
+
+echo "Removing worktree: $WORKTREE_NAME"
+echo "  Location: $WORKTREE_PATH"
+echo "  Build dir: $BUILD_PATH"
+echo ""
+
+# Kill associated tmux session if exists (uses iree- prefix).
+project-deinit --session "iree-$WORKTREE_NAME" --tmux-only --yes
+
+# Remove the worktree using git.
+cd "$MAIN_WORKTREE"
+git worktree remove "$WORKTREE_PATH" --force
+
+# Remove the build directory if it exists.
+if [ -d "$BUILD_PATH" ]; then
+    info "Removing build directory: $BUILD_PATH"
+    rm -rf "$BUILD_PATH"
+else
+    warn "Build directory not found (skipping): $BUILD_PATH"
+fi
+
+# Prune any stale worktree references.
+git worktree prune
+
+echo ""
+info "Worktree removed successfully!"

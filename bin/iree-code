@@ -1,0 +1,73 @@
+#!/bin/bash
+# Launch VS Code for IREE development with workspace auto-detection.
+# Usage: iree-code [worktree-name] [-- code-args...]
+#
+# Auto-detects workspace from current directory or worktree name.
+
+set -e
+
+IREE_BASE="$HOME/src/iree"
+
+show_help() {
+    echo "Usage: iree-code [worktree-name] [-- code-args...]"
+    echo ""
+    echo "Launch VS Code for IREE development."
+    echo "Auto-detects workspace from current directory or worktree name."
+    echo ""
+    echo "Examples:"
+    echo "  iree-code              # Detect from cwd if inside IREE worktree"
+    echo "  iree-code experiment1  # Open specific worktree"
+    echo "  iree-code -- --new-window  # Pass args to code"
+}
+
+# Detect worktree from current directory.
+detect_worktree() {
+    local cwd="$PWD"
+    if [[ "$cwd" == "$IREE_BASE/"* ]]; then
+        # Extract worktree name: $HOME/src/iree/<name>/... -> <name>
+        local rel="${cwd#"$IREE_BASE"/}"
+        echo "${rel%%/*}"
+    fi
+}
+
+# Parse arguments.
+WORKTREE=""
+CODE_ARGS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --help|-h)
+            show_help
+            exit 0
+            ;;
+        --)
+            shift
+            CODE_ARGS=("$@")
+            break
+            ;;
+        *)
+            WORKTREE="$1"
+            ;;
+    esac
+    shift
+done
+
+# If no worktree specified, try to detect from cwd.
+if [ -z "$WORKTREE" ]; then
+    WORKTREE=$(detect_worktree)
+fi
+
+if [ -n "$WORKTREE" ]; then
+    WORKTREE_DIR="$IREE_BASE/$WORKTREE"
+    if [ ! -d "$WORKTREE_DIR" ]; then
+        echo "Error: Worktree not found: $WORKTREE_DIR" >&2
+        echo "Available worktrees:" >&2
+        for d in "$IREE_BASE"/*/; do
+            [ -d "$d" ] && echo "  $(basename "$d")" >&2
+        done
+        exit 1
+    fi
+    exec project-code "$WORKTREE_DIR" -- "${CODE_ARGS[@]}"
+else
+    # No worktree detected, fall back to project-code in cwd.
+    exec project-code . -- "${CODE_ARGS[@]}"
+fi

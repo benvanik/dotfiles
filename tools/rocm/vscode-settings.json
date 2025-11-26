@@ -1,0 +1,6 @@
+{
+  "cmake.environment": {
+    "HIP_PATH": "$TOOL_ROOT",
+    "ROCM_PATH": "$TOOL_ROOT"
+  }
+}

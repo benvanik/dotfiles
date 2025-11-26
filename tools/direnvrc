@@ -1,0 +1,149 @@
+# Versioned tools for direnv.
+# Link to ~/.direnvrc or source from ~/.config/direnv/direnvrc.
+
+source_env "${HOME}/.dotfiles/tools/platform.sh"
+source_env "${HOME}/.dotfiles/tools/versions.sh"
+
+# Track active tools for summary output.
+_DIRENV_TOOLS=""
+
+# Add tool to active list (called by _use_tool).
+_track_tool() {
+    local tool="$1" version="$2"
+    if [ -n "$_DIRENV_TOOLS" ]; then
+        _DIRENV_TOOLS="$_DIRENV_TOOLS $tool:$version"
+    else
+        _DIRENV_TOOLS="$tool:$version"
+    fi
+}
+
+# Generic tool loader.
+# Args: tool, requirement, path_subdirs.
+_use_tool() {
+    local tool="$1" requirement="${2:-latest}" path_subdirs="${3:-bin}"
+
+    # Silent skip if platform doesn't support.
+    _platform_supports "$tool" || return 0
+
+    local tool_dir="${HOME}/tools/${tool}"
+    local tool_path
+
+    if ! tool_path=$(_find_version "$tool_dir" "$requirement"); then
+        log_error "No ${tool} version matching '${requirement}' found in ${tool_dir}"
+        return 1
+    fi
+
+    # Add to PATH.
+    for subdir in $path_subdirs; do
+        [ -d "${tool_path}/${subdir}" ] && PATH_add "${tool_path}/${subdir}"
+    done
+
+    # Source tool-specific env.sh if exists (at tool level, not version level).
+    local env_file="${tool_dir}/env.sh"
+    if [ -f "$env_file" ]; then
+        # Export the root for the env.sh to use.
+        local root_var
+        root_var="$(echo "${tool}" | tr '[:lower:]' '[:upper:]')_ROOT"
+        eval "export ${root_var}=\"${tool_path}\""
+        source_env "$env_file"
+    fi
+
+    # Track for summary output.
+    _track_tool "$tool" "$(_version_from_path "$tool_path")"
+}
+
+# Tool-specific functions.
+use_bazel() { _use_tool "bazel" "${1:-latest}" "bin"; }
+use_cmake() { _use_tool "cmake" "${1:-latest}" "bin"; }
+use_llvm() { _use_tool "llvm" "${1:-latest}" "bin"; }
+use_mold() { _use_tool "mold" "${1:-latest}" "bin"; }
+use_ninja() { _use_tool "ninja" "${1:-latest}" "bin"; }
+use_rocm() { _use_tool "rocm" "${1:-latest}" "bin"; }
+use_vulkan() { _use_tool "vulkan" "${1:-latest}" "bin"; }
+
+# Override Vulkan validation layers (use after use_vulkan).
+# Supports: "debug", "release", or path to custom layers.
+use_vulkan_layers() {
+    local variant="${1:-debug}"
+    local vulkan_dir="$HOME/tools/vulkan"
+    local layers_path
+
+    case "$variant" in
+        debug|release)
+            layers_path="$vulkan_dir/$variant"
+            ;;
+        *)
+            # Assume it's a path.
+            layers_path="$variant"
+            ;;
+    esac
+
+    if [ ! -d "$layers_path" ]; then
+        log_error "Vulkan layers '$variant' not found at $layers_path"
+        log_error "Build with: vulkan-build-layers"
+        return 1
+    fi
+
+    # VK_LAYER_PATH replaces default layer search path.
+    export VK_LAYER_PATH="$layers_path/share/vulkan/explicit_layer.d"
+    export LD_LIBRARY_PATH="${layers_path}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+    _track_tool "vk-layers" "$variant"
+}
+
+# Set per-project history directory.
+# Usage: use_project_history [history_dir]
+#
+# This sets HISTORY_BASE for zsh's per-directory-history plugin.
+# History is stored per-directory within HISTORY_BASE.
+#
+# Examples:
+#   use_project_history                    # .history/ in current dir
+#   use_project_history "$PWD/../.history" # Share across worktrees
+use_project_history() {
+    local history_dir="${1:-$PWD/.history}"
+    export HISTORY_BASE="$history_dir"
+    mkdir -p "$HISTORY_BASE"
+}
+
+# Enable ccache with project-isolated cache directory.
+# Usage: use_ccache [cache_name]
+#
+# Cache stored at: ${CCACHE_BASE_DIR:-~/.cache/ccache}/<cache_name>
+# For worktrees sharing cache, use same cache_name.
+#
+# Examples:
+#   use_ccache             # Cache name from directory basename
+#   use_ccache "iree"      # All IREE worktrees share this cache
+#
+use_ccache() {
+    command -v ccache >/dev/null || {
+        log_error "ccache not found. Install with: sudo apt install ccache"
+        return 1
+    }
+
+    local cache_name="${1:-$(basename "$PWD")}"
+    local base_cache="${CCACHE_BASE_DIR:-$HOME/.cache/ccache}"
+
+    export CCACHE_DIR="${base_cache}/${cache_name}"
+    export CMAKE_C_COMPILER_LAUNCHER="ccache"
+    export CMAKE_CXX_COMPILER_LAUNCHER="ccache"
+
+    mkdir -p "$CCACHE_DIR"
+    _track_tool "ccache" "$cache_name"
+}
+
+# Source .envrc.local if exists (for machine-specific overrides).
+# Also prints the environment summary.
+source_local_envrc() {
+    [ -f ".envrc.local" ] && source_env ".envrc.local"
+    _print_env_summary
+}
+
+# Print a clean one-line summary of active tools.
+_print_env_summary() {
+    [ -z "$_DIRENV_TOOLS" ] && return
+
+    # Format: [env] llvm:21.1.6 cmake:4.2.0 ninja:1.13.2
+    printf '\033[0;36m[env]\033[0m %s\n' "$_DIRENV_TOOLS" >&2
+}

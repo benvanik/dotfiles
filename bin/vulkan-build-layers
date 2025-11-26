@@ -1,0 +1,94 @@
+#!/bin/bash
+# Build Vulkan validation layers from source with debug symbols.
+# Usage: vulkan-build-layers [--release] [--update]
+#
+# Builds to ~/src/vulkan/Vulkan-ValidationLayers/build-{debug,release}/install/
+# Creates symlink at ~/tools/vulkan/{debug,release}
+#
+# Options:
+#   --release   Build release instead of debug
+#   --update    Update source before building (git pull)
+
+set -e
+
+BUILD_TYPE="debug"
+UPDATE=false
+
+for arg in "$@"; do
+    case "$arg" in
+        --release) BUILD_TYPE="release" ;;
+        --update)  UPDATE=true ;;
+        -h|--help)
+            echo "Usage: vulkan-build-layers [--release] [--update]"
+            echo ""
+            echo "Options:"
+            echo "  --release   Build release instead of debug"
+            echo "  --update    Update source before building"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $arg" >&2
+            exit 1
+            ;;
+    esac
+done
+
+SRC_DIR="$HOME/src/vulkan/Vulkan-ValidationLayers"
+VULKAN_DIR="$HOME/tools/vulkan"
+
+# Clone if not present.
+if [ ! -d "$SRC_DIR" ]; then
+    echo "Cloning Vulkan-ValidationLayers..."
+    mkdir -p "$(dirname "$SRC_DIR")"
+    git clone https://github.com/KhronosGroup/Vulkan-ValidationLayers.git "$SRC_DIR"
+fi
+
+cd "$SRC_DIR"
+
+# Update if requested.
+if [ "$UPDATE" = true ]; then
+    echo "Updating source..."
+    git pull
+fi
+
+if [ "$BUILD_TYPE" = "release" ]; then
+    BUILD_DIR="build-release"
+    CMAKE_TYPE="Release"
+else
+    BUILD_DIR="build-debug"
+    CMAKE_TYPE="Debug"
+fi
+
+INSTALL_DIR="$SRC_DIR/$BUILD_DIR/install"
+
+echo "Building Vulkan validation layers ($BUILD_TYPE)"
+echo "Source: $SRC_DIR"
+echo "Build: $SRC_DIR/$BUILD_DIR"
+echo "Install: $INSTALL_DIR"
+echo ""
+
+echo "Configuring $CMAKE_TYPE build..."
+cmake -S . -B "$BUILD_DIR" \
+    -D CMAKE_BUILD_TYPE="$CMAKE_TYPE" \
+    -D CMAKE_INSTALL_PREFIX="$INSTALL_DIR" \
+    -D UPDATE_DEPS=ON \
+    -G Ninja
+
+echo ""
+echo "Building..."
+cmake --build "$BUILD_DIR" -j"$(nproc)"
+
+echo ""
+echo "Installing to $INSTALL_DIR..."
+cmake --install "$BUILD_DIR"
+
+# Create symlink in tools directory.
+mkdir -p "$VULKAN_DIR"
+ln -sfn "$INSTALL_DIR" "$VULKAN_DIR/$BUILD_TYPE"
+echo ""
+echo "Created: ~/tools/vulkan/$BUILD_TYPE -> $INSTALL_DIR"
+
+echo ""
+echo "Usage in .envrc:"
+echo "  use_vulkan                  # SDK"
+echo "  use_vulkan_layers $BUILD_TYPE     # Override with $BUILD_TYPE layers"

@@ -1,0 +1,41 @@
+# ~/.gitconfig - Git configuration (synced)
+# Machine-specific settings (signing key path) go in ~/.gitconfig.local
+# Run `git-setup-signing` to configure signing on a new machine.
+
+[include]
+	path = ~/.gitconfig.local
+
+# User identity is in ~/.gitconfig.local (generated from ~/.shrc.local).
+[user]
+	signingkey = ~/.ssh/id_ed25519.pub
+
+# Sign all commits and tags using SSH keys.
+[commit]
+	gpgsign = true
+
+[tag]
+	gpgsign = true
+
+[gpg]
+	format = ssh
+
+[gpg "ssh"]
+	# This is set to a common default; override in ~/.gitconfig.local if different.
+	allowedSignersFile = ~/.ssh/allowed_signers
+
+[init]
+	defaultBranch = main
+
+[rebase]
+	updateRefs = true
+
+[core]
+	excludesFile = ~/.gitignore_global
+
+[lfs]
+	concurrenttransfers = 3
+
+[lfs "customtransfer.xet"]
+	path = git-xet
+	args = transfer
+	concurrent = true

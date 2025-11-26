@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(jq)",
+      "Bash(jq:*)",
+      "Bash(jq:* | head::*)",
+      "Bash(jq:* | tail::*)",
+      "Bash(jq:* | grep::*)",
+      "Bash(jq:* | rg::*)",
+      "Bash(echo:*)",
+      "Bash(*/tmp/*)",
+      "Read(//tmp/**)"
+    ],
+    "deny": [],
+    "ask": []
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "~/.claude/statusline.sh"
+  },
+  "alwaysThinkingEnabled": true,
+  "env": {
+    "CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR": "1"
+  }
+}

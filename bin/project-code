@@ -1,0 +1,59 @@
+#!/bin/bash
+# Launch VS Code with shell environment and workspace auto-detection.
+# Usage: project-code [directory] [-- code-args...]
+#
+# Sources ~/.shrc for GUI launches, auto-detects workspace files.
+
+# Source environment for GUI launches (before set -e, shrc has non-zero exits).
+[ -f "$HOME/.shrc" ] && . "$HOME/.shrc"
+
+set -e
+
+# Parse arguments.
+TARGET_DIR="."
+CODE_ARGS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --help|-h)
+            echo "Usage: project-code [directory] [-- code-args...]"
+            echo ""
+            echo "Launch VS Code with shell environment and workspace detection."
+            echo "Looks for .code-workspace or *.code-workspace in directory."
+            exit 0
+            ;;
+        --)
+            shift
+            CODE_ARGS=("$@")
+            break
+            ;;
+        *)
+            TARGET_DIR="$1"
+            ;;
+    esac
+    shift
+done
+
+# Find workspace file.
+find_workspace() {
+    local dir="$1"
+    local basename
+    basename=$(basename "$(realpath "$dir")")
+
+    # Try <basename>.code-workspace first, then any *.code-workspace.
+    if [ -f "$dir/$basename.code-workspace" ]; then
+        echo "$dir/$basename.code-workspace"
+    else
+        # Find first *.code-workspace file.
+        local ws
+        ws=$(find "$dir" -maxdepth 1 -name "*.code-workspace" -type f 2>/dev/null | head -1)
+        [ -n "$ws" ] && echo "$ws"
+    fi
+}
+
+WORKSPACE=$(find_workspace "$TARGET_DIR")
+
+if [ -n "$WORKSPACE" ]; then
+    exec code --file-uri "file://$(realpath "$WORKSPACE")" "${CODE_ARGS[@]}"
+else
+    exec code "$TARGET_DIR" "${CODE_ARGS[@]}"
+fi

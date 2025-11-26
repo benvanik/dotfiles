@@ -1,0 +1,5 @@
+{
+  "bazel.executable": "$TOOL_ROOT/bin/bazel",
+  "bazel.buildifierExecutable": "$TOOL_ROOT/bin/buildifier",
+  "bazel.buildifierFixOnFormat": true
+}

@@ -1,0 +1,152 @@
+#!/bin/bash
+# Set up TheRock for local ROCm development.
+# Usage: therock-setup [--clone-only] [--build-only] [--symlinks-only]
+#
+# Creates both debug and release builds with Core + Compiler components.
+# Uses ROCM_GPU_TARGET from environment (default: gfx1100).
+
+set -e
+
+THEROCK_DIR="$HOME/src/rocm/TheRock"
+TOOLS_ROCM="$HOME/tools/rocm"
+# Default to RDNA3 (gfx1100). Common targets: gfx90a (MI200), gfx942 (MI300).
+GPU_TARGET="${ROCM_GPU_TARGET:-gfx1100}"
+
+# Parse arguments.
+CLONE_ONLY=false
+BUILD_ONLY=false
+SYMLINKS_ONLY=false
+for arg in "$@"; do
+    case "$arg" in
+        --clone-only) CLONE_ONLY=true ;;
+        --build-only) BUILD_ONLY=true ;;
+        --symlinks-only) SYMLINKS_ONLY=true ;;
+        --help|-h)
+            echo "Usage: therock-setup [--clone-only] [--build-only] [--symlinks-only]"
+            echo ""
+            echo "Sets up TheRock for local ROCm development."
+            echo "Uses ROCM_GPU_TARGET env var (default: gfx1100)."
+            exit 0
+            ;;
+    esac
+done
+
+# Common CMake options for Core + Compiler only.
+CMAKE_COMMON=(
+    -GNinja
+    -DTHEROCK_AMDGPU_TARGETS="$GPU_TARGET"
+    -DTHEROCK_ENABLE_ALL=OFF
+    -DTHEROCK_ENABLE_CORE=ON
+    -DTHEROCK_ENABLE_COMPILER=ON
+    # Limit LLVM link parallelism to avoid OOM (debug links use ~30GB each).
+    -DLLVM_PARALLEL_LINK_JOBS=2
+)
+
+clone_therock() {
+    echo "=== Cloning TheRock ==="
+    mkdir -p "$(dirname "$THEROCK_DIR")"
+
+    if [ -d "$THEROCK_DIR" ]; then
+        echo "TheRock already exists at $THEROCK_DIR"
+        echo "Updating..."
+        cd "$THEROCK_DIR"
+        git pull --ff-only
+    else
+        git clone https://github.com/ROCm/TheRock.git "$THEROCK_DIR"
+        cd "$THEROCK_DIR"
+    fi
+
+    # Set up Python venv and fetch sources.
+    echo "Setting up build environment..."
+    python3 -m venv .venv
+    .venv/bin/pip install -r requirements.txt
+    .venv/bin/python ./build_tools/fetch_sources.py
+}
+
+configure_therock() {
+    echo "=== Configuring TheRock for $GPU_TARGET ==="
+    cd "$THEROCK_DIR"
+
+    # Activate venv for build tools.
+    source .venv/bin/activate
+
+    # Clear environment variables that can contaminate the build.
+    # TheRock builds its own LLVM and cross-compiles to amdgcn - it must
+    # control its own toolchain. Our mold linker doesn't support LTO flags
+    # that LLD (required for amdgcn) uses.
+    unset LDFLAGS
+    unset LLVM_ROOT LLVM_DIR CLANG_DIR MLIR_DIR
+
+    # Use GCC 14 (GCC 15 has abseil compatibility issues).
+    export CC=/usr/bin/gcc-14
+    export CXX=/usr/bin/g++-14
+
+    # Limit parallelism for ALL cmake --build calls (including subprojects).
+    # Debug builds use ~2-3GB RAM per compile job.
+    export CMAKE_BUILD_PARALLEL_LEVEL=4
+
+    # Configure Debug.
+    echo ""
+    echo "--- Configuring Debug build ---"
+    cmake -B build-debug "${CMAKE_COMMON[@]}" \
+        -DCMAKE_BUILD_TYPE=Debug
+
+    # Configure Release.
+    echo ""
+    echo "--- Configuring Release build ---"
+    cmake -B build-release "${CMAKE_COMMON[@]}" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX="$THEROCK_DIR/install"
+
+    deactivate
+}
+
+build_therock() {
+    echo "=== Building TheRock ==="
+
+    # Use therock-build for actual builds.
+    therock-build debug
+    therock-build release
+
+    # Install release build.
+    echo ""
+    echo "--- Installing Release ---"
+    cd "$THEROCK_DIR"
+    source .venv/bin/activate
+    cmake --install build-release
+    deactivate
+}
+
+setup_symlinks() {
+    echo "=== Setting up symlinks ==="
+    mkdir -p "$TOOLS_ROCM"
+
+    ln -sfn "$THEROCK_DIR/build-debug" "$TOOLS_ROCM/debug"
+    echo "Created: ~/tools/rocm/debug -> $THEROCK_DIR/build-debug"
+
+    ln -sfn "$THEROCK_DIR/install" "$TOOLS_ROCM/release"
+    echo "Created: ~/tools/rocm/release -> $THEROCK_DIR/install"
+}
+
+# Main execution.
+if [ "$SYMLINKS_ONLY" = true ]; then
+    setup_symlinks
+elif [ "$BUILD_ONLY" = true ]; then
+    configure_therock
+    build_therock
+    setup_symlinks
+elif [ "$CLONE_ONLY" = true ]; then
+    clone_therock
+else
+    clone_therock
+    configure_therock
+    build_therock
+    setup_symlinks
+fi
+
+echo ""
+echo "=== TheRock setup complete ==="
+echo ""
+echo "Usage in .envrc:"
+echo "  use_rocm \"debug\"    # Debug build"
+echo "  use_rocm \"release\"  # Release install"

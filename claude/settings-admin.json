@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Read(~/**)",
+      "Edit(~/**)",
+      "Write(~/**)",
+      "Bash",
+      "WebFetch",
+      "Read(//etc/**)",
+      "Read(//usr/**)",
+      "Read(//opt/**)",
+      "Read(//var/log/**)"
+    ],
+    "deny": [
+      "Read(~/.ssh/id_*)",
+      "Read(~/.ssh/*_rsa)",
+      "Read(~/.ssh/*_ed25519)",
+      "Read(~/.gnupg/**)",
+      "Read(~/.aws/credentials)",
+      "Read(~/.config/gcloud/**)",
+      "Bash(rm -rf /)",
+      "Bash(rm -rf /*)",
+      "Bash(dd if=*of=/dev/*)",
+      "Bash(:(){ :|:& };:)"
+    ],
+    "ask": []
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "~/.claude/statusline.sh"
+  },
+  "alwaysThinkingEnabled": true,
+  "env": {
+    "CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR": "1"
+  }
+}

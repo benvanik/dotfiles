@@ -1,0 +1,57 @@
+# ~/.profile - Executed by the command interpreter for login shells.
+# This file is not read by bash if ~/.bash_profile or ~/.bash_login exists.
+# See /usr/share/doc/bash/examples/startup-files for examples.
+#
+# ============================================================================
+# WARNING: DO NOT ADD PATH OR ENVIRONMENT VARIABLES HERE
+# ============================================================================
+# This file is a symlink to ~/.dotfiles/shell/profile (version controlled).
+# Installers that modify ~/.profile will pollute the dotfiles repo.
+#
+# Add PATH/env modifications to:
+#   ~/.shrc.local    - Machine-specific (not committed, for local tools)
+#   ~/.shrc          - Shared across machines (committed to dotfiles)
+#
+# If an installer modified this file:
+#   dotfiles doctor  - Check for uncommitted changes
+#   dotfiles fixup   - Move additions to ~/.shrc.local
+# ============================================================================
+
+# ============================================================================
+# Universal Shell Configuration
+# ============================================================================
+# Source common config for all shells (bash, zsh, etc.).
+# This sets up PATH and environment variables.
+[ -f ~/.shrc ] && . ~/.shrc
+
+# Set BASH_ENV so non-interactive bash (e.g., bash -c) also gets the environment.
+export BASH_ENV="$HOME/.shrc"
+
+# ============================================================================
+# Bash-Specific Configuration (Login Shells)
+# ============================================================================
+# If running bash, also source .bashrc for interactive settings.
+if [ -n "$BASH_VERSION" ]; then
+    # Include .bashrc if it exists.
+    if [ -f "$HOME/.bashrc" ]; then
+        . "$HOME/.bashrc"
+    fi
+fi
+
+# ============================================================================
+# User Binary Directories
+# ============================================================================
+# Note: These are also set in ~/.shrc, but kept here for compatibility
+# with shells that only read .profile.
+
+# User's private bin directory.
+if [ -d "$HOME/bin" ] ; then
+    PATH="$HOME/bin:$PATH"
+fi
+
+# User's local bin directory.
+if [ -d "$HOME/.local/bin" ] ; then
+    PATH="$HOME/.local/bin:$PATH"
+fi
+
+# End of ~/.profile

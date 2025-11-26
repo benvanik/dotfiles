@@ -1,0 +1,115 @@
+#!/bin/bash
+# Setup SSH commit signing for git.
+
+set -e
+
+show_help() {
+    cat << 'EOF'
+git-setup-signing - Configure SSH commit signing for git
+
+USAGE
+    git-setup-signing
+
+PREREQUISITES
+    - git user.email must be configured
+    - SSH public key must exist (~/.ssh/id_ed25519.pub or similar)
+
+WHAT IT DOES
+    1. Finds your SSH public key (id_ed25519, id_rsa, id_ecdsa, or *_github)
+    2. Sets user.signingkey in git config
+    3. Creates/updates ~/.ssh/allowed_signers for signature verification
+
+EXAMPLES
+    git-setup-signing
+        Configure signing with auto-detected key
+
+    # Test signing after setup:
+    git commit --allow-empty -m 'test signed commit'
+    git log --show-signature -1
+
+SEE ALSO
+    ssh-keygen    Generate SSH keys
+EOF
+}
+
+case "${1:-}" in
+    -h|--help) show_help; exit 0 ;;
+esac
+
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+info() { printf "${GREEN}[git-signing]${NC} %s\n" "$1"; }
+warn() { printf "${YELLOW}[git-signing]${NC} %s\n" "$1"; }
+error() { printf "${RED}[git-signing]${NC} %s\n" "$1" >&2; }
+
+# Get email from git config.
+EMAIL=$(git config --global user.email 2>/dev/null)
+if [ -z "$EMAIL" ]; then
+    error "git user.email not configured"
+    error "Run: git config --global user.email your@email.com"
+    exit 1
+fi
+
+# Find SSH public key.
+SSH_DIR="$HOME/.ssh"
+KEY_FILE=""
+
+# Check common key names in order of preference.
+for key in id_ed25519.pub id_rsa.pub id_ecdsa.pub; do
+    if [ -f "$SSH_DIR/$key" ]; then
+        KEY_FILE="$SSH_DIR/$key"
+        break
+    fi
+done
+
+# Also check for *_github.pub keys.
+if [ -z "$KEY_FILE" ]; then
+    for key in "$SSH_DIR"/*_github.pub; do
+        if [ -f "$key" ]; then
+            KEY_FILE="$key"
+            break
+        fi
+    done
+fi
+
+if [ -z "$KEY_FILE" ]; then
+    error "No SSH public key found in $SSH_DIR"
+    error "Generate one with: ssh-keygen -t ed25519 -C \"$EMAIL\""
+    exit 1
+fi
+
+info "Found SSH key: $KEY_FILE"
+
+# Set signing key in git config.
+# Use ~ prefix so it's portable across machines.
+# shellcheck disable=SC2088  # Intentional: literal ~ for portable gitconfig.
+KEY_PATH="~/.ssh/$(basename "$KEY_FILE")"
+git config --global user.signingkey "$KEY_PATH"
+info "Set user.signingkey = $KEY_PATH"
+
+# Create allowed_signers file.
+ALLOWED_SIGNERS="$SSH_DIR/allowed_signers"
+KEY_CONTENT=$(cat "$KEY_FILE")
+
+# Check if already in allowed_signers.
+if [ -f "$ALLOWED_SIGNERS" ] && grep -q "$EMAIL" "$ALLOWED_SIGNERS"; then
+    info "Email already in $ALLOWED_SIGNERS"
+else
+    echo "$EMAIL $KEY_CONTENT" >> "$ALLOWED_SIGNERS"
+    info "Added to $ALLOWED_SIGNERS"
+fi
+
+# Verify settings.
+echo ""
+info "Git signing configured!"
+echo ""
+echo "Current settings:"
+echo "  user.signingkey = $(git config --global user.signingkey)"
+echo "  gpg.format = $(git config --global gpg.format)"
+echo "  commit.gpgsign = $(git config --global commit.gpgsign)"
+echo ""
+echo "To test: git commit --allow-empty -m 'test signed commit'"
+echo "To verify: git log --show-signature -1"

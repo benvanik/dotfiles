@@ -1,0 +1,61 @@
+# Machine-specific configuration (created by dotfiles install)
+*.local
+*.local.*
+
+# Secrets and credentials
+.secrets
+secrets
+credentials.json
+.credentials.json
+*.pem
+*.key
+*.p12
+*.pfx
+*.der
+*.csr
+
+# Shell history
+.zsh_history
+.bash_history
+history.jsonl
+
+# Claude Code session data
+.claude/projects/
+.claude/todos/
+.claude/plans/
+
+# Local env/config files
+.env
+.env.*
+.envrc
+.direnv/
+.npmrc
+.yarnrc
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# Editor/IDE
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.code-workspace
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Node
+node_modules/
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.dylib

@@ -1,0 +1,19 @@
+#!/bin/sh
+# Pre-commit hook for dotfiles repository.
+# Runs dotfiles test to validate syntax and configuration.
+#
+# Installation: dotfiles install (automatically links to .git/hooks/)
+# Manual: ln -sf ../../git/hooks/pre-commit .git/hooks/pre-commit
+
+set -e
+
+# Find dotfiles directory (relative to .git/hooks/).
+DOTFILES="$(cd "$(dirname "$0")/../.." && pwd)"
+
+echo "Running dotfiles test..."
+if "$DOTFILES/bin/dotfiles" test; then
+    echo "Pre-commit checks passed."
+else
+    echo "Pre-commit checks failed. Fix errors before committing."
+    exit 1
+fi

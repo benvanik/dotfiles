@@ -1,0 +1,54 @@
+# ~/.aliases - Shared aliases across all shells
+# Add your custom aliases here - they'll work in bash, zsh, and other shells.
+
+# ============================================================================
+# File & Directory Listing
+# ============================================================================
+
+# Use eza (modern ls replacement) if available, otherwise fall back to ls.
+if command -v eza >/dev/null 2>&1; then
+    alias ls='eza --color=always --icons=auto --group-directories-first'
+    alias ll='eza -lah --icons=auto --group-directories-first --git'  # long format with git status
+    alias la='eza -a --icons=auto --group-directories-first'           # show hidden files
+    alias l='eza -1 --icons=auto --group-directories-first'            # one per line
+    alias lt='eza -T --icons=auto --git-ignore'                        # tree view
+    alias llt='eza -lT --icons=auto --git-ignore'                      # long tree view
+else
+    alias ls='ls --color=auto'        # colorize ls output
+    alias ll='ls -alF'                # long format with type indicators
+    alias la='ls -A'                  # show hidden files (except . and ..)
+    alias l='ls -CF'                  # column format with type indicators
+fi
+
+# ============================================================================
+# Grep & Search
+# ============================================================================
+
+alias grep='grep --color=auto'    # colorize grep matches
+alias fgrep='fgrep --color=auto'  # fast grep with color
+alias egrep='egrep --color=auto'  # extended grep with color
+
+# ============================================================================
+# Applications
+# ============================================================================
+
+# ============================================================================
+# Claude Code
+# ============================================================================
+
+# Admin mode: full home directory access, all bash commands.
+# Use from ~ for sysadmin tasks. Projects in ~/src/ use restricted settings.
+alias claude-admin='claude --settings ~/.claude/settings-admin.json'
+
+# ============================================================================
+# Custom Aliases
+# ============================================================================
+# Add your personal aliases below this line.
+# Examples:
+#   alias ..='cd ..'
+#   alias ...='cd ../..'
+#   alias gs='git status'
+#   alias gd='git diff'
+#   alias gc='git commit'
+
+# End of ~/.aliases

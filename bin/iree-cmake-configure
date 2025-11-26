@@ -1,0 +1,494 @@
+#!/usr/bin/env python3
+"""
+Generate CMake configuration command from VS Code settings.
+
+This ensures command-line CMake configuration matches VS Code's configuration exactly.
+Parses settings with correct priority: .vscode-workspace > .vscode/*.code-workspace > .vscode/settings.json
+
+Directory structure:
+  ~/src/iree/
+  ├── main/           # Primary worktree
+  ├── <name>/         # Feature worktrees
+  └── builds/
+      └── <name>/     # Build directories
+"""
+
+import json
+import os
+import sys
+import argparse
+import subprocess
+import re
+from pathlib import Path
+from typing import Dict, List, Optional, Any
+
+
+def strip_jsonc_comments(text):
+    """Strip // comments and trailing commas from JSONC text."""
+    # Remove single-line comments (// ...).
+    result = []
+    for line in text.splitlines():
+        # Find // outside of strings.
+        in_string = False
+        escape_next = False
+        comment_start = -1
+
+        for i, char in enumerate(line):
+            if escape_next:
+                escape_next = False
+                continue
+
+            if char == '\\':
+                escape_next = True
+                continue
+
+            if char == '"':
+                in_string = not in_string
+
+            if not in_string and i < len(line) - 1:
+                if char == '/' and line[i + 1] == '/':
+                    comment_start = i
+                    break
+
+        if comment_start >= 0:
+            line = line[:comment_start]
+
+        result.append(line)
+
+    text = '\n'.join(result)
+
+    # Remove trailing commas before closing brackets/braces.
+    text = re.sub(r',(\s*[}\]])', r'\1', text)
+
+    return text
+
+
+def load_json_file(file_path: Path) -> Dict[str, Any]:
+    """Load and parse a JSONC file."""
+    if not file_path.exists():
+        return {}
+
+    with open(file_path, 'r') as f:
+        content = f.read()
+
+    clean_content = strip_jsonc_comments(content)
+
+    try:
+        return json.loads(clean_content)
+    except json.JSONDecodeError as e:
+        print(f"Warning: Error parsing {file_path}: {e}", file=sys.stderr)
+        return {}
+
+
+def find_workspace_file(start_path: Path) -> Optional[Path]:
+    """
+    Find workspace file with priority:
+    1. .vscode-workspace in current directory (worktree-specific)
+    2. .vscode/*.code-workspace in current directory
+    3. Search up directory tree for either
+    """
+    current = start_path
+    while current != current.parent:
+        # Priority 1: .vscode-workspace (worktree-specific)
+        worktree_workspace = current / ".vscode-workspace"
+        if worktree_workspace.exists():
+            return worktree_workspace
+
+        # Priority 2: .vscode/*.code-workspace
+        vscode_dir = current / ".vscode"
+        if vscode_dir.exists():
+            workspace_files = list(vscode_dir.glob("*.code-workspace"))
+            if workspace_files:
+                return workspace_files[0]  # Take first match
+
+        current = current.parent
+
+    return None
+
+
+def find_settings_json(start_path: Path) -> Optional[Path]:
+    """Find .vscode/settings.json in current directory or parent directories."""
+    current = start_path
+    while current != current.parent:
+        settings_file = current / ".vscode" / "settings.json"
+        if settings_file.exists():
+            return settings_file
+        current = current.parent
+
+    # Fallback to main IREE repo (new structure: ~/src/iree/main/).
+    main_iree = Path.home() / "src" / "iree" / "main" / ".vscode" / "settings.json"
+    if main_iree.exists():
+        return main_iree
+
+    # Legacy fallback: ~/src/iree/.vscode/settings.json.
+    legacy_iree = Path.home() / "src" / "iree" / ".vscode" / "settings.json"
+    if legacy_iree.exists():
+        return legacy_iree
+
+    return None
+
+
+def substitute_variables(value: str, workspace_folder: Path) -> str:
+    """Substitute VS Code variables in strings."""
+    if not isinstance(value, str):
+        return value
+
+    # ${workspaceFolder}
+    value = value.replace("${workspaceFolder}", str(workspace_folder))
+
+    # ${workspaceFolder:name} - for multi-root, just use workspace folder
+    value = re.sub(r'\$\{workspaceFolder:[^}]+\}', str(workspace_folder), value)
+
+    # ${env:VAR}
+    def replace_env(match):
+        var_name = match.group(1)
+        return os.environ.get(var_name, '')
+    value = re.sub(r'\$\{env:([^}]+)\}', replace_env, value)
+
+    # ${config:setting} - can't resolve these without full VS Code context
+    # Just leave them as-is for now
+
+    return value
+
+
+def merge_settings(base: Dict[str, Any], overlay: Dict[str, Any], workspace_folder: Path) -> Dict[str, Any]:
+    """
+    Merge overlay settings into base settings.
+    Overlay takes precedence. Performs variable substitution.
+    """
+    result = base.copy()
+
+    for key, value in overlay.items():
+        if isinstance(value, dict) and key in result and isinstance(result[key], dict):
+            # Merge dictionaries recursively.
+            result[key] = merge_settings(result[key], value, workspace_folder)
+        elif isinstance(value, str):
+            # Substitute variables in strings.
+            result[key] = substitute_variables(value, workspace_folder)
+        elif isinstance(value, list):
+            # For lists, substitute variables in string elements.
+            result[key] = [
+                substitute_variables(item, workspace_folder) if isinstance(item, str) else item
+                for item in value
+            ]
+        else:
+            result[key] = value
+
+    return result
+
+
+def load_all_settings(source_dir: Path) -> Dict[str, Any]:
+    """
+    Load all VS Code settings with correct priority:
+    1. .vscode-workspace (highest priority, worktree-specific)
+    2. .vscode/*.code-workspace (shared workspace)
+    3. .vscode/settings.json (base folder settings)
+    """
+    settings = {}
+
+    # Base: folder settings
+    settings_file = find_settings_json(source_dir)
+    if settings_file:
+        print(f"Loading folder settings: {settings_file}", file=sys.stderr)
+        settings = load_json_file(settings_file)
+
+    # Overlay: workspace file (shared or worktree-specific)
+    workspace_file = find_workspace_file(source_dir)
+    if workspace_file:
+        print(f"Loading workspace settings: {workspace_file}", file=sys.stderr)
+        workspace_data = load_json_file(workspace_file)
+
+        # Workspace files have settings nested under "settings" key.
+        workspace_settings = workspace_data.get("settings", {})
+        settings = merge_settings(settings, workspace_settings, source_dir)
+
+    return settings
+
+
+def extract_cmake_args(settings: Dict[str, Any]) -> List[str]:
+    """Extract cmake arguments from settings."""
+    args = []
+
+    # Parse cmake.configureSettings (recommended approach)
+    configure_settings = settings.get("cmake.configureSettings", {})
+    for key, value in configure_settings.items():
+        # Convert boolean values to ON/OFF.
+        if isinstance(value, bool):
+            value = "ON" if value else "OFF"
+        elif isinstance(value, (int, float)):
+            value = str(value)
+        args.append(f"-D{key}={value}")
+
+    # Parse cmake.configureArgs (legacy approach)
+    configure_args = settings.get("cmake.configureArgs", [])
+    # Filter out comments and empty strings.
+    configure_args = [arg.strip() for arg in configure_args
+                     if arg.strip() and not arg.strip().startswith("//")]
+    args.extend(configure_args)
+
+    return args
+
+
+def extract_environment(settings: Dict[str, Any]) -> Dict[str, str]:
+    """Extract environment variables from settings."""
+    env = {}
+
+    # Global environment (applies to configure, build, test)
+    cmake_env = settings.get("cmake.environment", {})
+    env.update(cmake_env)
+
+    # Configure-specific environment (only for configure)
+    configure_env = settings.get("cmake.configureEnvironment", {})
+    env.update(configure_env)
+
+    return env
+
+
+def extract_build_directory(settings: Dict[str, Any], source_dir: Path) -> Optional[Path]:
+    """Extract build directory from settings, with variable substitution."""
+    build_dir_str = settings.get("cmake.buildDirectory")
+    if build_dir_str:
+        # Substitute variables.
+        build_dir_str = substitute_variables(build_dir_str, source_dir)
+        return Path(build_dir_str)
+    return None
+
+
+def extract_generator(settings: Dict[str, Any]) -> Optional[str]:
+    """Extract CMake generator from settings."""
+    return settings.get("cmake.generator")
+
+
+def generate_cmake_command(source_dir: Path, build_dir: Path, settings: Dict[str, Any],
+                          build_type: str,
+                          generator_override: Optional[str] = None) -> List[str]:
+    """Generate full CMake configure command from settings."""
+    cmd = ["cmake"]
+    cmd.extend(["-B", str(build_dir)])
+    cmd.extend(["-S", str(source_dir)])
+
+    # Generator.
+    generator = generator_override or extract_generator(settings) or "Ninja"
+    cmd.extend(["-G", generator])
+
+    # Build type (always pass explicitly).
+    cmd.append(f"-DCMAKE_BUILD_TYPE={build_type}")
+
+    # CMake arguments.
+    cmake_args = extract_cmake_args(settings)
+    cmd.extend(cmake_args)
+
+    return cmd
+
+
+def infer_build_directory(source_dir: Path) -> Path:
+    """Infer build directory from source directory name."""
+    iree_root = Path.home() / "src" / "iree"
+
+    # Check if we're in the new directory structure: ~/src/iree/<name>/.
+    try:
+        relative = source_dir.relative_to(iree_root)
+        parts = relative.parts
+        if len(parts) >= 1 and parts[0] not in ("builds",):
+            # New structure: ~/src/iree/<name>/ -> ~/src/iree/builds/<name>/.
+            worktree_name = parts[0]
+            return iree_root / "builds" / worktree_name
+    except ValueError:
+        pass
+
+    # Legacy fallback: check for old naming convention.
+    source_name = source_dir.name
+    if source_name.startswith("iree-") and not source_name.endswith("-build"):
+        # Legacy: ~/src/iree-loom -> ~/src/iree-loom-build.
+        return source_dir.parent / f"{source_name}-build"
+    elif source_name == "iree":
+        # Standalone iree directory.
+        return source_dir.parent / "iree-build"
+
+    # Default: build/ subdirectory.
+    return source_dir / "build"
+
+
+def get_current_build_type(build_dir: Path) -> Optional[str]:
+    """
+    Extract current build type from CMakeCache.txt.
+    Returns None if build directory doesn't exist or build type not found.
+    """
+    cache_file = build_dir / "CMakeCache.txt"
+    if not cache_file.exists():
+        return None
+
+    try:
+        with open(cache_file, 'r') as f:
+            for line in f:
+                if line.startswith("CMAKE_BUILD_TYPE:"):
+                    # Format: CMAKE_BUILD_TYPE:STRING=Debug
+                    value = line.split("=", 1)[1].strip()
+                    return value if value else None
+    except (IOError, OSError):
+        return None
+
+    return None
+
+
+def validate_worktree_root(path: Path) -> bool:
+    """
+    Validate that we're in an IREE worktree root directory.
+    Returns True if valid, False otherwise.
+    """
+    # Check for .git (file for worktree, directory for main repo)
+    git_path = path / ".git"
+    if not git_path.exists():
+        return False
+
+    # Check for IREE's root CMakeLists.txt
+    cmake_file = path / "CMakeLists.txt"
+    if not cmake_file.exists():
+        return False
+
+    # Verify it's actually IREE by checking for "project(IREE" in CMakeLists.txt
+    try:
+        content = cmake_file.read_text()
+        if "project(IREE" not in content:
+            return False
+    except:
+        return False
+
+    return True
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Generate and optionally execute CMake configuration from VS Code settings"
+    )
+    parser.add_argument(
+        "-s", "--source-dir",
+        type=Path,
+        default=Path.cwd(),
+        help="Source directory (default: current directory)"
+    )
+    parser.add_argument(
+        "-b", "--build-dir",
+        type=Path,
+        help="Build directory (overrides settings, auto-detected if not specified)"
+    )
+    parser.add_argument(
+        "-g", "--generator",
+        help="CMake generator (overrides settings, default: Ninja or from settings)"
+    )
+    parser.add_argument(
+        "-t", "--build-type",
+        choices=["Debug", "Release", "RelWithDebInfo", "MinSizeRel"],
+        help="CMake build type (overrides detected or default Debug)"
+    )
+    parser.add_argument(
+        "-n", "--dry-run",
+        action="store_true",
+        help="Print the cmake command without executing it"
+    )
+    parser.add_argument(
+        "--print-settings",
+        action="store_true",
+        help="Print merged settings and exit"
+    )
+
+    args = parser.parse_args()
+
+    # Validate we're in an IREE worktree root directory.
+    if not validate_worktree_root(args.source_dir):
+        print("ERROR: Must be run from an IREE worktree root directory", file=sys.stderr)
+        print(file=sys.stderr)
+        print(f"Current directory: {args.source_dir}", file=sys.stderr)
+        print(file=sys.stderr)
+        print("This script must be run from the root of an IREE git worktree.", file=sys.stderr)
+        print("Valid locations:", file=sys.stderr)
+        print("  - ~/src/iree/main (primary worktree)", file=sys.stderr)
+        print("  - ~/src/iree/<name> (feature worktrees)", file=sys.stderr)
+        print(file=sys.stderr)
+        print("Please navigate to the worktree root and try again:", file=sys.stderr)
+        print("  cd ~/src/iree/<your-worktree>", file=sys.stderr)
+        print("  iree-cmake-configure", file=sys.stderr)
+        sys.exit(1)
+
+    # Load all settings with correct priority.
+    settings = load_all_settings(args.source_dir)
+
+    if not settings:
+        print("Warning: No settings found", file=sys.stderr)
+
+    if args.print_settings:
+        print("Merged settings:")
+        print(json.dumps(settings, indent=2))
+        return
+
+    # Determine build directory.
+    build_dir = args.build_dir
+    if build_dir is None:
+        # Try to get from settings.
+        build_dir = extract_build_directory(settings, args.source_dir)
+    if build_dir is None:
+        # Infer from source directory name.
+        build_dir = infer_build_directory(args.source_dir)
+
+    print(f"Source directory: {args.source_dir}", file=sys.stderr)
+    print(f"Build directory:  {build_dir}", file=sys.stderr)
+
+    # Determine build type.
+    if args.build_type:
+        # Explicit override from command line.
+        build_type = args.build_type
+        print(f"Build type:       {build_type} (from --build-type flag)", file=sys.stderr)
+    else:
+        # Detect from existing build or use Debug default.
+        detected_type = get_current_build_type(build_dir)
+        if detected_type:
+            build_type = detected_type
+            print(f"Build type:       {build_type} (detected from existing build)", file=sys.stderr)
+        else:
+            build_type = "Debug"
+            print(f"Build type:       {build_type} (default for new build)", file=sys.stderr)
+
+    # Validate build type change.
+    if build_dir.exists():
+        current_type = get_current_build_type(build_dir)
+        if current_type and current_type != build_type:
+            print(file=sys.stderr)
+            print(f"WARNING: Build type changing from {current_type} to {build_type}", file=sys.stderr)
+            print(f"         This requires full reconfiguration and rebuild.", file=sys.stderr)
+            print(file=sys.stderr)
+            if not args.dry_run:
+                response = input(f"Continue with {build_type}? [y/N]: ")
+                if response.lower() != 'y':
+                    print("Aborted. To keep current build type, run without --build-type flag.", file=sys.stderr)
+                    sys.exit(1)
+                print(file=sys.stderr)
+
+    # Extract and apply environment variables.
+    env_vars = extract_environment(settings)
+    if env_vars:
+        print(f"Environment variables from settings:", file=sys.stderr)
+        for key, value in env_vars.items():
+            print(f"  {key}={value}", file=sys.stderr)
+            os.environ[key] = str(value)
+
+    print(file=sys.stderr)
+
+    # Generate command.
+    cmd = generate_cmake_command(args.source_dir, build_dir, settings, build_type, args.generator)
+
+    # Print command.
+    print("CMake command:")
+    print(" \\\n  ".join(cmd))
+    print(file=sys.stderr)
+
+    # Execute unless dry-run requested.
+    if not args.dry_run:
+        print(f"Executing cmake configuration...", file=sys.stderr)
+        result = subprocess.run(cmd)
+        sys.exit(result.returncode)
+    else:
+        print(f"Dry-run mode: cmake not executed", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

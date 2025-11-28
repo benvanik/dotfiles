@@ -102,7 +102,7 @@ else
         exec $MUX attach-session -t "$session_name"
     else
         info "Creating new session: $session_name (shell: $USER_SHELL)"
-        $MUX set-option -g default-shell "$USER_SHELL"
-        exec $MUX new-session -s "$session_name" -c "$target_dir"
+        # Pass shell directly to new-session to avoid needing server for set-option.
+        exec $MUX new-session -s "$session_name" -c "$target_dir" "$USER_SHELL"
     fi
 fi

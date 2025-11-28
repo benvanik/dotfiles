@@ -1,12 +1,13 @@
 #!/bin/bash
 # Build IREE in the paired build directory.
 #
-# Usage: iree-cmake-build [target] [-- cmake-args...]
+# Usage: iree-cmake-build [targets...] [-- cmake-args...]
 #
 # Examples:
-#   iree-cmake-build                    # Build all targets
-#   iree-cmake-build iree-compile       # Build specific target
-#   iree-cmake-build -- -j16            # Override parallel jobs
+#   iree-cmake-build                           # Build all targets
+#   iree-cmake-build iree-compile              # Build specific target
+#   iree-cmake-build iree-opt iree-compile     # Build multiple targets
+#   iree-cmake-build -- -j16                   # Override parallel jobs
 #
 # This script automatically finds the correct build directory based on the
 # current worktree location:
@@ -95,7 +96,7 @@ if [ ! -f "$BUILD_DIR/CMakeCache.txt" ]; then
 fi
 
 # Parse arguments: everything before -- is a target, after is cmake args.
-TARGET=""
+TARGETS=()
 CMAKE_ARGS=()
 PARALLEL_JOBS="-j90"
 SEEN_SEPARATOR=false
@@ -113,23 +114,23 @@ for arg in "$@"; do
             CMAKE_ARGS+=("$arg")
         fi
     else
-        TARGET="$arg"
+        TARGETS+=("$arg")
     fi
 done
 
 # Build command.
 CMD=(cmake --build "$BUILD_DIR" "$PARALLEL_JOBS")
-if [ -n "$TARGET" ]; then
-    CMD+=(--target "$TARGET")
-fi
+for target in "${TARGETS[@]}"; do
+    CMD+=(--target "$target")
+done
 if [ ${#CMAKE_ARGS[@]} -gt 0 ]; then
     CMD+=("${CMAKE_ARGS[@]}")
 fi
 
 info "Source: $SOURCE_DIR"
 info "Build:  $BUILD_DIR"
-if [ -n "$TARGET" ]; then
-    info "Target: $TARGET"
+if [ ${#TARGETS[@]} -gt 0 ]; then
+    info "Targets: ${TARGETS[*]}"
 fi
 echo ""
 

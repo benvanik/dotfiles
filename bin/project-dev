@@ -3,6 +3,9 @@
 
 set -e
 
+# Use user's shell (typically zsh) for new sessions.
+USER_SHELL="${SHELL:-/bin/zsh}"
+
 show_help() {
     cat << 'EOF'
 project-dev - Create or attach to a project tmux/byobu session
@@ -87,7 +90,8 @@ if [ -n "$TMUX" ]; then
         info "Switching to existing session: $session_name"
         $MUX switch-client -t "$session_name"
     else
-        info "Creating new session: $session_name"
+        info "Creating new session: $session_name (shell: $USER_SHELL)"
+        $MUX set-option -g default-shell "$USER_SHELL"
         $MUX new-session -d -s "$session_name" -c "$target_dir"
         $MUX switch-client -t "$session_name"
     fi
@@ -97,7 +101,8 @@ else
         info "Attaching to existing session: $session_name"
         exec $MUX attach-session -t "$session_name"
     else
-        info "Creating new session: $session_name"
+        info "Creating new session: $session_name (shell: $USER_SHELL)"
+        $MUX set-option -g default-shell "$USER_SHELL"
         exec $MUX new-session -s "$session_name" -c "$target_dir"
     fi
 fi

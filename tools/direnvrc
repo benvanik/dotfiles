@@ -133,6 +133,45 @@ use_ccache() {
     _track_tool "ccache" "$cache_name"
 }
 
+# Activate Python virtual environment if present.
+# Usage: use_venv [path]
+#
+# Looks for venv in order: $1, .venv/, venv/
+# Silently skips if no venv found (allows .envrc to be portable).
+#
+# Examples:
+#   use_venv              # Auto-detect .venv/ or venv/
+#   use_venv ".venv"      # Explicit path
+#
+use_venv() {
+    local venv_path="${1:-}"
+
+    # Auto-detect if not specified.
+    if [ -z "$venv_path" ]; then
+        if [ -d ".venv" ]; then
+            venv_path=".venv"
+        elif [ -d "venv" ]; then
+            venv_path="venv"
+        else
+            # No venv found - silently skip.
+            return 0
+        fi
+    fi
+
+    # Verify venv exists.
+    if [ ! -f "${venv_path}/bin/activate" ]; then
+        log_error "venv not found at ${venv_path}"
+        return 1
+    fi
+
+    # Activate venv using direnv's layout mechanism.
+    export VIRTUAL_ENV="$(cd "$venv_path" && pwd)"
+    PATH_add "${VIRTUAL_ENV}/bin"
+    export VIRTUAL_ENV_PROMPT="${venv_path##*/}"
+
+    _track_tool "venv" "${venv_path##*/}"
+}
+
 # Source .envrc.local if exists (for machine-specific overrides).
 # Also prints the environment summary.
 source_local_envrc() {

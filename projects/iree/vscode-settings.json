@@ -1,2 +1,9 @@
 {
+  "cmake.preRunCoverageTarget": "iree-runtime-coverage-clear-all",
+  "cmake.postRunCoverageTarget": "iree-runtime-coverage-export",
+  "cmake.coverageInfoFiles": [
+    "${config:cmake.buildDirectory}/coverage/runtime.lcov.info"
+  ],
+  "testing.coverageToolbarEnabled": true,
+  "testing.showCoverageInExplorer": true
 }

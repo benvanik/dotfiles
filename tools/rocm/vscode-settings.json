@@ -1,6 +1,18 @@
 {
   "cmake.environment": {
     "HIP_PATH": "$TOOL_ROOT",
-    "ROCM_PATH": "$TOOL_ROOT"
+    "ROCM_PATH": "$TOOL_ROOT",
+    "IREE_HAL_AMDGPU_LIBHSA_PATH": "$TOOL_ROOT/lib/"
+  },
+  "cmake.testEnvironment": {
+    "IREE_HAL_AMDGPU_LIBHSA_PATH": "$TOOL_ROOT/lib/"
+  },
+  "cmake.debugConfig": {
+    "env": {
+      "IREE_HAL_AMDGPU_LIBHSA_PATH": "$TOOL_ROOT/lib/"
+    }
+  },
+  "lldb-dap.environment": {
+    "IREE_HAL_AMDGPU_LIBHSA_PATH": "$TOOL_ROOT/lib/"
   }
 }

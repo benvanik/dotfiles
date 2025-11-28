@@ -136,6 +136,9 @@ def substitute_variables(value: str, workspace_folder: Path) -> str:
     # ${workspaceFolder}
     value = value.replace("${workspaceFolder}", str(workspace_folder))
 
+    # ${workspaceFolderBasename}
+    value = value.replace("${workspaceFolderBasename}", workspace_folder.name)
+
     # ${workspaceFolder:name} - for multi-root, just use workspace folder
     value = re.sub(r'\$\{workspaceFolder:[^}]+\}', str(workspace_folder), value)
 

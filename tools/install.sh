@@ -57,21 +57,17 @@ EOF
         local tool="${entry%%:*}"
         local platforms="${entry##*:}"
         if tool_supported "$tool" "$platforms"; then
-            printf "    %-12s" "$tool"
-            # Show if version is required.
-            case "$tool" in
-                llvm|rocm) echo "(requires version)" ;;
-                *)         echo "" ;;
-            esac
+            printf "    %-12s\n" "$tool"
         fi
     done
     cat << EOF
 
 EXAMPLES
     tools/install.sh cmake              Install latest CMake
-    tools/install.sh llvm 21.1.6        Install LLVM 21.1.6
+    tools/install.sh llvm               Install latest LLVM
+    tools/install.sh llvm 21.1.6        Install specific LLVM version
     tools/install.sh ninja              Install latest Ninja
-    tools/install.sh --all              Install all tools (interactive)
+    tools/install.sh --all              Install all tools (fetches latest versions)
 
 TOOL HELP
     tools/install.sh <tool> --help      Show tool-specific options
@@ -83,28 +79,19 @@ install_all() {
     info "Installing all supported tools for $PLATFORM..."
     echo ""
 
-    local tools_needing_version=()
-
+    local failed_tools=()
     for tool in $(get_supported_tools); do
-        case "$tool" in
-            llvm|rocm)
-                # These need versions specified.
-                tools_needing_version+=("$tool")
-                ;;
-            *)
-                info "Installing $tool..."
-                "$SCRIPT_DIR/$tool/install.sh" || warn "Failed to install $tool"
-                echo ""
-                ;;
-        esac
+        info "Installing $tool..."
+        if ! "$SCRIPT_DIR/$tool/install.sh"; then
+            warn "Failed to install $tool"
+            failed_tools+=("$tool")
+        fi
+        echo ""
     done
 
-    if [ ${#tools_needing_version[@]} -gt 0 ]; then
-        echo ""
-        warn "The following tools require version specification:"
-        for tool in "${tools_needing_version[@]}"; do
-            echo "  tools/install.sh $tool <version>"
-        done
+    if [ ${#failed_tools[@]} -gt 0 ]; then
+        error "Failed to install: ${failed_tools[*]}"
+        exit 1
     fi
 
     info "Done!"

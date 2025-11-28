@@ -1,6 +1,6 @@
 #!/bin/bash
 # Install ROCm from TheRock pip index.
-# Usage: rocm/install.sh <version> [gpu-target]
+# Usage: rocm/install.sh [version] [gpu-target]
 set -e
 
 TOOL_NAME="rocm"
@@ -15,17 +15,42 @@ fi
 
 ROCM_DIR="$TOOLS_DIR/rocm"
 
+# Fetch latest ROCm version from pip index.
+# Sets FETCHED_VERSION on success.
+fetch_latest_version() {
+    local gpu_target="${1:-gfx1100}"
+    local index_suffix
+    case "$gpu_target" in
+        gfx110*) index_suffix="gfx110X-all" ;;
+        gfx90*)  index_suffix="gfx90X-all" ;;
+        gfx94*)  index_suffix="gfx94X-all" ;;
+        *)       index_suffix="$gpu_target" ;;
+    esac
+    local index_url="https://rocm.nightlies.amd.com/v2/${index_suffix}"
+
+    info "Fetching latest ROCm version from pip index..."
+    # Parse the pip index page for rocm package versions.
+    # Format: rocm-7.11.0a20251127.tar.gz (version with date suffix).
+    FETCHED_VERSION=$(curl -fsSL "$index_url/rocm/" 2>/dev/null | \
+        grep -oE 'rocm-[0-9]+\.[0-9]+\.[0-9]+[a-z0-9]*\.tar\.gz' | \
+        sed 's/\.tar\.gz//' | sed 's/rocm-//' | sort -V | tail -1)
+    if [ -z "$FETCHED_VERSION" ]; then
+        error "Failed to fetch latest version from $index_url"
+        exit 1
+    fi
+}
+
 # Handle flags.
 while [ $# -gt 0 ]; do
     case "$1" in
         -h|--help)
             cat << EOF
-Usage: rocm/install.sh <version> [gpu-target]
+Usage: rocm/install.sh [version] [gpu-target]
 
 Install ROCm from TheRock pip index to ~/tools/rocm/<version>/
 
 Arguments:
-    version     ROCm version (e.g., 7.9.0)
+    version     ROCm version (e.g., 7.9.0) - fetches latest if omitted
     gpu-target  GPU target (default: \$ROCM_GPU_TARGET or gfx1100)
                 Supported: gfx110*, gfx90*, gfx94*
 
@@ -33,6 +58,7 @@ Options:
     --force     Reinstall even if version exists
 
 Examples:
+    rocm/install.sh                 # Install latest for default GPU
     rocm/install.sh 7.9.0           # Uses ROCM_GPU_TARGET
     rocm/install.sh 7.9.0 gfx90a    # Override GPU target
 
@@ -51,14 +77,16 @@ EOF
     esac
 done
 
-# Get version (required).
-if [ -z "$1" ]; then
-    error "Version required. Example: rocm/install.sh 7.9.0"
-    exit 1
-fi
-
-VERSION="$1"
+# Get GPU target first (needed for version lookup).
 GPU_TARGET="${2:-${ROCM_GPU_TARGET:-gfx1100}}"
+
+# Get version (fetch latest if not specified).
+if [ -z "$1" ]; then
+    fetch_latest_version "$GPU_TARGET"
+    VERSION="$FETCHED_VERSION"
+else
+    VERSION="$1"
+fi
 
 # Map GPU target to index URL pattern.
 case "$GPU_TARGET" in

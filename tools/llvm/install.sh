@@ -9,14 +9,30 @@ source "$SCRIPT_DIR/../install-utils.sh"
 
 LLVM_DIR="$TOOLS_DIR/llvm"
 
+# Fetch latest LLVM version from GitHub releases.
+# Sets FETCHED_VERSION on success.
+fetch_latest_version() {
+    info "Fetching latest LLVM version..."
+    FETCHED_VERSION=$(curl -fsSL "https://api.github.com/repos/llvm/llvm-project/releases/latest" | \
+        grep '"tag_name"' | sed -E 's/.*"llvmorg-([^"]+)".*/\1/')
+    if [ -z "$FETCHED_VERSION" ]; then
+        error "Failed to fetch latest version"
+        exit 1
+    fi
+}
+
 # Handle flags.
 while [ $# -gt 0 ]; do
     case "$1" in
         -h|--help)
-            show_install_usage "llvm" "VERSION"
+            show_install_usage "llvm" "[VERSION]"
             echo ""
             echo "Downloads pre-built LLVM/Clang from GitHub releases."
-            echo "Example: llvm/install.sh 21.1.6"
+            echo "Without a version, installs the latest release."
+            echo ""
+            echo "Examples:"
+            echo "  llvm/install.sh           # Install latest"
+            echo "  llvm/install.sh 21.1.6    # Install specific version"
             echo ""
             echo "Options:"
             echo "  --force    Reinstall even if version exists"
@@ -34,14 +50,13 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# Get version (required for LLVM - too many options to auto-detect).
+# Get version (fetch latest if not specified).
 if [ -z "$1" ]; then
-    error "Version required. Example: llvm/install.sh 21.1.6"
-    echo ""
-    echo "Find versions at: https://github.com/llvm/llvm-project/releases"
-    exit 1
+    fetch_latest_version
+    VERSION="$FETCHED_VERSION"
+else
+    VERSION="$1"
 fi
-VERSION="$1"
 
 info "Installing LLVM $VERSION"
 
@@ -57,20 +72,18 @@ if version_installed "$LLVM_DIR" "$VERSION"; then
 fi
 
 # Determine download URL based on platform/arch.
+# LLVM 21+ uses new naming: LLVM-$VERSION-Linux-X64.tar.xz
 if [ "$PLATFORM" = "linux" ] && [ "$ARCH" = "x86_64" ]; then
-    TARBALL="clang+llvm-$VERSION-x86_64-linux-gnu-ubuntu-22.04.tar.xz"
-    # Try ubuntu-22.04 first, fall back to generic linux-gnu.
-    URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-$VERSION/$TARBALL"
+    TARBALL="LLVM-$VERSION-Linux-X64.tar.xz"
+elif [ "$PLATFORM" = "linux" ] && [ "$ARCH" = "aarch64" ]; then
+    TARBALL="LLVM-$VERSION-Linux-ARM64.tar.xz"
 elif [ "$PLATFORM" = "darwin" ] && [ "$ARCH" = "aarch64" ]; then
-    TARBALL="clang+llvm-$VERSION-arm64-apple-darwin24.tar.xz"
-    URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-$VERSION/$TARBALL"
-elif [ "$PLATFORM" = "darwin" ] && [ "$ARCH" = "x86_64" ]; then
-    TARBALL="clang+llvm-$VERSION-x86_64-apple-darwin.tar.xz"
-    URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-$VERSION/$TARBALL"
+    TARBALL="LLVM-$VERSION-macOS-ARM64.tar.xz"
 else
     error "Unsupported platform: $PLATFORM/$ARCH"
     exit 1
 fi
+URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-$VERSION/$TARBALL"
 
 # Download.
 download "$URL" "$TARBALL"
@@ -80,7 +93,8 @@ info "Extracting..."
 tar xf "$TARBALL"
 
 # Rename extracted directory to version.
-EXTRACTED=$(ls -d clang+llvm-$VERSION* 2>/dev/null | head -1)
+# New naming: LLVM-$VERSION-* (e.g., LLVM-21.1.6-Linux-X64).
+EXTRACTED=$(ls -d LLVM-$VERSION* 2>/dev/null | head -1)
 if [ -n "$EXTRACTED" ] && [ "$EXTRACTED" != "$VERSION" ]; then
     mv "$EXTRACTED" "$VERSION"
 fi

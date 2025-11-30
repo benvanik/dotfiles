@@ -204,8 +204,8 @@ secret_patterns=(
 
 secrets_found=0
 for pattern in "${secret_patterns[@]}"; do
-    # Search all files except .git, templates, and this test file.
-    if grep -rE "$pattern" --include="*" --exclude-dir=".git" --exclude="*.template" --exclude="run-tier1.sh" . 2>/dev/null | head -1 > /tmp/secret_check; then
+    # Search all files except .git, deps/*/* (submodules), templates, and this test file.
+    if grep -rE "$pattern" --include="*" --exclude-dir=".git" --exclude-dir="deps" --exclude="*.template" --exclude="run-tier1.sh" . 2>/dev/null | head -1 > /tmp/secret_check; then
         if [ -s /tmp/secret_check ]; then
             fail "Potential secret found matching: $pattern"
             ((++secrets_found))
@@ -250,7 +250,8 @@ if [ $missing -eq 0 ]; then
 fi
 
 # Check for *.local files that shouldn't be committed.
-local_files=$(find . -name "*.local" -o -name "*.local.*" 2>/dev/null | grep -v ".git" | head -5)
+# Exclude .git and deps/*/* (submodules in deps/).
+local_files=$(find . \( -path "./.git" -o -path "./deps/*/*" \) -prune -o \( -name "*.local" -o -name "*.local.*" \) -print 2>/dev/null | head -5)
 if [ -n "$local_files" ]; then
     fail "*.local files should not be committed"
     echo "$local_files" | while read -r f; do echo "    $f"; done

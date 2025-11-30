@@ -4,8 +4,10 @@
 **/.claude/settings.local.json
 **/CLAUDE.local.md
 
-# direnv local overrides (machine-specific).
+# direnv project environments (machine-specific, managed by project-init).
+.envrc
 .envrc.local
+.history/
 
 # OS artifacts.
 .DS_Store
@@ -14,9 +16,11 @@ Thumbs.db
 *.swo
 *~
 
-# Editor directories.
+# Editor directories (including symlinks to shared configs).
 .idea/
+.idea
 .vscode/
+.vscode
 
 # Python.
 __pycache__/

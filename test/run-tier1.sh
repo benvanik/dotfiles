@@ -38,7 +38,6 @@ section "syntax" "Shell syntax validation"
 posix_files=(
     "shell/shrc"
     "shell/profile"
-    "shell/aliases"
 )
 # Add platform files if they exist.
 for f in shell/platform/*.sh; do

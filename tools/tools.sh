@@ -9,7 +9,7 @@ TOOLS_DIR="$HOME/tools"
 # Source platform utilities.
 . "$HOME/.dotfiles/tools/platform.sh" 2>/dev/null || return 0
 
-# Helper to add tool to PATH and source env.sh.
+# Helper to load a tool by setting ROOT and sourcing env.sh.
 _load_tool() {
     local tool="$1"
     local tool_dir="$TOOLS_DIR/$tool"
@@ -18,10 +18,8 @@ _load_tool() {
     # Skip if no latest symlink.
     [ -L "$latest" ] || return 0
 
-    # Add bin to PATH.
-    _add_path "$latest/bin"
-
     # Export root variable and source env.sh if exists.
+    # env.sh is responsible for adding to PATH.
     local root_var
     root_var="$(echo "$tool" | tr '[:lower:]' '[:upper:]')_ROOT"
     eval "export ${root_var}=\"\$(readlink -f \"$latest\")\""

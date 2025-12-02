@@ -125,6 +125,10 @@ info "Installing ROCm packages (this may take a while)..."
     --index-url "$INDEX_URL" \
     "rocm[libraries,devel]==$VERSION"
 
+# Remove bare 'python' symlink to avoid shadowing system python.
+# Keep python3 - ROCm scripts use it in their shebangs.
+rm -f "$VERSION/bin/python"
+
 # Update latest symlink.
 update_latest "$ROCM_DIR" "$VERSION"
 

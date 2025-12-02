@@ -18,9 +18,9 @@ _track_tool() {
 }
 
 # Generic tool loader.
-# Args: tool, requirement, path_subdirs.
+# Args: tool, requirement.
 _use_tool() {
-    local tool="$1" requirement="${2:-latest}" path_subdirs="${3:-bin}"
+    local tool="$1" requirement="${2:-latest}"
 
     # Silent skip if platform doesn't support.
     _platform_supports "$tool" || return 0
@@ -33,33 +33,28 @@ _use_tool() {
         return 1
     fi
 
-    # Add to PATH.
-    for subdir in $path_subdirs; do
-        [ -d "${tool_path}/${subdir}" ] && PATH_add "${tool_path}/${subdir}"
-    done
+    # Export root variable for env.sh to use.
+    local root_var
+    root_var="$(echo "${tool}" | tr '[:lower:]' '[:upper:]')_ROOT"
+    eval "export ${root_var}=\"${tool_path}\""
 
-    # Source tool-specific env.sh if exists (at tool level, not version level).
+    # Source tool-specific env.sh if exists.
+    # env.sh is responsible for adding to PATH.
     local env_file="${tool_dir}/env.sh"
-    if [ -f "$env_file" ]; then
-        # Export the root for the env.sh to use.
-        local root_var
-        root_var="$(echo "${tool}" | tr '[:lower:]' '[:upper:]')_ROOT"
-        eval "export ${root_var}=\"${tool_path}\""
-        source_env "$env_file"
-    fi
+    [ -f "$env_file" ] && source_env "$env_file"
 
     # Track for summary output.
     _track_tool "$tool" "$(_version_from_path "$tool_path")"
 }
 
 # Tool-specific functions.
-use_bazel() { _use_tool "bazel" "${1:-latest}" "bin"; }
-use_cmake() { _use_tool "cmake" "${1:-latest}" "bin"; }
-use_llvm() { _use_tool "llvm" "${1:-latest}" "bin"; }
-use_mold() { _use_tool "mold" "${1:-latest}" "bin"; }
-use_ninja() { _use_tool "ninja" "${1:-latest}" "bin"; }
-use_rocm() { _use_tool "rocm" "${1:-latest}" "bin"; }
-use_vulkan() { _use_tool "vulkan" "${1:-latest}" "bin"; }
+use_bazel() { _use_tool "bazel" "${1:-latest}"; }
+use_cmake() { _use_tool "cmake" "${1:-latest}"; }
+use_llvm() { _use_tool "llvm" "${1:-latest}"; }
+use_mold() { _use_tool "mold" "${1:-latest}"; }
+use_ninja() { _use_tool "ninja" "${1:-latest}"; }
+use_rocm() { _use_tool "rocm" "${1:-latest}"; }
+use_vulkan() { _use_tool "vulkan" "${1:-latest}"; }
 
 # Override Vulkan validation layers (use after use_vulkan).
 # Supports: "debug", "release", or path to custom layers.

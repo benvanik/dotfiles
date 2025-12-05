@@ -414,6 +414,11 @@ VS CODE WORKSPACE OPTIONS
     --vscode-settings FILE  Merge additional settings from JSON file
     --vscode-name NAME  Override workspace name (default: directory basename)
 
+CLAUDE CODE OPTIONS
+    --claude [DIR]      Generate .claude/settings.local.json for sandbox
+                        DIR is the build directory for Edit permissions
+                        (default: uses --cmake dir if specified)
+
 INTERACTIVE MODE
     By default, project-init uses fzf for interactive tool selection.
     Tools are grouped by category (Build Tools, ML/GPU Tools).
@@ -465,6 +470,10 @@ parse_args() {
     VSCODE_EXTRA_SETTINGS=""
     VSCODE_NAME=""
     BUILD_DIR="./build"
+
+    # Claude Code options.
+    CLAUDE_ENABLED=false
+    CLAUDE_BUILD_DIR=""
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -527,6 +536,14 @@ parse_args() {
             --vscode-name)
                 shift
                 VSCODE_NAME="$1"
+                ;;
+            --claude)
+                CLAUDE_ENABLED=true
+                # Check if next arg is a directory (not another flag).
+                if [ $# -gt 1 ] && [[ ! "$2" =~ ^- ]]; then
+                    shift
+                    CLAUDE_BUILD_DIR="$1"
+                fi
                 ;;
             -*)
                 # Handle combined short flags like -by.
@@ -724,6 +741,37 @@ COLOREOF
 }
 
 # ============================================================================
+# Claude Code Settings Generation
+# ============================================================================
+
+# Generate Claude Code settings.local.json for sandbox write access.
+# Args: build_dir (absolute path to build directory)
+generate_claude_settings() {
+    local build_dir="$1"
+
+    mkdir -p .claude
+
+    # Build the Edit rules array.
+    # Linux sandbox only supports literal paths (no globs).
+    local edit_rules='["Edit(/tmp)"'
+    if [ -n "$build_dir" ]; then
+        edit_rules="$edit_rules, \"Edit($build_dir)\""
+    fi
+    edit_rules="$edit_rules]"
+
+    # Generate settings.local.json.
+    cat > .claude/settings.local.json << EOF
+{
+  "permissions": {
+    "allow": $edit_rules
+  }
+}
+EOF
+
+    info "Created Claude Code settings: .claude/settings.local.json"
+}
+
+# ============================================================================
 # Main
 # ============================================================================
 
@@ -897,12 +945,30 @@ main() {
         generate_vscode_workspace "$project_name"
     fi
 
+    # Generate Claude Code settings if requested.
+    if [ "$CLAUDE_ENABLED" = "true" ]; then
+        # Resolve build dir to absolute path.
+        local claude_build=""
+        if [ -n "$CLAUDE_BUILD_DIR" ]; then
+            claude_build="$CLAUDE_BUILD_DIR"
+        elif [ -n "$BUILD_DIR" ] && [ "$BUILD_DIR" != "./build" ]; then
+            # Use cmake build dir if specified.
+            claude_build="$BUILD_DIR"
+        fi
+        # Make absolute if relative.
+        if [ -n "$claude_build" ] && [[ "$claude_build" != /* ]]; then
+            claude_build="$(pwd)/${claude_build#./}"
+        fi
+        generate_claude_settings "$claude_build"
+    fi
+
     echo ""
     echo -e "${GREEN}Created:${NC}"
     echo "  .envrc       - Project tool configuration (commit this)"
     [ ! -f ".envrc.local" ] || echo "  .envrc.local - Machine overrides (gitignored)"
     [ "$USE_HISTORY" = "true" ] && echo "  .history/    - Per-project shell history (gitignored)"
     [ "$VSCODE_ENABLED" = "true" ] && echo "  $project_name.code-workspace - VS Code workspace"
+    [ "$CLAUDE_ENABLED" = "true" ] && echo "  .claude/settings.local.json - Claude Code sandbox settings"
     echo ""
 
     # Allow direnv.

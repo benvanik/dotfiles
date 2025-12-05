@@ -190,6 +190,13 @@ _create_symlinks() {
     _link claude/statusline.sh .claude/statusline.sh
     _link claude/CLAUDE.md .claude/CLAUDE.md
 
+    # GPU passthrough wrapper for Claude Code sandbox (Linux only).
+    if [ "$(uname -s)" = "Linux" ] && command -v bwrap &>/dev/null; then
+        info "Setting up Claude sandbox GPU passthrough..."
+        mkdir -p "$HOME/.local/bin"
+        ln -sf "$DOTFILES/claude/bwrap-gpu-wrapper" "$HOME/.local/bin/bwrap"
+    fi
+
     info "Setting up tmux configuration..."
     _link tmux.conf .tmux.conf
 

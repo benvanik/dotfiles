@@ -51,7 +51,8 @@ EXAMPLES
 WHAT IT CREATES
     ~/src/iree/<name>/           Git worktree
     ~/src/iree/builds/<name>/    Build directory
-    Symlinks: .claude/, .vscode/, CLAUDE*.md from main/
+    Symlinks: .vscode/, .claude/settings.json, CLAUDE*.md from main/
+    .claude/settings.local.json generated with per-worktree build path
     .envrc with direnv integration
     <name>.code-workspace with color-coded theme
 
@@ -155,14 +156,33 @@ fi
 ln -s ../main/.vscode .vscode
 info "Symlinked: .vscode -> ../main/.vscode"
 
-# Symlink .claude directory (Claude Code settings).
+# Set up .claude directory with shared config + per-worktree settings.
 if [ -d .claude ]; then
     rm -rf .claude
 fi
-if [ -d "$MAIN_WORKTREE/.claude" ]; then
-    ln -s ../main/.claude .claude
-    info "Symlinked: .claude -> ../main/.claude"
-fi
+mkdir -p .claude
+
+# Symlink shared Claude files from main worktree.
+for f in settings.json CLAUDE.md; do
+    if [ -f "$MAIN_WORKTREE/.claude/$f" ]; then
+        ln -s "../../main/.claude/$f" ".claude/$f"
+        info "Symlinked: .claude/$f"
+    fi
+done
+
+# Generate per-worktree settings.local.json with sandbox write access.
+# Linux sandbox only supports literal paths (no globs).
+cat > .claude/settings.local.json << EOF
+{
+  "permissions": {
+    "allow": [
+      "Edit(/tmp)",
+      "Edit($BUILD_PATH)"
+    ]
+  }
+}
+EOF
+info "Created: .claude/settings.local.json (sandbox: /tmp, $BUILD_PATH)"
 
 # Symlink CLAUDE*.md files from main worktree.
 for claude_file in "$MAIN_WORKTREE"/CLAUDE*.md; do

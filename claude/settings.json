@@ -3,17 +3,32 @@
   "env": {
     "CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR": "1"
   },
+  "sandbox": {
+    "enabled": true,
+    "autoAllowBashIfSandboxed": true,
+    "allowUnsandboxedCommands": false
+  },
   "permissions": {
     "allow": [
-      "Bash(jq)",
-      "Bash(jq:*)",
-      "Bash(jq:* | head::*)",
-      "Bash(jq:* | tail::*)",
-      "Bash(jq:* | grep::*)",
-      "Bash(jq:* | rg::*)",
-      "Bash(echo:*)",
-      "Bash(*/tmp/*)",
-      "Read(//tmp/**)"
+      "Bash",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:api.github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:llvm.org)",
+      "WebFetch(domain:mlir.llvm.org)",
+      "WebFetch(domain:releases.llvm.org)",
+      "WebFetch(domain:iree.dev)",
+      "WebFetch(domain:openxla.org)",
+      "WebFetch(domain:vulkan.lunarg.com)",
+      "WebFetch(domain:registry.khronos.org)",
+      "WebFetch(domain:rocm.docs.amd.com)",
+      "WebFetch(domain:docs.python.org)",
+      "WebFetch(domain:pypi.org)",
+      "WebFetch(domain:en.cppreference.com)",
+      "WebFetch(domain:cmake.org)",
+      "WebFetch(domain:ninja-build.org)",
+      "WebFetch(domain:stackoverflow.com)",
     ],
     "deny": [],
     "ask": []

@@ -15,11 +15,15 @@ _version_gte() {
     v1_minor="${v1#*.}"
     v1_minor="${v1_minor%%.*}"
     v1_patch="${v1##*.}"
+    # Strip prerelease suffixes (e.g., 0a20251127 -> 0).
+    v1_patch="${v1_patch%%[!0-9]*}"
 
     v2_major="${v2%%.*}"
     v2_minor="${v2#*.}"
     v2_minor="${v2_minor%%.*}"
     v2_patch="${v2##*.}"
+    # Strip prerelease suffixes.
+    v2_patch="${v2_patch%%[!0-9]*}"
 
     # Default missing components to 0.
     : "${v1_major:=0}" "${v1_minor:=0}" "${v1_patch:=0}"

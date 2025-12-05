@@ -15,7 +15,7 @@
 #
 # --dev-bind-try gracefully skips missing devices (no error on non-GPU systems).
 #
-# See: https://github.com/anthropics/claude-code/issues/XXXX
+# See: https://github.com/anthropics/claude-code/issues/13108
 
 set -euo pipefail
 

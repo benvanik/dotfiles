@@ -5,7 +5,9 @@
 | Command | Purpose |
 |---------|---------|
 | `project-init` | Initialize project with .envrc |
+| `cuda/install.sh 12.9.1` | Install CUDA SDK to ~/tools/cuda/ |
 | `rocm-install 7.9.0` | Install ROCm version to ~/tools/rocm/ |
+| `use_cuda [version]` | In .envrc: load CUDA SDK (sets IREE_CUDA_TOOLKIT_ROOT) |
 | `use_llvm ">=21.0.0"` | In .envrc: require LLVM 21+ |
 | `use_rocm "debug"` | In .envrc: use TheRock debug build |
 | `use_ccache "iree"` | In .envrc: enable ccache with named cache |
@@ -33,6 +35,7 @@ In .envrc files:
 - `use_cmake [version]` - Load CMake
 - `use_ninja [version]` - Load Ninja
 - `use_mold [version]` - Load Mold linker
+- `use_cuda [version]` - Load CUDA SDK (Linux only, sets IREE_CUDA_TOOLKIT_ROOT)
 - `use_rocm [version]` - Load ROCm (Linux only, silent skip elsewhere)
 - `use_ccache [cache_name]` - Enable ccache with per-project isolation
 - `use_iree_dev [llvm_ver] [cmake_ver]` - Load IREE development tools
@@ -46,10 +49,15 @@ In .envrc files:
 
 ## Platform Behavior
 
+- CUDA: Linux only, silent skip on macOS/WSL
 - ROCm: Linux only, silent skip on macOS/WSL
 - Other tools: Error if requested but not found
 
 ## Environment Variables Set
+
+CUDA:
+- `IREE_CUDA_TOOLKIT_ROOT` - CUDA toolkit path (used by IREE Bazel build)
+- `CUDA_TOOLKIT_ROOT_DIR` - Standard CMake CUDA path
 
 LLVM:
 - `CC`, `CXX` - Compiler paths

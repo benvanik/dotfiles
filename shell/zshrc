@@ -60,6 +60,9 @@ setopt INTERACTIVE_COMMENTS         # allow comments in interactive shell
 # Regex matching compatibility.
 setopt BASH_REMATCH                 # ${BASH_REMATCH[@]} in [[ str =~ regex ]]
 
+# Don't pause before expanding an interactive `rm *` command.
+unsetopt RM_STAR_WAIT
+
 # Don't let cd wander during tab completion.
 unset CDPATH
 
@@ -85,6 +88,7 @@ setopt HIST_EXPIRE_DUPS_FIRST       # expire duplicate entries first
 # ============================================================================
 
 autoload -Uz compinit
+zstyle ':completion:*' menu select
 
 # Cache completion data for faster loading.
 : ${XDG_CACHE_HOME:=$HOME/.cache}

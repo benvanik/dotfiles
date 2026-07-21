@@ -1,5 +1,5 @@
 #!/bin/bash
-# Install Bazel development tools (bazelisk, buildifier, buildozer).
+# Install Bazel development tools (bazelisk, buildifier, buildozer, ibazel).
 # Usage: bazel/install.sh [buildtools-version]
 set -e
 
@@ -22,6 +22,7 @@ Installs:
   - bazelisk (as 'bazel') - Bazel version manager
   - buildifier - BUILD file formatter
   - buildozer - BUILD file editor
+  - ibazel - Bazel file watcher (requires Go)
 
 Options:
   --force    Reinstall even if version exists
@@ -116,6 +117,16 @@ curl -L --progress-bar -o "$VERSION/bin/buildozer" \
     "https://github.com/bazelbuild/buildtools/releases/download/v$VERSION/buildozer-$SUFFIX"
 chmod +x "$VERSION/bin/buildozer"
 
+# Install ibazel via Go.
+if command -v go &>/dev/null; then
+    info "Installing ibazel..."
+    GOBIN="$BAZEL_DIR/$VERSION/bin" go install github.com/bazelbuild/bazel-watcher/cmd/ibazel@latest
+    IBAZEL_INSTALLED=1
+else
+    warn "Go not found, skipping ibazel installation"
+    IBAZEL_INSTALLED=0
+fi
+
 # Update latest symlink.
 update_latest "$BAZEL_DIR" "$VERSION"
 
@@ -135,3 +146,6 @@ info "Bazel tools installed successfully!"
 echo "  bazel (bazelisk $BAZELISK_VER)"
 echo "  buildifier $VERSION"
 echo "  buildozer $VERSION"
+if [ "$IBAZEL_INSTALLED" = "1" ]; then
+    echo "  ibazel (latest)"
+fi

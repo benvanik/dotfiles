@@ -71,6 +71,12 @@ _add_path "$HOME/.cargo/bin"
 # Go binaries.
 _add_path "$HOME/go/bin"
 
+# Nix profile binaries (Determinate Nix installs system-wide to /nix/).
+# The installer hooks into /etc/bash.bashrc, but that runs before this
+# file rebuilds PATH, so the entries get lost. Add them explicitly.
+_add_path "/nix/var/nix/profiles/default/bin"
+_add_path "$HOME/.local/state/nix/profile/bin"
+
 # NVM default node (so node/npm work in non-interactive shells).
 # Resolve alias (e.g., "24") to actual version directory (e.g., "v24.11.1").
 if [ -d "$HOME/.nvm/versions/node" ] && [ -f "$HOME/.nvm/alias/default" ]; then
@@ -156,6 +162,12 @@ fi
 # HuggingFace Hub - enable fast transfers and set cache location.
 export HF_HUB_ENABLE_HF_TRANSFER=1
 export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
+
+# Disable automatic claude code updates.
+export DISABLE_AUTOUPDATER=1
+
+# Suppress beads_rust INFO-level tracing output (too verbose for normal use).
+export RUST_LOG="${RUST_LOG:-beads_rust=warn}"
 
 # ============================================================================
 # direnv Integration

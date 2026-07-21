@@ -14,10 +14,12 @@ source "$SCRIPT_DIR/install-utils.sh"
 # Format: tool:platforms (linux, darwin, all)
 TOOLS=(
     "bazel:all"
+    "beads:all"
     "cmake:all"
     "llvm:all"
     "mold:linux"
     "ninja:all"
+    "nix:all"
     "nvm:all"
     "rocm:linux"
     "vulkan:linux"

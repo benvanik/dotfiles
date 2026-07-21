@@ -33,7 +33,10 @@ for tool in llvm cmake ninja mold vulkan; do
     _load_tool "$tool"
 done
 
-# ROCm only on Linux (silent skip otherwise).
+# CUDA and ROCm only on Linux (silent skip otherwise).
+if _platform_supports cuda; then
+    _load_tool cuda
+fi
 if _platform_supports rocm; then
     _load_tool rocm
 fi

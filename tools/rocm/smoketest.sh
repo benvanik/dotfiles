@@ -1,8 +1,36 @@
 #!/bin/bash
 # Smoketest for ROCm.
-# Verifies HIP compiler and runtime tools are runnable.
+# Verifies the SDK root, HIP compiler, and runtime tools are usable.
 
-set -e
+set -euo pipefail
+
+rocm_root="${ROCM_ROOT:-${ROCM_HOME:-${HIP_PATH:-}}}"
+if [ -z "$rocm_root" ] && command -v hipcc &>/dev/null; then
+    hipcc_path="$(command -v hipcc)"
+    rocm_root="$(cd "$(dirname "$hipcc_path")/.." && pwd -P)"
+fi
+
+if [ -z "$rocm_root" ]; then
+    echo "  rocm root: not active"
+    exit 1
+fi
+
+if [ ! -e "$rocm_root/include/hip/hip_runtime.h" ]; then
+    echo "  missing HIP headers under $rocm_root/include" >&2
+    exit 1
+fi
+
+if [ ! -e "$rocm_root/lib/libamdhip64.so" ]; then
+    echo "  missing HIP runtime library under $rocm_root/lib" >&2
+    exit 1
+fi
+
+if [ ! -e "$rocm_root/lib/cmake/hip/hip-config.cmake" ]; then
+    echo "  missing HIP CMake package under $rocm_root/lib/cmake" >&2
+    exit 1
+fi
+
+echo "  rocm root: $rocm_root"
 
 # Check hipcc (HIP compiler).
 if command -v hipcc &>/dev/null; then
@@ -20,4 +48,17 @@ fi
 # Check hip-config if available.
 if command -v hipconfig &>/dev/null; then
     echo "  hipconfig: $(hipconfig --version 2>/dev/null || echo 'available')"
+fi
+
+if command -v cmake &>/dev/null; then
+    cmake_tmp="${TMPDIR:-/tmp}/rocm-smoketest.$$"
+    mkdir -p "$cmake_tmp"
+    trap 'rm -rf "$cmake_tmp"' EXIT
+    cat > "$cmake_tmp/CMakeLists.txt" << 'EOF'
+cmake_minimum_required(VERSION 3.16)
+project(rocm_smoketest LANGUAGES CXX)
+find_package(hip CONFIG REQUIRED)
+EOF
+    cmake -S "$cmake_tmp" -B "$cmake_tmp/build" -DCMAKE_PREFIX_PATH="$rocm_root" >/dev/null
+    echo "  cmake: find_package(hip CONFIG) ok"
 fi

@@ -50,11 +50,105 @@ _use_tool() {
 # Tool-specific functions.
 use_bazel() { _use_tool "bazel" "${1:-latest}"; }
 use_cmake() { _use_tool "cmake" "${1:-latest}"; }
+use_cuda() { _use_tool "cuda" "${1:-latest}"; }
 use_llvm() { _use_tool "llvm" "${1:-latest}"; }
 use_mold() { _use_tool "mold" "${1:-latest}"; }
 use_ninja() { _use_tool "ninja" "${1:-latest}"; }
 use_rocm() { _use_tool "rocm" "${1:-latest}"; }
 use_vulkan() { _use_tool "vulkan" "${1:-latest}"; }
+
+# Activate a Nix flake devshell with caching.
+#
+# Projects with a flake.nix declare their development dependencies declaratively.
+# This function evaluates the flake once and caches the resulting environment.
+# Subsequent directory entries are instant (reads from cache). The cache
+# invalidates automatically when flake.nix or flake.lock change.
+#
+# Usage: use_flake
+#
+# Requires nix (install with: ~/.dotfiles/tools/nix/install.sh).
+use_flake() {
+    # Find nix binary.
+    local nix=""
+    if command -v nix &>/dev/null; then
+        nix="nix"
+    elif [ -x /nix/var/nix/profiles/default/bin/nix ]; then
+        nix="/nix/var/nix/profiles/default/bin/nix"
+    else
+        log_error "nix not found (install with: ~/.dotfiles/tools/nix/install.sh)"
+        return 1
+    fi
+
+    # Must have a flake.nix in the current directory.
+    if [ ! -f flake.nix ]; then
+        log_error "use_flake: no flake.nix in $(pwd)"
+        return 1
+    fi
+
+    # Tell direnv to re-evaluate when flake inputs change.
+    watch_file flake.nix
+    watch_file flake.lock
+
+    # Cache directory keyed by project path.
+    local project_hash
+    project_hash="$(echo -n "$PWD" | sha256sum | cut -d' ' -f1)"
+    local cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/direnv/flake/${project_hash}"
+    mkdir -p "$cache_dir"
+
+    # Cache key from flake input content. If flake.lock doesn't exist yet
+    # (fresh flake), hash flake.nix alone.
+    local input_hash
+    input_hash="$(cat flake.nix flake.lock 2>/dev/null | sha256sum | cut -d' ' -f1)"
+    local cache_file="${cache_dir}/${input_hash}.env"
+
+    if [ ! -f "$cache_file" ]; then
+        # Print directly to stderr to bypass DIRENV_LOG_FORMAT suppression,
+        # since this operation takes several seconds and silence is confusing.
+        printf '\033[0;33m[nix]\033[0m evaluating flake devshell (cached after first run)...\n' >&2
+        if ! "$nix" print-dev-env --accept-flake-config 2>/dev/null > "${cache_file}.tmp"; then
+            rm -f "${cache_file}.tmp"
+            log_error "nix print-dev-env failed"
+            return 1
+        fi
+        mv "${cache_file}.tmp" "$cache_file"
+
+        # Remove stale cache entries for this project.
+        find "$cache_dir" -name "*.env" ! -name "${input_hash}.env" -delete 2>/dev/null || true
+    fi
+
+    # Save variables that nix's stdenv setup clobbers with build-time values.
+    # These are for Nix's build sandbox, not for interactive development.
+    local old_nix_build_top="${NIX_BUILD_TOP:-}"
+    local old_tmp="${TMP:-}"
+    local old_tmpdir="${TMPDIR:-}"
+    local old_temp="${TEMP:-}"
+    local old_tempdir="${TEMPDIR:-}"
+    local old_xdg_data_dirs="${XDG_DATA_DIRS:-}"
+
+    # Evaluate the cached environment script directly. The nix print-dev-env
+    # output saves the current PATH at the top (nix_saved_PATH="$PATH") and
+    # appends it at the bottom (PATH="...nix paths...:$nix_saved_PATH"), so
+    # evaluating in the direnv context correctly merges nix paths with the
+    # user's existing PATH.
+    eval "$(< "$cache_file")"
+
+    # Restore clobbered variables. Nix stdenv sets these to
+    # build-sandbox paths (NIX_BUILD_TOP, etc.) that are meaningless
+    # in a dev shell. Restore the pre-eval values, but default temp
+    # dirs to /tmp if the originals were empty — an empty TMPDIR
+    # causes tools (notably git's SSH signing) to construct paths
+    # rooted at "/" which fails with Permission denied.
+    export NIX_BUILD_TOP="$old_nix_build_top"
+    export TMP="${old_tmp:-/tmp}"
+    export TMPDIR="${old_tmpdir:-/tmp}"
+    export TEMP="${old_temp:-/tmp}"
+    export TEMPDIR="${old_tempdir:-/tmp}"
+    if [ -n "$old_xdg_data_dirs" ]; then
+        export XDG_DATA_DIRS="$old_xdg_data_dirs"
+    fi
+
+    _track_tool "nix" "flake"
+}
 
 # Override Vulkan validation layers (use after use_vulkan).
 # Supports: "debug", "release", or path to custom layers.

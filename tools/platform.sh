@@ -29,7 +29,7 @@ _detect_arch() {
 _platform_supports() {
     local tool="$1"
     case "$tool" in
-        rocm) [ "$(_detect_os)" = "linux" ] ;;
+        cuda|rocm) [ "$(_detect_os)" = "linux" ] ;;
         *) return 0 ;;
     esac
 }

@@ -130,9 +130,10 @@ This replaces verbose direnv logging (`DIRENV_LOG_FORMAT=""` in shrc).
 ## Byobu/tmux Notes
 
 - **Never use `byobu start-server`**: The byobu profile creates a `byobu-janitor` session that immediately exits, killing the server. Use `byobu new-session` directly.
-- **Custom tmux**: We build a custom tmux in `deps/tmux/` with mouse handling fixes. Install with `~/.dotfiles/deps/install-tmux.sh --rebuild`.
-- **Plugins**: After fresh install, start tmux and press `prefix + I` to install TPM plugins.
+- **Official releases**: `dotfiles multiplexer` installs the latest stable tmux and Byobu under `~/.local`, leaving distribution packages in `/usr/bin` as fallbacks. It refuses to replace tmux while a user server is running because client/server version skew produces misleading failures.
+- **Trustmux**: Byobu's mobile companion daemon is excluded from the normal terminal stack. Install it explicitly with `dotfiles multiplexer --enable-trustmux`.
+- **Plugins**: The multiplexer updater installs or fast-forwards TPM and every plugin declared in `tmux.conf`. It fails if a plugin checkout contains local changes.
 
 ## Test Exclusions
 
-The `deps/` directory contains git submodules (like `deps/tmux/`). Tests exclude `deps/**/*` to avoid recursing into submodules, but scripts directly in `deps/` are still checked.
+The local-only `deps/` directory may contain source experiments. Tests exclude it to avoid recursing into external checkouts.

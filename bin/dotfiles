@@ -34,6 +34,7 @@ ${BOLD}COMMANDS${NC}
     ${BOLD}update${NC}            Pull latest changes from git
     ${BOLD}install${NC}           Set up dotfiles (deps check, symlinks, identity)
     ${BOLD}deps${NC}              Run install-deps.sh (install packages)
+    ${BOLD}multiplexer${NC}       Update official tmux, Byobu, TPM, and plugins
     ${BOLD}setup${NC}             Configure git SSH signing
     ${BOLD}help${NC}              Show this help
 
@@ -444,6 +445,13 @@ cmd_deps() {
 }
 
 # ============================================================================
+# Multiplexer Command
+# ============================================================================
+cmd_multiplexer() {
+    "$DOTFILES/bin/update-multiplexer" "$@"
+}
+
+# ============================================================================
 # Setup Command
 # ============================================================================
 cmd_setup() {
@@ -733,6 +741,7 @@ main() {
         update)  cmd_update "$@" ;;
         install) cmd_install "$@" ;;
         deps)    cmd_deps "$@" ;;
+        multiplexer) cmd_multiplexer "$@" ;;
         setup)   cmd_setup "$@" ;;
         help|--help|-h) show_help ;;
         *)

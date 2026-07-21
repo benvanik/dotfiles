@@ -27,7 +27,7 @@ section() { printf "\n${BOLD}[%s]${NC} %s\n" "$1" "$2"; }
 START_TIME=$(date +%s.%N)
 
 echo ""
-printf "${BOLD}[dotfiles]${NC} Running Tier 1 tests...\n"
+printf "%b[dotfiles]%b Running Tier 1 tests...\n" "$BOLD" "$NC"
 
 # ============================================================================
 # Syntax Validation
@@ -431,10 +431,16 @@ for tool_dir in "$DOTFILES"/tools/*/; do
             # Set up the ROOT variable the env.sh expects.
             root_var="$(echo "$tool" | tr '[:lower:]' '[:upper:]')_ROOT"
             eval "export ${root_var}=\"\$(readlink -f \"$TOOLS_DIR/$tool/latest\")\""
-            . "$TOOLS_DIR/$tool/env.sh" 2>/dev/null || true
+            if ! . "$TOOLS_DIR/$tool/env.sh"; then
+                fail "environment: $tool"
+                ((++smoketest_fail))
+                continue
+            fi
+        else
+            # Tools without environment configuration use the conventional
+            # version-root bin directory.
+            export PATH="$TOOLS_DIR/$tool/latest/bin:$PATH"
         fi
-        # Add tool to PATH.
-        export PATH="$TOOLS_DIR/$tool/latest/bin:$PATH"
     fi
 
     # Run smoketest.

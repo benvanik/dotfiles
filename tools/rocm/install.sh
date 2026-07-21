@@ -101,6 +101,7 @@ sdk_surface_valid() {
 
     [ -d "$install_dir/.venv" ] || return 1
     [ -x "$install_dir/bin/hipcc" ] || return 1
+    [ -x "$install_dir/bin/hipconfig" ] || return 1
     [ -e "$install_dir/include/hip/hip_runtime.h" ] || return 1
     [ -e "$install_dir/lib/libamdhip64.so" ] || return 1
     [ -e "$install_dir/lib/cmake/hip/hip-config.cmake" ] || return 1
@@ -192,18 +193,7 @@ materialize_sdk_root() {
 }
 
 write_env_file() {
-    cat > "$ROCM_DIR/env.sh" << 'EOF'
-# ROCm environment.
-# Sourced by direnvrc when using use_rocm.
-if [ -n "${ROCM_ROOT:-}" ]; then
-    export ROCM_PATH="$ROCM_ROOT"
-    export ROCM_HOME="$ROCM_ROOT"
-    export HIP_PATH="$ROCM_ROOT"
-    export PATH="$ROCM_ROOT/bin:$PATH"
-    export LD_LIBRARY_PATH="$ROCM_ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-    export CMAKE_PREFIX_PATH="$ROCM_ROOT${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
-fi
-EOF
+    install -m 0644 "$SCRIPT_DIR/environment.sh" "$ROCM_DIR/env.sh"
     info "Updated env.sh"
 }
 

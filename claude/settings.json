@@ -3,11 +3,6 @@
   "env": {
     "CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR": "1"
   },
-  "sandbox": {
-    "enabled": true,
-    "autoAllowBashIfSandboxed": true,
-    "allowUnsandboxedCommands": false
-  },
   "permissions": {
     "allow": [
       "Bash",
@@ -28,14 +23,22 @@
       "WebFetch(domain:en.cppreference.com)",
       "WebFetch(domain:cmake.org)",
       "WebFetch(domain:ninja-build.org)",
-      "WebFetch(domain:stackoverflow.com)",
+      "WebFetch(domain:stackoverflow.com)"
     ],
     "deny": [],
     "ask": []
   },
   "statusLine": {
     "type": "command",
-    "command": "~/.claude/statusline.sh"
+    "command": "npx -y @owloops/claude-powerline --style=powerline"
   },
-  "alwaysThinkingEnabled": true
+  "sandbox": {
+    "enabled": true,
+    "autoAllowBashIfSandboxed": true,
+    "allowUnsandboxedCommands": false
+  },
+  "alwaysThinkingEnabled": true,
+  "enabledPlugins": {
+    "clangd-lsp@claude-plugins-official": true
+  }
 }

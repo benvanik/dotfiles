@@ -1,0 +1,18 @@
+{
+  "theme": "dark",
+  "display": {
+    "style": "powerline",
+    "charset": "unicode",
+    "autoWrap": true,
+    "lines": [
+      {
+        "segments": {
+          "directory": { "enabled": true, "style": "basename" },
+          "git": { "enabled": true, "showWorkingTree": true },
+          "block": { "enabled": true, "type": "time" },
+          "context": { "enabled": true, "showPercentageOnly": true }
+        }
+      }
+    ]
+  }
+}

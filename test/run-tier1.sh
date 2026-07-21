@@ -124,13 +124,13 @@ fi
 # ============================================================================
 section "links" "Symlink target verification"
 
-# Extract '_link X Y' calls from bin/dotfiles and verify X exists.
+# Extract managed source paths from bin/dotfiles and verify they exist.
 link_pass=0
 link_fail=0
 while IFS= read -r line; do
-    # Parse: _link <source> <dest>
-    if [[ "$line" =~ ^[[:space:]]*_link[[:space:]]+([^[:space:]]+) ]]; then
-        src="${BASH_REMATCH[1]}"
+    # Parse: _link/_copy <source> <dest>
+    if [[ "$line" =~ ^[[:space:]]*_(link|copy)[[:space:]]+([^[:space:]]+) ]]; then
+        src="${BASH_REMATCH[2]}"
         if [ -e "$DOTFILES/$src" ]; then
             ((++link_pass))
         else
@@ -308,10 +308,16 @@ section "configs" "Config file syntax"
 
 # tmux config.
 if command -v tmux &>/dev/null; then
-    if tmux -f tmux.conf source-file /dev/null 2>/dev/null; then
-        pass "tmux.conf syntax"
+    tmux_socket="dotfiles-test-$$"
+    if tmux -L "$tmux_socket" -f /dev/null new-session -d 2>/dev/null; then
+        if tmux -L "$tmux_socket" source-file "$DOTFILES/tmux.conf" 2>/dev/null; then
+            pass "tmux.conf syntax"
+        else
+            fail "tmux.conf syntax"
+        fi
+        tmux -L "$tmux_socket" kill-server 2>/dev/null || true
     else
-        fail "tmux.conf syntax"
+        fail "could not start isolated tmux server"
     fi
 else
     skip "tmux not installed"

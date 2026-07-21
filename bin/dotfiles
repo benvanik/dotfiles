@@ -157,6 +157,30 @@ _link() {
     info "Linked $dst -> $src"
 }
 
+# Copy a managed file for tools that do not reliably follow symlinks.
+_copy() {
+    local src="$DOTFILES/$1"
+    local dst="$HOME/$2"
+
+    mkdir -p "$(dirname "$dst")"
+
+    # Replace symlinks so the destination is always a regular file.
+    if [ -L "$dst" ]; then
+        rm "$dst"
+    elif [ -e "$dst" ]; then
+        if cmp -s "$src" "$dst"; then
+            info "Already copied $dst"
+            return
+        fi
+        mkdir -p "$BACKUP_DIR"
+        mv "$dst" "$BACKUP_DIR/"
+        warn "Backed up $dst"
+    fi
+
+    cp -p "$src" "$dst"
+    info "Copied $dst from $src"
+}
+
 # Create all symlinks.
 _create_symlinks() {
     info "Setting up shell configuration..."
@@ -188,6 +212,7 @@ _create_symlinks() {
     _link claude/settings.json .claude/settings.json
     _link claude/settings-admin.json .claude/settings-admin.json
     _link claude/statusline.sh .claude/statusline.sh
+    _link claude/claude-powerline.json .claude/claude-powerline.json
     _link claude/CLAUDE.md .claude/CLAUDE.md
 
     # GPU passthrough wrapper for Claude Code sandbox (Linux only).
@@ -196,6 +221,10 @@ _create_symlinks() {
         mkdir -p "$HOME/.local/bin"
         ln -sf "$DOTFILES/claude/bwrap-gpu-wrapper" "$HOME/.local/bin/bwrap"
     fi
+
+    info "Setting up Codex configuration..."
+    mkdir -p "$HOME/.codex"
+    _copy codex/AGENTS.md .codex/AGENTS.md
 
     info "Setting up tmux configuration..."
     _link tmux.conf .tmux.conf

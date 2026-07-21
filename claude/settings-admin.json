@@ -10,7 +10,10 @@
       "Read(//etc/**)",
       "Read(//usr/**)",
       "Read(//opt/**)",
-      "Read(//var/log/**)"
+      "Read(//var/log/**)",
+      "Read(/tmp/**)",
+      "Edit(/tmp/**)",
+      "Write(/tmp/**)"
     ],
     "deny": [
       "Read(~/.ssh/id_*)",

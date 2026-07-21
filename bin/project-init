@@ -37,6 +37,7 @@ _PI_TOOLS=(
     "mold:latest:linux:Fast linker"
     "bazel:latest:all:Bazel build system"
     "nvm:latest:all:Node.js version manager"
+    "python:system:all:Python venv (creates .venv)"
     "ccache:system:all:Compiler cache (3-4x faster rebuilds)"
     "rocm:>=6.0.0:linux:AMD ROCm/HIP"
     "vulkan:latest:linux:Vulkan SDK"
@@ -44,7 +45,7 @@ _PI_TOOLS=(
 
 # Group definitions: id:name:tools (comma-separated tool names)
 _PI_TOOL_GROUPS=(
-    "build:Build Tools:cmake,ninja,llvm,mold,bazel,nvm,ccache"
+    "build:Build Tools:cmake,ninja,llvm,mold,bazel,nvm,python,ccache"
     "gpu:ML/GPU Tools:rocm,vulkan"
 )
 
@@ -79,7 +80,10 @@ tool_installed() {
 
     if [ "$version" = "system" ]; then
         # System tool: check via command -v.
-        command -v "$tool" &>/dev/null
+        # Special case: "python" tool checks for python3.
+        local cmd="$tool"
+        [ "$tool" = "python" ] && cmd="python3"
+        command -v "$cmd" &>/dev/null
     else
         # Versioned tool: check ~/tools/.
         [ -d "$HOME/tools/$tool/latest" ] || \
@@ -108,13 +112,15 @@ get_tool_info() {
 }
 
 # Parse existing .envrc to find selected tools.
+# Maps direnv function names back to tool names (e.g., venv -> python).
 parse_envrc() {
     local envrc="$1"
     [ -f "$envrc" ] || return
     # Match use_<tool> but not use_project_history or source_local_envrc.
     grep -oE 'use_[a-z_]+' "$envrc" 2>/dev/null | \
         grep -v 'use_project_history' | \
-        sed 's/use_//' || true
+        sed 's/use_//' | \
+        sed 's/^venv$/python/' || true
 }
 
 # Check if history is enabled in existing .envrc.
@@ -177,12 +183,12 @@ run_fzf() {
     local outfile
     outfile=$(mktemp)
 
-    # Run fzf with stdout to file.
-    fzf "$@" > "$outfile" 2>/dev/null </dev/stdin || true
+    # Run fzf with stdout to file. Stdin is inherited from caller.
+    fzf "$@" > "$outfile" 2>/dev/null || true
 
-    # Filter out any numeric-only lines (terminal escape responses from fzf 0.60).
+    # Output results if non-empty.
     if [ -s "$outfile" ]; then
-        grep -v '^[0-9][0-9]*$' "$outfile" 2>/dev/null || true
+        cat "$outfile"
     fi
 
     rm -f "$outfile"
@@ -203,24 +209,21 @@ select_tools_fzf() {
     [ -z "$items" ] && return 0
 
     # Count items for height calculation.
-    # Need room for: items + border(2) + header(1) + prompt(1) + buffer(2).
     local count
     count=$(echo "$items" | wc -l)
     local height=$((count + 6))
     [ "$height" -lt 8 ] && height=8
 
+    # Write items to temp file for position-based pre-selection.
     local infile
     infile=$(mktemp)
     echo "$items" > "$infile"
 
-    # Build pre-selection bind command.
-    # fzf uses pos(N)+toggle to select specific items (1-indexed).
-    # Items start unselected, so toggle selects them.
+    # Build pre-selection bind command using pos(N)+toggle for each preselected item.
     local bind_cmd=""
     if [ -n "$preselected" ]; then
         local idx=1
         while IFS=$'\t' read -r tool_name _; do
-            # Check if this tool is in preselected list.
             if echo "$preselected" | grep -qxF "$tool_name"; then
                 if [ -n "$bind_cmd" ]; then
                     bind_cmd="$bind_cmd+pos($idx)+toggle"
@@ -230,19 +233,18 @@ select_tools_fzf() {
             fi
             idx=$((idx + 1))
         done < "$infile"
-        # Return cursor to first position after pre-selecting.
         [ -n "$bind_cmd" ] && bind_cmd="$bind_cmd+first"
     fi
 
-    # Run fzf with optional pre-selection.
-    # Use transform binding to require explicit Tab-selection (abort if nothing selected).
+    # Run fzf with pre-selection if needed.
+    # accept-non-empty prevents Enter from outputting highlighted item when nothing Tab-selected.
     local result
     if [ -n "$bind_cmd" ]; then
         result=$(run_fzf --multi \
             --height "$height" \
             --border \
             --prompt "Select $group_name: " \
-            --header "Tab: toggle, Enter: confirm" \
+            --header "Tab: toggle, Enter: confirm, Esc: none" \
             --marker "✓" \
             --pointer "▶" \
             --delimiter $'\t' \
@@ -250,20 +252,20 @@ select_tools_fzf() {
             --tabstop 12 \
             --sync \
             --bind "load:$bind_cmd" \
-            --bind 'enter:transform:test -n "{+}" && echo accept || echo abort' \
+            --bind 'enter:accept-non-empty' \
             < "$infile")
     else
         result=$(run_fzf --multi \
             --height "$height" \
             --border \
             --prompt "Select $group_name: " \
-            --header "Tab: toggle, Enter: confirm" \
+            --header "Tab: toggle, Enter: confirm, Esc: none" \
             --marker "✓" \
             --pointer "▶" \
             --delimiter $'\t' \
             --with-nth "1,2" \
             --tabstop 12 \
-            --bind 'enter:transform:test -n "{+}" && echo accept || echo abort' \
+            --bind 'enter:accept-non-empty' \
             < "$infile")
     fi
 
@@ -279,6 +281,7 @@ select_tools_fzf() {
 select_history_fzf() {
     local current="$1"
 
+    # Show current state in option labels.
     local items
     if [ "$current" = "true" ]; then
         items=$'yes\tEnable per-project shell history (current)\nno\tDisable per-project shell history'
@@ -286,31 +289,22 @@ select_history_fzf() {
         items=$'yes\tEnable per-project shell history\nno\tDisable per-project shell history (current)'
     fi
 
-    local infile
-    infile=$(mktemp)
-    echo "$items" > "$infile"
-
-    # Pre-select current value (yes=1, no=2).
-    local bind_cmd=""
-    if [ "$current" = "true" ]; then
-        bind_cmd="pos(1)+toggle+first"
-    else
-        bind_cmd="pos(2)+toggle+first"
-    fi
-
     local choice
-    choice=$(run_fzf --height 8 \
+    choice=$(echo "$items" | run_fzf --height 8 \
         --border \
         --prompt "Per-project history: " \
         --header "Enter to select" \
         --delimiter $'\t' \
-        --with-nth "1,2" \
-        --sync \
-        --bind "load:$bind_cmd" \
-        < "$infile" | cut -f1)
+        --with-nth "1,2" | cut -f1)
 
-    rm -f "$infile"
-    [ "$choice" = "yes" ] && echo "true" || echo "false"
+    # Default to current value if nothing selected.
+    if [ -z "$choice" ]; then
+        echo "$current"
+    elif [ "$choice" = "yes" ]; then
+        echo "true"
+    else
+        echo "false"
+    fi
 }
 
 # ============================================================================
@@ -352,6 +346,7 @@ generate_envrc() {
             mold)   echo "use_mold" ;;
             bazel)  echo "use_bazel" ;;
             nvm)    echo "use_nvm" ;;
+            python) echo "use_venv" ;;
             ccache)
                 if [ -n "$CACHE_NAME" ]; then
                     echo "use_ccache \"$CACHE_NAME\""
@@ -400,13 +395,14 @@ OPTIONS
     -g, --gpu           Also include GPU/ML tools
     -a, --all           Select all available tools
     -y, --yes           Skip confirmation prompt
-    --no-env            Skip .envrc generation (use with --vscode)
+    --no-env            Skip .envrc generation (workspace only)
+    --no-beads          Skip beads issue tracking initialization
     --no-history        Disable per-project shell history
     --cache-name NAME   Override ccache cache name (default: directory basename)
     --history-path PATH Override history directory path
 
-VS CODE WORKSPACE OPTIONS
-    --vscode            Generate <basename>.code-workspace file
+VS CODE WORKSPACE OPTIONS (workspace generated by default)
+    --no-vscode         Skip workspace file generation
     --cmake [DIR]       Enable CMake settings (default: ./build/)
     --llvm              Enable LLVM settings (clangd, clang-format, lldb)
     --bazel             Enable Bazel settings (bazel, buildifier)
@@ -424,7 +420,7 @@ INTERACTIVE MODE
     Tools are grouped by category (Build Tools, ML/GPU Tools).
     Only installed tools (present in ~/tools/<tool>/) are shown.
 
-    If .envrc already exists, current tools are pre-selected.
+    If .envrc already exists, current selection is shown in the header.
 
 NON-INTERACTIVE PRESETS
     --build         cmake, ninja, llvm, mold, bazel
@@ -441,8 +437,10 @@ EXAMPLES
 FILES CREATED
     .envrc              Project tool configuration (commit this)
     .envrc.local        Machine overrides template (gitignored)
+    .beads/             Beads issue tracking (if bd installed)
     .history/           Per-project shell history (if enabled)
-    <name>.code-workspace  VS Code workspace file (if --vscode)
+    .venv/              Python virtual environment (if python selected)
+    <name>.code-workspace  VS Code workspace file (unless --no-vscode)
 
 SEE ALSO
     direnv, use_llvm, use_cmake, use_rocm (in ~/.direnvrc)
@@ -460,8 +458,8 @@ parse_args() {
     CACHE_NAME=""
     HISTORY_PATH=""
 
-    # VS Code workspace options.
-    VSCODE_ENABLED=false
+    # VS Code workspace options (enabled by default).
+    VSCODE_ENABLED=true
     NO_ENV=false
     VSCODE_CMAKE=false
     VSCODE_LLVM=false
@@ -474,6 +472,9 @@ parse_args() {
     # Claude Code options.
     CLAUDE_ENABLED=false
     CLAUDE_BUILD_DIR=""
+
+    # Beads issue tracking (enabled by default).
+    BEADS_ENABLED=true
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -506,8 +507,8 @@ parse_args() {
                 shift
                 HISTORY_PATH="$1"
                 ;;
-            --vscode)
-                VSCODE_ENABLED=true
+            --no-vscode)
+                VSCODE_ENABLED=false
                 ;;
             --no-env)
                 NO_ENV=true
@@ -536,6 +537,9 @@ parse_args() {
             --vscode-name)
                 shift
                 VSCODE_NAME="$1"
+                ;;
+            --no-beads)
+                BEADS_ENABLED=false
                 ;;
             --claude)
                 CLAUDE_ENABLED=true
@@ -785,6 +789,23 @@ main() {
     fi
     cd "$TARGET_DIR"
 
+    # Initialize beads issue tracking (runs in all modes including --no-env).
+    if [ "$BEADS_ENABLED" = "true" ] && command -v bd &>/dev/null && [ ! -d ".beads" ]; then
+        bd init -q
+        bd config set id.prefix=bd -q
+        # Add .beads/ to git local exclude if in a git repo.
+        if git rev-parse --git-dir &>/dev/null 2>&1; then
+            local git_dir
+            git_dir=$(git rev-parse --git-dir)
+            local exclude_file="$git_dir/info/exclude"
+            mkdir -p "$(dirname "$exclude_file")"
+            if [ ! -f "$exclude_file" ] || ! grep -q '\.beads/' "$exclude_file"; then
+                echo '.beads/' >> "$exclude_file"
+            fi
+        fi
+        info "Initialized beads: .beads/ (prefix: bd-*)"
+    fi
+
     # Handle --no-env mode: generate workspace only and exit.
     if [ "$NO_ENV" = "true" ]; then
         if [ "$VSCODE_ENABLED" = "true" ]; then
@@ -902,21 +923,47 @@ main() {
     local new_envrc
     new_envrc=$(generate_envrc "$USE_HISTORY" "${selected_tools[@]}")
 
-    # Check if same as existing.
+    # Check what needs to be created/updated.
+    local envrc_changed=true
     if [ -f ".envrc" ]; then
         local existing
         existing=$(cat .envrc)
         if [ "$new_envrc" = "$existing" ]; then
-            info "No changes needed. .envrc is already up to date."
-            exit 0
+            envrc_changed=false
         fi
     fi
 
-    echo "Will generate .envrc:"
-    echo "────────────────────────────────────────"
-    echo "$new_envrc"
-    echo "────────────────────────────────────────"
-    echo ""
+    local project_name
+    project_name=$(basename "$(pwd)")
+    local workspace_file="$project_name.code-workspace"
+    [ -n "$VSCODE_NAME" ] && workspace_file="$VSCODE_NAME.code-workspace"
+
+    local needs_workspace=false
+    if [ "$VSCODE_ENABLED" = "true" ] && [ ! -f "$workspace_file" ]; then
+        needs_workspace=true
+    fi
+
+    local needs_claude=false
+    if [ "$CLAUDE_ENABLED" = "true" ] && [ ! -f ".claude/settings.local.json" ]; then
+        needs_claude=true
+    fi
+
+    # Exit early only if nothing needs to be done.
+    if [ "$envrc_changed" = "false" ] && [ "$needs_workspace" = "false" ] && [ "$needs_claude" = "false" ]; then
+        info "No changes needed. All files are up to date."
+        exit 0
+    fi
+
+    # Show what will be created/updated.
+    if [ "$envrc_changed" = "true" ]; then
+        echo "Will generate .envrc:"
+        echo "────────────────────────────────────────"
+        echo "$new_envrc"
+        echo "────────────────────────────────────────"
+        echo ""
+    else
+        info ".envrc unchanged"
+    fi
 
     # Confirm unless -y.
     if [ "$AUTO_CONFIRM" != "true" ]; then
@@ -925,8 +972,10 @@ main() {
         [[ $REPLY =~ ^[Nn]$ ]] && { echo "Aborted."; exit 1; }
     fi
 
-    # Write .envrc.
-    echo "$new_envrc" > .envrc
+    # Write .envrc if changed.
+    if [ "$envrc_changed" = "true" ]; then
+        echo "$new_envrc" > .envrc
+    fi
 
     # Create .envrc.local if doesn't exist.
     if [ ! -f ".envrc.local" ]; then
@@ -938,9 +987,13 @@ main() {
         mkdir -p .history
     fi
 
-    # Generate VS Code workspace if requested.
-    local project_name
-    project_name=$(basename "$(pwd)")
+    # Create Python venv if python is selected and .venv doesn't exist.
+    if [[ " ${selected_tools[*]} " == *" python "* ]] && [ ! -d ".venv" ]; then
+        info "Creating Python virtual environment..."
+        python3 -m venv .venv
+    fi
+
+    # Generate VS Code workspace if enabled.
     if [ "$VSCODE_ENABLED" = "true" ]; then
         generate_vscode_workspace "$project_name"
     fi
@@ -966,7 +1019,9 @@ main() {
     echo -e "${GREEN}Created:${NC}"
     echo "  .envrc       - Project tool configuration (commit this)"
     [ ! -f ".envrc.local" ] || echo "  .envrc.local - Machine overrides (gitignored)"
+    [ -d ".beads" ] && echo "  .beads/      - Beads issue tracking (gitignored)"
     [ "$USE_HISTORY" = "true" ] && echo "  .history/    - Per-project shell history (gitignored)"
+    [ -d ".venv" ] && echo "  .venv/       - Python virtual environment (gitignored)"
     [ "$VSCODE_ENABLED" = "true" ] && echo "  $project_name.code-workspace - VS Code workspace"
     [ "$CLAUDE_ENABLED" = "true" ] && echo "  .claude/settings.local.json - Claude Code sandbox settings"
     echo ""

@@ -218,6 +218,9 @@ use_llvm ">=21.0.0"
 use_mold
 use_bazel
 
+# Repository-local build scripts.
+PATH_add build_tools/bin
+
 # Compiler cache (shared across all IREE worktrees).
 use_ccache "iree"
 
@@ -229,10 +232,9 @@ use_vulkan
 source_local_envrc
 EOF
 
-# Create .envrc.local template.
+# Create .envrc.local for machine-specific overrides.
 cat > .envrc.local << 'EOF'
 # Machine-specific overrides (not committed to git).
-# Uncomment and modify as needed:
 
 # Override LLVM version:
 # use_llvm "20.1.0"
@@ -250,7 +252,7 @@ if command -v direnv &>/dev/null; then
 fi
 
 # Generate VS Code workspace using project-init.
-project-init --no-env --vscode \
+project-init --no-env \
     --cmake "$BUILD_PATH" \
     --llvm \
     --bazel \

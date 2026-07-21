@@ -1,0 +1,79 @@
+#!/bin/bash
+# Launch VS Code for IREE-X development with workspace auto-detection.
+# Usage: iree-x-code [worktree-name] [-- code-args...]
+#
+# Auto-detects workspace from current directory or worktree name.
+
+set -euo pipefail
+
+IREE_X_BASE="$HOME/src/iree-x"
+
+show_help() {
+    echo "Usage: iree-x-code [worktree-name] [-- code-args...]"
+    echo ""
+    echo "Launch VS Code for IREE-X development."
+    echo "Auto-detects workspace from current directory or worktree name."
+    echo ""
+    echo "Examples:"
+    echo "  iree-x-code              # Detect from cwd if inside IREE-X worktree"
+    echo "  iree-x-code experiment1  # Open specific worktree"
+    echo "  iree-x-code -- --new-window  # Pass args to code"
+}
+
+# Detect worktree from current directory.
+detect_worktree() {
+    local cwd="$PWD"
+    if [[ "$cwd" == "$IREE_X_BASE/"* ]]; then
+        # Extract worktree name: $HOME/src/iree-x/<name>/... -> <name>
+        local rel="${cwd#"$IREE_X_BASE"/}"
+        local worktree="${rel%%/*}"
+        case "$worktree" in
+            builds|.scratch|"")
+                return 0
+                ;;
+        esac
+        echo "$worktree"
+    fi
+}
+
+# Parse arguments.
+WORKTREE=""
+CODE_ARGS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --help|-h)
+            show_help
+            exit 0
+            ;;
+        --)
+            shift
+            CODE_ARGS=("$@")
+            break
+            ;;
+        *)
+            WORKTREE="$1"
+            ;;
+    esac
+    shift
+done
+
+# If no worktree specified, try to detect from cwd.
+if [ -z "$WORKTREE" ]; then
+    WORKTREE=$(detect_worktree)
+fi
+
+if [ -n "$WORKTREE" ]; then
+    WORKTREE_DIR="$IREE_X_BASE/$WORKTREE"
+    if [ ! -d "$WORKTREE_DIR" ]; then
+        echo "Error: Worktree not found: $WORKTREE_DIR" >&2
+        echo "Available worktrees:" >&2
+        for d in "$IREE_X_BASE"/*/; do
+            [ -e "$d/.git" ] && echo "  $(basename "$d")" >&2
+        done
+        exit 1
+    fi
+    exec project-code "$WORKTREE_DIR" -- "${CODE_ARGS[@]}"
+else
+    # No worktree detected, fall back to project-code in cwd.
+    exec project-code . -- "${CODE_ARGS[@]}"
+fi

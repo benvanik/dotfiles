@@ -1,0 +1,802 @@
+#!/usr/bin/env python3
+# Copyright 2026 The IREE Authors
+#
+# Licensed under the Apache License v2.0 with LLVM Exceptions.
+# See https://llvm.org/LICENSE.txt for license information.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+"""Runs an IREE test selection across the local mini-CI matrix."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import dataclasses
+import datetime
+import json
+import os
+import pathlib
+import re
+import shlex
+import sys
+import time
+from typing import Iterable
+
+
+BAZEL_DEFAULT_CONFIGS = ("asan", "tsan", "ubsan")
+DEFAULT_PLATFORMS = ("linux-bazel", "linux-cmake", "windows", "macos")
+
+
+@dataclasses.dataclass
+class CommandStep:
+    argv: list[str]
+    env: dict[str, str] = dataclasses.field(default_factory=dict)
+
+
+@dataclasses.dataclass
+class Job:
+    name: str
+    platform: str
+    steps: list[CommandStep]
+    log_path: pathlib.Path
+    skip_reason: str | None = None
+
+
+@dataclasses.dataclass
+class JobResult:
+    name: str
+    platform: str
+    status: str
+    exit_code: int | None
+    elapsed_seconds: float
+    log_path: str
+    command: str
+    skip_reason: str | None = None
+    excerpt: list[str] = dataclasses.field(default_factory=list)
+
+
+def find_worktree_root(start: pathlib.Path) -> pathlib.Path | None:
+    directory = start.resolve()
+    while directory != directory.parent:
+        if (directory / ".git").exists() and (directory / ".bazelversion").exists():
+            return directory
+        directory = directory.parent
+    return None
+
+
+def split_csv(value: str) -> list[str]:
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def ctest_path_from_bazel_package(package: str) -> str | None:
+    if package.startswith("runtime/src/"):
+        return package.removeprefix("runtime/src/")
+    if package.startswith("compiler/src/"):
+        return package.removeprefix("compiler/src/")
+    if package.startswith("tools/"):
+        return package
+    if package.startswith("tests/"):
+        return package
+    if package.startswith("samples/"):
+        return package
+    return None
+
+
+def derive_ctest_regex(targets: Iterable[str]) -> tuple[str | None, str | None]:
+    expressions = []
+    target_list = list(targets)
+    if target_list == ["//..."]:
+        return None, None
+    for target in target_list:
+        if not target.startswith("//"):
+            return None, f"cannot derive CTest regex from non-absolute label {target}"
+        label = target.removeprefix("//")
+        if label == "...":
+            return None, None
+        if label.endswith("/..."):
+            package = label.removesuffix("/...")
+            ctest_path = ctest_path_from_bazel_package(package)
+            if not ctest_path:
+                return None, f"cannot map Bazel package {package} to a CTest path"
+            expressions.append(f"^{re.escape(ctest_path)}/")
+            continue
+        if ":" not in label:
+            return None, f"label {target} is not concrete and is not a package wildcard"
+        package, name = label.split(":", 1)
+        ctest_path = ctest_path_from_bazel_package(package)
+        if not ctest_path:
+            return None, f"cannot map Bazel package {package} to a CTest path"
+        if name in ("all", "tests"):
+            expressions.append(f"^{re.escape(ctest_path)}/")
+        else:
+            expressions.append(f"^{re.escape(ctest_path + '/' + name)}$")
+    if not expressions:
+        return None, None
+    if len(expressions) == 1:
+        return expressions[0], None
+    return "(" + "|".join(expressions) + ")", None
+
+
+def cmake_package_from_bazel_package(package: str) -> str | None:
+    if package.startswith("runtime/src/"):
+        return package.removeprefix("runtime/src/").replace("/", "_")
+    if package.startswith("compiler/src/"):
+        return package.removeprefix("compiler/src/").replace("/", "_")
+    if package.startswith("tools/"):
+        return package.replace("/", "_")
+    if package.startswith("tests/"):
+        return package.replace("/", "_")
+    if package.startswith("samples/"):
+        return package.replace("/", "_")
+    return None
+
+
+def derive_cmake_targets(targets: Iterable[str]) -> list[str]:
+    cmake_targets = []
+    for target in targets:
+        if not target.startswith("//") or target.endswith("/...") or target == "//...":
+            return ["iree-test-deps"]
+        label = target.removeprefix("//")
+        if ":" not in label:
+            return ["iree-test-deps"]
+        package, name = label.split(":", 1)
+        if name in ("all", "tests"):
+            return ["iree-test-deps"]
+        if "." in name:
+            return ["iree-test-deps"]
+        cmake_package = cmake_package_from_bazel_package(package)
+        if not cmake_package:
+            return ["iree-test-deps"]
+        cmake_targets.append(f"{cmake_package}_{name}")
+    return cmake_targets or ["iree-test-deps"]
+
+
+def default_setup_root(worktree_root: pathlib.Path) -> pathlib.Path:
+    parent = worktree_root.parent
+    if (parent / ".windows-setup").exists() or (parent / ".macos-setup").exists():
+        return parent
+    return worktree_root
+
+
+def make_run_directory(
+    worktree_root: pathlib.Path, logs_dir: str | None
+) -> pathlib.Path:
+    if logs_dir:
+        run_dir = pathlib.Path(logs_dir)
+        if not run_dir.is_absolute():
+            run_dir = worktree_root / run_dir
+        run_dir.mkdir(parents=True, exist_ok=True)
+        return run_dir
+    base_dir = worktree_root / ".iree-test-everywhere"
+    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_dir = base_dir / timestamp
+    for counter in range(1, 100):
+        if not run_dir.exists():
+            break
+        run_dir = base_dir / f"{timestamp}-{counter:02d}"
+    run_dir.mkdir(parents=True, exist_ok=False)
+    latest = base_dir / "latest"
+    try:
+        if latest.exists() or latest.is_symlink():
+            latest.unlink()
+        latest.symlink_to(run_dir.name)
+    except OSError as error:
+        print(
+            f"iree-test-everywhere: could not update {latest}: {error}", file=sys.stderr
+        )
+    return run_dir
+
+
+def make_bazel_job(
+    *,
+    worktree_root: pathlib.Path,
+    run_dir: pathlib.Path,
+    config: str,
+    targets: list[str],
+    bazel_args: list[str],
+) -> Job:
+    output_root = worktree_root / ".iree-test-everywhere" / "bazel-output"
+    output_root.mkdir(parents=True, exist_ok=True)
+    output_base = output_root / config
+    output_base.mkdir(parents=True, exist_ok=True)
+    symlink_prefix = worktree_root / ".iree-test-everywhere" / f"bazel-{config}-"
+    bazel = os.environ.get("IREE_BAZEL_BIN", "bazel")
+    command = [
+        bazel,
+        f"--output_base={output_base}",
+        "test",
+        "--config=localdev",
+        "--keep_going",
+        "--test_tag_filters=-nodocker",
+        "--build_tag_filters=",
+        "--cache_test_results=no",
+        "--test_output=errors",
+        f"--symlink_prefix={symlink_prefix}",
+        f"--config={config}",
+        *targets,
+        *bazel_args,
+    ]
+    return Job(
+        name=f"bazel-{config}",
+        platform="linux-bazel",
+        steps=[CommandStep(command)],
+        log_path=run_dir / f"bazel-{config}.log",
+    )
+
+
+def make_linux_cmake_job(
+    *,
+    worktree_root: pathlib.Path,
+    run_dir: pathlib.Path,
+    build_dir: pathlib.Path,
+    ctest_regex: str | None,
+    cmake_targets: list[str],
+) -> Job:
+    cache_path = build_dir / "CMakeCache.txt"
+    steps = []
+    if not cache_path.exists():
+        steps.append(
+            CommandStep(
+                [
+                    "cmake",
+                    "-G",
+                    "Ninja",
+                    "-B",
+                    str(build_dir),
+                    "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
+                    "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+                    "-DIREE_ENABLE_ASSERTIONS=ON",
+                ]
+            )
+        )
+    for target in cmake_targets:
+        steps.append(
+            CommandStep(
+                [
+                    "cmake",
+                    "--build",
+                    str(build_dir),
+                    "--target",
+                    target,
+                    "--",
+                    "-k",
+                    "0",
+                ]
+            )
+        )
+    env = {}
+    if ctest_regex:
+        env["IREE_CTEST_TESTS_REGEX"] = ctest_regex
+    steps.append(
+        CommandStep(
+            [
+                str(worktree_root / "build_tools" / "cmake" / "ctest_all.sh"),
+                str(build_dir),
+            ],
+            env=env,
+        )
+    )
+    return Job(
+        name="cmake-linux",
+        platform="linux-cmake",
+        steps=steps,
+        log_path=run_dir / "cmake-linux.log",
+    )
+
+
+def make_remote_job(
+    *,
+    run_dir: pathlib.Path,
+    name: str,
+    platform: str,
+    wrapper: pathlib.Path,
+    ctest_regex: str | None,
+    available_required: bool,
+) -> Job:
+    if not wrapper.exists():
+        skip_reason = f"missing wrapper: {wrapper}"
+        if available_required:
+            steps = [CommandStep([str(wrapper), "--build-first"])]
+            return Job(
+                name=name,
+                platform=platform,
+                steps=steps,
+                log_path=run_dir / f"{name}.log",
+            )
+        return Job(
+            name=name,
+            platform=platform,
+            steps=[],
+            log_path=run_dir / f"{name}.log",
+            skip_reason=skip_reason,
+        )
+    command = [str(wrapper), "--build-first"]
+    if ctest_regex:
+        command.extend(["-R", ctest_regex])
+    return Job(
+        name=name,
+        platform=platform,
+        steps=[CommandStep(command)],
+        log_path=run_dir / f"{name}.log",
+    )
+
+
+def format_command(argv: list[str]) -> str:
+    return shlex.join(str(arg) for arg in argv)
+
+
+def append_log_header(log_file, step: CommandStep) -> None:
+    if step.env:
+        for key in sorted(step.env):
+            log_file.write(f"$ export {key}={shlex.quote(step.env[key])}\n".encode())
+    log_file.write(f"$ {format_command(step.argv)}\n".encode())
+    log_file.write(b"\n")
+    log_file.flush()
+
+
+async def run_step(
+    *,
+    step: CommandStep,
+    worktree_root: pathlib.Path,
+    log_file,
+    verbose: bool,
+    job_name: str,
+) -> int:
+    append_log_header(log_file, step)
+    env = os.environ.copy()
+    env.update(step.env)
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *step.argv,
+            cwd=str(worktree_root),
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+    except OSError as error:
+        log_file.write(f"failed to start command: {error}\n".encode())
+        log_file.flush()
+        return 127
+    if process.stdout is None:
+        return 1
+    while True:
+        line = await process.stdout.readline()
+        if not line:
+            break
+        log_file.write(line)
+        log_file.flush()
+        if verbose:
+            sys.stdout.write(f"[{job_name}] {line.decode(errors='replace')}")
+            sys.stdout.flush()
+    return await process.wait()
+
+
+async def run_job(
+    *,
+    job: Job,
+    worktree_root: pathlib.Path,
+    semaphore: asyncio.Semaphore,
+    verbose: bool,
+    failure_lines: int,
+) -> JobResult:
+    if job.skip_reason:
+        return JobResult(
+            name=job.name,
+            platform=job.platform,
+            status="SKIP",
+            exit_code=None,
+            elapsed_seconds=0.0,
+            log_path=str(job.log_path),
+            command="",
+            skip_reason=job.skip_reason,
+        )
+    command = " && ".join(format_command(step.argv) for step in job.steps)
+    start_time = time.monotonic()
+    exit_code = 0
+    async with semaphore:
+        job.log_path.parent.mkdir(parents=True, exist_ok=True)
+        with job.log_path.open("wb") as log_file:
+            for step in job.steps:
+                exit_code = await run_step(
+                    step=step,
+                    worktree_root=worktree_root,
+                    log_file=log_file,
+                    verbose=verbose,
+                    job_name=job.name,
+                )
+                if exit_code != 0:
+                    break
+    elapsed_seconds = time.monotonic() - start_time
+    status = "PASS" if exit_code == 0 else "FAIL"
+    excerpt = []
+    if status == "FAIL":
+        excerpt = extract_failure_excerpt(job.log_path, failure_lines)
+    return JobResult(
+        name=job.name,
+        platform=job.platform,
+        status=status,
+        exit_code=exit_code,
+        elapsed_seconds=elapsed_seconds,
+        log_path=str(job.log_path),
+        command=command,
+        excerpt=excerpt,
+    )
+
+
+def extract_failure_excerpt(log_path: pathlib.Path, line_count: int) -> list[str]:
+    patterns = (
+        "FAILED",
+        "FAIL:",
+        "ERROR:",
+        "Error:",
+        "error:",
+        "Traceback",
+        "AddressSanitizer",
+        "ThreadSanitizer",
+        "UndefinedBehaviorSanitizer",
+        "MemorySanitizer",
+    )
+    try:
+        lines = log_path.read_text(errors="replace").splitlines()
+    except OSError:
+        return []
+    selected = []
+    for index, line in enumerate(lines):
+        if any(pattern in line for pattern in patterns):
+            start = max(0, index - 2)
+            end = min(len(lines), index + line_count)
+            selected = lines[start:end]
+            break
+    if not selected:
+        selected = lines[-line_count:]
+    return [line.rstrip() for line in selected if line.rstrip()]
+
+
+def print_summary(results: list[JobResult]) -> None:
+    name_width = max([len("job"), *(len(result.name) for result in results)])
+    status_width = max([len("status"), *(len(result.status) for result in results)])
+    elapsed_width = len("seconds")
+    print("")
+    print(
+        f"{'job':<{name_width}}  {'status':<{status_width}}  {'seconds':>{elapsed_width}}  log"
+    )
+    print(f"{'-' * name_width}  {'-' * status_width}  {'-' * elapsed_width}  {'-' * 3}")
+    for result in results:
+        elapsed = "-" if result.status == "SKIP" else f"{result.elapsed_seconds:.1f}"
+        print(
+            f"{result.name:<{name_width}}  "
+            f"{result.status:<{status_width}}  "
+            f"{elapsed:>{elapsed_width}}  "
+            f"{result.log_path}"
+        )
+    failed_results = [result for result in results if result.status == "FAIL"]
+    skipped_results = [result for result in results if result.status == "SKIP"]
+    for result in skipped_results:
+        print("")
+        print(f"{result.name} skipped: {result.skip_reason}")
+    for result in failed_results:
+        print("")
+        print(f"{result.name} failed; excerpt from {result.log_path}:")
+        for line in result.excerpt:
+            print(f"  {line}")
+
+
+def write_summary(run_dir: pathlib.Path, results: list[JobResult]) -> None:
+    summary_json = run_dir / "summary.json"
+    summary_json.write_text(
+        json.dumps([dataclasses.asdict(result) for result in results], indent=2) + "\n",
+        encoding="utf-8",
+    )
+    summary_txt = run_dir / "summary.txt"
+    lines = []
+    for result in results:
+        elapsed = "-" if result.status == "SKIP" else f"{result.elapsed_seconds:.1f}s"
+        lines.append(f"{result.name}: {result.status} ({elapsed}) {result.log_path}")
+        if result.skip_reason:
+            lines.append(f"  {result.skip_reason}")
+    summary_txt.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def parse_arguments(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run an IREE test selection across local Bazel/CMake and remote CTest runners.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "targets", nargs="+", help="Bazel test labels or package patterns."
+    )
+    parser.add_argument(
+        "--platforms",
+        default=",".join(DEFAULT_PLATFORMS),
+        help="Comma-separated platform set: linux-bazel,linux-cmake,windows,macos,all.",
+    )
+    parser.add_argument(
+        "--bazel-configs",
+        default=",".join(BAZEL_DEFAULT_CONFIGS),
+        help="Comma-separated Bazel sanitizer configs for linux-bazel.",
+    )
+    parser.add_argument(
+        "--include-msan",
+        action="store_true",
+        help="Append msan to the Bazel sanitizer config list.",
+    )
+    parser.add_argument(
+        "--bazel-arg",
+        action="append",
+        default=[],
+        help="Additional Bazel test argument. Repeat for multiple arguments.",
+    )
+    parser.add_argument(
+        "--ctest-regex",
+        help="CTest -R regex for local CMake, Windows, and macOS. Derived from simple Bazel labels when omitted.",
+    )
+    parser.add_argument(
+        "--cmake-build-dir",
+        default=os.environ.get("IREE_BUILD_DIR", "build"),
+        help="Local CMake build directory.",
+    )
+    parser.add_argument(
+        "--cmake-build-target",
+        action="append",
+        default=[],
+        help="Local CMake target to build before testing. Derived from concrete labels when omitted.",
+    )
+    parser.add_argument(
+        "--setup-root",
+        help="Directory containing .windows-setup and .macos-setup.",
+    )
+    parser.add_argument(
+        "--logs-dir",
+        help="Directory for logs and summaries. Defaults to .iree-test-everywhere/<timestamp>.",
+    )
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=0,
+        help="Maximum concurrent jobs. Zero means one slot per selected job.",
+    )
+    parser.add_argument(
+        "--failure-lines",
+        type=int,
+        default=32,
+        help="Number of failure excerpt lines to print per failed job.",
+    )
+    parser.add_argument(
+        "--require-available",
+        action="store_true",
+        help="Fail remote jobs instead of skipping when their wrapper is not installed.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the planned jobs without executing them.",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Stream job output while commands run.",
+    )
+    return parser.parse_args(argv)
+
+
+def make_jobs(
+    args: argparse.Namespace, worktree_root: pathlib.Path, run_dir: pathlib.Path
+) -> list[Job]:
+    platform_names = split_csv(args.platforms)
+    if "all" in platform_names:
+        platform_names = list(DEFAULT_PLATFORMS)
+    unknown_platforms = sorted(set(platform_names) - set(DEFAULT_PLATFORMS))
+    if unknown_platforms:
+        raise ValueError(f"unknown platform(s): {', '.join(unknown_platforms)}")
+
+    if args.ctest_regex is not None:
+        ctest_regex = args.ctest_regex or None
+        ctest_error = None
+    else:
+        ctest_regex, ctest_error = derive_ctest_regex(args.targets)
+
+    jobs = []
+    if "linux-bazel" in platform_names:
+        bazel_configs = split_csv(args.bazel_configs)
+        if args.include_msan and "msan" not in bazel_configs:
+            bazel_configs.append("msan")
+        for config in bazel_configs:
+            jobs.append(
+                make_bazel_job(
+                    worktree_root=worktree_root,
+                    run_dir=run_dir,
+                    config=config,
+                    targets=args.targets,
+                    bazel_args=args.bazel_arg,
+                )
+            )
+
+    ctest_platform_requested = any(
+        platform in platform_names for platform in ("linux-cmake", "windows", "macos")
+    )
+    if ctest_platform_requested and ctest_error:
+        skip_reason = f"{ctest_error}; pass --ctest-regex to enable CTest runners"
+    else:
+        skip_reason = None
+
+    if "linux-cmake" in platform_names:
+        if skip_reason:
+            jobs.append(
+                Job(
+                    name="cmake-linux",
+                    platform="linux-cmake",
+                    steps=[],
+                    log_path=run_dir / "cmake-linux.log",
+                    skip_reason=skip_reason,
+                )
+            )
+        else:
+            cmake_build_dir = pathlib.Path(args.cmake_build_dir)
+            if not cmake_build_dir.is_absolute():
+                cmake_build_dir = worktree_root / cmake_build_dir
+            cmake_targets = args.cmake_build_target or derive_cmake_targets(
+                args.targets
+            )
+            jobs.append(
+                make_linux_cmake_job(
+                    worktree_root=worktree_root,
+                    run_dir=run_dir,
+                    build_dir=cmake_build_dir,
+                    ctest_regex=ctest_regex,
+                    cmake_targets=cmake_targets,
+                )
+            )
+
+    setup_root = (
+        pathlib.Path(args.setup_root)
+        if args.setup_root
+        else default_setup_root(worktree_root)
+    )
+    if not setup_root.is_absolute():
+        setup_root = worktree_root / setup_root
+    if "windows" in platform_names:
+        if skip_reason:
+            jobs.append(
+                Job(
+                    name="cmake-windows",
+                    platform="windows",
+                    steps=[],
+                    log_path=run_dir / "cmake-windows.log",
+                    skip_reason=skip_reason,
+                )
+            )
+        else:
+            jobs.append(
+                make_remote_job(
+                    run_dir=run_dir,
+                    name="cmake-windows",
+                    platform="windows",
+                    wrapper=setup_root / ".windows-setup" / "windows-cmake-test",
+                    ctest_regex=ctest_regex,
+                    available_required=args.require_available,
+                )
+            )
+    if "macos" in platform_names:
+        if skip_reason:
+            jobs.append(
+                Job(
+                    name="cmake-macos",
+                    platform="macos",
+                    steps=[],
+                    log_path=run_dir / "cmake-macos.log",
+                    skip_reason=skip_reason,
+                )
+            )
+        else:
+            jobs.append(
+                make_remote_job(
+                    run_dir=run_dir,
+                    name="cmake-macos",
+                    platform="macos",
+                    wrapper=setup_root / ".macos-setup" / "macos-cmake-test",
+                    ctest_regex=ctest_regex,
+                    available_required=args.require_available,
+                )
+            )
+    return jobs
+
+
+async def run_jobs(
+    *,
+    jobs: list[Job],
+    worktree_root: pathlib.Path,
+    verbose: bool,
+    failure_lines: int,
+    max_jobs: int,
+) -> list[JobResult]:
+    semaphore = asyncio.Semaphore(max_jobs or max(1, len(jobs)))
+    tasks = [
+        asyncio.create_task(
+            run_job(
+                job=job,
+                worktree_root=worktree_root,
+                semaphore=semaphore,
+                verbose=verbose,
+                failure_lines=failure_lines,
+            )
+        )
+        for job in jobs
+    ]
+    results = []
+    for task in asyncio.as_completed(tasks):
+        result = await task
+        results.append(result)
+        if result.status == "SKIP":
+            print(f"[{result.name}] SKIP: {result.skip_reason}")
+        else:
+            print(f"[{result.name}] {result.status} in {result.elapsed_seconds:.1f}s")
+    name_order = {job.name: index for index, job in enumerate(jobs)}
+    results.sort(key=lambda result: name_order[result.name])
+    return results
+
+
+def print_plan(jobs: list[Job], run_dir: pathlib.Path) -> None:
+    print(f"logs: {run_dir}")
+    for job in jobs:
+        print("")
+        print(f"{job.name} ({job.platform})")
+        if job.skip_reason:
+            print(f"  SKIP: {job.skip_reason}")
+            continue
+        for step in job.steps:
+            if step.env:
+                for key in sorted(step.env):
+                    print(f"  export {key}={shlex.quote(step.env[key])}")
+            print(f"  {format_command(step.argv)}")
+
+
+def main(argv: list[str]) -> int:
+    args = parse_arguments(argv)
+    worktree_root = find_worktree_root(pathlib.Path.cwd())
+    if not worktree_root:
+        print("iree-test-everywhere: must run from an IREE worktree", file=sys.stderr)
+        return 1
+    if not (worktree_root / "configured.bazelrc").exists():
+        print(
+            "iree-test-everywhere: Bazel is not configured; run iree-bazel-configure",
+            file=sys.stderr,
+        )
+        return 1
+    run_dir = make_run_directory(worktree_root, args.logs_dir)
+    try:
+        jobs = make_jobs(args, worktree_root, run_dir)
+    except ValueError as error:
+        print(f"iree-test-everywhere: {error}", file=sys.stderr)
+        return 1
+    if args.jobs < 0:
+        print("iree-test-everywhere: --jobs must be non-negative", file=sys.stderr)
+        return 1
+    if not jobs:
+        print("iree-test-everywhere: no jobs selected", file=sys.stderr)
+        return 1
+    print_plan(jobs, run_dir)
+    if args.dry_run:
+        return 0
+    try:
+        results = asyncio.run(
+            run_jobs(
+                jobs=jobs,
+                worktree_root=worktree_root,
+                verbose=args.verbose,
+                failure_lines=args.failure_lines,
+                max_jobs=args.jobs,
+            )
+        )
+    except KeyboardInterrupt:
+        print("iree-test-everywhere: interrupted", file=sys.stderr)
+        return 130
+    write_summary(run_dir, results)
+    print_summary(results)
+    if any(result.status == "FAIL" for result in results):
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -22,6 +22,7 @@ ARGUMENTS
 WHAT IT REMOVES
     - Associated tmux session (if any)
     - .envrc and .envrc.local files
+    - Non-empty .beads moved to ../attic/<project>/.beads
     - .history directory (with confirmation)
 
 EXAMPLES
@@ -112,6 +113,55 @@ confirm() {
     [[ $REPLY =~ ^[Yy]$ ]]
 }
 
+directory_has_entries() {
+    [ -d "$1" ] && [ -n "$(find "$1" -mindepth 1 -print -quit)" ]
+}
+
+make_attic_dir() {
+    local base_dir="$1"
+    if { [ ! -e "$base_dir" ] || [ -d "$base_dir" ]; } && [ ! -e "$base_dir/.beads" ]; then
+        echo "$base_dir"
+        return 0
+    fi
+
+    local timestamp
+    timestamp=$(date "+%Y%m%d-%H%M%S")
+    local candidate="${base_dir}-${timestamp}"
+    local counter=1
+    while [ -e "$candidate" ]; do
+        candidate="${base_dir}-${timestamp}-${counter}"
+        counter=$((counter + 1))
+    done
+    echo "$candidate"
+}
+
+archive_beads() {
+    if [ ! -d ".beads" ]; then
+        return 0
+    fi
+
+    if ! directory_has_entries ".beads"; then
+        if confirm "Remove empty .beads directory?"; then
+            rmdir .beads
+            info "Removed empty .beads/"
+        fi
+        return 0
+    fi
+
+    local project_parent
+    project_parent=$(dirname "$PWD")
+    local project_name
+    project_name=$(basename "$PWD")
+    local archive_dir
+    archive_dir=$(make_attic_dir "$project_parent/attic/$project_name")
+
+    if confirm "Move .beads to $archive_dir/.beads?"; then
+        mkdir -p "$archive_dir"
+        mv .beads "$archive_dir/.beads"
+        info "Moved .beads/ to $archive_dir/.beads"
+    fi
+}
+
 # Kill associated tmux session if exists.
 if command -v tmux &>/dev/null; then
     if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
@@ -149,6 +199,9 @@ if [ -f ".envrc.local" ]; then
         info "Removed .envrc.local"
     fi
 fi
+
+# Archive local issue state before deleting local project files.
+archive_beads
 
 # Remove history directory.
 if [ -d ".history" ]; then

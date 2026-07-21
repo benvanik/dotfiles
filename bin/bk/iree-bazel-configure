@@ -8,15 +8,10 @@
 
 set -e
 
-# Colors.
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-RED='\033[0;31m'
-NC='\033[0m'
-
-info() { printf "${GREEN}[iree-bazel]${NC} %s\n" "$1"; }
-warn() { printf "${YELLOW}[iree-bazel]${NC} %s\n" "$1"; }
-error() { printf "${RED}[iree-bazel]${NC} %s\n" "$1" >&2; }
+# Source shared library.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/iree-bazel-lib"
+iree_bazel_init "iree-bazel-configure"
 
 show_help() {
     cat << 'EOF'
@@ -42,47 +37,29 @@ SEE ALSO
 EOF
 }
 
+# Handle help before worktree check.
 case "${1:-}" in
     -h|--help) show_help; exit 0 ;;
 esac
 
-# Find the IREE worktree root (directory with .git and .bazelversion).
-find_worktree_root() {
-    local dir="$PWD"
-    while [ "$dir" != "/" ]; do
-        if [ -e "$dir/.git" ] && [ -f "$dir/.bazelversion" ]; then
-            echo "$dir"
-            return 0
-        fi
-        dir=$(dirname "$dir")
-    done
-    return 1
-}
+# Set up worktree (configure doesn't call iree_ensure_configured - it IS the configure).
+iree_require_worktree
+cd "$IREE_BAZEL_WORKTREE_DIR"
 
-# Find worktree root.
-WORKTREE_DIR=$(find_worktree_root)
-if [ -z "$WORKTREE_DIR" ]; then
-    error "Not in an IREE worktree (no .bazelversion found)"
-    error "Run from within ~/src/iree/<worktree>/"
-    exit 1
-fi
-
-cd "$WORKTREE_DIR"
-
-info "Configuring IREE for Bazel in $WORKTREE_DIR..."
+iree_info "Configuring IREE for Bazel in $IREE_BAZEL_WORKTREE_DIR..."
 
 # Run platform detection.
-if [ -f "configure_bazel.py" ]; then
-    info "Running configure_bazel.py..."
+if [[ -f "configure_bazel.py" ]]; then
+    iree_info "Running configure_bazel.py..."
     python3 configure_bazel.py
 else
-    error "configure_bazel.py not found in $WORKTREE_DIR"
+    iree_error "configure_bazel.py not found in $IREE_BAZEL_WORKTREE_DIR"
     exit 1
 fi
 
 # Create user.bazelrc if it doesn't exist.
-if [ ! -f "user.bazelrc" ]; then
-    info "Creating user.bazelrc..."
+if [[ ! -f "user.bazelrc" ]]; then
+    iree_info "Creating user.bazelrc..."
     cat > user.bazelrc << 'EOF'
 # Local Bazel configuration.
 # This file is not version-controlled.
@@ -96,12 +73,12 @@ build:debug --config=asserts --compilation_mode=opt '--per_file_copt=iree|llvm@-
 # Enable assertions (optimized but with runtime checks).
 build:asserts --compilation_mode=opt '--copt=-UNDEBUG'
 EOF
-    info "Created user.bazelrc with recommended settings"
+    iree_info "Created user.bazelrc with recommended settings"
 else
-    info "user.bazelrc already exists, skipping"
+    iree_info "user.bazelrc already exists, skipping"
 fi
 
-info "Configuration complete!"
+iree_info "Configuration complete!"
 echo ""
 echo "Build with:  iree-bazel-build [target]"
 echo "Test with:   iree-bazel-test [target]"

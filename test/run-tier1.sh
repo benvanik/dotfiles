@@ -312,6 +312,20 @@ if command -v tmux &>/dev/null; then
     if tmux -L "$tmux_socket" -f /dev/null new-session -d 2>/dev/null; then
         if tmux -L "$tmux_socket" source-file "$DOTFILES/tmux.conf" 2>/dev/null; then
             pass "tmux.conf syntax"
+
+            click_binding_found=false
+            for key_table in root copy-mode copy-mode-vi; do
+                if tmux -L "$tmux_socket" list-keys -T "$key_table" 2>/dev/null |
+                    grep -Eq 'DoubleClick1Pane|TripleClick1Pane'; then
+                    click_binding_found=true
+                    break
+                fi
+            done
+            if [ "$click_binding_found" = false ]; then
+                pass "tmux double/triple-click copy bindings disabled"
+            else
+                fail "tmux double/triple-click copy bindings disabled"
+            fi
         else
             fail "tmux.conf syntax"
         fi

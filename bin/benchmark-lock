@@ -1,0 +1,334 @@
+#!/bin/bash
+# Lock machine-level benchmark knobs for lower-noise local performance runs.
+#
+# Usage:
+#   benchmark-lock
+#   benchmark-lock --status
+#   benchmark-lock --repair-stale
+#   benchmark-unlock
+#
+# The original values are saved under /tmp and restored by benchmark-unlock.
+# Re-running benchmark-lock while already locked is refused so we never
+# overwrite the real baseline values. Using /tmp means a reboot clears the
+# snapshot instead of leaving a stale persistent state file.
+
+set -euo pipefail
+
+USER_NAME="${SUDO_USER:-${USER:-$(id -un 2>/dev/null || id -u)}}"
+STATE_DIR="${BENCHMARK_LOCK_STATE_DIR:-/tmp/benchmark-lock-$USER_NAME}"
+STATE_FILE="$STATE_DIR/state.tsv"
+TMP_STATE="$STATE_FILE.tmp.$$"
+LEGACY_ROOT_STATE_DIR="/tmp/benchmark-lock-root"
+STATE_OWNER_UID="${SUDO_UID:-$(id -u)}"
+STATE_OWNER_GID="${SUDO_GID:-$(id -g)}"
+
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+info() { printf "${GREEN}[benchmark-lock]${NC} %s\n" "$1"; }
+warn() { printf "${YELLOW}[benchmark-lock]${NC} %s\n" "$1"; }
+error() { printf "${RED}[benchmark-lock]${NC} %s\n" "$1" >&2; }
+
+record_state() {
+    local kind="$1"
+    local path="$2"
+    local value="$3"
+    printf '%s\t%s\t%s\n' "$kind" "$path" "$value" >> "$TMP_STATE"
+}
+
+read_one_line() {
+    local path="$1"
+    tr -d '\n' < "$path"
+}
+
+describe_path() {
+    local path="$1"
+    if [[ -e "$path" ]]; then
+        stat -c '%U:%G mode=%a %n' "$path" 2>/dev/null || ls -ld "$path"
+    else
+        printf '%s (missing)\n' "$path"
+    fi
+}
+
+set_state_owner_and_mode() {
+    local path="$1"
+    if [[ -n "${STATE_OWNER_UID:-}" && -n "${STATE_OWNER_GID:-}" ]]; then
+        chown "$STATE_OWNER_UID:$STATE_OWNER_GID" "$path" 2>/dev/null || \
+            sudo chown "$STATE_OWNER_UID:$STATE_OWNER_GID" "$path"
+    fi
+    if [[ -d "$path" ]]; then
+        chmod 700 "$path"
+    else
+        chmod 600 "$path"
+    fi
+}
+
+repair_existing_state_owner_if_sudo() {
+    if [[ -z "${SUDO_UID:-}" || -z "${SUDO_GID:-}" || ! -e "$STATE_DIR" ]]; then
+        return 0
+    fi
+    if [[ ! -d "$STATE_DIR" ]]; then
+        return 0
+    fi
+    set_state_owner_and_mode "$STATE_DIR"
+    if [[ -e "$STATE_FILE" ]]; then
+        set_state_owner_and_mode "$STATE_FILE"
+    fi
+}
+
+state_dir_entries() {
+    if [[ ! -d "$STATE_DIR" || ! -r "$STATE_DIR" || ! -x "$STATE_DIR" ]]; then
+        return 0
+    fi
+    find "$STATE_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null
+}
+
+print_lock_status() {
+    if [[ -f "$STATE_FILE" && -r "$STATE_FILE" ]]; then
+        info "Benchmark lock is active: $STATE_FILE"
+        return 0
+    fi
+    if [[ -e "$STATE_FILE" && ! -r "$STATE_FILE" ]]; then
+        warn "Benchmark lock state exists but is not readable:"
+        warn "  $(describe_path "$STATE_FILE")"
+        return 2
+    fi
+    if [[ -e "$STATE_DIR" ]]; then
+        if [[ ! -d "$STATE_DIR" ]]; then
+            warn "Benchmark lock state path exists but is not a directory:"
+            warn "  $(describe_path "$STATE_DIR")"
+            return 2
+        fi
+        if [[ ! -r "$STATE_DIR" || ! -x "$STATE_DIR" ]]; then
+            warn "Benchmark lock state directory exists but is not usable:"
+            warn "  $(describe_path "$STATE_DIR")"
+            return 2
+        fi
+        if [[ -n "$(state_dir_entries)" ]]; then
+            warn "Benchmark lock state directory exists without $STATE_FILE:"
+            warn "  $(describe_path "$STATE_DIR")"
+            return 2
+        fi
+    fi
+    if [[ -e "$LEGACY_ROOT_STATE_DIR" && "$STATE_DIR" != "$LEGACY_ROOT_STATE_DIR" ]]; then
+        warn "Legacy root-owned benchmark lock may be active: $LEGACY_ROOT_STATE_DIR"
+        return 2
+    fi
+    info "Benchmark lock is not active."
+    return 0
+}
+
+repair_stale_state_dir() {
+    if [[ -e "$STATE_FILE" ]]; then
+        error "Refusing to repair because a benchmark lock state file exists:"
+        error "  $(describe_path "$STATE_FILE")"
+        exit 1
+    fi
+    if [[ ! -e "$STATE_DIR" ]]; then
+        info "No benchmark lock state directory exists: $STATE_DIR"
+        exit 0
+    fi
+    if [[ ! -d "$STATE_DIR" ]]; then
+        error "Refusing to repair non-directory benchmark lock state path:"
+        error "  $(describe_path "$STATE_DIR")"
+        exit 1
+    fi
+    sudo -v
+    if sudo rmdir "$STATE_DIR"; then
+        info "Removed empty stale benchmark lock state directory: $STATE_DIR"
+        exit 0
+    fi
+    error "Could not remove $STATE_DIR with rmdir."
+    error "It may be non-empty, in which case inspect it before removing it."
+    exit 1
+}
+
+require_lock_state_available() {
+    if [[ -f "$STATE_FILE" ]]; then
+        error "Benchmark lock is already active: $STATE_FILE"
+        error "Run benchmark-unlock before locking again."
+        exit 1
+    fi
+    if [[ -e "$STATE_FILE" && ! -f "$STATE_FILE" ]]; then
+        error "Benchmark lock state path exists but is not a regular file:"
+        error "  $(describe_path "$STATE_FILE")"
+        exit 1
+    fi
+    if [[ -e "$STATE_DIR" ]]; then
+        if [[ ! -d "$STATE_DIR" ]]; then
+            error "Benchmark lock state path exists but is not a directory:"
+            error "  $(describe_path "$STATE_DIR")"
+            exit 1
+        fi
+        if [[ ! -r "$STATE_DIR" || ! -w "$STATE_DIR" || ! -x "$STATE_DIR" ]]; then
+            error "Benchmark lock state directory exists but is not usable:"
+            error "  $(describe_path "$STATE_DIR")"
+            error "Remove the stale directory or set BENCHMARK_LOCK_STATE_DIR."
+            exit 1
+        fi
+        if [[ -n "$(state_dir_entries)" ]]; then
+            error "Benchmark lock state directory exists without state.tsv and is not empty:"
+            error "  $(describe_path "$STATE_DIR")"
+            error "Inspect it before removing it or set BENCHMARK_LOCK_STATE_DIR."
+            exit 1
+        fi
+    fi
+    if [[ -e "$LEGACY_ROOT_STATE_DIR" && "$STATE_DIR" != "$LEGACY_ROOT_STATE_DIR" ]]; then
+        error "Legacy root-owned benchmark lock may be active: $LEGACY_ROOT_STATE_DIR"
+        error "Run benchmark-unlock before locking again."
+        exit 1
+    fi
+}
+
+sudo_write_required() {
+    local value="$1"
+    local path="$2"
+    if ! printf '%s\n' "$value" | sudo tee "$path" >/dev/null; then
+        error "Failed to write '$value' to $path"
+        error "State was saved at $STATE_FILE; run benchmark-unlock after fixing the issue."
+        exit 1
+    fi
+}
+
+sudo_write_optional() {
+    local value="$1"
+    local path="$2"
+    if ! printf '%s\n' "$value" | sudo tee "$path" >/dev/null; then
+        warn "Could not write '$value' to optional knob $path"
+        return 1
+    fi
+}
+
+repair_existing_state_owner_if_sudo
+
+if [[ "${1:-}" == "--status" ]]; then
+    status_code=0
+    print_lock_status || status_code=$?
+    printf 'ASLR randomize_va_space: %s\n' "$(read_one_line /proc/sys/kernel/randomize_va_space)"
+    exit "$status_code"
+fi
+
+if [[ "${1:-}" == "--repair-stale" ]]; then
+    repair_stale_state_dir
+fi
+
+require_lock_state_available
+
+sudo -v
+
+mkdir -p "$STATE_DIR"
+set_state_owner_and_mode "$STATE_DIR"
+: > "$TMP_STATE"
+set_state_owner_and_mode "$TMP_STATE"
+
+cleanup_tmp_state() {
+    rm -f "$TMP_STATE"
+}
+trap cleanup_tmp_state EXIT
+
+if [[ ! -r /proc/sys/kernel/randomize_va_space ]]; then
+    error "Cannot read /proc/sys/kernel/randomize_va_space"
+    exit 1
+fi
+record_state "aslr" "/proc/sys/kernel/randomize_va_space" \
+    "$(read_one_line /proc/sys/kernel/randomize_va_space)"
+
+shopt -s nullglob
+
+cpu_governor_count=0
+for governor_path in /sys/devices/system/cpu/cpufreq/policy*/scaling_governor; do
+    available_path="${governor_path%/*}/scaling_available_governors"
+    if [[ -r "$available_path" ]] &&
+       ! grep -qw "performance" "$available_path"; then
+        warn "Skipping $governor_path; performance governor is not advertised."
+        continue
+    fi
+    record_state "cpu_governor" "$governor_path" "$(read_one_line "$governor_path")"
+    cpu_governor_count=$((cpu_governor_count + 1))
+done
+
+cpu_preference_count=0
+for preference_path in /sys/devices/system/cpu/cpufreq/policy*/energy_performance_preference; do
+    available_path="${preference_path%/*}/energy_performance_available_preferences"
+    if [[ -r "$available_path" ]] &&
+       ! grep -qw "performance" "$available_path"; then
+        warn "Skipping $preference_path; performance preference is not advertised."
+        continue
+    fi
+    record_state "cpu_energy_preference" "$preference_path" \
+        "$(read_one_line "$preference_path")"
+    cpu_preference_count=$((cpu_preference_count + 1))
+done
+
+amdgpu_count=0
+for vendor_path in /sys/class/drm/card*/device/vendor; do
+    if [[ "$(read_one_line "$vendor_path")" != "0x1002" ]]; then
+        continue
+    fi
+    dpm_path="${vendor_path%/vendor}/power_dpm_force_performance_level"
+    if [[ ! -r "$dpm_path" ]]; then
+        continue
+    fi
+    record_state "amdgpu_dpm" "$dpm_path" "$(read_one_line "$dpm_path")"
+    amdgpu_count=$((amdgpu_count + 1))
+done
+
+mv "$TMP_STATE" "$STATE_FILE"
+set_state_owner_and_mode "$STATE_FILE"
+trap - EXIT
+
+info "Saved original benchmark state to $STATE_FILE"
+
+sudo_write_required "0" "/proc/sys/kernel/randomize_va_space"
+info "Disabled ASLR."
+
+if [[ "$cpu_governor_count" -eq 0 ]]; then
+    warn "No CPU scaling_governor policy files were found."
+else
+    for governor_path in /sys/devices/system/cpu/cpufreq/policy*/scaling_governor; do
+        available_path="${governor_path%/*}/scaling_available_governors"
+        if [[ -r "$available_path" ]] &&
+           ! grep -qw "performance" "$available_path"; then
+            continue
+        fi
+        sudo_write_required "performance" "$governor_path"
+    done
+    info "Set $cpu_governor_count CPU frequency policies to performance."
+fi
+
+if [[ "$cpu_preference_count" -gt 0 ]]; then
+    changed_count=0
+    for preference_path in /sys/devices/system/cpu/cpufreq/policy*/energy_performance_preference; do
+        available_path="${preference_path%/*}/energy_performance_available_preferences"
+        if [[ -r "$available_path" ]] &&
+           ! grep -qw "performance" "$available_path"; then
+            continue
+        fi
+        if sudo_write_optional "performance" "$preference_path"; then
+            changed_count=$((changed_count + 1))
+        fi
+    done
+    info "Set $changed_count CPU energy-performance preferences to performance."
+fi
+
+if [[ "$amdgpu_count" -gt 0 ]]; then
+    changed_count=0
+    for vendor_path in /sys/class/drm/card*/device/vendor; do
+        if [[ "$(read_one_line "$vendor_path")" != "0x1002" ]]; then
+            continue
+        fi
+        dpm_path="${vendor_path%/vendor}/power_dpm_force_performance_level"
+        if [[ ! -r "$dpm_path" ]]; then
+            continue
+        fi
+        if sudo_write_optional "high" "$dpm_path"; then
+            changed_count=$((changed_count + 1))
+        fi
+    done
+    info "Requested high AMDGPU DPM performance level on $changed_count card(s)."
+fi
+
+info "Benchmark lock active. Run benchmark-unlock to restore the saved state."
+info "For Google Benchmark ASLR checks, run benchmarks as: setarch x86_64 -R <command>"

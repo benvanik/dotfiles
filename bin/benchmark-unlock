@@ -1,0 +1,194 @@
+#!/bin/bash
+# Restore machine-level benchmark knobs saved by benchmark-lock.
+
+set -euo pipefail
+
+USER_NAME="${SUDO_USER:-${USER:-$(id -un 2>/dev/null || id -u)}}"
+STATE_DIR="${BENCHMARK_LOCK_STATE_DIR:-/tmp/benchmark-lock-$USER_NAME}"
+STATE_FILE="$STATE_DIR/state.tsv"
+LEGACY_ROOT_STATE_DIR="/tmp/benchmark-lock-root"
+LEGACY_ROOT_STATE_FILE="$LEGACY_ROOT_STATE_DIR/state.tsv"
+
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+info() { printf "${GREEN}[benchmark-unlock]${NC} %s\n" "$1"; }
+warn() { printf "${YELLOW}[benchmark-unlock]${NC} %s\n" "$1"; }
+error() { printf "${RED}[benchmark-unlock]${NC} %s\n" "$1" >&2; }
+
+sudo_write() {
+    local value="$1"
+    local path="$2"
+    printf '%s\n' "$value" | sudo tee "$path" >/dev/null
+}
+
+read_root_state() {
+    local source_path="$1"
+    local destination_path="$2"
+
+    # sudo is required for the source; the destination is a user-owned mktemp.
+    # shellcheck disable=SC2024
+    sudo cat "$source_path" > "$destination_path"
+}
+
+describe_path() {
+    local path="$1"
+    if [[ -e "$path" ]]; then
+        stat -c '%U:%G mode=%a %n' "$path" 2>/dev/null || ls -ld "$path"
+    else
+        printf '%s (missing)\n' "$path"
+    fi
+}
+
+state_dir_entries() {
+    if [[ ! -d "$STATE_DIR" || ! -r "$STATE_DIR" || ! -x "$STATE_DIR" ]]; then
+        return 0
+    fi
+    find "$STATE_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null
+}
+
+print_lock_status() {
+    if [[ -f "$STATE_FILE" && -r "$STATE_FILE" ]]; then
+        info "Benchmark lock is active: $STATE_FILE"
+        return 0
+    fi
+    if [[ -e "$STATE_FILE" && ! -r "$STATE_FILE" ]]; then
+        warn "Benchmark lock state exists but is not readable:"
+        warn "  $(describe_path "$STATE_FILE")"
+        return 2
+    fi
+    if [[ -e "$STATE_DIR" ]]; then
+        if [[ ! -d "$STATE_DIR" ]]; then
+            warn "Benchmark lock state path exists but is not a directory:"
+            warn "  $(describe_path "$STATE_DIR")"
+            return 2
+        fi
+        if [[ ! -r "$STATE_DIR" || ! -x "$STATE_DIR" ]]; then
+            warn "Benchmark lock state directory exists but is not usable:"
+            warn "  $(describe_path "$STATE_DIR")"
+            return 2
+        fi
+        if [[ -n "$(state_dir_entries)" ]]; then
+            warn "Benchmark lock state directory exists without $STATE_FILE:"
+            warn "  $(describe_path "$STATE_DIR")"
+            return 2
+        fi
+    fi
+    if [[ -e "$LEGACY_ROOT_STATE_DIR" && "$STATE_DIR" != "$LEGACY_ROOT_STATE_DIR" ]]; then
+        warn "Legacy root-owned benchmark lock may be active: $LEGACY_ROOT_STATE_DIR"
+        return 2
+    fi
+    info "Benchmark lock is not active."
+    return 0
+}
+
+if [[ "${1:-}" == "--status" ]]; then
+    status_code=0
+    print_lock_status || status_code=$?
+    exit "$status_code"
+fi
+
+sudo -v
+
+RESTORE_STATE_FILE="$STATE_FILE"
+TEMP_RESTORE_STATE=""
+RESTORE_LEGACY_ROOT_STATE=0
+RESTORE_ROOT_OWNED_STATE=0
+if [[ ! -r "$RESTORE_STATE_FILE" ]]; then
+    if [[ -e "$STATE_FILE" ]]; then
+        TEMP_RESTORE_STATE="$(mktemp)"
+        if read_root_state "$STATE_FILE" "$TEMP_RESTORE_STATE"; then
+            RESTORE_STATE_FILE="$TEMP_RESTORE_STATE"
+            RESTORE_ROOT_OWNED_STATE=1
+            warn "Restoring root-owned benchmark lock: $STATE_FILE"
+        else
+            rm -f "$TEMP_RESTORE_STATE"
+            error "Could not read benchmark lock state: $STATE_FILE"
+            exit 1
+        fi
+    elif [[ -e "$STATE_DIR" && ( ! -r "$STATE_DIR" || ! -x "$STATE_DIR" ) ]]; then
+        TEMP_RESTORE_STATE="$(mktemp)"
+        if read_root_state "$STATE_FILE" "$TEMP_RESTORE_STATE"; then
+            RESTORE_STATE_FILE="$TEMP_RESTORE_STATE"
+            RESTORE_ROOT_OWNED_STATE=1
+            warn "Restoring sudo-created benchmark lock: $STATE_FILE"
+        else
+            rm -f "$TEMP_RESTORE_STATE"
+            error "Benchmark lock state directory is present but not readable:"
+            error "  $(describe_path "$STATE_DIR")"
+            error "Could not read $STATE_FILE with sudo; inspect it before removing it."
+            exit 1
+        fi
+    elif [[ -e "$STATE_DIR" ]]; then
+        if [[ ! -d "$STATE_DIR" || ! -r "$STATE_DIR" || ! -x "$STATE_DIR" ||
+              -n "$(state_dir_entries)" ]]; then
+            error "Benchmark lock state directory is present but has no readable state.tsv:"
+            error "  $(describe_path "$STATE_DIR")"
+            error "Inspect it before removing it."
+            exit 1
+        fi
+        info "Benchmark lock is not active; removing empty state directory."
+        rmdir "$STATE_DIR" 2>/dev/null || true
+        exit 0
+    else
+        RESTORE_STATE_FILE="$STATE_FILE"
+    fi
+fi
+if [[ ! -r "$RESTORE_STATE_FILE" ]]; then
+    if [[ -e "$LEGACY_ROOT_STATE_DIR" && "$STATE_DIR" != "$LEGACY_ROOT_STATE_DIR" ]]; then
+        TEMP_RESTORE_STATE="$(mktemp)"
+        if read_root_state "$LEGACY_ROOT_STATE_FILE" "$TEMP_RESTORE_STATE"; then
+            RESTORE_STATE_FILE="$TEMP_RESTORE_STATE"
+            RESTORE_LEGACY_ROOT_STATE=1
+            warn "Restoring legacy root-owned benchmark lock: $LEGACY_ROOT_STATE_FILE"
+        else
+            rm -f "$TEMP_RESTORE_STATE"
+            error "Could not read legacy root-owned state: $LEGACY_ROOT_STATE_FILE"
+            exit 1
+        fi
+    else
+        info "Benchmark lock is not active; nothing to restore."
+        exit 0
+    fi
+fi
+
+failure_count=0
+while IFS=$'\t' read -r kind path value; do
+    if [[ -z "${kind:-}" || -z "${path:-}" ]]; then
+        continue
+    fi
+    if [[ ! -e "$path" ]]; then
+        warn "Saved $kind path no longer exists: $path"
+        continue
+    fi
+    if sudo_write "$value" "$path"; then
+        info "Restored $kind: $path = $value"
+    else
+        warn "Failed to restore $kind: $path = $value"
+        failure_count=$((failure_count + 1))
+    fi
+done < "$RESTORE_STATE_FILE"
+
+if [[ "$failure_count" -ne 0 ]]; then
+    error "Restore had $failure_count failure(s); keeping $STATE_FILE for retry."
+    exit 1
+fi
+
+if [[ "$RESTORE_ROOT_OWNED_STATE" -ne 0 ]]; then
+    sudo rm -f "$STATE_FILE"
+else
+    rm -f "$STATE_FILE"
+fi
+if [[ "$RESTORE_LEGACY_ROOT_STATE" -ne 0 ]]; then
+    sudo rm -f "$LEGACY_ROOT_STATE_FILE"
+    sudo rmdir "$LEGACY_ROOT_STATE_DIR" 2>/dev/null || true
+fi
+rm -f "$TEMP_RESTORE_STATE"
+if [[ "$RESTORE_ROOT_OWNED_STATE" -ne 0 ]]; then
+    sudo rmdir "$STATE_DIR" 2>/dev/null || true
+else
+    rmdir "$STATE_DIR" 2>/dev/null || true
+fi
+info "Benchmark lock released."

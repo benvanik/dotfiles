@@ -270,14 +270,11 @@ install_nvm() {
     # shellcheck disable=SC1091
     . "$NVM_DIR/nvm.sh"
 
-    # Install Node.js LTS if not present.
-    if ! command -v node &>/dev/null; then
-        info "Installing Node.js 24 (LTS)..."
-        nvm install 24
-        nvm alias default 24
-    else
-        info "Node.js already installed: $(node --version)"
-    fi
+    # Ensure the configured NVM default exists even when the OS provides an
+    # older node binary. nvm install is idempotent for an installed release.
+    info "Installing Node.js 24 (LTS)..."
+    nvm install 24
+    nvm alias default 24
 }
 
 # ============================================================================

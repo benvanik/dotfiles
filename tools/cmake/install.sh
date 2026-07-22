@@ -99,4 +99,16 @@ update_latest "$CMAKE_DIR" "$VERSION"
 # Cleanup tarball.
 rm -f "$TARBALL"
 
+# Create env.sh if it doesn't exist.
+if [ ! -f "env.sh" ]; then
+    cat > env.sh << 'EOF'
+# CMake environment.
+# Sourced by direnvrc when using use_cmake.
+if [ -n "$CMAKE_ROOT" ]; then
+    export PATH="$CMAKE_ROOT/bin:$PATH"
+fi
+EOF
+    info "Created env.sh"
+fi
+
 info "CMake $VERSION installed successfully!"

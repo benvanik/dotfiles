@@ -51,7 +51,6 @@ _use_tool() {
 use_bazel() { _use_tool "bazel" "${1:-latest}"; }
 use_cmake() { _use_tool "cmake" "${1:-latest}"; }
 use_llvm() { _use_tool "llvm" "${1:-latest}"; }
-use_mold() { _use_tool "mold" "${1:-latest}"; }
 use_ninja() { _use_tool "ninja" "${1:-latest}"; }
 use_rocm() { _use_tool "rocm" "${1:-latest}"; }
 use_vulkan() { _use_tool "vulkan" "${1:-latest}"; }

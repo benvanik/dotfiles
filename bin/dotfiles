@@ -97,7 +97,7 @@ cmd_install() {
         echo ""
         error "Missing required packages. Install them first:"
         echo ""
-        echo "    sudo ~/.dotfiles/install-deps.sh"
+        echo "    ~/.dotfiles/install-deps.sh"
         echo ""
         exit 1
     fi
@@ -188,7 +188,6 @@ _create_symlinks() {
     _link claude/settings.json .claude/settings.json
     _link claude/settings-admin.json .claude/settings-admin.json
     _link claude/statusline.sh .claude/statusline.sh
-    _link claude/CLAUDE.md .claude/CLAUDE.md
 
     # GPU passthrough wrapper for Claude Code sandbox (Linux only).
     if [ "$(uname -s)" = "Linux" ] && command -v bwrap &>/dev/null; then
@@ -246,15 +245,13 @@ EOF
     fi
 }
 
-# Set up git SSH signing if not already configured.
+# Set up git SSH signing and ensure local verification is configured.
 _setup_git_signing() {
-    if ! git config --global user.signingkey &>/dev/null; then
-        if [ -d "$HOME/.ssh" ] && ls "$HOME/.ssh"/*.pub &>/dev/null; then
-            info "Setting up git SSH signing..."
-            "$DOTFILES/bin/git-setup-signing"
-        else
-            warn "No SSH keys found - run 'dotfiles setup' after creating keys"
-        fi
+    if [ -d "$HOME/.ssh" ] && ls "$HOME/.ssh"/*.pub &>/dev/null; then
+        info "Setting up git SSH signing..."
+        "$DOTFILES/bin/git-setup-signing"
+    elif ! git config --global --includes user.signingkey &>/dev/null; then
+        warn "No SSH keys found - run 'dotfiles setup' after creating keys"
     fi
 }
 
@@ -327,7 +324,7 @@ _check_shell_components() {
             echo "  - $component"
         done
         echo ""
-        warn "Run: sudo ~/.dotfiles/install-deps.sh"
+        warn "Run: ~/.dotfiles/install-deps.sh"
         echo ""
     fi
 }
@@ -488,7 +485,7 @@ cmd_doctor() {
     printf "%bVersioned tools (~/tools/):%b\n" "$BOLD" "$NC"
     if [ -d "$HOME/tools" ]; then
         local found_tools=false
-        for tool in llvm cmake ninja mold bazel rocm vulkan; do
+        for tool in llvm cmake ninja bazel rocm vulkan; do
             if [ -L "$HOME/tools/$tool/latest" ]; then
                 local version
                 version=$(basename "$(readlink "$HOME/tools/$tool/latest")")

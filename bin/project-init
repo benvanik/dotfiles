@@ -34,7 +34,6 @@ _PI_TOOLS=(
     "cmake:>=3.28.0:all:CMake build system"
     "ninja:latest:all:Ninja build tool"
     "llvm:>=21.0.0:all:LLVM/Clang toolchain"
-    "mold:latest:linux:Fast linker"
     "bazel:latest:all:Bazel build system"
     "nvm:latest:all:Node.js version manager"
     "ccache:system:all:Compiler cache (3-4x faster rebuilds)"
@@ -44,12 +43,12 @@ _PI_TOOLS=(
 
 # Group definitions: id:name:tools (comma-separated tool names)
 _PI_TOOL_GROUPS=(
-    "build:Build Tools:cmake,ninja,llvm,mold,bazel,nvm,ccache"
+    "build:Build Tools:cmake,ninja,llvm,bazel,nvm,ccache"
     "gpu:ML/GPU Tools:rocm,vulkan"
 )
 
 # Build preset tools (ccache is opt-in, not included in preset).
-_PI_BUILD_TOOLS=(cmake ninja llvm mold bazel)
+_PI_BUILD_TOOLS=(cmake ninja llvm bazel)
 
 # GPU preset tools.
 _PI_GPU_TOOLS=(rocm vulkan)
@@ -349,7 +348,6 @@ generate_envrc() {
             llvm)   echo "use_llvm \"$version\"" ;;
             cmake)  echo "use_cmake \"$version\"" ;;
             ninja)  echo "use_ninja" ;;
-            mold)   echo "use_mold" ;;
             bazel)  echo "use_bazel" ;;
             nvm)    echo "use_nvm" ;;
             ccache)
@@ -427,7 +425,7 @@ INTERACTIVE MODE
     If .envrc already exists, current tools are pre-selected.
 
 NON-INTERACTIVE PRESETS
-    --build         cmake, ninja, llvm, mold, bazel
+    --build         cmake, ninja, llvm, bazel
     --build --gpu   Above + rocm, vulkan
     --all           All available tools
 

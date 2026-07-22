@@ -16,7 +16,6 @@ TOOLS=(
     "bazel:all"
     "cmake:all"
     "llvm:all"
-    "mold:linux"
     "ninja:all"
     "nvm:all"
     "rocm:linux"

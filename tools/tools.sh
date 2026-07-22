@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# Load default tool versions for interactive shells.
+# Load default tool versions when no explicit selection is active.
 # Sourced from ~/.shrc.
 # Uses 'local' which is supported by bash, zsh, and dash.
 
@@ -18,10 +18,15 @@ _load_tool() {
     # Skip if no latest symlink.
     [ -L "$latest" ] || return 0
 
-    # Export root variable and source env.sh if exists.
-    # env.sh is responsible for adding to PATH.
+    # An existing root is an explicit selection, usually made by direnv. It
+    # must survive ~/.shrc being sourced again through BASH_ENV in child shells.
     local root_var
+    local current_root
     root_var="$(echo "$tool" | tr '[:lower:]' '[:upper:]')_ROOT"
+    eval "current_root=\${${root_var}:-}"
+    [ -n "$current_root" ] && return 0
+
+    # Export the global default and let env.sh configure the tool.
     eval "export ${root_var}=\"\$(readlink -f \"$latest\")\""
 
     local env_file="$tool_dir/env.sh"
@@ -29,7 +34,7 @@ _load_tool() {
 }
 
 # Load core development tools (latest versions).
-for tool in llvm cmake ninja mold vulkan; do
+for tool in bazel llvm cmake ninja vulkan; do
     _load_tool "$tool"
 done
 

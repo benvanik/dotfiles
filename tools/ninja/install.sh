@@ -86,4 +86,16 @@ update_latest "$NINJA_DIR" "$VERSION"
 # Cleanup.
 rm -f "$ZIPFILE"
 
+# Create env.sh if it doesn't exist.
+if [ ! -f "env.sh" ]; then
+    cat > env.sh << 'EOF'
+# Ninja environment.
+# Sourced by direnvrc when using use_ninja.
+if [ -n "$NINJA_ROOT" ]; then
+    export PATH="$NINJA_ROOT/bin:$PATH"
+fi
+EOF
+    info "Created env.sh"
+fi
+
 info "Ninja $VERSION installed successfully!"

@@ -17,8 +17,8 @@ don't work on those projects.
 # 1. Clone dotfiles
 git clone https://github.com/USER/dotfiles ~/.dotfiles
 
-# 2. Install dependencies (requires sudo)
-sudo ~/.dotfiles/install-deps.sh
+# 2. Install dependencies (prompts for sudo when installing system packages)
+~/.dotfiles/install-deps.sh
 
 # 3. Set up symlinks and configuration
 ~/.dotfiles/bin/dotfiles install

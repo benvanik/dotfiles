@@ -46,7 +46,7 @@ warn() { printf "${YELLOW}[git-signing]${NC} %s\n" "$1"; }
 error() { printf "${RED}[git-signing]${NC} %s\n" "$1" >&2; }
 
 # Get email from git config.
-EMAIL=$(git config --global user.email 2>/dev/null)
+EMAIL=$(git config --global --includes user.email 2>/dev/null)
 if [ -z "$EMAIL" ]; then
     error "git user.email not configured"
     error "Run: git config --global user.email your@email.com"
@@ -57,13 +57,21 @@ fi
 SSH_DIR="$HOME/.ssh"
 KEY_FILE=""
 
+# Preserve an existing machine-local choice when its public key still exists.
+CONFIGURED_KEY=$(git config --global --includes --path user.signingkey 2>/dev/null || true)
+if [ -n "$CONFIGURED_KEY" ] && [ -f "$CONFIGURED_KEY" ]; then
+    KEY_FILE="$CONFIGURED_KEY"
+fi
+
 # Check common key names in order of preference.
-for key in id_ed25519.pub id_rsa.pub id_ecdsa.pub; do
-    if [ -f "$SSH_DIR/$key" ]; then
-        KEY_FILE="$SSH_DIR/$key"
-        break
-    fi
-done
+if [ -z "$KEY_FILE" ]; then
+    for key in id_ed25519.pub id_rsa.pub id_ecdsa.pub; do
+        if [ -f "$SSH_DIR/$key" ]; then
+            KEY_FILE="$SSH_DIR/$key"
+            break
+        fi
+    done
+fi
 
 # Also check for *_github.pub keys.
 if [ -z "$KEY_FILE" ]; then
@@ -87,7 +95,7 @@ info "Found SSH key: $KEY_FILE"
 # Use ~ prefix so it's portable across machines.
 # shellcheck disable=SC2088  # Intentional: literal ~ for portable gitconfig.
 KEY_PATH="~/.ssh/$(basename "$KEY_FILE")"
-git config --global user.signingkey "$KEY_PATH"
+git config --file "$HOME/.gitconfig.local" user.signingkey "$KEY_PATH"
 info "Set user.signingkey = $KEY_PATH"
 
 # Create allowed_signers file.
@@ -95,7 +103,7 @@ ALLOWED_SIGNERS="$SSH_DIR/allowed_signers"
 KEY_CONTENT=$(cat "$KEY_FILE")
 
 # Check if already in allowed_signers.
-if [ -f "$ALLOWED_SIGNERS" ] && grep -q "$EMAIL" "$ALLOWED_SIGNERS"; then
+if [ -f "$ALLOWED_SIGNERS" ] && grep -Fq "$EMAIL " "$ALLOWED_SIGNERS"; then
     info "Email already in $ALLOWED_SIGNERS"
 else
     echo "$EMAIL $KEY_CONTENT" >> "$ALLOWED_SIGNERS"
@@ -107,9 +115,9 @@ echo ""
 info "Git signing configured!"
 echo ""
 echo "Current settings:"
-echo "  user.signingkey = $(git config --global user.signingkey)"
-echo "  gpg.format = $(git config --global gpg.format)"
-echo "  commit.gpgsign = $(git config --global commit.gpgsign)"
+echo "  user.signingkey = $(git config --global --includes user.signingkey)"
+echo "  gpg.format = $(git config --global --includes gpg.format)"
+echo "  commit.gpgsign = $(git config --global --includes commit.gpgsign)"
 echo ""
 echo "To test: git commit --allow-empty -m 'test signed commit'"
 echo "To verify: git log --show-signature -1"

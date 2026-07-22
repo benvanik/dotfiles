@@ -17,7 +17,7 @@ dotfiles install           # Set up symlinks and configuration
 dotfiles fixup             # Integrate installer pollution into .shrc.local
 
 # Dependencies
-sudo ~/.dotfiles/install-deps.sh    # Install system packages
+~/.dotfiles/install-deps.sh         # Install system and user packages
 ```
 
 A pre-commit hook runs `dotfiles test` automatically.
@@ -105,7 +105,7 @@ Installers that modify `~/.bashrc` or `~/.zshrc` pollute the git repo (they're s
 
 When entering a project with `.envrc`, a single-line summary is printed:
 ```
-[env] llvm:21.1.6 cmake:4.2.0 ninja:1.13.2 mold:2.40.4
+[env] llvm:21.1.6 cmake:4.2.0 ninja:1.13.2
 ```
 
 This replaces verbose direnv logging (`DIRENV_LOG_FORMAT=""` in shrc).

@@ -4,7 +4,7 @@
 #
 # Clears environment variables that can contaminate the build:
 # - CC/CXX: Let TheRock use system compiler, not our LLVM
-# - LDFLAGS: Prevent mold from leaking into amdgcn cross-compilation (needs LLD)
+# - LDFLAGS: Prevent host linker selection from leaking into AMDGPU builds
 # - LLVM_*: Let TheRock use its own built LLVM
 
 set -e

@@ -9,7 +9,7 @@
 | `use_llvm ">=21.0.0"` | In .envrc: require LLVM 21+ |
 | `use_rocm "debug"` | In .envrc: use TheRock debug build |
 | `use_ccache "iree"` | In .envrc: enable ccache with named cache |
-| `use_iree_dev` | Convenience: llvm+cmake+ninja+mold+rocm |
+| `use_iree_dev` | Convenience: llvm+cmake+ninja+rocm |
 
 ## Directory Layout
 
@@ -32,7 +32,6 @@ In .envrc files:
 - `use_llvm [version]` - Load LLVM/Clang
 - `use_cmake [version]` - Load CMake
 - `use_ninja [version]` - Load Ninja
-- `use_mold [version]` - Load Mold linker
 - `use_rocm [version]` - Load ROCm (Linux only, silent skip elsewhere)
 - `use_ccache [cache_name]` - Enable ccache with per-project isolation
 - `use_iree_dev [llvm_ver] [cmake_ver]` - Load IREE development tools
@@ -54,9 +53,6 @@ In .envrc files:
 LLVM:
 - `CC`, `CXX` - Compiler paths
 - `LLVM_ROOT`, `LLVM_DIR`, `CLANG_DIR`, `MLIR_DIR` - CMake paths
-
-Mold:
-- `LDFLAGS` - Adds -fuse-ld=mold
 
 ROCm:
 - `ROCM_HOME`, `HIP_PATH` - ROCm paths

@@ -15,9 +15,11 @@ from .model import HuggingFaceClient, ModelInspector
 from .output import print_json, print_model_human, print_placement_human
 from .paths import state_root
 from .placement import load_hardware_catalog, place_model
-
-
-COMMANDS = ("model", "place")
+from .provider_cli import (
+    PROVIDER_COMMANDS,
+    add_provider_parsers,
+    run_provider_command,
+)
 
 
 def _add_model_arguments(parser: argparse.ArgumentParser) -> None:
@@ -150,6 +152,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="List catalog IDs and aliases without inspecting a model.",
     )
+    add_provider_parsers(subparsers)
     return parser
 
 
@@ -227,6 +230,8 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         else:
             print_placement_human(placement_report)
         return 0
+    if args.command in PROVIDER_COMMANDS:
+        return run_provider_command(args)
     raise RunpodLocalError(
         f"unsupported command: {args.command}",
         code="unsupported_command",

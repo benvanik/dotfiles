@@ -204,6 +204,7 @@ secret_patterns=(
     'ANTHROPIC_API_KEY=sk-ant-'
     'OPENAI_API_KEY=sk-'
     'HF_TOKEN=hf_[a-zA-Z0-9]'
+    'RUNPOD_API_KEY=[A-Za-z0-9_-]{16,}'
     'ghp_[a-zA-Z0-9]{36}'
     'gho_[a-zA-Z0-9]{36}'
     'github_pat_[a-zA-Z0-9]'

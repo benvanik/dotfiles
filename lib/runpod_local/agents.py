@@ -15,6 +15,8 @@ Planning commands:
 
 - `runpod-model`: resolve an exact Hugging Face revision and checkpoint.
 - `runpod-place`: apply the versioned static VRAM placement policy.
+- `runpod-stock`: query live stock and on-demand price.
+- `runpod-profile`: author validated reusable launch policy.
 
 Lifecycle commands are documented by the installed command's own
 `--agents-md` output.
@@ -62,5 +64,81 @@ Statuses have strict meanings:
 Provider memory, the 0.90 allocation fraction, 1.03 weight slack, and 4 GiB
 framework reserve are visible and overrideable. Live price/stock is a separate
 provider query and never changes these memory facts.
+""",
+    "auth": """# `runpod-auth`
+
+`runpod-auth login` is a human-only credential bootstrap. It reads the key from
+a no-echo terminal prompt, validates it with a read-only Pod-list request, and
+then stores it at `~/.config/runpod-local/api-key` with mode 0600 inside a
+mode-0700 directory. Never paste a key into chat, pass it as an argument, or
+write it into a launch profile.
+
+```sh
+runpod-auth login
+runpod-auth status --check --json
+```
+
+`RUNPOD_API_KEY` is an environment-only override. The key is sent in an
+Authorization header, never in a URL. `logout` is plan-only unless
+`--execute` is present and removes no Runpod account resources.
+""",
+    "stock": """# `runpod-stock`
+
+Query live Runpod GraphQL stock and on-demand prices using header
+authentication. Global price/stock is advisory; the launch receipt's actual
+GPU, datacenter, and hourly price are authoritative.
+
+```sh
+runpod-stock --gpu pro --gpu h200 --gpu b200 --min-memory 96 \\
+  --available-only --json
+runpod-stock --data-centers --json
+```
+
+Filters are local and deterministic. `--max-hourly` applies to price per GPU
+times `--gpu-count`.
+""",
+    "volume": """# `runpod-volume`
+
+List, inspect, and create persistent network volumes. Creation is plan-only
+without `--execute`.
+
+```sh
+runpod-volume list --json
+runpod-volume create model-cache --size-gb 500 \\
+  --data-center US-KS-2 --json
+```
+
+Network volumes pin Pods to one Secure Cloud datacenter and survive Pod
+termination. This command intentionally has no volume-delete action: model
+cache deletion is a separate high-risk operation, not session cleanup.
+""",
+    "template": """# `runpod-template`
+
+List templates visible to the authenticated account while omitting all
+environment values from output. Use the resulting exact template ID when
+authoring a profile.
+
+```sh
+runpod-template list --search pytorch --json
+```
+""",
+    "profile": """# `runpod-profile`
+
+Profiles are non-secret, mode-0600 local policy records under
+`~/.local/runpod/profiles`. They pin allowed GPU IDs, image or template,
+network-volume identity, cache paths, price cap, SSH identity, and hard TTL.
+
+```sh
+runpod-profile create nvidia-dev \\
+  --template-id TEMPLATE_ID --network-volume-id VOLUME_ID \\
+  --gpu pro6000 --gpu h200 --gpu b200 --gpu b300 \\
+  --max-hourly 8 --ttl 4h --json
+```
+
+Literal values for environment names containing TOKEN, KEY, SECRET, PASSWORD,
+or CREDENTIAL are rejected. Use `--secret-env
+HF_TOKEN=runpod_secret_name`; the profile stores only the Runpod secret
+reference. Local profiles are advisory across machines; provider state and
+exact Pod IDs remain authoritative.
 """,
 }

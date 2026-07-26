@@ -268,12 +268,15 @@ def place_model(
         )
     )
     repository = model_estimate.get("repository", {})
+    checkpoint = model_estimate.get("checkpoint")
     return {
         "schema_version": "runpod.placement.v1",
         "generated_at": utc_now(),
         "model": {
             "repository": repository.get("id"),
+            "requested_revision": repository.get("requested_revision"),
             "resolved_revision": repository.get("resolved_revision"),
+            "checkpoint": checkpoint if isinstance(checkpoint, dict) else None,
             "weight_format": weight_format,
             "weight_bytes": weight_bytes,
             "kv_cache": kv_cache,

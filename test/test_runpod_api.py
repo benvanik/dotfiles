@@ -6,6 +6,7 @@ import unittest
 from runpod_local.api import RunpodApi, gpu_stock_is_available, normalize_pod
 from runpod_local.auth import ApiCredential
 from runpod_local.errors import RunpodLocalError
+from runpod_local.provider_cli import standard_volume_monthly_usd
 
 
 class FakeTransport:
@@ -48,6 +49,11 @@ def api_with_responses(*responses):
 
 
 class RunpodApiTest(unittest.TestCase):
+    def test_standard_volume_monthly_estimate_uses_documented_tiers(self):
+        self.assertEqual(standard_volume_monthly_usd(250), 17.50)
+        self.assertEqual(standard_volume_monthly_usd(1000), 70.00)
+        self.assertEqual(standard_volume_monthly_usd(1250), 82.50)
+
     def test_pod_list_is_normalized_and_drops_remote_environment(self):
         raw_pod = {
             "id": "pod123",

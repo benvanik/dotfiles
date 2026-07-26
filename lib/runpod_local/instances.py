@@ -40,6 +40,7 @@ POD_OWNING_PHASES = {
 }
 MAX_EVENTS = 100
 INTENT_TTL_SECONDS = 15 * 60
+MIN_IDLE_TIMEOUT_SECONDS = 30
 OPERATION_ID_PATTERN = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
     r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
@@ -72,12 +73,23 @@ def _positive_duration(value: Any, *, label: str) -> int:
     return value
 
 
+def instance_lock_scope(name: str) -> str:
+    validate_record_name(name)
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:32]
+    return f"instance-{digest}"
+
+
 def validate_lease_request(
     ttl_seconds: Any, idle_timeout_seconds: Any
 ) -> None:
     _positive_duration(ttl_seconds, label="lease TTL")
     if idle_timeout_seconds is not None:
         _positive_duration(idle_timeout_seconds, label="idle timeout")
+        if idle_timeout_seconds < MIN_IDLE_TIMEOUT_SECONDS:
+            raise RunpodLocalError(
+                f"idle timeout must be at least {MIN_IDLE_TIMEOUT_SECONDS} seconds",
+                code="invalid_lease",
+            )
 
 
 def json_document_hash(value: dict[str, Any]) -> str:
@@ -156,8 +168,16 @@ def append_event(
     if details:
         entry["details"] = details
     events.append(entry)
-    if len(events) > MAX_EVENTS:
-        del events[:-MAX_EVENTS]
+    while len(events) > MAX_EVENTS:
+        activity_index = next(
+            (
+                index
+                for index, existing in enumerate(events)
+                if existing.get("event") == "activity"
+            ),
+            None,
+        )
+        del events[0 if activity_index is None else activity_index]
 
 
 def transition_instance(
@@ -212,6 +232,10 @@ def lease_expiry_reasons(
     record: dict[str, Any], *, now: datetime.datetime
 ) -> list[str]:
     utc_timestamp(now)
+    if record.get("phase") == "termination_pending":
+        return ["termination_retry"]
+    if record.get("phase") == "rollback_required":
+        return ["rollback_retry"]
     if record.get("phase") == "intent":
         deadline = record.get("intent_expires_at")
         if not isinstance(deadline, str):
@@ -366,12 +390,10 @@ def validate_instance_record(record: dict[str, Any]) -> dict[str, Any]:
             f"instance {name} has no lease request",
             code="invalid_instance_record",
         )
-    _positive_duration(
-        lease_request.get("ttl_seconds"), label="requested lease TTL"
+    validate_lease_request(
+        lease_request.get("ttl_seconds"),
+        lease_request.get("idle_timeout_seconds"),
     )
-    idle_timeout = lease_request.get("idle_timeout_seconds")
-    if idle_timeout is not None:
-        _positive_duration(idle_timeout, label="requested idle timeout")
     if not isinstance(record.get("pod_payload"), dict):
         raise RunpodLocalError(
             f"instance {name} has no Pod request payload",
@@ -441,10 +463,10 @@ def validate_instance_record(record: dict[str, Any]) -> dict[str, Any]:
                 f"active instance {name} has no lease",
                 code="invalid_instance_record",
             )
-        _positive_duration(lease.get("ttl_seconds"), label="lease TTL")
-        idle_timeout = lease.get("idle_timeout_seconds")
-        if idle_timeout is not None:
-            _positive_duration(idle_timeout, label="idle timeout")
+        validate_lease_request(
+            lease.get("ttl_seconds"),
+            lease.get("idle_timeout_seconds"),
+        )
         parse_utc_timestamp(str(lease.get("activated_at", "")))
         parse_utc_timestamp(str(lease.get("expires_at", "")))
         parse_utc_timestamp(str(lease.get("last_activity_at", "")))
@@ -485,7 +507,7 @@ class InstanceStore:
         now: datetime.datetime,
     ) -> dict[str, Any]:
         _positive_duration(ttl_seconds, label="lease TTL")
-        with self.state.locked("instances"):
+        with self.state.locked(instance_lock_scope(name)):
             record = self.load(name)
             if record is None:
                 raise AssertionError("required instance unexpectedly absent")
@@ -500,10 +522,17 @@ class InstanceStore:
                     code="lease_expired",
                 )
             lease = record["lease"]
-            lease["ttl_seconds"] = ttl_seconds
-            lease["expires_at"] = utc_timestamp(
-                now + datetime.timedelta(seconds=ttl_seconds)
+            activated_at = parse_utc_timestamp(lease["activated_at"])
+            expires_at = activated_at + datetime.timedelta(
+                seconds=ttl_seconds
             )
+            if expires_at <= now:
+                raise RunpodLocalError(
+                    "new hard TTL would already be expired",
+                    code="invalid_lease",
+                )
+            lease["ttl_seconds"] = ttl_seconds
+            lease["expires_at"] = utc_timestamp(expires_at)
             append_event(
                 record,
                 "ttl_set",
@@ -521,7 +550,7 @@ class InstanceStore:
         now: datetime.datetime,
     ) -> dict[str, Any]:
         _positive_duration(extension_seconds, label="lease extension")
-        with self.state.locked("instances"):
+        with self.state.locked(instance_lock_scope(name)):
             record = self.load(name)
             if record is None:
                 raise AssertionError("required instance unexpectedly absent")
@@ -564,6 +593,9 @@ class InstanceStore:
         *,
         now: datetime.datetime,
         source: str,
+        expected_operation_id: str | None = None,
+        expected_pod_id: str | None = None,
+        record_event: bool = True,
     ) -> dict[str, Any]:
         if (
             not source
@@ -574,7 +606,7 @@ class InstanceStore:
                 "activity source must be a short printable string",
                 code="invalid_activity_source",
             )
-        with self.state.locked("instances"):
+        with self.state.locked(instance_lock_scope(name)):
             record = self.load(name)
             if record is None:
                 raise AssertionError("required instance unexpectedly absent")
@@ -583,6 +615,17 @@ class InstanceStore:
                     f"cannot record activity while instance {name} is {record['phase']}",
                     code="instance_not_active",
                 )
+            if (
+                expected_operation_id is not None
+                and record["operation_id"] != expected_operation_id
+            ) or (
+                expected_pod_id is not None
+                and record.get("pod_id") != expected_pod_id
+            ):
+                raise RunpodLocalError(
+                    f"instance {name} no longer owns the expected Pod operation",
+                    code="instance_identity_changed",
+                )
             if lease_expiry_reasons(record, now=now):
                 raise RunpodLocalError(
                     f"cannot record activity after instance {name} has expired",
@@ -590,11 +633,45 @@ class InstanceStore:
                 )
             record["lease"]["last_activity_at"] = utc_timestamp(now)
             record["lease"]["activity_source"] = source
-            append_event(
-                record,
-                "activity",
-                at=now,
-                details={"source": source},
-            )
+            if record_event:
+                append_event(
+                    record,
+                    "activity",
+                    at=now,
+                    details={"source": source},
+                )
             self.save(record)
+            return record
+
+    def check_active_lease(
+        self,
+        name: str,
+        *,
+        now: datetime.datetime,
+        expected_operation_id: str,
+        expected_pod_id: str,
+    ) -> dict[str, Any]:
+        with self.state.locked(instance_lock_scope(name)):
+            record = self.load(name)
+            if record is None:
+                raise AssertionError("required instance unexpectedly absent")
+            if record["phase"] != "active":
+                raise RunpodLocalError(
+                    f"instance {name} is {record['phase']}, not active",
+                    code="instance_not_active",
+                )
+            if (
+                record["operation_id"] != expected_operation_id
+                or record.get("pod_id") != expected_pod_id
+            ):
+                raise RunpodLocalError(
+                    f"instance {name} no longer owns the expected Pod operation",
+                    code="instance_identity_changed",
+                )
+            reasons = lease_expiry_reasons(record, now=now)
+            if reasons:
+                raise RunpodLocalError(
+                    "instance lease has expired: " + ", ".join(reasons),
+                    code="lease_expired",
+                )
             return record

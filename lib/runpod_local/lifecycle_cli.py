@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import json
 import pathlib
+import sys
+import time
 from typing import Any
 
 from .api import RunpodApi
@@ -100,7 +103,10 @@ def add_lifecycle_parsers(subparsers: Any) -> None:
     )
     up.add_argument(
         "--idle-ttl",
-        help="Terminate after no explicit local heartbeat for this duration.",
+        help=(
+            "Terminate after no explicit local heartbeat "
+            "(minimum: 30s)."
+        ),
     )
     _add_model_options(up)
     up.add_argument(
@@ -146,7 +152,7 @@ def add_lifecycle_parsers(subparsers: Any) -> None:
     ttl_show.add_argument("name", nargs="?")
 
     ttl_set = ttl_actions.add_parser(
-        "set", help="Set a new hard deadline relative to now."
+        "set", help="Set total hard lifetime relative to original submission."
     )
     _add_common(ttl_set, credentials=False)
     ttl_set.add_argument("name")
@@ -178,6 +184,21 @@ def add_lifecycle_parsers(subparsers: Any) -> None:
         "--execute",
         action="store_true",
         help="Delete expired reconciled Pods; otherwise emit a local plan.",
+    )
+
+    ttl_watch = ttl_actions.add_parser(
+        "watch", help="Run foreground TTL enforcement at a bounded interval."
+    )
+    _add_common(ttl_watch)
+    ttl_watch.add_argument(
+        "--interval",
+        default="30s",
+        help="Enforcement interval from 5s through 5m (default: 30s).",
+    )
+    ttl_watch.add_argument(
+        "--execute",
+        action="store_true",
+        help="Required acknowledgement for repeated provider deletion checks.",
     )
 
 
@@ -258,7 +279,9 @@ def _model_placement(
         admitted_ids.intersection_update(requested_ids)
     summary = {
         "repository": placement["model"]["repository"],
+        "requested_revision": placement["model"]["requested_revision"],
         "resolved_revision": placement["model"]["resolved_revision"],
+        "checkpoint": placement["model"]["checkpoint"],
         "weight_format": placement["model"]["weight_format"],
         "weight_bytes": placement["model"]["weight_bytes"],
         "kv_cache": placement["model"]["kv_cache"],
@@ -400,7 +423,7 @@ def _local_lease_status(
 def _run_ttl(args: argparse.Namespace) -> int:
     if not args.ttl_action:
         raise RunpodLocalError(
-            "ttl action required: show, set, extend, touch, or enforce",
+            "ttl action required: show, set, extend, touch, enforce, or watch",
             code="missing_action",
         )
     state = _state(args)
@@ -422,10 +445,40 @@ def _run_ttl(args: argparse.Namespace) -> int:
         )
     elif args.ttl_action == "touch":
         result = store.touch(args.name, now=now, source=args.source)
-    else:
+    elif args.ttl_action == "enforce":
         result = _manager(
             args, provider_required=args.execute
         ).enforce_ttl(execute=args.execute)
+    else:
+        if not args.execute:
+            raise RunpodLocalError(
+                "ttl watch requires --execute",
+                code="execute_required",
+            )
+        interval_seconds = parse_duration(args.interval)
+        if not 5 <= interval_seconds <= 5 * 60:
+            raise RunpodLocalError(
+                "watch interval must be between 5 seconds and 5 minutes",
+                code="invalid_watch_interval",
+            )
+        manager = _manager(args, provider_required=True)
+        try:
+            while True:
+                result = manager.enforce_ttl(execute=True)
+                if args.json:
+                    print(
+                        json.dumps(
+                            result,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                    )
+                    sys.stdout.flush()
+                elif result["actions"]:
+                    _print(result, as_json=args.json)
+                time.sleep(interval_seconds)
+        except KeyboardInterrupt:
+            return 130
     _print(result, as_json=args.json)
     if (
         args.ttl_action == "enforce"

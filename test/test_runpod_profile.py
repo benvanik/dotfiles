@@ -1,17 +1,46 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import pathlib
+import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 from runpod_local.errors import RunpodLocalError
 from runpod_local.profile import (
     DEFAULT_CACHE_ENVIRONMENT,
     ProfileStore,
     create_profile,
+    load_ssh_public_key_file,
+    validate_profile,
+    validate_profile_ssh_files,
+    validate_ssh_key_pair,
+    validate_ssh_public_key,
 )
 from runpod_local.state import StateStore
 from runpod_local.timeutil import parse_duration
+
+
+SSH_PUBLIC_KEY = (
+    "ssh-ed25519 "
+    "AAAAC3NzaC1lZDI1NTE5AAAAIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f "
+    "fixture@example"
+)
+
+
+def _ssh_wire_string(value: bytes) -> bytes:
+    return len(value).to_bytes(4, "big") + value
+
+
+OTHER_SSH_PUBLIC_KEY = (
+    "ssh-ed25519 "
+    + base64.b64encode(
+        _ssh_wire_string(b"ssh-ed25519")
+        + _ssh_wire_string(b"\x42" * 32)
+    ).decode("ascii")
+)
 
 
 def profile(**overrides):
@@ -22,6 +51,7 @@ def profile(**overrides):
         "default_ttl_seconds": 4 * 60 * 60,
         "template_id": "template123",
         "network_volume_id": "volume123",
+        "ssh_public_key": SSH_PUBLIC_KEY,
     }
     arguments.update(overrides)
     return create_profile(**arguments)
@@ -41,6 +71,9 @@ class ProfileTest(unittest.TestCase):
         )
         self.assertEqual(value["limits"]["max_hourly_usd"], 8.0)
         self.assertEqual(value["lease"]["expiry_action"], "terminate")
+        self.assertEqual(
+            pod["environment"]["SSH_PUBLIC_KEY"], SSH_PUBLIC_KEY
+        )
 
     def test_literal_secret_is_rejected(self):
         with self.assertRaises(RunpodLocalError) as caught:
@@ -58,6 +91,13 @@ class ProfileTest(unittest.TestCase):
         self.assertEqual(
             value["pod"]["environment"]["HF_TOKEN"],
             "{{ RUNPOD_SECRET_huggingface }}",
+        )
+
+    def test_provider_public_key_environment_is_reserved(self):
+        with self.assertRaises(RunpodLocalError) as caught:
+            profile(environment={"PUBLIC_KEY": SSH_PUBLIC_KEY})
+        self.assertEqual(
+            caught.exception.code, "invalid_profile_environment"
         )
 
     def test_storage_choice_must_be_explicit(self):
@@ -94,6 +134,157 @@ class ProfileTest(unittest.TestCase):
             with self.assertRaises(RunpodLocalError) as caught:
                 state.read("profiles", "nvidia-dev")
             self.assertEqual(caught.exception.code, "unsafe_state_record")
+
+    def test_public_key_validation_rejects_non_key_text_and_controls(self):
+        self.assertEqual(validate_ssh_public_key(SSH_PUBLIC_KEY), SSH_PUBLIC_KEY)
+        for value in (
+            "",
+            "ssh-dss AAAAB3NzaC1kc3MAAACB",
+            "ssh-ed25519 not-base64!",
+            "ssh-ed25519 YWJj",
+            OTHER_SSH_PUBLIC_KEY.replace("ssh-ed25519", "ssh-rsa", 1),
+            (
+                "ssh-ed25519 "
+                + base64.b64encode(
+                    _ssh_wire_string(b"ssh-ed25519")
+                    + _ssh_wire_string(b"\x42" * 31)
+                ).decode("ascii")
+            ),
+            f"{OTHER_SSH_PUBLIC_KEY} ",
+            f"{OTHER_SSH_PUBLIC_KEY}\x7f",
+            f"{SSH_PUBLIC_KEY}\n",
+            f"{SSH_PUBLIC_KEY}\tcomment",
+        ):
+            with self.subTest(value=value):
+                with self.assertRaises(RunpodLocalError) as caught:
+                    validate_ssh_public_key(value)
+                self.assertEqual(
+                    caught.exception.code, "invalid_ssh_public_key"
+                )
+
+    def test_public_key_file_is_single_owned_non_writable_regular_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            public_key_path = root / "id_ed25519.pub"
+            public_key_path.write_text(f"{SSH_PUBLIC_KEY}\n")
+            public_key_path.chmod(0o644)
+
+            loaded_path, loaded_key = load_ssh_public_key_file(
+                str(public_key_path)
+            )
+            self.assertEqual(loaded_path, public_key_path)
+            self.assertEqual(loaded_key, SSH_PUBLIC_KEY)
+
+            public_key_path.chmod(0o664)
+            with self.assertRaises(RunpodLocalError):
+                load_ssh_public_key_file(str(public_key_path))
+
+            public_key_path.chmod(0o644)
+            public_key_path.write_text(
+                f"{SSH_PUBLIC_KEY}\n{OTHER_SSH_PUBLIC_KEY}\n"
+            )
+            with self.assertRaises(RunpodLocalError):
+                load_ssh_public_key_file(str(public_key_path))
+
+            linked_path = root / "linked.pub"
+            linked_path.symlink_to(public_key_path)
+            with self.assertRaises(RunpodLocalError):
+                load_ssh_public_key_file(str(linked_path))
+
+    def test_key_pair_is_derived_noninteractively_and_compared_exactly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            identity_path = pathlib.Path(directory) / "id_ed25519"
+            identity_path.write_text("fixture private material")
+            identity_path.chmod(0o600)
+            completed = subprocess.CompletedProcess(
+                [],
+                0,
+                stdout=(
+                    " ".join(SSH_PUBLIC_KEY.split(maxsplit=2)[:2]) + "\n"
+                ).encode("utf-8"),
+                stderr=b"",
+            )
+            with mock.patch(
+                "runpod_local.profile.subprocess.run",
+                return_value=completed,
+            ) as run:
+                validate_ssh_key_pair(str(identity_path), SSH_PUBLIC_KEY)
+            self.assertEqual(
+                run.call_args.args[0],
+                [
+                    "ssh-keygen",
+                    "-y",
+                    "-P",
+                    "",
+                    "-f",
+                    str(identity_path),
+                ],
+            )
+            with mock.patch(
+                "runpod_local.profile.subprocess.run",
+                return_value=subprocess.CompletedProcess(
+                    [],
+                    0,
+                    stdout=f"{OTHER_SSH_PUBLIC_KEY}\n".encode("utf-8"),
+                    stderr=b"",
+                ),
+            ):
+                with self.assertRaises(RunpodLocalError) as caught:
+                    validate_ssh_key_pair(str(identity_path), SSH_PUBLIC_KEY)
+            self.assertEqual(caught.exception.code, "ssh_key_mismatch")
+
+    def test_profile_rejects_tampered_public_key_identity(self):
+        value = profile()
+        value["ssh"]["public_key_sha256"] = "0" * 64
+        with self.assertRaises(RunpodLocalError) as caught:
+            validate_profile(value)
+        self.assertEqual(caught.exception.code, "invalid_profile")
+
+    def test_launch_preflight_rejects_consistent_injected_key_tamper(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            identity_path = root / "id_ed25519"
+            identity_path.write_text("fixture private material")
+            identity_path.chmod(0o600)
+            public_key_path = root / "id_ed25519.pub"
+            public_key_path.write_text(f"{SSH_PUBLIC_KEY}\n")
+            public_key_path.chmod(0o644)
+            value = profile(
+                identity_file=str(identity_path),
+                public_key_file=str(public_key_path),
+            )
+            value["pod"]["environment"][
+                "SSH_PUBLIC_KEY"
+            ] = OTHER_SSH_PUBLIC_KEY
+            value["ssh"]["public_key_sha256"] = hashlib.sha256(
+                OTHER_SSH_PUBLIC_KEY.encode("utf-8")
+            ).hexdigest()
+            validate_profile(value)
+
+            with self.assertRaises(RunpodLocalError) as caught:
+                validate_profile_ssh_files(value)
+            self.assertEqual(caught.exception.code, "ssh_key_mismatch")
+
+    def test_malformed_profile_fields_fail_with_typed_errors(self):
+        malformed_values = []
+        value = profile()
+        value["ssh"]["public_key_file"] = 5
+        malformed_values.append(value)
+        value = profile()
+        value["pod"]["environment"] = []
+        malformed_values.append(value)
+        value = profile()
+        del value["created_at"]
+        malformed_values.append(value)
+        for value in malformed_values:
+            with self.subTest(value=value):
+                with self.assertRaises(RunpodLocalError) as caught:
+                    validate_profile(value)
+                self.assertEqual(caught.exception.code, "invalid_profile")
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            validate_ssh_public_key("ssh-ed25519 \ud800")
+        self.assertEqual(caught.exception.code, "invalid_ssh_public_key")
 
     def test_duration_parser_supports_composition_and_caps_lifetime(self):
         self.assertEqual(parse_duration("1h30m"), 5400)

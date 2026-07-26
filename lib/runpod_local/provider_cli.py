@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import getpass
+import hashlib
 import math
 import pathlib
 import re
@@ -14,12 +16,60 @@ from .auth import ApiCredential, CredentialStore
 from .errors import RunpodLocalError
 from .output import print_json
 from .paths import credentials_file, state_root
-from .profile import ProfileStore, create_profile
+from .profile import (
+    ProfileStore,
+    create_profile,
+    load_ssh_public_key_file,
+    validate_ssh_identity_file,
+    validate_ssh_key_pair,
+)
 from .state import StateStore
 from .timeutil import parse_duration
 
 
 PROVIDER_COMMANDS = ("auth", "stock", "volume", "template", "profile")
+STANDARD_VOLUME_PRICING = {
+    "as_of": "2026-07-26",
+    "first_tier_gb": 1000,
+    "first_tier_usd_per_gb_month": 0.07,
+    "additional_usd_per_gb_month": 0.05,
+    "source": "https://docs.runpod.io/storage/network-volumes",
+}
+
+
+def standard_volume_monthly_usd(size_gb: int) -> float:
+    first_tier = min(size_gb, STANDARD_VOLUME_PRICING["first_tier_gb"])
+    additional = max(
+        0, size_gb - STANDARD_VOLUME_PRICING["first_tier_gb"]
+    )
+    return round(
+        first_tier
+        * STANDARD_VOLUME_PRICING["first_tier_usd_per_gb_month"]
+        + additional
+        * STANDARD_VOLUME_PRICING["additional_usd_per_gb_month"],
+        2,
+    )
+
+
+def volume_lock_scope(name: str) -> str:
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:32]
+    return f"volume-{digest}"
+
+
+def created_volume_violations(
+    volume: dict[str, Any], request: dict[str, Any]
+) -> list[str]:
+    violations = []
+    volume_id = volume.get("id")
+    if (
+        not isinstance(volume_id, str)
+        or not re.fullmatch(r"[A-Za-z0-9_-]{1,191}", volume_id)
+    ):
+        violations.append("missing_or_invalid_volume_id")
+    for field in ("name", "size_gb", "data_center_id"):
+        if volume.get(field) != request[field]:
+            violations.append(f"{field}_mismatch")
+    return violations
 
 
 def _add_agents_argument(parser: argparse.ArgumentParser) -> None:
@@ -156,10 +206,19 @@ def add_provider_parsers(subparsers: Any) -> None:
     volume_create = volume_subparsers.add_parser(
         "create", help="Plan or create a network volume."
     )
-    _add_common_provider_arguments(volume_create)
+    _add_common_provider_arguments(volume_create, state=True)
     volume_create.add_argument("name")
-    volume_create.add_argument("--size-gb", required=True, type=int)
-    volume_create.add_argument("--data-center", required=True)
+    volume_create.add_argument(
+        "--size-gb",
+        required=True,
+        type=int,
+        help="Standard network-volume size from 1 through 4000 GB.",
+    )
+    volume_create.add_argument(
+        "--data-center",
+        required=True,
+        help="Exact live Secure Cloud datacenter ID.",
+    )
     volume_create.add_argument(
         "--execute",
         action="store_true",
@@ -201,10 +260,17 @@ def add_provider_parsers(subparsers: Any) -> None:
     )
     profile_create.add_argument("name")
     runtime_source = profile_create.add_mutually_exclusive_group(required=True)
-    runtime_source.add_argument("--image")
-    runtime_source.add_argument("--template-id")
+    runtime_source.add_argument(
+        "--image", help="Explicit container tag or digest reference."
+    )
+    runtime_source.add_argument(
+        "--template-id", help="Exact account-visible Runpod template ID."
+    )
     storage = profile_create.add_mutually_exclusive_group(required=True)
-    storage.add_argument("--network-volume-id")
+    storage.add_argument(
+        "--network-volume-id",
+        help="Persistent volume ID; this pins the profile datacenter.",
+    )
     storage.add_argument(
         "--ephemeral",
         action="store_true",
@@ -216,16 +282,41 @@ def add_provider_parsers(subparsers: Any) -> None:
         required=True,
         help="GPU catalog alias or exact ID; repeat in fallback order.",
     )
-    profile_create.add_argument("--gpu-count", type=int, default=1)
-    profile_create.add_argument("--max-hourly", type=float, required=True)
+    profile_create.add_argument(
+        "--gpu-count",
+        type=int,
+        default=1,
+        help="GPU count (default: 1; multi-GPU fit remains indeterminate).",
+    )
+    profile_create.add_argument(
+        "--max-hourly",
+        type=float,
+        required=True,
+        help="Maximum total Pod rate in USD/hour, excluding volume storage.",
+    )
     profile_create.add_argument(
         "--ttl",
         default="4h",
         help="Default hard lifetime, such as 4h or 1h30m.",
     )
-    profile_create.add_argument("--container-disk-gb", type=int, default=50)
-    profile_create.add_argument("--min-vcpu-per-gpu", type=int, default=8)
-    profile_create.add_argument("--min-ram-per-gpu", type=int, default=32)
+    profile_create.add_argument(
+        "--container-disk-gb",
+        type=int,
+        default=50,
+        help="Ephemeral container disk size (default: 50 GB).",
+    )
+    profile_create.add_argument(
+        "--min-vcpu-per-gpu",
+        type=int,
+        default=8,
+        help="Minimum vCPU per GPU (default: 8).",
+    )
+    profile_create.add_argument(
+        "--min-ram-per-gpu",
+        type=int,
+        default=32,
+        help="Minimum host RAM GB per GPU (default: 32).",
+    )
     profile_create.add_argument(
         "--cuda",
         action="append",
@@ -233,7 +324,13 @@ def add_provider_parsers(subparsers: Any) -> None:
         help="Allowed CUDA version such as 12.8; repeat as needed.",
     )
     profile_create.add_argument(
-        "--identity-file", default="~/.ssh/id_ed25519"
+        "--identity-file",
+        default="~/.ssh/id_ed25519_runpod",
+        help="Dedicated mode-0600 non-interactive private key.",
+    )
+    profile_create.add_argument(
+        "--public-key-file",
+        help="Public key to inject; defaults to IDENTITY_FILE.pub.",
     )
     profile_create.add_argument(
         "--env",
@@ -510,16 +607,89 @@ def _run_volume(args: argparse.Namespace) -> int:
         "size_gb": args.size_gb,
         "data_center_id": args.data_center,
     }
-    result = {
-        "schema_version": "runpod.plan.v1",
-        "action": "create_network_volume",
-        "request": request,
-        "executed": args.execute,
-    }
-    if args.execute:
-        result["volume"] = _api(args).create_network_volume(**request)
+    lock = (
+        StateStore(state_root(args.state_root)).locked(
+            volume_lock_scope(args.name)
+        )
+        if args.execute
+        else contextlib.nullcontext()
+    )
+    with lock:
+        api = _api(args)
+        stock = api.stock(
+            gpu_count=1,
+            secure_cloud=True,
+            include_data_centers=True,
+        )
+        center_matches = [
+            center
+            for center in stock["data_centers"]
+            if center.get("data_center_id") == args.data_center
+        ]
+        if len(center_matches) != 1:
+            raise RunpodLocalError(
+                f"Runpod did not return exactly one Secure Cloud data center "
+                f"for {args.data_center}",
+                code="invalid_provider_id",
+            )
+        same_name = [
+            volume
+            for volume in api.list_network_volumes()
+            if volume.get("name") == args.name
+        ]
+        exact_matches = [
+            volume
+            for volume in same_name
+            if volume.get("size_gb") == args.size_gb
+            and volume.get("data_center_id") == args.data_center
+        ]
+        if len(same_name) > 1 or (same_name and not exact_matches):
+            raise RunpodLocalError(
+                f"network volume name {args.name!r} is ambiguous or belongs to "
+                "a different size/datacenter",
+                code="volume_name_conflict",
+            )
+        if exact_matches and created_volume_violations(
+            exact_matches[0], request
+        ):
+            raise RunpodLocalError(
+                f"network volume {args.name!r} has no valid durable ID",
+                code="invalid_provider_response",
+            )
+        result = {
+            "schema_version": "runpod.plan.v1",
+            "action": (
+                "reuse_network_volume"
+                if exact_matches
+                else "create_network_volume"
+            ),
+            "request": request,
+            "data_center": center_matches[0],
+            "standard_storage_estimate": {
+                "monthly_usd": standard_volume_monthly_usd(args.size_gb),
+                "pricing": STANDARD_VOLUME_PRICING,
+                "excludes_compute": True,
+            },
+            "executed": False,
+        }
+        if exact_matches:
+            result["volume"] = exact_matches[0]
+            result["reconciled_existing"] = True
+        elif args.execute:
+            created = api.create_network_volume(**request)
+            violations = created_volume_violations(created, request)
+            result["volume"] = created
+            result["executed"] = True
+            result["verification"] = {
+                "status": "error" if violations else "verified",
+                "violations": violations,
+            }
     _print_result(result, as_json=args.json)
-    return 0
+    return (
+        1
+        if result.get("verification", {}).get("status") == "error"
+        else 0
+    )
 
 
 def _safe_template(template: dict[str, Any]) -> dict[str, Any]:
@@ -580,6 +750,11 @@ def _run_profile(args: argparse.Namespace) -> int:
         _print_result(store.load(args.name), as_json=args.json)
         return 0
     environment = _parse_environment(args.env, args.secret_env)
+    public_key_path, public_key = load_ssh_public_key_file(
+        args.public_key_file or f"{args.identity_file}.pub"
+    )
+    validate_ssh_identity_file(args.identity_file)
+    validate_ssh_key_pair(args.identity_file, public_key)
     profile = create_profile(
         name=args.name,
         gpu_names=args.gpu,
@@ -595,6 +770,8 @@ def _run_profile(args: argparse.Namespace) -> int:
         min_vcpu_per_gpu=args.min_vcpu_per_gpu,
         min_ram_per_gpu=args.min_ram_per_gpu,
         identity_file=args.identity_file,
+        public_key_file=str(public_key_path),
+        ssh_public_key=public_key,
         environment=environment,
     )
     store.save(profile, replace=args.replace)

@@ -18,11 +18,18 @@ from .instances import (
     build_pod_payload,
     lease_expiry_reasons,
     json_document_hash,
+    instance_lock_scope,
     profile_hash,
     transition_instance,
     validate_lease_request,
 )
-from .profile import validate_profile
+from .profile import (
+    validate_profile,
+    validate_profile_ssh_files,
+    validate_ssh_identity_file,
+    validate_ssh_key_pair,
+    validate_ssh_public_key,
+)
 from .state import StateStore, validate_record_name
 from .timeutil import parse_utc_timestamp, utc_timestamp
 
@@ -51,6 +58,8 @@ class LifecycleManager:
         *,
         clock: Callable[[], datetime.datetime] | None = None,
         uuid_factory: Callable[[], uuid.UUID] | None = None,
+        profile_ssh_validator: Callable[[dict[str, Any]], Any] | None = None,
+        key_pair_validator: Callable[[str, str], None] | None = None,
     ) -> None:
         self.api = api
         self.state = state
@@ -59,6 +68,10 @@ class LifecycleManager:
             lambda: datetime.datetime.now(datetime.timezone.utc)
         )
         self.uuid_factory = uuid_factory or uuid.uuid4
+        self.profile_ssh_validator = (
+            profile_ssh_validator or validate_profile_ssh_files
+        )
+        self.key_pair_validator = key_pair_validator or validate_ssh_key_pair
 
     def _api(self) -> RunpodApi:
         if self.api is None:
@@ -72,6 +85,29 @@ class LifecycleManager:
         now = self.clock()
         utc_timestamp(now)
         return now
+
+    def _validate_record_ssh_identity(self, record: dict[str, Any]) -> None:
+        connection = record.get("connection")
+        payload = record.get("pod_payload")
+        environment = payload.get("env") if isinstance(payload, dict) else None
+        if not isinstance(connection, dict) or not isinstance(
+            environment, dict
+        ):
+            raise RunpodLocalError(
+                "launch receipt has no SSH identity policy",
+                code="invalid_instance_record",
+            )
+        public_key = environment.get("SSH_PUBLIC_KEY")
+        if not isinstance(public_key, str):
+            raise RunpodLocalError(
+                "launch receipt has no injected SSH public key",
+                code="invalid_instance_record",
+            )
+        public_key = validate_ssh_public_key(public_key)
+        identity_path = validate_ssh_identity_file(
+            connection.get("identity_file")
+        )
+        self.key_pair_validator(str(identity_path), public_key)
 
     def _volume_for_profile(
         self, profile: dict[str, Any]
@@ -133,6 +169,8 @@ class LifecycleManager:
                     f"instance {name} has unfinished work for another profile",
                     code="instance_profile_conflict",
                 )
+            if existing["phase"] == "intent":
+                self._validate_record_ssh_identity(existing)
             return {
                 "schema_version": "runpod.launch-plan.v1",
                 "action": "reconcile_existing_launch",
@@ -140,6 +178,7 @@ class LifecycleManager:
                 "instance": existing,
                 "executed": False,
             }
+        self.profile_ssh_validator(profile)
         if (
             existing is not None
             and self._find_owned_remote(existing) is not None
@@ -183,7 +222,7 @@ class LifecycleManager:
         validate_record_name(name)
         profile = validate_profile(profile)
         validate_lease_request(ttl_seconds, idle_timeout_seconds)
-        with self.state.locked("instances"):
+        with self.state.locked(instance_lock_scope(name)):
             record = self.instances.load(name, required=False)
             if record is not None and record["phase"] not in TERMINAL_PHASES:
                 if record["profile"]["sha256"] != profile_hash(profile):
@@ -191,6 +230,8 @@ class LifecycleManager:
                         f"instance {name} has unfinished work for another profile",
                         code="instance_profile_conflict",
                     )
+                if record["phase"] == "intent":
+                    self._validate_record_ssh_identity(record)
                 return self._advance_launch(record)
             if record is not None and self._find_owned_remote(record) is not None:
                 raise RunpodLocalError(
@@ -198,6 +239,7 @@ class LifecycleManager:
                     code="terminal_pod_leak",
                 )
 
+            self.profile_ssh_validator(profile)
             volume, placement = self._placement(
                 profile, allowed_gpu_ids=allowed_gpu_ids
             )
@@ -283,6 +325,7 @@ class LifecycleManager:
                 )
         just_marked_submitting = False
         if phase == "intent":
+            self._validate_record_ssh_identity(record)
             now = self._now()
             transition_instance(
                 record,
@@ -507,20 +550,78 @@ class LifecycleManager:
         *,
         execute: bool,
         reason: str,
+        expected_operation_id: str | None = None,
+        require_expired: bool = False,
     ) -> dict[str, Any]:
         validate_record_name(name)
-        with self.state.locked("instances"):
+        with self.state.locked(instance_lock_scope(name)):
             record = self.instances.load(name)
             if record is None:
                 raise AssertionError("required instance unexpectedly absent")
+            if (
+                expected_operation_id is not None
+                and record["operation_id"] != expected_operation_id
+            ):
+                raise RunpodLocalError(
+                    f"instance {name} no longer owns the expected operation",
+                    code="instance_identity_changed",
+                )
+            if require_expired:
+                current_reasons = lease_expiry_reasons(
+                    record, now=self._now()
+                )
+                if not current_reasons:
+                    return {
+                        "schema_version": "runpod.termination-plan.v1",
+                        "instance_name": name,
+                        "phase": record["phase"],
+                        "action": "lease_no_longer_expired",
+                        "executed": False,
+                    }
+                reason = "+".join(current_reasons)
             if record["phase"] in TERMINAL_PHASES:
                 remote = self._find_owned_remote(record)
                 if remote is not None:
-                    raise RunpodLocalError(
-                        f"terminal receipt {name} still has live Pod "
-                        f"{remote.get('id')}",
-                        code="terminal_pod_leak",
+                    result = {
+                        "schema_version": "runpod.termination-plan.v1",
+                        "instance_name": name,
+                        "phase": record["phase"],
+                        "action": "delete_terminal_pod_leak",
+                        "pod_id": remote["id"],
+                        "remote_name": remote["name"],
+                        "network_volume_id": record["expected"][
+                            "network_volume_id"
+                        ],
+                        "volume_action": "preserve",
+                        "executed": execute,
+                    }
+                    if not execute:
+                        return result
+                    append_event(
+                        record,
+                        "terminal_leak_delete_started",
+                        at=self._now(),
+                        details={"reason": reason},
                     )
+                    self.instances.save(record)
+                    try:
+                        self._api().delete_pod(remote["id"])
+                    except HttpRequestError as error:
+                        if error.status != 404:
+                            append_event(
+                                record,
+                                "terminal_leak_delete_failed",
+                                at=self._now(),
+                            )
+                            self.instances.save(record)
+                            raise
+                    append_event(
+                        record,
+                        "terminal_leak_delete_completed",
+                        at=self._now(),
+                    )
+                    self.instances.save(record)
+                    return result
                 return {
                     "schema_version": "runpod.termination-plan.v1",
                     "instance_name": name,
@@ -656,6 +757,10 @@ class LifecycleManager:
         remote_by_id = {
             pod.get("id"): pod for pod in remote if isinstance(pod.get("id"), str)
         }
+        remote_by_name: dict[str, list[dict[str, Any]]] = {}
+        for pod in remote:
+            if isinstance(pod.get("name"), str):
+                remote_by_name.setdefault(pod["name"], []).append(pod)
         managed_ids = set()
         instances = []
         now = self._now()
@@ -665,6 +770,20 @@ class LifecycleManager:
             if isinstance(pod_id, str):
                 managed_ids.add(pod_id)
             drift = []
+            name_matches = remote_by_name.get(record["remote_name"], [])
+            if pod_id is None and record["phase"] in {
+                "intent",
+                "submitting",
+                "conflict",
+            }:
+                for candidate in name_matches:
+                    candidate_id = candidate.get("id")
+                    if isinstance(candidate_id, str):
+                        managed_ids.add(candidate_id)
+                if len(name_matches) == 1:
+                    pod = name_matches[0]
+                elif len(name_matches) > 1:
+                    drift.append("duplicate_remote_name")
             if live and pod is None and record["phase"] in {
                 "provisioning",
                 "active",
@@ -676,9 +795,19 @@ class LifecycleManager:
                 drift.append("pod_name_mismatch")
             if pod is not None and record["phase"] in TERMINAL_PHASES:
                 drift.append("terminal_receipt_has_live_pod")
+            if record["phase"] in {
+                "termination_pending",
+                "rollback_required",
+            }:
+                drift.append("cleanup_pending")
+            if record["phase"] == "intent" and pod is not None:
+                drift.append("unsubmitted_intent_has_live_pod")
             allocation_violations = []
             allocation_pending = []
-            if pod is not None and record["phase"] not in TERMINAL_PHASES:
+            if pod is not None and record["phase"] in {
+                "provisioning",
+                "active",
+            }:
                 allocation_violations, allocation_pending = (
                     verify_allocated_pod(record, pod)
                 )
@@ -724,8 +853,10 @@ class LifecycleManager:
                         record["name"],
                         execute=True,
                         reason="+".join(reasons),
+                        expected_operation_id=record["operation_id"],
+                        require_expired=True,
                     )
-                    action["executed"] = True
+                    action["executed"] = action["termination"]["executed"]
                 except RunpodLocalError as error:
                     action["error"] = {
                         "code": error.code,

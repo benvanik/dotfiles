@@ -1,0 +1,5 @@
+#!/bin/bash
+set -euo pipefail
+
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+exec "$SCRIPT_DIRECTORY/runpod" copy "$@"

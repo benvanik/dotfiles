@@ -74,6 +74,9 @@ Scripts in `bin/` prefixed with project names are optional and can be removed:
 These scripts assume specific directory layouts (`~/src/iree/`, `~/src/rocm/`, etc.).
 If you don't work on these projects, delete the scripts or ignore them.
 
+The Runpod command suite has its own security, storage, lifecycle, and
+agent-operation guide in [`runpod/README.md`](runpod/README.md).
+
 ## Platform Support
 
 | Platform | Status |

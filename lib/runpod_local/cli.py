@@ -10,6 +10,11 @@ from . import __version__
 from .agents import AGENT_DOCS
 from .cache import JsonCache
 from .errors import RunpodLocalError
+from .doctor_cli import (
+    DOCTOR_COMMANDS,
+    add_doctor_parser,
+    run_doctor_command,
+)
 from .http import JsonHttpTransport
 from .lifecycle_cli import (
     LIFECYCLE_COMMANDS,
@@ -24,6 +29,11 @@ from .provider_cli import (
     PROVIDER_COMMANDS,
     add_provider_parsers,
     run_provider_command,
+)
+from .remote_cli import (
+    REMOTE_COMMANDS,
+    add_remote_parsers,
+    run_remote_command,
 )
 
 
@@ -159,6 +169,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_provider_parsers(subparsers)
     add_lifecycle_parsers(subparsers)
+    add_remote_parsers(subparsers)
+    add_doctor_parser(subparsers)
     return parser
 
 
@@ -240,16 +252,34 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         return run_provider_command(args)
     if args.command in LIFECYCLE_COMMANDS:
         return run_lifecycle_command(args)
+    if args.command in REMOTE_COMMANDS:
+        return run_remote_command(args)
+    if args.command in DOCTOR_COMMANDS:
+        return run_doctor_command(args)
     raise RunpodLocalError(
         f"unsupported command: {args.command}",
         code="unsupported_command",
     )
 
 
+def parse_arguments(
+    parser: argparse.ArgumentParser, arguments: list[str]
+) -> argparse.Namespace:
+    remote_command: list[str] | None = None
+    if arguments and arguments[0] == "ssh" and "--" in arguments[1:]:
+        delimiter = arguments.index("--", 1)
+        remote_command = arguments[delimiter + 1 :]
+        arguments = arguments[:delimiter]
+    args = parser.parse_args(arguments)
+    if remote_command is not None:
+        args.remote_command = remote_command
+    return args
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     arguments = list(sys.argv[1:] if argv is None else argv)
-    args = parser.parse_args(arguments)
+    args = parse_arguments(parser, arguments)
     try:
         return run(args, parser)
     except RunpodLocalError as error:

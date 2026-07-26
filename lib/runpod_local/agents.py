@@ -16,10 +16,24 @@ Planning commands:
 - `runpod-model`: resolve an exact Hugging Face revision and checkpoint.
 - `runpod-place`: apply the versioned static VRAM placement policy.
 - `runpod-stock`: query live stock and on-demand price.
+- `runpod-volume`: plan/reconcile persistent cache-volume creation.
+- `runpod-template`: inspect account-visible templates without environment data.
 - `runpod-profile`: author validated reusable launch policy.
 
-Lifecycle commands are documented by the installed command's own
-`--agents-md` output.
+Session commands:
+
+- `runpod-up`: plan or execute one crash-reconcilable Pod launch.
+- `runpod-status`: reconcile receipts against exact live Pod identities.
+- `runpod-down`: plan or delete one Pod while preserving its volume.
+- `runpod-ttl`: inspect/mutate leases or run the foreground cleanup watcher.
+- `runpod-ssh`: open a validated session or one quoted remote command.
+- `runpod-tunnel`: open one loopback-only tunnel without faking activity.
+- `runpod-copy`: copy persistent cache/tool data or ephemeral session data.
+- `runpod-doctor`: read-only local/provider integrity audit.
+
+Paid mutations always require `--execute`. `runpod-ttl set`, `extend`, and
+`touch` are immediate local lease mutations; they do not contact Runpod.
+Network volumes outlive Pods and are never deleted by this suite.
 """,
     "model": """# `runpod-model`
 
@@ -48,7 +62,7 @@ Runpod GPU catalog and explicit memory policy.
 
 ```sh
 runpod-place Qwen/Qwen3-32B --gpu pro6000 --gpu h200 --gpu b200 --json
-runpod-place openai/gpt-oss-120b --context 131072 --list-gpus
+runpod-place --list-gpus
 ```
 
 Statuses have strict meanings:
@@ -104,13 +118,18 @@ without `--execute`.
 
 ```sh
 runpod-volume list --json
-runpod-volume create model-cache --size-gb 500 \\
-  --data-center US-KS-2 --json
+runpod-volume create model-cache --size-gb 250 \\
+  --data-center DATA_CENTER_ID --json
 ```
 
 Network volumes pin Pods to one Secure Cloud datacenter and survive Pod
-termination. This command intentionally has no volume-delete action: model
-cache deletion is a separate high-risk operation, not session cleanup.
+termination. Creation validates the live datacenter, reports the dated standard
+storage estimate, and reconciles one exact existing name/size/datacenter match
+before any POST. Same-state-root creates for one name are serialized, and the
+returned ID/name/size/datacenter must match before success is reported. Never
+blindly retry an ambiguous create; inspect `list` first.
+This command intentionally has no volume-delete action: model-cache deletion is
+a separate console/API action, not session cleanup.
 """,
     "template": """# `runpod-template`
 
@@ -130,16 +149,20 @@ network-volume identity, cache paths, price cap, SSH identity, and hard TTL.
 
 ```sh
 runpod-profile create nvidia-dev \\
-  --template-id TEMPLATE_ID --network-volume-id VOLUME_ID \\
-  --gpu pro6000 --gpu h200 --gpu b200 --gpu b300 \\
-  --max-hourly 8 --ttl 4h --json
+  --image IMAGE_OR_DIGEST --network-volume-id VOLUME_ID \\
+  --gpu pro6000-server --gpu h200 \\
+  --max-hourly 4.50 --ttl 4h \\
+  --identity-file ~/.ssh/id_ed25519_runpod \\
+  --public-key-file ~/.ssh/id_ed25519_runpod.pub --json
 ```
 
 Literal values for environment names containing TOKEN, KEY, SECRET, PASSWORD,
 or CREDENTIAL are rejected. Use `--secret-env
 HF_TOKEN=runpod_secret_name`; the profile stores only the Runpod secret
-reference. Local profiles are advisory across machines; provider state and
-exact Pod IDs remain authoritative.
+reference. `PUBLIC_KEY` is provider-owned; the tool validates and injects one
+profile-specific `SSH_PUBLIC_KEY`. The private/public pair is revalidated
+immediately before a fresh billable submission. Local profiles are advisory
+across machines; provider state and exact Pod IDs remain authoritative.
 """,
     "up": """# `runpod-up`
 
@@ -208,11 +231,93 @@ runpod-ttl extend compiler 30m --json
 runpod-ttl touch compiler --source benchmark_driver --json
 runpod-ttl enforce --json
 runpod-ttl enforce --execute --json
+runpod-ttl watch --execute --interval 30s
 ```
 
-Enforcement is one-shot and plan-only without `--execute`. A local deadline is
-not a fleet guarantee unless an awake credentialed process invokes enforcement
-regularly. Expired leases cannot be touched or extended. Cleanup deletes only
-the exact verified Pod and preserves its network volume.
+`set` changes total lifetime while retaining the original submission anchor;
+`extend` explicitly moves the current deadline. `enforce` is one-shot and
+plan-only without `--execute`; `watch` is a foreground enforcer and requires
+`--execute`. With `--json`, watcher output is one compact JSON object per line.
+A local deadline is not a fleet guarantee unless that credentialed process
+remains awake. Expired leases cannot be touched or extended. Pending cleanup is
+retried, stale scans recheck operation identity and expiry, and exact deletion
+always preserves the network volume.
+""",
+    "ssh": """# `runpod-ssh`
+
+Resolve an active local receipt against the exact live Pod, validate its
+allocation and mapped SSH endpoint, then use one dedicated identity and one
+per-Pod known-hosts file.
+
+```sh
+runpod-ssh compiler
+runpod-ssh compiler -- nvidia-smi --query-gpu=name,memory.total --format=csv
+runpod-ssh --json compiler
+```
+
+Remote arguments after `--` are encoded as one `exec` command with POSIX shell
+quoting; they are never appended as raw OpenSSH arguments. Endpoint inspection
+is mutually exclusive with a remote command so command arguments are not
+printed accidentally. First connection uses explicit per-Pod TOFU
+(`accept-new`); a later key change fails and is never silently removed.
+
+The subprocess receives neither Runpod/Hugging Face credentials nor an SSH
+agent socket. Attached SSH commands emit explicit idle heartbeats bound to the
+exact operation/Pod, but never move the hard deadline.
+""",
+    "tunnel": """# `runpod-tunnel`
+
+Open one foreground SSH tunnel with loopback binding on both machines.
+
+```sh
+runpod-tunnel compiler --local-port 8000 --remote-port 8000
+runpod-tunnel --json compiler --local-port 8000 --remote-port 8000
+```
+
+The exact forwarding rule is
+`127.0.0.1:LOCAL:127.0.0.1:REMOTE`; there is no public-bind option. Run vLLM
+on remote `127.0.0.1` and expose only `22/tcp` from the Pod. The foreground
+process checks the lease but does not refresh idle activity merely because a
+tunnel exists. The request/benchmark driver should call `runpod-ttl touch`
+after real work.
+""",
+    "copy": """# `runpod-copy`
+
+Copy in either direction through the reconciled direct SSH endpoint.
+
+```sh
+runpod-copy push compiler ./bench.py /workspace/tools/bench.py
+runpod-copy pull compiler /workspace/results/profile.json ./profile.json
+runpod-copy push --recursive compiler ./loom /workspace/src/loom
+```
+
+Remote operands must be canonical absolute paths beneath persistent
+`/workspace` or ephemeral `/root/runpod-session` and use a conservative
+literal-segment grammar: no traversal, whitespace, globs, colons, shell syntax,
+backslashes, or tildes. Local operands are made absolute, OpenSSH
+config/proxies/agents are disabled, and every transfer uses the per-Pod
+known-hosts file. `--json` or `--print` inspects without copying.
+""",
+    "doctor": """# `runpod-doctor`
+
+Run a read-only integrity audit over command availability, credential and state
+permissions, profile/receipt schemas, SSH identities, dedicated host keys, and
+overdue leases.
+
+```sh
+runpod-doctor
+runpod-doctor --live --json
+```
+
+`--live` additionally lists Pods once, volumes once, and stock once, then joins
+active receipts to immutable Pod IDs and validates allocation, price cap,
+volume, and SSH readiness. Missing endpoint mappings during initialization are
+warnings; identity/policy drift and terminal receipts with live Pods are
+errors. Pods owned by a split-state controller are reported as unmanaged and
+never mutated.
+
+Doctor never creates, starts, stops, or deletes provider resources and never
+prints credential or remote environment values. Its exit status is nonzero
+when any check is an error.
 """,
 }

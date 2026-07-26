@@ -21,6 +21,11 @@ from runpod_local.timeutil import parse_utc_timestamp
 GPU_ID = "NVIDIA RTX PRO 6000 Blackwell Server Edition"
 NOW = datetime.datetime(2026, 7, 26, 20, 0, tzinfo=datetime.timezone.utc)
 OPERATION_ID = uuid.UUID("12345678-1234-4234-8234-123456789abc")
+SSH_PUBLIC_KEY = (
+    "ssh-ed25519 "
+    "AAAAC3NzaC1lZDI1NTE5AAAAIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f "
+    "fixture@example"
+)
 
 
 def profile(**overrides):
@@ -31,6 +36,7 @@ def profile(**overrides):
         "default_ttl_seconds": 3600,
         "image_name": "runpod/pytorch:fixture",
         "network_volume_id": "volume123",
+        "ssh_public_key": SSH_PUBLIC_KEY,
     }
     arguments.update(overrides)
     return create_profile(**arguments)
@@ -182,6 +188,10 @@ class LifecycleTest(unittest.TestCase):
         self.state = StateStore(
             pathlib.Path(self.temporary.name) / "runpod-state"
         )
+        self.identity = pathlib.Path(self.temporary.name) / "id_ed25519"
+        self.identity.write_text("fixture private key")
+        self.identity.chmod(0o600)
+        self.launch_profile = profile(identity_file=str(self.identity))
         self.api = FakeApi()
         self.clock = MutableClock()
         self.manager = LifecycleManager(
@@ -189,12 +199,14 @@ class LifecycleTest(unittest.TestCase):
             self.state,
             clock=self.clock,
             uuid_factory=lambda: OPERATION_ID,
+            profile_ssh_validator=lambda _: None,
+            key_pair_validator=lambda _identity, _public: None,
         )
 
     def launch(self, **overrides):
         arguments = {
             "name": "compiler",
-            "profile": profile(),
+            "profile": self.launch_profile,
             "ttl_seconds": 3600,
             "idle_timeout_seconds": 900,
         }
@@ -387,6 +399,27 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual(record["phase"], "rollback_required")
         self.assertEqual(record["pod_id"], "pod123")
 
+    def test_intent_key_failure_prevents_first_billable_request(self):
+        def reject_key_pair(_identity, _public_key):
+            raise RunpodLocalError(
+                "fixture key mismatch",
+                code="ssh_key_mismatch",
+            )
+
+        self.manager.key_pair_validator = reject_key_pair
+        with self.assertRaises(RunpodLocalError) as caught:
+            self.launch()
+
+        record = InstanceStore(self.state).load("compiler")
+        self.assertEqual(caught.exception.code, "ssh_key_mismatch")
+        self.assertEqual(record["phase"], "intent")
+        self.assertEqual(self.api.create_calls, 0)
+
+        self.manager.key_pair_validator = lambda _identity, _public: None
+        resumed = self.launch()
+        self.assertEqual(resumed["phase"], "active")
+        self.assertEqual(self.api.create_calls, 1)
+
     def test_down_is_plan_only_then_deletes_pod_but_never_volume(self):
         self.launch()
 
@@ -403,6 +436,47 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual(
             InstanceStore(self.state).load("compiler")["phase"], "terminated"
         )
+
+    def test_terminal_exact_identity_leak_can_be_cleaned_up(self):
+        self.launch()
+        self.manager.terminate("compiler", execute=True, reason="operator")
+        terminal = InstanceStore(self.state).load("compiler")
+        self.api.pods.append(dict(terminal["provider"]))
+
+        plan = self.manager.terminate(
+            "compiler", execute=False, reason="terminal_leak_recovery"
+        )
+        self.assertEqual(plan["action"], "delete_terminal_pod_leak")
+
+        self.manager.terminate(
+            "compiler", execute=True, reason="terminal_leak_recovery"
+        )
+        self.assertEqual(self.api.pods, [])
+        self.assertEqual(
+            InstanceStore(self.state).load("compiler")["phase"],
+            "terminated",
+        )
+
+    def test_stale_operation_identity_cannot_delete_reused_local_name(self):
+        first = self.launch()
+        self.manager.terminate("compiler", execute=True, reason="operator")
+        self.manager.uuid_factory = lambda: uuid.UUID(
+            "87654321-4321-4321-8321-ba9876543210"
+        )
+        second = self.launch()
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            self.manager.terminate(
+                "compiler",
+                execute=True,
+                reason="stale_watcher",
+                expected_operation_id=first["operation_id"],
+                require_expired=True,
+            )
+
+        self.assertEqual(caught.exception.code, "instance_identity_changed")
+        self.assertEqual(second["phase"], "active")
+        self.assertEqual(self.api.delete_calls, ["pod123"])
 
     def test_expired_lease_cannot_be_touched_or_extended(self):
         record = self.launch()
@@ -439,6 +513,81 @@ class LifecycleTest(unittest.TestCase):
 
         self.assertTrue(result["actions"][0]["executed"])
         self.assertEqual(self.api.delete_calls, ["pod123"])
+
+    def test_failed_ttl_delete_is_retried_until_receipt_is_terminal(self):
+        record = self.launch()
+        self.clock.now = parse_utc_timestamp(record["lease"]["expires_at"])
+        self.api.delete_error = HttpRequestError(
+            "fixture transient delete failure", status=503
+        )
+
+        first = self.manager.enforce_ttl(execute=True)
+
+        self.assertIn("error", first["actions"][0])
+        self.assertEqual(
+            InstanceStore(self.state).load("compiler")["phase"],
+            "termination_pending",
+        )
+
+        self.api.delete_error = None
+        second = self.manager.enforce_ttl(execute=True)
+
+        self.assertEqual(
+            second["actions"][0]["reasons"], ["termination_retry"]
+        )
+        self.assertTrue(second["actions"][0]["executed"])
+        self.assertEqual(
+            InstanceStore(self.state).load("compiler")["phase"],
+            "terminated",
+        )
+
+    def test_stale_ttl_scan_cannot_delete_a_freshly_heartbeated_lease(self):
+        record = self.launch()
+        old_deadline = parse_utc_timestamp(
+            record["lease"]["last_activity_at"]
+        ) + datetime.timedelta(
+            seconds=record["lease"]["idle_timeout_seconds"]
+        )
+        self.clock.now = old_deadline + datetime.timedelta(seconds=1)
+        self.assertIn(
+            "explicit_heartbeat_idle_timeout",
+            lease_expiry_reasons(record, now=self.clock.now),
+        )
+        InstanceStore(self.state).touch(
+            "compiler",
+            now=old_deadline - datetime.timedelta(seconds=1),
+            source="racing_heartbeat",
+            expected_operation_id=record["operation_id"],
+            expected_pod_id=record["pod_id"],
+        )
+
+        result = self.manager.terminate(
+            "compiler",
+            execute=True,
+            reason="stale_idle_scan",
+            expected_operation_id=record["operation_id"],
+            require_expired=True,
+        )
+
+        self.assertEqual(result["action"], "lease_no_longer_expired")
+        self.assertFalse(result["executed"])
+        self.assertEqual(self.api.delete_calls, [])
+
+    def test_hard_ttl_set_remains_anchored_to_submission(self):
+        record = self.launch()
+        activated_at = parse_utc_timestamp(record["lease"]["activated_at"])
+        self.clock.now = activated_at + datetime.timedelta(seconds=300)
+
+        updated = InstanceStore(self.state).set_ttl(
+            "compiler",
+            ttl_seconds=1800,
+            now=self.clock.now,
+        )
+
+        self.assertEqual(
+            parse_utc_timestamp(updated["lease"]["expires_at"]),
+            activated_at + datetime.timedelta(seconds=1800),
+        )
 
 
 if __name__ == "__main__":

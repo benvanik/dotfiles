@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import urllib.parse
 from typing import Any
 
@@ -13,6 +14,7 @@ from .timeutil import utc_timestamp
 
 REST_BASE = "https://rest.runpod.io/v1"
 GRAPHQL_URL = "https://api.runpod.io/graphql"
+AVAILABLE_STOCK_STATUSES = frozenset({"High", "Medium", "Low"})
 GPU_TYPES_QUERY = """
 query {
   gpuTypes {
@@ -60,13 +62,33 @@ def _provider_id(value: str, *, label: str) -> str:
 
 def _numeric(value: Any) -> float | None:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return float(value)
+        result = float(value)
+        return result if math.isfinite(result) and result >= 0 else None
     if isinstance(value, str):
         try:
-            return float(value)
+            result = float(value)
         except ValueError:
             return None
+        return result if math.isfinite(result) and result >= 0 else None
     return None
+
+
+def gpu_stock_is_available(gpu: dict[str, Any], *, gpu_count: int) -> bool:
+    """Interpret Runpod's global stock signal without requiring count hints.
+
+    The live GraphQL service can report High/Medium/Low stock while returning
+    an empty availableGpuCounts list. Treat the stock status as authoritative
+    in that case; a non-empty count list remains an additional constraint.
+    """
+    if gpu_count <= 0:
+        raise RunpodLocalError(
+            "GPU count must be positive",
+            code="invalid_gpu_count",
+        )
+    if gpu.get("stock_status") not in AVAILABLE_STOCK_STATUSES:
+        return False
+    counts = gpu.get("available_gpu_counts")
+    return not counts or gpu_count in counts
 
 
 def normalize_pod(pod: dict[str, Any]) -> dict[str, Any]:
@@ -84,25 +106,78 @@ def normalize_pod(pod: dict[str, Any]) -> dict[str, Any]:
         if isinstance(pod.get("portMappings"), dict)
         else {}
     )
+    adjusted_cost = _numeric(pod.get("adjustedCostPerHr"))
+    cost_per_hour = (
+        adjusted_cost
+        if adjusted_cost is not None
+        else _numeric(pod.get("costPerHr"))
+    )
     return {
         "id": pod.get("id"),
         "name": pod.get("name"),
         "desired_status": pod.get("desiredStatus"),
         "image": pod.get("image", pod.get("imageName")),
+        "template_id": pod.get("templateId"),
+        "interruptible": pod.get("interruptible"),
+        "locked": pod.get("locked"),
         "gpu_id": gpu.get("id", machine.get("gpuTypeId")),
         "gpu_count": gpu.get("count"),
-        "cost_per_hour": _numeric(
-            pod.get("adjustedCostPerHr", pod.get("costPerHr"))
-        ),
+        "cost_per_hour": cost_per_hour,
         "data_center_id": machine.get("dataCenterId"),
+        "secure_cloud": machine.get("secureCloud"),
         "machine_id": pod.get("machineId"),
         "network_volume_id": (
             network_volume.get("id") if network_volume is not None else None
         ),
-        "network_volume": network_volume,
+        "network_volume": (
+            {
+                "id": network_volume.get("id"),
+                "name": network_volume.get("name"),
+                "size_gb": network_volume.get("size"),
+                "data_center_id": network_volume.get("dataCenterId"),
+            }
+            if network_volume is not None
+            else None
+        ),
         "public_ip": pod.get("publicIp"),
         "port_mappings": port_mappings,
         "ports": pod.get("ports") if isinstance(pod.get("ports"), list) else [],
+    }
+
+
+def normalize_volume(volume: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": volume.get("id"),
+        "name": volume.get("name"),
+        "size_gb": volume.get("size"),
+        "data_center_id": volume.get("dataCenterId"),
+    }
+
+
+def normalize_data_center(center: dict[str, Any]) -> dict[str, Any]:
+    availability = center.get("gpuAvailability")
+    if not isinstance(availability, list):
+        availability = []
+    normalized_availability = []
+    for gpu in availability:
+        if not isinstance(gpu, dict):
+            raise RunpodLocalError(
+                "Runpod data-center availability contains a non-object",
+                code="invalid_provider_response",
+            )
+        normalized_availability.append(
+            {
+                "gpu_id": gpu.get("gpuTypeId"),
+                "display_name": gpu.get("displayName"),
+                "stock_status": gpu.get("stockStatus") or "None",
+            }
+        )
+    normalized_availability.sort(key=lambda gpu: gpu["gpu_id"] or "")
+    return {
+        "data_center_id": center.get("id"),
+        "name": center.get("name"),
+        "location": center.get("location"),
+        "gpu_availability": normalized_availability,
     }
 
 
@@ -241,7 +316,7 @@ class RunpodApi:
                 "Runpod network-volume response was not an object list",
                 code="invalid_provider_response",
             )
-        return value
+        return [normalize_volume(volume) for volume in value]
 
     def get_network_volume(self, volume_id: str) -> dict[str, Any]:
         volume_id = _provider_id(volume_id, label="network volume ID")
@@ -253,7 +328,7 @@ class RunpodApi:
                 "Runpod network-volume response was not an object",
                 code="invalid_provider_response",
             )
-        return value
+        return normalize_volume(value)
 
     def create_network_volume(
         self, *, name: str, size_gb: int, data_center_id: str
@@ -274,7 +349,7 @@ class RunpodApi:
                 "Runpod network-volume creation response was not an object",
                 code="invalid_provider_response",
             )
-        return value
+        return normalize_volume(value)
 
     def list_templates(self) -> list[dict[str, Any]]:
         value = self._rest("GET", "templates")
@@ -332,7 +407,7 @@ class RunpodApi:
                     "memory_gb": gpu.get("memoryInGb"),
                     "secure_cloud": gpu.get("secureCloud"),
                     "community_cloud": gpu.get("communityCloud"),
-                    "stock_status": lowest.get("stockStatus", "None"),
+                    "stock_status": lowest.get("stockStatus") or "None",
                     "on_demand_price_per_gpu_hour": _numeric(
                         lowest.get("uninterruptablePrice")
                     ),
@@ -362,7 +437,12 @@ class RunpodApi:
                     "Runpod GraphQL response has no data-center list",
                     code="invalid_provider_response",
                 )
-            data_centers = raw_centers
+            data_centers = [
+                normalize_data_center(center) for center in raw_centers
+            ]
+            data_centers.sort(
+                key=lambda center: center["data_center_id"] or ""
+            )
         return {
             "schema_version": "runpod.stock.v1",
             "generated_at": utc_timestamp(),

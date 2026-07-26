@@ -9,7 +9,7 @@ import pathlib
 import re
 from typing import Any
 
-from .api import RunpodApi
+from .api import RunpodApi, gpu_stock_is_available
 from .auth import ApiCredential, CredentialStore
 from .errors import RunpodLocalError
 from .output import print_json
@@ -304,6 +304,11 @@ def _human_line(value: dict[str, Any]) -> str:
             f"{value.get('id')}  {value.get('size')} GB  "
             f"{value.get('dataCenterId')}  {value.get('name')}"
         )
+    if "data_center_id" in value and "size_gb" in value:
+        return (
+            f"{value.get('id')}  {value.get('size_gb')} GB  "
+            f"{value.get('data_center_id')}  {value.get('name')}"
+        )
     if value.get("schema_version") == "runpod.profile.v1":
         pod = value["pod"]
         return (
@@ -438,9 +443,8 @@ def _run_stock(args: argparse.Namespace) -> int:
         memory = gpu.get("memory_gb")
         if not isinstance(memory, (int, float)) or memory < args.min_memory:
             continue
-        counts = gpu.get("available_gpu_counts", [])
-        if args.available_only and (
-            gpu.get("stock_status") == "None" or args.gpu_count not in counts
+        if args.available_only and not gpu_stock_is_available(
+            gpu, gpu_count=args.gpu_count
         ):
             continue
         price = gpu.get("on_demand_price_per_gpu_hour")
@@ -467,7 +471,15 @@ def _run_volume(args: argparse.Namespace) -> int:
         )
     if args.volume_action == "list":
         value = _api(args).list_network_volumes()
-        _print_result(value, as_json=args.json)
+        if args.json:
+            print_json(
+                {
+                    "schema_version": "runpod.volume-list.v1",
+                    "volumes": value,
+                }
+            )
+        else:
+            _print_result(value, as_json=False)
         return 0
     if args.volume_action == "get":
         value = _api(args).get_network_volume(args.volume_id)
@@ -542,7 +554,15 @@ def _run_template(args: argparse.Namespace) -> int:
                 f"{template.get('image_name', '')}"
             ).casefold()
         ]
-    _print_result(templates, as_json=args.json)
+    if args.json:
+        print_json(
+            {
+                "schema_version": "runpod.template-list.v1",
+                "templates": templates,
+            }
+        )
+    else:
+        _print_result(templates, as_json=False)
     return 0
 
 

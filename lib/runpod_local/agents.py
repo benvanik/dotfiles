@@ -141,4 +141,78 @@ HF_TOKEN=runpod_secret_name`; the profile stores only the Runpod secret
 reference. Local profiles are advisory across machines; provider state and
 exact Pod IDs remain authoritative.
 """,
+    "up": """# `runpod-up`
+
+Plan by default. `--execute` fsyncs a unique local launch intent before the
+first create request, reconciles an ambiguous request by exact UUID-bearing
+remote name, verifies the actual GPU/count/datacenter/volume/image/security/
+ports/total price, and rolls back a contradictory allocation.
+
+```sh
+runpod-up compiler --profile pro-h200 --model Qwen/Qwen3-32B \\
+  --context 32768 --ttl 4h --idle-ttl 30m --json
+runpod-up compiler --profile pro-h200 --model Qwen/Qwen3-32B \\
+  --context 32768 --ttl 4h --idle-ttl 30m --execute --json
+```
+
+Static model placement admits only `candidate` by default.
+`--allow-indeterminate-fit` is explicit and never admits `tight` or
+`impossible`. Omitting `--model` means the profile/operator owns fit.
+
+The hard deadline starts immediately before Pod submission, so provisioning
+time counts. A submission with an ambiguous response and no visible matching
+Pod is never re-submitted automatically: retry this same command later to
+reconcile. Local locks coordinate only one machine. A second machine with a
+split state root can launch another Pod; `runpod-status` exposes it as
+unmanaged here.
+""",
+    "status": """# `runpod-status`
+
+Join private local receipts to the live provider by immutable Pod ID and report
+drift plus unmanaged Pods. Remote state is authoritative. No mutation occurs.
+
+```sh
+runpod-status --json
+runpod-status compiler --json
+runpod-status --local-only --json
+```
+
+`--local-only` needs no API credential and makes no claim that a locally active
+Pod still exists. A UUID-prefixed Pod without a receipt can belong to another
+controller and is never deleted automatically.
+""",
+    "down": """# `runpod-down`
+
+Plan by default. `--execute` re-fetches the exact receipt Pod ID, requires its
+remote name to match, persists termination intent, and deletes the Pod.
+
+```sh
+runpod-down compiler --json
+runpod-down compiler --execute --json
+```
+
+Session cleanup never calls Pod stop and never deletes the network volume.
+Network-volume model caches survive termination. Identity conflicts and
+ambiguous submissions fail closed instead of guessing which Pod to delete.
+""",
+    "ttl": """# `runpod-ttl`
+
+Hard TTL is an absolute billing guard anchored to submission. Idle TTL means no
+explicit heartbeat from these local tools; it does not inspect GPU utilization
+or vLLM requests. Heartbeats never move the hard deadline.
+
+```sh
+runpod-ttl show compiler --json
+runpod-ttl set compiler 4h --json
+runpod-ttl extend compiler 30m --json
+runpod-ttl touch compiler --source benchmark_driver --json
+runpod-ttl enforce --json
+runpod-ttl enforce --execute --json
+```
+
+Enforcement is one-shot and plan-only without `--execute`. A local deadline is
+not a fleet guarantee unless an awake credentialed process invokes enforcement
+regularly. Expired leases cannot be touched or extended. Cleanup deletes only
+the exact verified Pod and preserves its network volume.
+""",
 }

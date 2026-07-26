@@ -11,6 +11,11 @@ from .agents import AGENT_DOCS
 from .cache import JsonCache
 from .errors import RunpodLocalError
 from .http import JsonHttpTransport
+from .lifecycle_cli import (
+    LIFECYCLE_COMMANDS,
+    add_lifecycle_parsers,
+    run_lifecycle_command,
+)
 from .model import HuggingFaceClient, ModelInspector
 from .output import print_json, print_model_human, print_placement_human
 from .paths import state_root
@@ -153,6 +158,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="List catalog IDs and aliases without inspecting a model.",
     )
     add_provider_parsers(subparsers)
+    add_lifecycle_parsers(subparsers)
     return parser
 
 
@@ -232,6 +238,8 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         return 0
     if args.command in PROVIDER_COMMANDS:
         return run_provider_command(args)
+    if args.command in LIFECYCLE_COMMANDS:
+        return run_lifecycle_command(args)
     raise RunpodLocalError(
         f"unsupported command: {args.command}",
         code="unsupported_command",

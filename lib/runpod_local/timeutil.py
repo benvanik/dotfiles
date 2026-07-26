@@ -16,6 +16,10 @@ DURATION_UNITS = {
     "d": 24 * 60 * 60,
 }
 MAX_DURATION_SECONDS = 30 * 24 * 60 * 60
+UTC_TIMESTAMP_PATTERN = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T"
+    r"[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+)
 
 
 def parse_duration(value: str) -> int:
@@ -54,3 +58,19 @@ def utc_timestamp(
         .isoformat()
         .replace("+00:00", "Z")
     )
+
+
+def parse_utc_timestamp(value: str) -> datetime.datetime:
+    if not isinstance(value, str) or not UTC_TIMESTAMP_PATTERN.fullmatch(value):
+        raise RunpodLocalError(
+            f"invalid UTC timestamp: {value!r}",
+            code="invalid_timestamp",
+        )
+    try:
+        instant = datetime.datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as error:
+        raise RunpodLocalError(
+            f"invalid UTC timestamp: {value!r}",
+            code="invalid_timestamp",
+        ) from error
+    return instant.astimezone(datetime.timezone.utc)

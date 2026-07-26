@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import math
 import unittest
 
-from runpod_local.api import RunpodApi
+from runpod_local.api import RunpodApi, gpu_stock_is_available, normalize_pod
 from runpod_local.auth import ApiCredential
 from runpod_local.errors import RunpodLocalError
 
@@ -79,6 +80,21 @@ class RunpodApiTest(unittest.TestCase):
         self.assertNotIn("fixture-runpod-token", request["url"])
         self.assertIn("includeNetworkVolume=true", request["url"])
 
+    def test_pod_cost_falls_back_and_rejects_nonfinite_values(self):
+        fallback = normalize_pod(
+            {"adjustedCostPerHr": None, "costPerHr": "1.99"}
+        )
+        nonfinite = normalize_pod(
+            {"adjustedCostPerHr": math.inf, "costPerHr": "nan"}
+        )
+        negative = normalize_pod(
+            {"adjustedCostPerHr": -1, "costPerHr": "-2"}
+        )
+
+        self.assertEqual(fallback["cost_per_hour"], 1.99)
+        self.assertIsNone(nonfinite["cost_per_hour"])
+        self.assertIsNone(negative["cost_per_hour"])
+
     def test_create_volume_uses_exact_rest_contract(self):
         response = {
             "id": "volume123",
@@ -90,7 +106,15 @@ class RunpodApiTest(unittest.TestCase):
         result = api.create_network_volume(
             name="model-cache", size_gb=500, data_center_id="US-KS-2"
         )
-        self.assertEqual(result, response)
+        self.assertEqual(
+            result,
+            {
+                "id": "volume123",
+                "name": "model-cache",
+                "size_gb": 500,
+                "data_center_id": "US-KS-2",
+            },
+        )
         request = transport.requests[0]
         self.assertEqual(request["method"], "POST")
         self.assertEqual(request["expected_statuses"], (201,))
@@ -138,6 +162,74 @@ class RunpodApiTest(unittest.TestCase):
             request["headers"]["Authorization"], "Bearer fixture-runpod-token"
         )
         self.assertIn("gpuCount: 1", request["payload"]["query"])
+
+    def test_data_center_stock_is_normalized(self):
+        gpu_response = {"data": {"gpuTypes": []}}
+        center_response = {
+            "data": {
+                "dataCenters": [
+                    {
+                        "id": "US-NC-2",
+                        "name": "North Carolina",
+                        "location": "US",
+                        "gpuAvailability": [
+                            {
+                                "gpuTypeId": "NVIDIA B200",
+                                "displayName": "B200",
+                                "stockStatus": None,
+                            }
+                        ],
+                    }
+                ]
+            }
+        }
+        api, _ = api_with_responses(gpu_response, center_response)
+
+        centers = api.stock(include_data_centers=True)["data_centers"]
+
+        self.assertEqual(centers[0]["data_center_id"], "US-NC-2")
+        self.assertEqual(
+            centers[0]["gpu_availability"][0]["stock_status"], "None"
+        )
+
+    def test_stock_status_remains_usable_when_count_hints_are_empty(self):
+        api, _ = api_with_responses(
+            {
+                "data": {
+                    "gpuTypes": [
+                        {
+                            "id": "NVIDIA H200",
+                            "displayName": "H200",
+                            "memoryInGb": 141,
+                            "secureCloud": True,
+                            "communityCloud": False,
+                            "lowestPrice": {
+                                "stockStatus": "High",
+                                "uninterruptablePrice": 4.39,
+                                "availableGpuCounts": [],
+                            },
+                        },
+                        {
+                            "id": "NVIDIA H200 NVL",
+                            "displayName": "H200 NVL",
+                            "memoryInGb": 143,
+                            "secureCloud": True,
+                            "communityCloud": False,
+                            "lowestPrice": {
+                                "stockStatus": None,
+                                "uninterruptablePrice": None,
+                                "availableGpuCounts": [],
+                            },
+                        },
+                    ]
+                }
+            }
+        )
+        gpus = api.stock(gpu_count=1)["gpus"]
+
+        self.assertTrue(gpu_stock_is_available(gpus[0], gpu_count=1))
+        self.assertEqual(gpus[1]["stock_status"], "None")
+        self.assertFalse(gpu_stock_is_available(gpus[1], gpu_count=1))
 
     def test_graphql_errors_fail_loud(self):
         api, _ = api_with_responses(

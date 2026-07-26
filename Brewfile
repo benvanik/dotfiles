@@ -8,6 +8,7 @@ brew "zsh"
 brew "git"
 brew "curl"
 brew "wget"
+brew "python"
 
 # Required by dotfiles.
 brew "fzf"

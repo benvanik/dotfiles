@@ -67,6 +67,7 @@ Scripts in `bin/` prefixed with project names are optional and can be removed:
 | Prefix | Project | Purpose |
 |--------|---------|---------|
 | `iree-*` | [IREE](https://github.com/iree-org/iree) | Compiler worktree and build management |
+| `runpod-*` | [Runpod](https://www.runpod.io/) | Private GPU model planning and session lifecycle |
 | `therock-*` | [TheRock](https://github.com/ROCm/TheRock) | ROCm/HIP compiler development |
 | `vulkan-*` | Vulkan SDK | SDK installation and layer building |
 
@@ -215,6 +216,7 @@ Installed automatically by `install-deps.sh`:
 | ripgrep | Fast grep | `apt install ripgrep` | `brew install ripgrep` |
 | jq | JSON processor | `apt install jq` | `brew install jq` |
 | git | Version control | `apt install git` | `brew install git` |
+| Python 3 | Standard-library command tools | `apt install python3` | `brew install python` |
 
 ## Recommended Packages
 

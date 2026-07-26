@@ -39,7 +39,7 @@ if [ "$MODE" = "ubuntu" ]; then
     # Verify core tools installed.
     section "tools" "Verifying installed tools"
 
-    for tool in zsh git fzf rg jq; do
+    for tool in zsh git fzf rg jq python3; do
         if command -v "$tool" &>/dev/null; then
             pass "$tool installed"
         else

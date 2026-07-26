@@ -97,6 +97,22 @@ if [ $bash_fail -eq 0 ]; then
     pass "bash syntax: $bash_pass files"
 fi
 
+# ============================================================================
+# Python Command Tests
+# ============================================================================
+section "python" "Python command validation"
+
+if command -v python3 &>/dev/null; then
+    if PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$DOTFILES/lib" \
+        python3 -m unittest discover -s test -p 'test_runpod_*.py'; then
+        pass "Runpod command tests"
+    else
+        fail "Runpod command tests"
+    fi
+else
+    fail "python3 required for Python commands"
+fi
+
 # Zsh files.
 zsh_files=("shell/zshrc")
 for f in shell/zshrc.d/*.zsh themes/*.zsh; do

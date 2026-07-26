@@ -61,7 +61,7 @@ install_apt() {
     sudo apt update
 
     info "Installing core packages..."
-    sudo apt install -y zsh git curl
+    sudo apt install -y zsh git curl python3
 
     info "Installing CLI tools..."
     sudo apt install -y fzf ripgrep bat jq shellcheck ccache direnv
@@ -80,7 +80,7 @@ install_apt() {
 
 install_dnf() {
     info "Installing core packages..."
-    sudo dnf install -y zsh git curl
+    sudo dnf install -y zsh git curl python3
 
     info "Installing CLI tools..."
     sudo dnf install -y fzf ripgrep bat jq ShellCheck ccache direnv
@@ -93,7 +93,7 @@ install_dnf() {
 install_pacman() {
     info "Installing packages..."
     sudo pacman -S --needed --noconfirm \
-        zsh git curl fzf ripgrep jq shellcheck ccache direnv fd bat eza zsh-autosuggestions
+        zsh git curl python fzf ripgrep jq shellcheck ccache direnv fd bat eza zsh-autosuggestions
 }
 
 install_brew() {
@@ -107,7 +107,7 @@ install_brew() {
     else
         # Fallback to individual installs.
         info "Installing core packages..."
-        brew install zsh git curl
+        brew install zsh git curl python
 
         info "Installing CLI tools..."
         brew install fzf ripgrep bat jq shellcheck direnv ccache

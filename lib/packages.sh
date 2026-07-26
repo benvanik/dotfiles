@@ -8,7 +8,7 @@
 # ============================================================================
 
 # Required packages - dotfiles install fails without these.
-REQUIRED_PACKAGES=(zsh git curl fzf rg jq direnv)
+REQUIRED_PACKAGES=(zsh git curl fzf rg jq direnv python3)
 
 # Recommended packages - warnings only, install proceeds.
 RECOMMENDED_PACKAGES=(fd bat eza shellcheck ccache)
@@ -31,9 +31,11 @@ declare -A PKG_NAMES=(
 
     # pacman differences.
     [pacman:rg]="ripgrep"
+    [pacman:python3]="python"
 
     # brew differences.
     [brew:rg]="ripgrep"
+    [brew:python3]="python"
 )
 
 # ============================================================================

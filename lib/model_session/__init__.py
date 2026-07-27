@@ -29,6 +29,8 @@ from .profile import (
     ProfileContract,
     ProfileResource,
     RuntimeContract,
+    SandboxContract,
+    StorageContract,
     load_profile,
 )
 from .runs import (
@@ -63,6 +65,8 @@ __all__ = [
     "RUN_SCHEMA",
     "SessionRun",
     "RuntimeContract",
+    "SandboxContract",
+    "StorageContract",
     "WEIGHT_FORMATS",
     "fingerprint_pi_installation",
     "inference_attachment_receipt_path",

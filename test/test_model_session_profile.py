@@ -19,6 +19,13 @@ from model_session import (
     load_run_from_state,
     materialize_new_run,
 )
+from model_session.checkpoint import maximum_encoded_bytes
+from model_session.profile import (
+    PROFILE_SCHEMA_V1,
+    load_profile_route,
+    parse_locked_profile,
+)
+from model_session.storage_limits import STORAGE_PAGE_SIZE
 
 
 REVISION = "a" * 40
@@ -67,7 +74,7 @@ class ProfileFixture:
 
     def document(self, **overrides: object) -> str:
         values: dict[str, object] = {
-            "schema": "model-session.profile.v1",
+            "schema": "model-session.profile.v2",
             "profile_id": "fixture-model",
             "project_id": "fixture-project",
             "state_root": str(self.state_root),
@@ -88,9 +95,49 @@ class ProfileFixture:
             "version": "0.82.1",
             "tools": '["read", "write", "edit", "bash"]',
             "system_prompt_line": 'system_prompt_file = "SYSTEM.md"',
+            "max_sessions": 7,
+            "work_bytes": 8 * 1024**3,
+            "work_inodes": 65_536,
+            "history_bytes": 2 * 1024**3,
+            "history_inodes": 16_384,
+            "checkpoint_bytes": 17 * 1024**3,
+            "max_file_bytes": 4 * 1024**3,
+            "max_logical_bytes": 16 * 1024**3,
+            "memory_bytes": 16 * 1024**3,
+            "max_tasks": 256,
+            "max_runtime_seconds": 86_400,
+            "idle_timeout_seconds": 3_600,
+            "shutdown_grace_seconds": 30,
+            "storage_extra": "",
+            "sandbox_extra": "",
+            "storage_table": None,
+            "sandbox_table": None,
             "extra": "",
         }
         values.update(overrides)
+        storage_table = values["storage_table"]
+        if storage_table is None:
+            storage_table = f"""[storage]
+max_sessions = {values["max_sessions"]}
+work_bytes = {values["work_bytes"]}
+work_inodes = {values["work_inodes"]}
+history_bytes = {values["history_bytes"]}
+history_inodes = {values["history_inodes"]}
+checkpoint_bytes = {values["checkpoint_bytes"]}
+max_file_bytes = {values["max_file_bytes"]}
+max_logical_bytes = {values["max_logical_bytes"]}
+{values["storage_extra"]}
+"""
+        sandbox_table = values["sandbox_table"]
+        if sandbox_table is None:
+            sandbox_table = f"""[sandbox]
+memory_bytes = {values["memory_bytes"]}
+max_tasks = {values["max_tasks"]}
+max_runtime_seconds = {values["max_runtime_seconds"]}
+idle_timeout_seconds = {values["idle_timeout_seconds"]}
+shutdown_grace_seconds = {values["shutdown_grace_seconds"]}
+{values["sandbox_extra"]}
+"""
         return f"""schema = "{values["schema"]}"
 profile_id = "{values["profile_id"]}"
 project_id = "{values["project_id"]}"
@@ -118,6 +165,9 @@ executable = "{values["executable"]}"
 version = "{values["version"]}"
 tools = {values["tools"]}
 {values["system_prompt_line"]}
+
+{storage_table}
+{sandbox_table}
 """
 
     def write_profile(self, **overrides: object) -> None:
@@ -169,6 +219,40 @@ class ModelSessionProfileTest(unittest.TestCase):
                 ("read", "write", "edit", "bash"),
             )
             self.assertEqual(
+                profile.contract.storage.as_dict(),
+                {
+                    "max_sessions": 7,
+                    "work_bytes": 8 * 1024**3,
+                    "work_inodes": 65_536,
+                    "history_bytes": 2 * 1024**3,
+                    "history_inodes": 16_384,
+                    "checkpoint_bytes": 17 * 1024**3,
+                    "max_sparse_extents": (
+                        (10 * 1024**3) // STORAGE_PAGE_SIZE
+                    ),
+                    "max_file_bytes": 4 * 1024**3,
+                    "max_logical_bytes": 16 * 1024**3,
+                },
+            )
+            self.assertEqual(
+                profile.contract.sandbox.as_dict(),
+                {
+                    "memory_bytes": 16 * 1024**3,
+                    "max_tasks": 256,
+                    "max_runtime_seconds": 86_400,
+                    "idle_timeout_seconds": 3_600,
+                    "shutdown_grace_seconds": 30,
+                },
+            )
+            self.assertEqual(
+                profile.contract.as_dict()["storage"],
+                profile.contract.storage.as_dict(),
+            )
+            self.assertEqual(
+                profile.contract.as_dict()["sandbox"],
+                profile.contract.sandbox.as_dict(),
+            )
+            self.assertEqual(
                 profile.resource_for_role("agents").content,
                 b"fixture agents v1\n",
             )
@@ -202,6 +286,330 @@ class ModelSessionProfileTest(unittest.TestCase):
                     with self.assertRaises(ModelSessionError) as caught:
                         load_profile(fixture.profile_root)
                     self.assertEqual(caught.exception.code, code)
+
+    def test_storage_and_sandbox_tables_are_exact_and_required(self) -> None:
+        cases = (
+            {"schema": "model-session.profile.v1"},
+            {"storage_table": ""},
+            {"sandbox_table": ""},
+            {"storage_extra": "unsupported = 1"},
+            {"sandbox_extra": "unsupported = 1"},
+        )
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                with tempfile.TemporaryDirectory() as directory:
+                    fixture = self.fixture(directory)
+                    fixture.write_profile(**overrides)
+                    with self.assertRaises(ModelSessionError) as caught:
+                        load_profile(fixture.profile_root)
+                    self.assertEqual(caught.exception.code, "invalid_profile")
+
+    def test_locked_v1_profile_preserves_its_exact_manifest_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.fixture(directory)
+            document = fixture.document(
+                schema=PROFILE_SCHEMA_V1,
+                storage_table="",
+                sandbox_table="",
+            ).encode("utf-8")
+            contract = parse_locked_profile(
+                document,
+                source_profile_root=str(fixture.profile_root),
+            )
+
+            self.assertEqual(contract.schema, PROFILE_SCHEMA_V1)
+            self.assertIsNone(contract.storage)
+            self.assertIsNone(contract.sandbox)
+            locked = contract.as_dict()
+            self.assertEqual(
+                set(locked),
+                {
+                    "schema",
+                    "profile_id",
+                    "project_id",
+                    "profile_root",
+                    "state_root",
+                    "project_root",
+                    "model",
+                    "runtime",
+                    "pi",
+                },
+            )
+            self.assertEqual(locked["schema"], PROFILE_SCHEMA_V1)
+
+            with self.assertRaises(ModelSessionError):
+                parse_locked_profile(
+                    fixture.document(schema=PROFILE_SCHEMA_V1).encode("utf-8"),
+                    source_profile_root=str(fixture.profile_root),
+                )
+
+    def test_v2_route_loads_an_immutable_v1_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.fixture(directory)
+            run = materialize_new_run(load_profile(fixture.profile_root))
+            v1_document = fixture.document(
+                schema=PROFILE_SCHEMA_V1,
+                storage_table="",
+                sandbox_table="",
+            ).encode("utf-8")
+            locked_profile_path = (
+                run.snapshot_root / "profile" / "profile.toml"
+            )
+            locked_profile_path.write_bytes(v1_document)
+
+            manifest_path = run.snapshot_root / "lock.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["profile"]["schema"] = PROFILE_SCHEMA_V1
+            del manifest["profile"]["storage"]
+            del manifest["profile"]["sandbox"]
+            profile_resource = next(
+                resource
+                for resource in manifest["resources"]
+                if resource["path"] == "profile/profile.toml"
+            )
+            profile_resource["sha256"] = hashlib.sha256(v1_document).hexdigest()
+            profile_resource["size"] = len(v1_document)
+            manifest_bytes = (
+                json.dumps(
+                    manifest,
+                    indent=2,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                )
+                + "\n"
+            ).encode("utf-8")
+            manifest_path.write_bytes(manifest_bytes)
+
+            receipt_path = run.root / "run.json"
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt["lock_sha256"] = hashlib.sha256(manifest_bytes).hexdigest()
+            receipt_path.write_text(
+                json.dumps(
+                    receipt,
+                    indent=2,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            loaded = load_run_from_state(
+                fixture.state_root,
+                "fixture-model",
+                run.session_id,
+            )
+            self.assertEqual(loaded.profile.schema, PROFILE_SCHEMA_V1)
+            self.assertIsNone(loaded.profile.storage)
+            self.assertIsNone(loaded.profile.sandbox)
+            self.assertNotIn("storage", loaded.profile.as_dict())
+            self.assertNotIn("sandbox", loaded.profile.as_dict())
+
+    def test_profile_route_accepts_known_historical_schema_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.fixture(directory)
+            fixture.write_profile(
+                schema=PROFILE_SCHEMA_V1,
+                storage_table="",
+                sandbox_table="",
+            )
+            route = load_profile_route(fixture.profile_root)
+            self.assertEqual(route.profile_id, "fixture-model")
+            self.assertEqual(route.state_root, fixture.state_root)
+            with self.assertRaises(ModelSessionError):
+                load_profile(fixture.profile_root)
+
+            fixture.write_profile(schema="model-session.profile.v3")
+            with self.assertRaises(ModelSessionError):
+                load_profile_route(fixture.profile_root)
+
+    def test_policy_integer_fields_reject_booleans(self) -> None:
+        fields = (
+            "max_sessions",
+            "work_bytes",
+            "work_inodes",
+            "history_bytes",
+            "history_inodes",
+            "checkpoint_bytes",
+            "max_file_bytes",
+            "max_logical_bytes",
+            "memory_bytes",
+            "max_tasks",
+            "max_runtime_seconds",
+            "idle_timeout_seconds",
+            "shutdown_grace_seconds",
+        )
+        for field in fields:
+            with self.subTest(field=field):
+                with tempfile.TemporaryDirectory() as directory:
+                    fixture = self.fixture(directory)
+                    fixture.write_profile(**{field: "true"})
+                    with self.assertRaises(ModelSessionError) as caught:
+                        load_profile(fixture.profile_root)
+                    self.assertEqual(caught.exception.code, "invalid_profile")
+
+    def test_policy_integer_bounds_and_overflow_fail_closed(self) -> None:
+        cases = (
+            {"max_sessions": 0},
+            {"max_sessions": 65},
+            {"work_bytes": 32 * 1024**3 + 1},
+            {"work_inodes": 1_000_001},
+            {"history_bytes": 32 * 1024**3 + 1},
+            {"history_inodes": 1_000_001},
+            {"checkpoint_bytes": 72 * 1024**3 + 1},
+            {"max_file_bytes": 64 * 1024**3 + 1},
+            {"max_logical_bytes": 64 * 1024**3 + 1},
+            {"memory_bytes": 128 * 1024**3 + 1},
+            {"max_tasks": 1025},
+            {"max_runtime_seconds": 604_801},
+            {"idle_timeout_seconds": 604_801},
+            {"shutdown_grace_seconds": 3_601},
+            {"max_sessions": 1 << 63},
+        )
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                with tempfile.TemporaryDirectory() as directory:
+                    fixture = self.fixture(directory)
+                    fixture.write_profile(**overrides)
+                    with self.assertRaises(ModelSessionError) as caught:
+                        load_profile(fixture.profile_root)
+                    self.assertEqual(caught.exception.code, "invalid_profile")
+
+    def test_policy_cross_field_relationships_fail_closed(self) -> None:
+        cases = (
+            {
+                "work_inodes": 900_000,
+                "history_inodes": 200_000,
+            },
+            {"work_bytes": STORAGE_PAGE_SIZE - 1},
+            {"work_bytes": 8 * 1024**3 + 1},
+            {"work_inodes": 1},
+            {"history_bytes": STORAGE_PAGE_SIZE - 1},
+            {"history_inodes": 1},
+            {
+                "max_file_bytes": 17 * 1024**3,
+                "max_logical_bytes": 16 * 1024**3,
+            },
+            {
+                "memory_bytes": (
+                    10 * 1024**3 + 512 * 1024**2 - 1
+                ),
+            },
+            {"memory_bytes": 16 * 1024**3 + 1},
+            {"max_tasks": 63},
+            {
+                "max_runtime_seconds": 3_600,
+                "idle_timeout_seconds": 3_601,
+            },
+            {
+                "idle_timeout_seconds": 29,
+                "shutdown_grace_seconds": 30,
+            },
+        )
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                with tempfile.TemporaryDirectory() as directory:
+                    fixture = self.fixture(directory)
+                    fixture.write_profile(**overrides)
+                    with self.assertRaises(ModelSessionError) as caught:
+                        load_profile(fixture.profile_root)
+                    self.assertEqual(caught.exception.code, "invalid_profile")
+
+    def test_policy_cross_field_equality_boundaries_are_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.fixture(directory)
+            fixture.write_profile(
+                max_sessions=8,
+                checkpoint_bytes=16 * 1024**3,
+                max_file_bytes=10 * 1024**3,
+                max_logical_bytes=10 * 1024**3,
+                memory_bytes=10 * 1024**3 + 512 * 1024**2,
+                max_tasks=64,
+                max_runtime_seconds=3_600,
+                idle_timeout_seconds=3_600,
+                shutdown_grace_seconds=3_600,
+            )
+            contract = load_profile(fixture.profile_root).contract
+            self.assertEqual(
+                contract.storage.max_file_bytes,
+                contract.storage.max_logical_bytes,
+            )
+            self.assertEqual(
+                contract.storage.max_sessions,
+                8,
+            )
+            self.assertEqual(contract.sandbox.max_tasks, 64)
+            self.assertEqual(
+                contract.sandbox.memory_bytes,
+                contract.storage.work_bytes
+                + contract.storage.history_bytes
+                + 512 * 1024**2,
+            )
+            self.assertEqual(
+                contract.sandbox.idle_timeout_seconds,
+                contract.sandbox.max_runtime_seconds,
+            )
+            self.assertEqual(
+                contract.sandbox.shutdown_grace_seconds,
+                contract.sandbox.idle_timeout_seconds,
+            )
+
+    def test_checkpoint_eligibility_is_independent_of_tmpfs_capacity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.fixture(directory)
+            fixture.write_profile(
+                max_sessions=64,
+                checkpoint_bytes=72 * 1024**3,
+                max_file_bytes=4 * 1024**3,
+                max_logical_bytes=4 * 1024**3,
+            )
+            storage = load_profile(fixture.profile_root).contract.storage
+            self.assertEqual(storage.max_sessions, 64)
+            self.assertEqual(storage.max_logical_bytes, 4 * 1024**3)
+            self.assertLess(
+                storage.max_logical_bytes,
+                storage.work_bytes + storage.history_bytes,
+            )
+
+    def test_checkpoint_capacity_covers_the_exact_codec_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.fixture(directory)
+            storage = load_profile(fixture.profile_root).contract.storage
+            limits = storage.checkpoint_limits()
+            self.assertEqual(
+                limits.max_entries,
+                storage.work_inodes + storage.history_inodes,
+            )
+            self.assertEqual(
+                limits.max_payload_bytes,
+                storage.max_logical_bytes,
+            )
+            self.assertEqual(
+                limits.max_sparse_extents,
+                (
+                    storage.work_bytes + storage.history_bytes
+                )
+                // STORAGE_PAGE_SIZE,
+            )
+            self.assertEqual(
+                limits.max_sparse_extents_per_file,
+                max(storage.work_bytes, storage.history_bytes)
+                // STORAGE_PAGE_SIZE,
+            )
+            minimum = maximum_encoded_bytes(limits)
+
+            fixture.write_profile(checkpoint_bytes=minimum)
+            accepted = load_profile(fixture.profile_root)
+            self.assertEqual(
+                accepted.contract.storage.checkpoint_bytes,
+                minimum,
+            )
+
+            fixture.write_profile(checkpoint_bytes=minimum - 1)
+            with self.assertRaises(ModelSessionError) as caught:
+                load_profile(fixture.profile_root)
+            self.assertEqual(caught.exception.code, "invalid_profile")
+            self.assertIn(str(minimum), str(caught.exception))
 
     def test_profile_rejects_dotfiles_containment_and_root_overlap(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

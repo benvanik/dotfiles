@@ -14,15 +14,32 @@ import tomllib
 from dataclasses import dataclass, field
 from typing import Any
 
+from .checkpoint import CheckpointLimits, maximum_encoded_bytes
 from .errors import ModelSessionError
 from .ownership import owner_has_private_primary_group
+from .storage_limits import STORAGE_PAGE_SIZE, StoragePoolLimits
 
 
-PROFILE_SCHEMA = "model-session.profile.v1"
+PROFILE_SCHEMA_V1 = "model-session.profile.v1"
+PROFILE_SCHEMA_V2 = "model-session.profile.v2"
+PROFILE_SCHEMA = PROFILE_SCHEMA_V2
+KNOWN_PROFILE_SCHEMAS = frozenset({PROFILE_SCHEMA_V1, PROFILE_SCHEMA_V2})
 PROFILE_FILE_NAME = "profile.toml"
 AGENTS_FILE_NAME = "AGENTS.md"
 MAX_PROFILE_BYTES = 256 * 1024
 MAX_RESOURCE_BYTES = 4 * 1024 * 1024
+SANDBOX_STORAGE_HEADROOM_BYTES = 512 * 1024 * 1024
+MAX_SESSIONS = 64
+MAX_VOLUME_BYTES = 32 * 1024**3
+MAX_STORAGE_INODES = 1_000_000
+MAX_CHECKPOINT_BYTES = 72 * 1024**3
+MAX_FILE_BYTES = 64 * 1024**3
+MAX_LOGICAL_BYTES = 64 * 1024**3
+MAX_SANDBOX_MEMORY_BYTES = 128 * 1024**3
+MIN_SANDBOX_TASKS = 64
+MAX_SANDBOX_TASKS = 1024
+MAX_RUNTIME_SECONDS = 7 * 24 * 60 * 60
+MAX_SHUTDOWN_GRACE_SECONDS = 60 * 60
 
 IDENTIFIER_PATTERN = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
 PROVIDER_PATTERN = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
@@ -45,7 +62,7 @@ SENSITIVE_FIELD_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-_TOP_LEVEL_KEYS = {
+_PROFILE_V1_KEYS = {
     "schema",
     "profile_id",
     "project_id",
@@ -54,6 +71,11 @@ _TOP_LEVEL_KEYS = {
     "model",
     "runtime",
     "pi",
+}
+_PROFILE_V2_KEYS = {
+    *_PROFILE_V1_KEYS,
+    "storage",
+    "sandbox",
 }
 _MODEL_KEYS = {
     "repository",
@@ -77,6 +99,23 @@ _PI_REQUIRED_KEYS = {
     "tools",
 }
 _PI_OPTIONAL_KEYS = {"system_prompt_file", "append_system_prompt_file"}
+_STORAGE_KEYS = {
+    "max_sessions",
+    "work_bytes",
+    "work_inodes",
+    "history_bytes",
+    "history_inodes",
+    "checkpoint_bytes",
+    "max_file_bytes",
+    "max_logical_bytes",
+}
+_SANDBOX_KEYS = {
+    "memory_bytes",
+    "max_tasks",
+    "max_runtime_seconds",
+    "idle_timeout_seconds",
+    "shutdown_grace_seconds",
+}
 
 _SYSTEM_SENSITIVE_TREES = (
     pathlib.Path("/bin"),
@@ -179,6 +218,84 @@ class PiContract:
 
 
 @dataclass(frozen=True)
+class StorageContract:
+    """Runtime tmpfs capacities and checkpoint-eligibility policy."""
+
+    # Retained-session ceiling for materialization admission policy.
+    max_sessions: int
+    # Hard byte capacity of the mutable work tmpfs.
+    work_bytes: int
+    # Hard inode/dentry capacity of the mutable work tmpfs.
+    work_inodes: int
+    # Hard byte capacity of the mutable history tmpfs.
+    history_bytes: int
+    # Hard inode/dentry capacity of the mutable history tmpfs.
+    history_inodes: int
+    # Maximum encoded bytes accepted for one checkpoint pack.
+    checkpoint_bytes: int
+    # Derived aggregate sparse-extent eligibility ceiling.
+    max_sparse_extents: int
+    # Maximum logical size of one checkpoint-eligible regular file.
+    max_file_bytes: int
+    # Maximum aggregate logical size of checkpoint-eligible state.
+    max_logical_bytes: int
+
+    def checkpoint_limits(self) -> CheckpointLimits:
+        """Return the codec envelope for checkpoint-eligible mutable state."""
+
+        return CheckpointLimits(
+            max_entries=self.work_inodes + self.history_inodes,
+            max_file_logical_bytes=self.max_file_bytes,
+            max_logical_bytes=self.max_logical_bytes,
+            # Inline symlink targets consume tmpfs inodes but no data blocks.
+            # Logical bytes are therefore the only safe aggregate payload cap.
+            max_payload_bytes=self.max_logical_bytes,
+            max_pack_bytes=self.checkpoint_bytes,
+            max_sparse_extents_per_file=(
+                max(self.work_bytes, self.history_bytes)
+                // STORAGE_PAGE_SIZE
+            ),
+            max_sparse_extents=self.max_sparse_extents,
+        )
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "max_sessions": self.max_sessions,
+            "work_bytes": self.work_bytes,
+            "work_inodes": self.work_inodes,
+            "history_bytes": self.history_bytes,
+            "history_inodes": self.history_inodes,
+            "checkpoint_bytes": self.checkpoint_bytes,
+            "max_sparse_extents": self.max_sparse_extents,
+            "max_file_bytes": self.max_file_bytes,
+            "max_logical_bytes": self.max_logical_bytes,
+        }
+
+
+@dataclass(frozen=True)
+class SandboxContract:
+    # Page-exact hard memory ceiling for the untrusted workload cgroup.
+    memory_bytes: int
+    # Hard task/thread ceiling for the untrusted workload cgroup.
+    max_tasks: int
+    # Maximum elapsed duration of one workload launch.
+    max_runtime_seconds: int
+    # Maximum duration without accepted workload activity.
+    idle_timeout_seconds: int
+    # Grace between cooperative shutdown and forced workload termination.
+    shutdown_grace_seconds: int
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "memory_bytes": self.memory_bytes,
+            "max_tasks": self.max_tasks,
+            "max_runtime_seconds": self.max_runtime_seconds,
+            "idle_timeout_seconds": self.idle_timeout_seconds,
+            "shutdown_grace_seconds": self.shutdown_grace_seconds,
+        }
+
+
+@dataclass(frozen=True)
 class ProfileContract:
     schema: str
     profile_id: str
@@ -189,9 +306,26 @@ class ProfileContract:
     model: ModelContract
     runtime: RuntimeContract
     pi: PiContract
+    storage: StorageContract | None = None
+    sandbox: SandboxContract | None = None
+
+    def __post_init__(self) -> None:
+        if self.schema == PROFILE_SCHEMA_V1:
+            if self.storage is not None or self.sandbox is not None:
+                raise ValueError(
+                    "profile v1 contracts cannot contain storage or sandbox policy"
+                )
+            return
+        if self.schema == PROFILE_SCHEMA_V2:
+            if self.storage is None or self.sandbox is None:
+                raise ValueError(
+                    "profile v2 contracts require storage and sandbox policy"
+                )
+            return
+        raise ValueError(f"unsupported profile schema {self.schema!r}")
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        value = {
             "schema": self.schema,
             "profile_id": self.profile_id,
             "project_id": self.project_id,
@@ -202,6 +336,12 @@ class ProfileContract:
             "runtime": self.runtime.as_dict(),
             "pi": self.pi.as_dict(),
         }
+        if self.schema == PROFILE_SCHEMA_V2:
+            if self.storage is None or self.sandbox is None:
+                raise AssertionError("profile v2 policy is absent")
+            value["storage"] = self.storage.as_dict()
+            value["sandbox"] = self.sandbox.as_dict()
+        return value
 
 
 @dataclass(frozen=True)
@@ -308,6 +448,173 @@ def _integer(value: Any, *, label: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         _fail(f"{label} must be a positive integer")
     return value
+
+
+def _bounded_integer(
+    value: Any,
+    *,
+    label: str,
+    maximum: int,
+) -> int:
+    result = _integer(value, label=label)
+    if result > maximum:
+        _fail(f"{label} must not exceed {maximum}")
+    return result
+
+
+def _parse_storage_contract(value: dict[str, Any]) -> StorageContract:
+    max_sessions = _bounded_integer(
+        value["max_sessions"],
+        label="profile.storage.max_sessions",
+        maximum=MAX_SESSIONS,
+    )
+    work_bytes = _bounded_integer(
+        value["work_bytes"],
+        label="profile.storage.work_bytes",
+        maximum=MAX_VOLUME_BYTES,
+    )
+    work_inodes = _bounded_integer(
+        value["work_inodes"],
+        label="profile.storage.work_inodes",
+        maximum=MAX_STORAGE_INODES,
+    )
+    history_bytes = _bounded_integer(
+        value["history_bytes"],
+        label="profile.storage.history_bytes",
+        maximum=MAX_VOLUME_BYTES,
+    )
+    history_inodes = _bounded_integer(
+        value["history_inodes"],
+        label="profile.storage.history_inodes",
+        maximum=MAX_STORAGE_INODES,
+    )
+    checkpoint_bytes = _bounded_integer(
+        value["checkpoint_bytes"],
+        label="profile.storage.checkpoint_bytes",
+        maximum=MAX_CHECKPOINT_BYTES,
+    )
+    max_file_bytes = _bounded_integer(
+        value["max_file_bytes"],
+        label="profile.storage.max_file_bytes",
+        maximum=MAX_FILE_BYTES,
+    )
+    max_logical_bytes = _bounded_integer(
+        value["max_logical_bytes"],
+        label="profile.storage.max_logical_bytes",
+        maximum=MAX_LOGICAL_BYTES,
+    )
+
+    total_inodes = work_inodes + history_inodes
+    if total_inodes > MAX_STORAGE_INODES:
+        _fail(
+            "profile.storage work_inodes plus history_inodes must not exceed "
+            f"{MAX_STORAGE_INODES}"
+        )
+    try:
+        StoragePoolLimits(work_bytes, work_inodes)
+        StoragePoolLimits(history_bytes, history_inodes)
+    except ModelSessionError as error:
+        _fail(f"profile.storage is not representable as bounded tmpfs: {error}")
+    volume_bytes = work_bytes + history_bytes
+    if max_file_bytes > max_logical_bytes:
+        _fail(
+            "profile.storage.max_file_bytes checkpoint eligibility must not "
+            "exceed max_logical_bytes"
+        )
+    max_sparse_extents = volume_bytes // STORAGE_PAGE_SIZE
+    storage = StorageContract(
+        max_sessions=max_sessions,
+        work_bytes=work_bytes,
+        work_inodes=work_inodes,
+        history_bytes=history_bytes,
+        history_inodes=history_inodes,
+        checkpoint_bytes=checkpoint_bytes,
+        max_sparse_extents=max_sparse_extents,
+        max_file_bytes=max_file_bytes,
+        max_logical_bytes=max_logical_bytes,
+    )
+    minimum_checkpoint_bytes = maximum_encoded_bytes(
+        storage.checkpoint_limits()
+    )
+    if checkpoint_bytes < minimum_checkpoint_bytes:
+        _fail(
+            "profile.storage.checkpoint_bytes must cover the complete "
+            "checkpoint-eligible representation bound of "
+            f"{minimum_checkpoint_bytes} bytes"
+        )
+    return storage
+
+
+def _parse_sandbox_contract(
+    value: dict[str, Any],
+    *,
+    storage: StorageContract,
+) -> SandboxContract:
+    memory_bytes = _bounded_integer(
+        value["memory_bytes"],
+        label="profile.sandbox.memory_bytes",
+        maximum=MAX_SANDBOX_MEMORY_BYTES,
+    )
+    max_tasks = _bounded_integer(
+        value["max_tasks"],
+        label="profile.sandbox.max_tasks",
+        maximum=MAX_SANDBOX_TASKS,
+    )
+    max_runtime_seconds = _bounded_integer(
+        value["max_runtime_seconds"],
+        label="profile.sandbox.max_runtime_seconds",
+        maximum=MAX_RUNTIME_SECONDS,
+    )
+    idle_timeout_seconds = _bounded_integer(
+        value["idle_timeout_seconds"],
+        label="profile.sandbox.idle_timeout_seconds",
+        maximum=MAX_RUNTIME_SECONDS,
+    )
+    shutdown_grace_seconds = _bounded_integer(
+        value["shutdown_grace_seconds"],
+        label="profile.sandbox.shutdown_grace_seconds",
+        maximum=MAX_SHUTDOWN_GRACE_SECONDS,
+    )
+
+    if memory_bytes % STORAGE_PAGE_SIZE != 0:
+        _fail(
+            "profile.sandbox.memory_bytes must be a multiple of "
+            f"{STORAGE_PAGE_SIZE}"
+        )
+    minimum_memory_bytes = (
+        storage.work_bytes
+        + storage.history_bytes
+        + SANDBOX_STORAGE_HEADROOM_BYTES
+    )
+    if memory_bytes < minimum_memory_bytes:
+        _fail(
+            "profile.sandbox.memory_bytes must cover work_bytes plus "
+            "history_bytes plus "
+            f"{SANDBOX_STORAGE_HEADROOM_BYTES} bytes of process headroom"
+        )
+    if max_tasks < MIN_SANDBOX_TASKS:
+        _fail(
+            "profile.sandbox.max_tasks must be at least "
+            f"{MIN_SANDBOX_TASKS} for launcher, helper, relay, Pi, and "
+            "runtime threads"
+        )
+    if idle_timeout_seconds > max_runtime_seconds:
+        _fail(
+            "profile.sandbox.idle_timeout_seconds must not exceed "
+            "max_runtime_seconds"
+        )
+    if shutdown_grace_seconds > idle_timeout_seconds:
+        _fail(
+            "profile.sandbox.shutdown_grace_seconds must not exceed "
+            "idle_timeout_seconds"
+        )
+    return SandboxContract(
+        memory_bytes=memory_bytes,
+        max_tasks=max_tasks,
+        max_runtime_seconds=max_runtime_seconds,
+        idle_timeout_seconds=idle_timeout_seconds,
+        shutdown_grace_seconds=shutdown_grace_seconds,
+    )
 
 
 def _path_is_within(path: pathlib.Path, root: pathlib.Path) -> bool:
@@ -672,6 +979,7 @@ def _parse_document(
     profile_root: pathlib.Path,
     *,
     require_live_profile_root: bool,
+    accepted_schemas: frozenset[str],
 ) -> ProfileContract:
     try:
         text = document.decode("utf-8")
@@ -681,10 +989,27 @@ def _parse_document(
             f"{PROFILE_FILE_NAME} is not valid UTF-8 TOML: {error}",
             code="invalid_profile",
         ) from error
+    if not isinstance(value, dict):
+        _fail("profile must be a TOML table")
     _reject_sensitive_fields(value)
+    schema = value.get("schema")
+    if not isinstance(schema, str) or schema not in KNOWN_PROFILE_SCHEMAS:
+        _fail(
+            "profile.schema must be one of "
+            f"{PROFILE_SCHEMA_V1!r} or {PROFILE_SCHEMA_V2!r}"
+        )
+    if schema not in accepted_schemas:
+        if accepted_schemas == frozenset({PROFILE_SCHEMA_V2}):
+            _fail(f"profile.schema must be exactly {PROFILE_SCHEMA_V2!r}")
+        _fail(f"profile.schema {schema!r} is not accepted here")
+    top_level_keys = (
+        _PROFILE_V1_KEYS
+        if schema == PROFILE_SCHEMA_V1
+        else _PROFILE_V2_KEYS
+    )
     top = _require_exact_keys(
         value,
-        required=_TOP_LEVEL_KEYS,
+        required=top_level_keys,
         label="profile",
     )
     model_value = _require_exact_keys(
@@ -703,9 +1028,20 @@ def _parse_document(
         optional=_PI_OPTIONAL_KEYS,
         label="profile.pi",
     )
+    storage_value: dict[str, Any] | None = None
+    sandbox_value: dict[str, Any] | None = None
+    if schema == PROFILE_SCHEMA_V2:
+        storage_value = _require_exact_keys(
+            top["storage"],
+            required=_STORAGE_KEYS,
+            label="profile.storage",
+        )
+        sandbox_value = _require_exact_keys(
+            top["sandbox"],
+            required=_SANDBOX_KEYS,
+            label="profile.sandbox",
+        )
 
-    if top["schema"] != PROFILE_SCHEMA:
-        _fail(f"profile.schema must be exactly {PROFILE_SCHEMA!r}")
     profile_id = _identifier(top["profile_id"], label="profile.profile_id")
     project_id = _identifier(top["project_id"], label="profile.project_id")
     state_root = _absolute_normalized_path(
@@ -854,8 +1190,18 @@ def _parse_document(
     if len(set(prompt_paths)) != len(prompt_paths):
         _fail("Pi system and append-system prompt files must be distinct")
 
+    storage: StorageContract | None = None
+    sandbox: SandboxContract | None = None
+    if schema == PROFILE_SCHEMA_V2:
+        if storage_value is None or sandbox_value is None:
+            raise AssertionError("profile v2 tables are absent")
+        storage = _parse_storage_contract(storage_value)
+        sandbox = _parse_sandbox_contract(
+            sandbox_value,
+            storage=storage,
+        )
     contract = ProfileContract(
-        schema=PROFILE_SCHEMA,
+        schema=schema,
         profile_id=profile_id,
         project_id=project_id,
         profile_root=profile_root,
@@ -884,6 +1230,8 @@ def _parse_document(
             system_prompt_file=system_prompt_file,
             append_system_prompt_file=append_system_prompt_file,
         ),
+        storage=storage,
+        sandbox=sandbox,
     )
     _validate_contract_paths(
         contract,
@@ -988,6 +1336,7 @@ def load_profile(profile_root: str | pathlib.Path) -> Profile:
         document,
         root,
         require_live_profile_root=True,
+        accepted_schemas=frozenset({PROFILE_SCHEMA_V2}),
     )
 
     roles_by_path: dict[pathlib.PurePosixPath, list[str]] = {
@@ -1062,8 +1411,12 @@ def load_profile_route(profile_root: str | pathlib.Path) -> ProfileRoute:
     _reject_sensitive_fields(value)
     if not isinstance(value, dict):
         _fail("profile must be a TOML table")
-    if value.get("schema") != PROFILE_SCHEMA:
-        _fail(f"profile.schema must be exactly {PROFILE_SCHEMA!r}")
+    schema = value.get("schema")
+    if not isinstance(schema, str) or schema not in KNOWN_PROFILE_SCHEMAS:
+        _fail(
+            "profile.schema must be one of "
+            f"{PROFILE_SCHEMA_V1!r} or {PROFILE_SCHEMA_V2!r}"
+        )
     profile_id = _identifier(
         value.get("profile_id"),
         label="profile.profile_id",
@@ -1113,6 +1466,7 @@ def parse_locked_profile(
         document,
         root,
         require_live_profile_root=False,
+        accepted_schemas=KNOWN_PROFILE_SCHEMAS,
     )
 
 

@@ -25,11 +25,15 @@ from model_session.pi_runtime import (
     render_pi_models_json,
 )
 from model_session.profile import (
+    PROFILE_SCHEMA,
     ModelContract,
     PiContract,
     ProfileContract,
     RuntimeContract,
+    SandboxContract,
+    StorageContract,
 )
+from model_session.storage_limits import STORAGE_PAGE_SIZE
 
 
 REVISION = "a" * 40
@@ -43,7 +47,7 @@ def make_contract(
 ) -> ProfileContract:
     installation_root = root / "pi"
     return ProfileContract(
-        schema="model-session.profile.v1",
+        schema=PROFILE_SCHEMA,
         profile_id="fixture-model",
         project_id="fixture-project",
         profile_root=root / "profile",
@@ -71,6 +75,26 @@ def make_contract(
             tools=("read", "write", "edit", "bash"),
             system_prompt_file=None,
             append_system_prompt_file=None,
+        ),
+        storage=StorageContract(
+            max_sessions=7,
+            work_bytes=8 * 1024**3,
+            work_inodes=65_536,
+            history_bytes=2 * 1024**3,
+            history_inodes=16_384,
+            checkpoint_bytes=17 * 1024**3,
+            max_sparse_extents=(
+                (10 * 1024**3) // STORAGE_PAGE_SIZE
+            ),
+            max_file_bytes=4 * 1024**3,
+            max_logical_bytes=16 * 1024**3,
+        ),
+        sandbox=SandboxContract(
+            memory_bytes=16 * 1024**3,
+            max_tasks=256,
+            max_runtime_seconds=86_400,
+            idle_timeout_seconds=3_600,
+            shutdown_grace_seconds=30,
         ),
     )
 

@@ -10,6 +10,8 @@ import unittest
 
 from model_session.cgroup import (
     CGROUP_ROOT,
+    MEMORY_PAGE_SIZE,
+    WORKLOAD_CGROUP_NAME,
     SessionCgroup,
     _current_cgroup_relative_path,
     delegated_scope_command,
@@ -54,6 +56,17 @@ class ModelSessionCgroupUnitTest(unittest.TestCase):
         with self.assertRaises(ModelSessionError):
             delegated_scope_command(("/absolute/model-session", ""))
 
+    def test_memory_limit_must_be_kernel_page_aligned(self) -> None:
+        with self.assertRaises(ModelSessionError) as caught:
+            SessionCgroup.create(
+                memory_bytes=MEMORY_PAGE_SIZE + 1,
+                max_tasks=1,
+            )
+        self.assertEqual(
+            caught.exception.code,
+            "cgroup_configuration_failed",
+        )
+
 
 class ModelSessionCgroupRealTest(unittest.TestCase):
     def test_delegated_scope_enforces_and_drains_one_workload_leaf(self) -> None:
@@ -88,21 +101,28 @@ class ModelSessionCgroupRealTest(unittest.TestCase):
         process: subprocess.Popen[bytes] | None = None
         with SessionCgroup.create(
             memory_bytes=1024 * 1024 * 1024,
-            max_processes=16,
+            max_tasks=16,
         ) as session:
             parent = CGROUP_ROOT.joinpath(*session.relative_path.parts[1:])
+            workload = parent / WORKLOAD_CGROUP_NAME
             self.assertEqual(
-                (parent / "memory.max").read_text(encoding="ascii").strip(),
+                (workload / "memory.max").read_text(encoding="ascii").strip(),
                 str(1024 * 1024 * 1024),
             )
             self.assertEqual(
-                (parent / "memory.swap.max")
+                (workload / "memory.swap.max")
                 .read_text(encoding="ascii")
                 .strip(),
                 "0",
             )
             self.assertEqual(
-                (parent / "pids.max").read_text(encoding="ascii").strip(),
+                (workload / "memory.oom.group")
+                .read_text(encoding="ascii")
+                .strip(),
+                "1",
+            )
+            self.assertEqual(
+                (workload / "pids.max").read_text(encoding="ascii").strip(),
                 "16",
             )
             workload_procs = session.duplicate_workload_procs()

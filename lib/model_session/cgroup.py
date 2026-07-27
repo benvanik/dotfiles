@@ -19,6 +19,7 @@ SYSTEMD_RUN = pathlib.Path("/usr/bin/systemd-run")
 CONTROL_CGROUP_NAME = "control"
 WORKLOAD_CGROUP_NAME = "workload"
 MAX_CGROUP_TEXT_BYTES = 64 * 1024
+MEMORY_PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
 
 
 def _fail(message: str, *, code: str = "cgroup_unavailable") -> None:
@@ -224,6 +225,33 @@ def _write_control(
         os.close(descriptor)
 
 
+def _read_named_control(directory_descriptor: int, name: str) -> str:
+    descriptor = _open_control_file(
+        directory_descriptor,
+        name,
+        os.O_RDONLY,
+    )
+    try:
+        return _read_control(descriptor, label=f"cgroup {name}")
+    finally:
+        os.close(descriptor)
+
+
+def _write_exact_control(
+    directory_descriptor: int,
+    name: str,
+    value: str,
+) -> None:
+    expected = f"{value}\n"
+    _write_control(directory_descriptor, name, expected)
+    actual = _read_named_control(directory_descriptor, name)
+    if actual != expected:
+        _fail(
+            f"cgroup {name} read back {actual!r}, expected {expected!r}",
+            code="cgroup_configuration_failed",
+        )
+
+
 def _read_control(descriptor: int, *, label: str) -> str:
     try:
         os.lseek(descriptor, 0, os.SEEK_SET)
@@ -292,7 +320,7 @@ def _create_child(
 
 @dataclass
 class SessionCgroup:
-    """Owned aggregate and workload cgroup controls for one launcher process."""
+    """Owned trusted-control and bounded-workload cgroups for one launch."""
 
     relative_path: pathlib.PurePosixPath
     _scope_descriptor: int
@@ -310,18 +338,24 @@ class SessionCgroup:
         cls,
         *,
         memory_bytes: int,
-        max_processes: int,
+        max_tasks: int,
     ) -> Self:
         if (
             isinstance(memory_bytes, bool)
             or not isinstance(memory_bytes, int)
             or memory_bytes <= 0
-            or isinstance(max_processes, bool)
-            or not isinstance(max_processes, int)
-            or max_processes <= 0
+            or isinstance(max_tasks, bool)
+            or not isinstance(max_tasks, int)
+            or max_tasks <= 0
         ):
             _fail(
-                "cgroup memory and process limits must be positive integers",
+                "cgroup memory and task limits must be positive integers",
+                code="cgroup_configuration_failed",
+            )
+        if memory_bytes % MEMORY_PAGE_SIZE != 0:
+            _fail(
+                "cgroup memory limit must be a multiple of "
+                f"{MEMORY_PAGE_SIZE}",
                 code="cgroup_configuration_failed",
             )
         relative = _current_cgroup_relative_path()
@@ -351,25 +385,6 @@ class SessionCgroup:
             os.close(controllers_descriptor)
             opened.remove(controllers_descriptor)
 
-            _write_control(scope_descriptor, "memory.max", f"{memory_bytes}\n")
-            _write_control(scope_descriptor, "memory.swap.max", "0\n")
-            _write_control(scope_descriptor, "memory.oom.group", "1\n")
-            _write_control(scope_descriptor, "pids.max", f"{max_processes}\n")
-
-            memory_events_descriptor = _open_control_file(
-                scope_descriptor,
-                "memory.events",
-                os.O_RDONLY,
-            )
-            opened.append(memory_events_descriptor)
-            initial_memory_events = _keyed_integers(
-                _read_control(
-                    memory_events_descriptor,
-                    label="memory.events",
-                ),
-                label="memory.events",
-            )
-
             control_descriptor = _create_child(
                 scope_descriptor,
                 CONTROL_CGROUP_NAME,
@@ -385,6 +400,53 @@ class SessionCgroup:
                 scope_descriptor,
                 "cgroup.subtree_control",
                 "+memory +pids\n",
+            )
+            enabled_controllers = set(
+                _read_named_control(
+                    scope_descriptor,
+                    "cgroup.subtree_control",
+                ).split()
+            )
+            if not {"memory", "pids"}.issubset(enabled_controllers):
+                _fail(
+                    "delegated cgroup did not enable memory and pids for "
+                    "its workload leaf",
+                    code="cgroup_configuration_failed",
+                )
+
+            _write_exact_control(
+                workload_descriptor,
+                "memory.max",
+                str(memory_bytes),
+            )
+            _write_exact_control(
+                workload_descriptor,
+                "memory.swap.max",
+                "0",
+            )
+            _write_exact_control(
+                workload_descriptor,
+                "memory.oom.group",
+                "1",
+            )
+            _write_exact_control(
+                workload_descriptor,
+                "pids.max",
+                str(max_tasks),
+            )
+
+            memory_events_descriptor = _open_control_file(
+                workload_descriptor,
+                "memory.events",
+                os.O_RDONLY,
+            )
+            opened.append(memory_events_descriptor)
+            initial_memory_events = _keyed_integers(
+                _read_control(
+                    memory_events_descriptor,
+                    label="workload memory.events",
+                ),
+                label="workload memory.events",
             )
 
             workload_procs_descriptor = _open_control_file(
@@ -472,9 +534,9 @@ class SessionCgroup:
         current = _keyed_integers(
             _read_control(
                 self._memory_events_descriptor,
-                label="memory.events",
+                label="workload memory.events",
             ),
-            label="memory.events",
+            label="workload memory.events",
         )
         keys = set(self._initial_memory_events) | set(current)
         return {

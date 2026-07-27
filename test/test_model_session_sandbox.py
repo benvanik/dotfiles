@@ -72,7 +72,7 @@ class SandboxFixture:
         for name in ("AGENTS.md", "SYSTEM.md"):
             (self.profile_root / name).chmod(0o644)
         (self.profile_root / "profile.toml").write_text(
-            f"""schema = "model-session.profile.v1"
+            f"""schema = "model-session.profile.v2"
 profile_id = "profile"
 project_id = "project"
 state_root = "{self.state_root}"
@@ -99,6 +99,23 @@ executable = "bin/pi"
 version = "0.82.1"
 tools = ["read", "write", "edit", "bash"]
 system_prompt_file = "SYSTEM.md"
+
+[storage]
+max_sessions = 7
+work_bytes = 8589934592
+work_inodes = 65536
+history_bytes = 2147483648
+history_inodes = 16384
+checkpoint_bytes = 18253611008
+max_file_bytes = 4294967296
+max_logical_bytes = 17179869184
+
+[sandbox]
+memory_bytes = 17179869184
+max_tasks = 256
+max_runtime_seconds = 86400
+idle_timeout_seconds = 3600
+shutdown_grace_seconds = 30
 """,
             encoding="utf-8",
         )

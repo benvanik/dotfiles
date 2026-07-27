@@ -14,6 +14,7 @@ from .api import RunpodApi
 from .auth import CredentialStore
 from .cache import JsonCache
 from .errors import RunpodLocalError
+from .huggingface_credentials import configured_huggingface_token
 from .instances import InstanceStore, lease_expiry_reasons
 from .lifecycle import LifecycleManager
 from .output import print_json
@@ -256,6 +257,7 @@ def _model_placement(
             gpu_count=profile["pod"]["gpu_count"],
         ),
         cache=JsonCache(root / "cache" / "huggingface"),
+        token=configured_huggingface_token(),
     )
     return (
         placement.admitted_gpu_ids,

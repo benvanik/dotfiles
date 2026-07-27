@@ -10,6 +10,7 @@ from . import __version__
 from .agents import AGENT_DOCS
 from .cache import JsonCache
 from .errors import RunpodLocalError
+from .huggingface_credentials import configured_huggingface_token
 from .doctor_cli import (
     DOCTOR_COMMANDS,
     add_doctor_parser,
@@ -180,6 +181,7 @@ def _model_inspector(args: argparse.Namespace) -> ModelInspector:
     client = HuggingFaceClient(
         cache=cache,
         transport=JsonHttpTransport(),
+        token=configured_huggingface_token(),
         offline=args.offline,
         refresh=args.refresh,
     )

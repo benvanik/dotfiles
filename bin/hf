@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""Pinned, private wrapper for the official Hugging Face CLI."""
+
+from __future__ import annotations
+
+import os
+import pathlib
+import stat
+import sys
+
+
+DOTFILES_ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(DOTFILES_ROOT / "lib"))
+
+from runpod_local.errors import RunpodLocalError  # noqa: E402
+from runpod_local.huggingface_credentials import (  # noqa: E402
+    HF_CLI_VERSION,
+    ensure_huggingface_secret_directory,
+    huggingface_token_path,
+)
+
+
+def _cache_home(environment: dict[str, str]) -> pathlib.Path:
+    configured = environment.get("HF_HOME")
+    if configured:
+        path = pathlib.Path(
+            os.path.expandvars(os.path.expanduser(configured))
+        )
+    else:
+        xdg_cache = environment.get("XDG_CACHE_HOME")
+        base = (
+            pathlib.Path(
+                os.path.expandvars(os.path.expanduser(xdg_cache))
+            )
+            if xdg_cache
+            else pathlib.Path.home() / ".cache"
+        )
+        path = base / "huggingface"
+    if not path.is_absolute():
+        raise RunpodLocalError(
+            "HF_HOME must be absolute or expand to an absolute path",
+            code="unsafe_hf_cache_path",
+        )
+    return path
+
+
+def _validate_optional_secret(path: pathlib.Path) -> None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise RunpodLocalError(
+            f"cannot inspect Hugging Face secret file {path}: {error}",
+            code="unsafe_hf_credential_file",
+        ) from error
+    if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+        raise RunpodLocalError(
+            f"Hugging Face secret path is not a regular file: {path}",
+            code="unsafe_hf_credential_file",
+        )
+    if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+        raise RunpodLocalError(
+            f"Hugging Face secret file is not owned by this user: {path}",
+            code="unsafe_hf_credential_file",
+        )
+    if metadata.st_mode & 0o077:
+        raise RunpodLocalError(
+            f"Hugging Face secret permissions are broader than 0600: {path}",
+            code="unsafe_hf_credential_permissions",
+        )
+
+
+def _managed_executable(environment: dict[str, str]) -> pathlib.Path:
+    configured = environment.get("HF_CLI_TOOL_ROOT")
+    root = (
+        pathlib.Path(os.path.expandvars(os.path.expanduser(configured)))
+        if configured
+        else pathlib.Path.home() / "tools" / "hf"
+    )
+    executable = root / HF_CLI_VERSION / "bin" / "hf"
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        raise RunpodLocalError(
+            f"managed hf {HF_CLI_VERSION} is not installed; run "
+            f"`{DOTFILES_ROOT}/tools/hf/install.sh {HF_CLI_VERSION}`",
+            code="hf_cli_missing",
+        )
+    return executable
+
+
+def main(arguments: list[str]) -> int:
+    if arguments and arguments[0] == "update":
+        raise RunpodLocalError(
+            "the managed hf CLI cannot self-update; change the dotfiles pin "
+            "and rerun tools/hf/install.sh",
+            code="managed_update_rejected",
+        )
+    if any(
+        argument == "--token"
+        or argument.startswith("--token=")
+        or argument == "--add-to-git-credential"
+        for argument in arguments
+    ):
+        raise RunpodLocalError(
+            "token arguments and Git-credential copies are disabled; use "
+            "interactive `hf auth login`",
+            code="unsafe_hf_token_argument",
+        )
+    if len(arguments) >= 2 and arguments[:2] == ["auth", "token"]:
+        raise RunpodLocalError(
+            "`hf auth token` prints the credential and is disabled",
+            code="unsafe_hf_token_output",
+        )
+
+    environment = dict(os.environ)
+    for name in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+        if environment.get(name):
+            raise RunpodLocalError(
+                f"refusing inherited {name}; use `hf auth login` so the "
+                "credential remains in the private token file",
+                code="unsafe_hf_environment_token",
+            )
+
+    token_path = huggingface_token_path(environment=environment)
+    ensure_huggingface_secret_directory(token_path)
+    _validate_optional_secret(token_path)
+    _validate_optional_secret(token_path.parent / "stored_tokens")
+
+    cache_home = _cache_home(environment)
+    cache_home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    environment["HF_HOME"] = str(cache_home)
+    environment["HF_HUB_CACHE"] = environment.get(
+        "HF_HUB_CACHE", str(cache_home / "hub")
+    )
+    environment["HF_XET_CACHE"] = environment.get(
+        "HF_XET_CACHE", str(cache_home / "xet")
+    )
+    environment["HF_ASSETS_CACHE"] = environment.get(
+        "HF_ASSETS_CACHE", str(cache_home / "assets")
+    )
+    environment["HF_TOKEN_PATH"] = str(token_path)
+    environment["HF_HUB_DISABLE_UPDATE_CHECK"] = "1"
+    environment.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+    environment.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
+    environment.pop("HF_HUB_ENABLE_HF_TRANSFER", None)
+
+    executable = _managed_executable(environment)
+    os.execve(executable, [str(executable), *arguments], environment)
+    raise AssertionError("execve unexpectedly returned")
+
+
+if __name__ == "__main__":
+    os.umask(0o077)
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except RunpodLocalError as error:
+        print(f"hf: error: {error}", file=sys.stderr)
+        raise SystemExit(1) from None

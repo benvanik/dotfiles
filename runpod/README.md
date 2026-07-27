@@ -40,6 +40,22 @@ The directory is mode 0700 and the file is mode 0600. The key is sent only in
 an Authorization header. It never appears in URLs, command arguments, launch
 profiles, receipts, JSON output, or SSH/SCP child environments.
 
+The official Hugging Face CLI is independently pinned under `~/tools/hf`:
+
+```sh
+~/.dotfiles/tools/hf/install.sh 1.24.0
+hf auth login
+hf auth whoami
+```
+
+The wrapper sets `HF_TOKEN_PATH` to
+`${XDG_CONFIG_HOME:-~/.config}/huggingface/token`; browser-OAuth refresh state
+is stored beside it. Model/Xet caches remain under
+`${XDG_CACHE_HOME:-~/.cache}/huggingface`. The local model inspector reads that
+same owned, non-symlink, mode-0600 token file for gated metadata requests.
+Tokens are never accepted as `hf` wrapper arguments or inherited environment
+values.
+
 Profiles inject one validated `SSH_PUBLIC_KEY` and snapshot its matching
 private-identity path. Profile creation and every fresh billable submission
 reject a missing, rotated, mismatched, broadly readable, or interactive private

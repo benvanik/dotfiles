@@ -77,6 +77,24 @@ use_iree_dev ">=21.0.0" ">=3.28.0"
 
 ## Installing New Tool Versions
 
+### Hugging Face CLI
+
+The committed wrapper pins the official CLI and keeps authentication material
+outside the model cache:
+
+```bash
+~/.dotfiles/tools/hf/install.sh 1.24.0
+hf auth login
+hf auth whoami
+```
+
+The managed environment lives under `~/tools/hf/`. Model and Xet data use
+`${XDG_CACHE_HOME:-~/.cache}/huggingface`; the active token and browser-OAuth
+refresh state use `${XDG_CONFIG_HOME:-~/.config}/huggingface` with private
+permissions. The wrapper rejects environment tokens, Git credential
+duplication, token-printing commands, and `hf update` so the dotfiles pin and
+private file remain authoritative.
+
 ### LLVM Example
 
 ```bash

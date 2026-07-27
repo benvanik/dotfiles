@@ -62,6 +62,7 @@ def plan_workload(
     cache: JsonCache,
     catalog: dict[str, Any] | None = None,
     transport: JsonHttpTransport | None = None,
+    token: str | None = None,
 ) -> WorkloadPlacement:
     """Inspects metadata and applies static placement without provider access."""
     if not request.allowed_gpu_ids:
@@ -100,18 +101,17 @@ def plan_workload(
     if resolved_catalog is None:
         raise AssertionError("hardware catalog unexpectedly absent")
     model_request = request.model
-    model = ModelInspector(
-        HuggingFaceClient(
-            cache=cache,
-            transport=(
-                transport
-                if transport is not None
-                else JsonHttpTransport()
-            ),
-            offline=model_request.offline,
-            refresh=model_request.refresh,
-        )
-    ).inspect(
+    client_arguments: dict[str, Any] = {
+        "cache": cache,
+        "transport": (
+            transport if transport is not None else JsonHttpTransport()
+        ),
+        "offline": model_request.offline,
+        "refresh": model_request.refresh,
+    }
+    if token is not None:
+        client_arguments["token"] = token
+    model = ModelInspector(HuggingFaceClient(**client_arguments)).inspect(
         model_request.repository,
         revision=model_request.revision,
         index_file=model_request.index_file,

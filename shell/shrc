@@ -159,9 +159,10 @@ fi
 # Environment Variables
 # ============================================================================
 
-# HuggingFace Hub - enable fast transfers and set cache location.
-export HF_HUB_ENABLE_HF_TRANSFER=1
-export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
+# Hugging Face Hub keeps immutable caches separate from private credentials.
+export HF_HOME="${HF_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/huggingface}"
+export HF_TOKEN_PATH="${HF_TOKEN_PATH:-${XDG_CONFIG_HOME:-$HOME/.config}/huggingface/token}"
+export HF_XET_HIGH_PERFORMANCE="${HF_XET_HIGH_PERFORMANCE:-1}"
 
 # Disable automatic claude code updates.
 export DISABLE_AUTOUPDATER=1

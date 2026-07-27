@@ -16,6 +16,7 @@ TOOLS=(
     "bazel:all"
     "beads:all"
     "cmake:all"
+    "hf:all"
     "llvm:all"
     "mold:linux"
     "ninja:all"

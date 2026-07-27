@@ -90,6 +90,226 @@ class RunpodApiTest(unittest.TestCase):
         )
         self.assertNotIn("fixture-runpod-token", request["url"])
         self.assertIn("includeNetworkVolume=true", request["url"])
+        self.assertEqual(len(transport.requests), 1)
+
+    def test_pod_gpu_count_falls_back_to_top_level_rest_field(self):
+        top_level = normalize_pod(
+            {
+                "gpu": {"id": "NVIDIA H200"},
+                "gpuCount": 2,
+            }
+        )
+        nested = normalize_pod(
+            {
+                "gpu": {"id": "NVIDIA H200", "count": 1},
+                "gpuCount": 2,
+            }
+        )
+
+        self.assertEqual(top_level["gpu_count"], 2)
+        self.assertEqual(nested["gpu_count"], 1)
+
+    def test_get_pod_merges_exact_graphql_policy_attestation(self):
+        pod_types = {
+            "RESERVED": False,
+            "INTERRUPTABLE": True,
+            "BID": True,
+            "BACKGROUND": True,
+        }
+        for pod_type, interruptible in pod_types.items():
+            with self.subTest(pod_type=pod_type):
+                rest_pod = {
+                    "id": "pod123",
+                    "name": "fixture",
+                    "gpu": {"id": "NVIDIA H200"},
+                    "gpuCount": 1,
+                }
+                policy_response = {
+                    "data": {
+                        "pod": {
+                            "id": "pod123",
+                            "gpuCount": 1,
+                            "locked": False,
+                            "podType": pod_type,
+                        }
+                    }
+                }
+                api, transport = api_with_responses(
+                    rest_pod, policy_response
+                )
+
+                pod = api.get_pod("pod123")
+
+                self.assertEqual(pod["gpu_count"], 1)
+                self.assertIs(pod["locked"], False)
+                self.assertIs(pod["interruptible"], interruptible)
+                self.assertEqual(len(transport.requests), 2)
+                self.assertEqual(transport.requests[0]["method"], "GET")
+                policy_request = transport.requests[1]
+                self.assertEqual(policy_request["method"], "POST")
+                self.assertEqual(
+                    policy_request["url"],
+                    "https://graphql.example.invalid/query",
+                )
+                query = policy_request["payload"]["query"]
+                self.assertIn(
+                    'pod(input: {podId: "pod123"})',
+                    query,
+                )
+                self.assertIn("gpuCount", query)
+                self.assertIn("locked", query)
+                self.assertIn("podType", query)
+
+    def test_get_pod_rejects_mismatched_provider_ids(self):
+        valid_policy = {
+            "data": {
+                "pod": {
+                    "id": "pod123",
+                    "gpuCount": 1,
+                    "locked": False,
+                    "podType": "RESERVED",
+                }
+            }
+        }
+        cases = {
+            "rest": (
+                {"id": "other", "gpuCount": 1},
+                valid_policy,
+            ),
+            "graphql": (
+                {"id": "pod123", "gpuCount": 1},
+                {
+                    "data": {
+                        "pod": {
+                            "id": "other",
+                            "gpuCount": 1,
+                            "locked": False,
+                            "podType": "RESERVED",
+                        }
+                    }
+                },
+            ),
+        }
+        for source, responses in cases.items():
+            with self.subTest(source=source):
+                api, _ = api_with_responses(*responses)
+
+                with self.assertRaises(RunpodLocalError) as caught:
+                    api.get_pod("pod123")
+
+                self.assertEqual(
+                    caught.exception.code,
+                    "invalid_provider_response",
+                )
+
+    def test_get_pod_rejects_invalid_graphql_policy_shape(self):
+        rest_pod = {"id": "pod123", "gpuCount": 1}
+        for name, response in {
+            "missing": {"data": {}},
+            "null": {"data": {"pod": None}},
+            "list": {"data": {"pod": []}},
+        }.items():
+            with self.subTest(name=name):
+                api, _ = api_with_responses(rest_pod, response)
+
+                with self.assertRaises(RunpodLocalError) as caught:
+                    api.get_pod("pod123")
+
+                self.assertEqual(
+                    caught.exception.code,
+                    "invalid_provider_response",
+                )
+
+    def test_get_pod_rejects_invalid_graphql_policy_types(self):
+        rest_pod = {"id": "pod123", "gpuCount": 1}
+        valid_policy = {
+            "id": "pod123",
+            "gpuCount": 1,
+            "locked": False,
+            "podType": "RESERVED",
+        }
+        cases = {
+            "boolean_gpu_count": {"gpuCount": True},
+            "string_gpu_count": {"gpuCount": "1"},
+            "zero_gpu_count": {"gpuCount": 0},
+            "integer_locked": {"locked": 0},
+            "unknown_pod_type": {"podType": "FIXTURE"},
+            "non_string_pod_type": {"podType": 1},
+            "unhashable_pod_type": {"podType": []},
+        }
+        for name, replacement in cases.items():
+            with self.subTest(name=name):
+                policy = dict(valid_policy)
+                policy.update(replacement)
+                api, _ = api_with_responses(
+                    rest_pod,
+                    {"data": {"pod": policy}},
+                )
+
+                with self.assertRaises(RunpodLocalError) as caught:
+                    api.get_pod("pod123")
+
+                self.assertEqual(
+                    caught.exception.code,
+                    "invalid_provider_response",
+                )
+
+    def test_get_pod_rejects_rest_graphql_gpu_count_mismatch(self):
+        api, _ = api_with_responses(
+            {"id": "pod123", "gpuCount": 2},
+            {
+                "data": {
+                    "pod": {
+                        "id": "pod123",
+                        "gpuCount": 1,
+                        "locked": False,
+                        "podType": "RESERVED",
+                    }
+                }
+            },
+        )
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            api.get_pod("pod123")
+
+        self.assertEqual(
+            caught.exception.code,
+            "invalid_provider_response",
+        )
+
+    def test_get_pod_rejects_rest_graphql_policy_mismatch(self):
+        policy_response = {
+            "data": {
+                "pod": {
+                    "id": "pod123",
+                    "gpuCount": 1,
+                    "locked": False,
+                    "podType": "RESERVED",
+                }
+            }
+        }
+        cases = {
+            "locked": {"locked": True},
+            "interruptible": {"interruptible": True},
+            "invalid_locked": {"locked": 0},
+            "invalid_interruptible": {"interruptible": 0},
+        }
+        for name, rest_policy in cases.items():
+            with self.subTest(name=name):
+                rest_pod = {
+                    "id": "pod123",
+                    "gpuCount": 1,
+                    **rest_policy,
+                }
+                api, _ = api_with_responses(rest_pod, policy_response)
+
+                with self.assertRaises(RunpodLocalError) as caught:
+                    api.get_pod("pod123")
+
+                self.assertEqual(
+                    caught.exception.code,
+                    "invalid_provider_response",
+                )
 
     def test_pod_cost_falls_back_and_rejects_nonfinite_values(self):
         fallback = normalize_pod(

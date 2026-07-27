@@ -51,6 +51,22 @@ query {
   }
 }
 """
+POD_POLICY_QUERY = """
+query {
+  pod(input: {podId: "%s"}) {
+    id
+    gpuCount
+    locked
+    podType
+  }
+}
+"""
+POD_TYPE_INTERRUPTIBLE = {
+    "RESERVED": False,
+    "INTERRUPTABLE": True,
+    "BID": True,
+    "BACKGROUND": True,
+}
 
 
 def _provider_id(value: str, *, label: str) -> str:
@@ -99,6 +115,9 @@ def gpu_stock_is_available(gpu: dict[str, Any], *, gpu_count: int) -> bool:
 
 def normalize_pod(pod: dict[str, Any]) -> dict[str, Any]:
     gpu = pod.get("gpu") if isinstance(pod.get("gpu"), dict) else {}
+    gpu_count = gpu.get("count")
+    if gpu_count is None:
+        gpu_count = pod.get("gpuCount")
     machine = (
         pod.get("machine") if isinstance(pod.get("machine"), dict) else {}
     )
@@ -127,7 +146,7 @@ def normalize_pod(pod: dict[str, Any]) -> dict[str, Any]:
         "interruptible": pod.get("interruptible"),
         "locked": pod.get("locked"),
         "gpu_id": gpu.get("id", machine.get("gpuTypeId")),
-        "gpu_count": gpu.get("count"),
+        "gpu_count": gpu_count,
         "cost_per_hour": cost_per_hour,
         "data_center_id": machine.get("dataCenterId"),
         "secure_cloud": machine.get("secureCloud"),
@@ -266,6 +285,51 @@ class RunpodApi:
             )
         return [normalize_pod(pod) for pod in value]
 
+    def _get_pod_policy_attestation(self, pod_id: str) -> dict[str, Any]:
+        data = self._graphql(POD_POLICY_QUERY % pod_id)
+        value = data.get("pod")
+        if not isinstance(value, dict):
+            raise RunpodLocalError(
+                "Runpod GraphQL Pod policy response has no Pod object",
+                code="invalid_provider_response",
+            )
+        if value.get("id") != pod_id:
+            raise RunpodLocalError(
+                "Runpod GraphQL Pod policy response ID did not match the "
+                "requested Pod",
+                code="invalid_provider_response",
+            )
+        gpu_count = value.get("gpuCount")
+        if (
+            not isinstance(gpu_count, int)
+            or isinstance(gpu_count, bool)
+            or gpu_count <= 0
+        ):
+            raise RunpodLocalError(
+                "Runpod GraphQL Pod policy response has invalid gpuCount",
+                code="invalid_provider_response",
+            )
+        locked = value.get("locked")
+        if not isinstance(locked, bool):
+            raise RunpodLocalError(
+                "Runpod GraphQL Pod policy response has invalid locked",
+                code="invalid_provider_response",
+            )
+        pod_type = value.get("podType")
+        if (
+            not isinstance(pod_type, str)
+            or pod_type not in POD_TYPE_INTERRUPTIBLE
+        ):
+            raise RunpodLocalError(
+                "Runpod GraphQL Pod policy response has unsupported podType",
+                code="invalid_provider_response",
+            )
+        return {
+            "gpuCount": gpu_count,
+            "locked": locked,
+            "interruptible": POD_TYPE_INTERRUPTIBLE[pod_type],
+        }
+
     def get_pod(self, pod_id: str) -> dict[str, Any]:
         pod_id = _provider_id(pod_id, label="Pod ID")
         value = self._rest(
@@ -278,7 +342,35 @@ class RunpodApi:
                 "Runpod Pod response was not an object",
                 code="invalid_provider_response",
             )
-        return normalize_pod(value)
+        if value.get("id") != pod_id:
+            raise RunpodLocalError(
+                "Runpod REST Pod response ID did not match the requested Pod",
+                code="invalid_provider_response",
+            )
+        policy = self._get_pod_policy_attestation(pod_id)
+        rest_gpu_count = normalize_pod(value)["gpu_count"]
+        if rest_gpu_count is not None and (
+            not isinstance(rest_gpu_count, int)
+            or isinstance(rest_gpu_count, bool)
+            or rest_gpu_count != policy["gpuCount"]
+        ):
+            raise RunpodLocalError(
+                "Runpod REST and GraphQL Pod GPU counts did not match",
+                code="invalid_provider_response",
+            )
+        for field in ("locked", "interruptible"):
+            rest_policy = value.get(field)
+            if rest_policy is not None and (
+                not isinstance(rest_policy, bool)
+                or rest_policy is not policy[field]
+            ):
+                raise RunpodLocalError(
+                    "Runpod REST and GraphQL Pod policy did not match",
+                    code="invalid_provider_response",
+                )
+        merged = dict(value)
+        merged.update(policy)
+        return normalize_pod(merged)
 
     def create_pod(self, payload: dict[str, Any]) -> dict[str, Any]:
         value = self._rest(

@@ -112,6 +112,9 @@ class FakeApi:
         self.created_cost = 1.99
         self.before_create = None
         self.before_get = None
+        self.account_ssh_attestation_calls = []
+        self.account_ssh_attestation_error = None
+        self.account_ssh_attestation = object()
 
     def get_network_volume(self, volume_id):
         return {
@@ -127,7 +130,15 @@ class FakeApi:
     def list_pods(self):
         return [dict(pod) for pod in self.pods]
 
-    def create_pod(self, payload):
+    def attest_account_ssh_key(self, public_key):
+        self.account_ssh_attestation_calls.append(public_key)
+        if self.account_ssh_attestation_error is not None:
+            raise self.account_ssh_attestation_error
+        return self.account_ssh_attestation
+
+    def create_pod(self, payload, *, account_ssh_attestation):
+        if account_ssh_attestation is not self.account_ssh_attestation:
+            raise AssertionError("wrong account SSH-key attestation")
         self.create_calls += 1
         if self.before_create is not None:
             self.before_create()
@@ -471,6 +482,33 @@ class LifecycleTest(unittest.TestCase):
 
         self.manager.key_pair_validator = lambda _identity, _public: None
         resumed = self.launch()
+        self.assertEqual(resumed["phase"], "active")
+        self.assertEqual(self.api.create_calls, 1)
+
+    def test_account_key_failure_leaves_retryable_intent_before_post(self):
+        self.api.account_ssh_attestation_error = RunpodLocalError(
+            "fixture account key is missing",
+            code="account_ssh_key_not_authorized",
+        )
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            self.launch()
+
+        record = InstanceStore(self.state).load("compiler")
+        self.assertEqual(
+            caught.exception.code, "account_ssh_key_not_authorized"
+        )
+        self.assertEqual(record["phase"], "intent")
+        self.assertIsNone(record["lease"])
+        self.assertNotIn("submission_started_at", record)
+        self.assertEqual(self.api.create_calls, 0)
+        self.assertEqual(
+            self.api.account_ssh_attestation_calls, [SSH_PUBLIC_KEY]
+        )
+
+        self.api.account_ssh_attestation_error = None
+        resumed = self.launch()
+
         self.assertEqual(resumed["phase"], "active")
         self.assertEqual(self.api.create_calls, 1)
 

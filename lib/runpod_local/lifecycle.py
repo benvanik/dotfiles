@@ -86,7 +86,7 @@ class LifecycleManager:
         utc_timestamp(now)
         return now
 
-    def _validate_record_ssh_identity(self, record: dict[str, Any]) -> None:
+    def _validate_record_ssh_identity(self, record: dict[str, Any]) -> str:
         connection = record.get("connection")
         payload = record.get("pod_payload")
         environment = payload.get("env") if isinstance(payload, dict) else None
@@ -108,6 +108,7 @@ class LifecycleManager:
             connection.get("identity_file")
         )
         self.key_pair_validator(str(identity_path), public_key)
+        return public_key
 
     def _volume_for_profile(
         self, profile: dict[str, Any]
@@ -324,8 +325,12 @@ class LifecycleManager:
                     code="launch_expired",
                 )
         just_marked_submitting = False
+        account_ssh_attestation: Any = None
         if phase == "intent":
-            self._validate_record_ssh_identity(record)
+            public_key = self._validate_record_ssh_identity(record)
+            account_ssh_attestation = self._api().attest_account_ssh_key(
+                public_key
+            )
             now = self._now()
             transition_instance(
                 record,
@@ -382,7 +387,10 @@ class LifecycleManager:
                 )
             else:
                 try:
-                    pod = self._api().create_pod(record["pod_payload"])
+                    pod = self._api().create_pod(
+                        record["pod_payload"],
+                        account_ssh_attestation=account_ssh_attestation,
+                    )
                 except HttpRequestError as error:
                     if (
                         error.status == 500

@@ -58,10 +58,20 @@ Tokens are never accepted as `hf` wrapper arguments or inherited environment
 values.
 
 Profiles inject one validated `SSH_PUBLIC_KEY` and snapshot its matching
-private-identity path. Profile creation and every fresh billable submission
-reject a missing, rotated, mismatched, broadly readable, or interactive private
-key. `PUBLIC_KEY` remains provider-owned and cannot be supplied as a second
-authorization channel. SSH then disables user config, agents, proxies, password
+private-identity path. That value is a durable profile/receipt identity; the
+controller does not treat its presence in the Pod environment as proof that
+full-TCP SSH will authorize it. Immediately before a fresh billable Pod create,
+the controller reads Runpod's `myself.pubKey` account field and requires one of
+its newline-separated keys to match the profile key's exact algorithm and key
+body. OpenSSH comments do not participate in identity. The resulting
+attestation is one-use and bound to the create payload. A missing or mismatched
+account key leaves the receipt in its retryable `intent` phase and sends no Pod
+create request.
+
+Profile creation and every fresh billable submission also reject a missing,
+rotated, mismatched, broadly readable, or interactive private key. `PUBLIC_KEY`
+remains provider-owned and cannot be supplied as a second authorization
+channel. SSH then disables user config, agents, proxies, password
 authentication, and forwarding side channels. Each Pod has its own mode-0600
 known-hosts file and `runpod-POD_ID` host-key alias. The first connection is
 TOFU via `accept-new`; a changed key fails.
@@ -174,7 +184,10 @@ chmod 644 ~/.ssh/id_ed25519_runpod.pub
 ```
 
 The public key is not secret. The private key never enters dotfiles or Runpod
-state.
+state. Before the first launch, paste the complete public-key line into the
+**SSH Public Keys** field in Runpod account settings. Multiple account keys use
+one line each. `runpod-up --execute` verifies the configured profile key there
+through a read-only account query; it never changes account SSH settings.
 
 Plan a 250 GB Pro+H200 cache in a datacenter where both offers are live:
 

@@ -12,6 +12,18 @@ from runpod_local.http import JsonHttpTransport
 from runpod_local.provider_cli import standard_volume_monthly_usd
 
 
+SSH_PUBLIC_KEY = (
+    "ssh-ed25519 "
+    "AAAAC3NzaC1lZDI1NTE5AAAAIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f "
+    "fixture@example"
+)
+OTHER_SSH_PUBLIC_KEY = (
+    "ssh-ed25519 "
+    "AAAAC3NzaC1lZDI1NTE5AAAAIEJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJC "
+    "other@example"
+)
+
+
 class FakeTransport:
     def __init__(self, *responses):
         self.responses = list(responses)
@@ -51,6 +63,17 @@ def api_with_responses(*responses):
         graphql_url="https://graphql.example.invalid/query",
     )
     return api, transport
+
+
+def account_ssh_key_response(public_keys=SSH_PUBLIC_KEY):
+    return {"data": {"myself": {"pubKey": public_keys}}}
+
+
+def pod_create_payload(public_key=SSH_PUBLIC_KEY):
+    return {
+        "name": "fixture",
+        "env": {"SSH_PUBLIC_KEY": public_key},
+    }
 
 
 class RunpodApiTest(unittest.TestCase):
@@ -360,17 +383,22 @@ class RunpodApiTest(unittest.TestCase):
 
     def test_create_pod_allowlists_only_definitive_capacity_error(self):
         api, transport = api_with_responses(
+            account_ssh_key_response(),
             {
                 "id": "pod123",
                 "name": "fixture",
                 "gpu": {"id": "NVIDIA H200", "count": 1},
             }
         )
+        attestation = api.attest_account_ssh_key(SSH_PUBLIC_KEY)
 
-        pod = api.create_pod({"name": "fixture"})
+        pod = api.create_pod(
+            pod_create_payload(),
+            account_ssh_attestation=attestation,
+        )
 
         self.assertEqual(pod["id"], "pod123")
-        request = transport.requests[0]
+        request = transport.requests[1]
         self.assertEqual(request["method"], "POST")
         self.assertEqual(request["expected_statuses"], (201,))
         self.assertEqual(
@@ -407,15 +435,111 @@ class RunpodApiTest(unittest.TestCase):
 
         api = RunpodApi(
             ApiCredential("fixture-runpod-token", source="test"),
-            transport=JsonHttpTransport(opener=failing_open),
+            transport=FakeTransport(account_ssh_key_response()),
             rest_base="https://rest.example.invalid/v1",
         )
+        attestation = api.attest_account_ssh_key(SSH_PUBLIC_KEY)
+        api.transport = JsonHttpTransport(opener=failing_open)
 
         with self.assertRaises(HttpRequestError) as caught:
-            api.create_pod({"name": "fixture"})
+            api.create_pod(
+                pod_create_payload(),
+                account_ssh_attestation=attestation,
+            )
 
         self.assertEqual(caught.exception.status, 500)
         self.assertEqual(caught.exception.provider_error, safe_message)
+
+    def test_account_ssh_key_match_is_comment_insensitive_and_multiline(self):
+        account_keys = (
+            f"{OTHER_SSH_PUBLIC_KEY}\n"
+            + " ".join(SSH_PUBLIC_KEY.split(maxsplit=2)[:2])
+            + " account-comment"
+        )
+        api, transport = api_with_responses(
+            account_ssh_key_response(account_keys)
+        )
+
+        api.attest_account_ssh_key(SSH_PUBLIC_KEY)
+
+        self.assertEqual(len(transport.requests), 1)
+        request = transport.requests[0]
+        self.assertEqual(request["method"], "POST")
+        self.assertEqual(
+            request["url"], "https://graphql.example.invalid/query"
+        )
+        self.assertIn("myself", request["payload"]["query"])
+        self.assertIn("pubKey", request["payload"]["query"])
+
+    def test_missing_account_ssh_key_fails_typed_without_create_post(self):
+        for account_key in (None, OTHER_SSH_PUBLIC_KEY):
+            with self.subTest(account_key=account_key):
+                api, transport = api_with_responses(
+                    account_ssh_key_response(account_key)
+                )
+
+                with self.assertRaises(RunpodLocalError) as caught:
+                    api.attest_account_ssh_key(SSH_PUBLIC_KEY)
+
+                self.assertEqual(
+                    caught.exception.code,
+                    "account_ssh_key_not_authorized",
+                )
+                self.assertIn(
+                    "SSH Public Keys", str(caught.exception)
+                )
+                self.assertIn(
+                    "no Pod create request was sent",
+                    str(caught.exception),
+                )
+                self.assertEqual(len(transport.requests), 1)
+
+    def test_create_pod_requires_matching_one_use_account_attestation(self):
+        api, transport = api_with_responses(
+            account_ssh_key_response(),
+            {
+                "id": "pod123",
+                "name": "fixture",
+                "gpu": {"id": "NVIDIA H200", "count": 1},
+            },
+        )
+
+        with self.assertRaises(RunpodLocalError) as missing:
+            api.create_pod(pod_create_payload())
+
+        self.assertEqual(
+            missing.exception.code, "account_ssh_attestation_required"
+        )
+        self.assertEqual(transport.requests, [])
+
+        attestation = api.attest_account_ssh_key(SSH_PUBLIC_KEY)
+        with self.assertRaises(RunpodLocalError) as mismatch:
+            api.create_pod(
+                pod_create_payload(OTHER_SSH_PUBLIC_KEY),
+                account_ssh_attestation=attestation,
+            )
+
+        self.assertEqual(
+            mismatch.exception.code, "account_ssh_attestation_mismatch"
+        )
+        self.assertEqual(len(transport.requests), 1)
+
+        pod = api.create_pod(
+            pod_create_payload(),
+            account_ssh_attestation=attestation,
+        )
+        self.assertEqual(pod["id"], "pod123")
+        self.assertEqual(len(transport.requests), 2)
+
+        with self.assertRaises(RunpodLocalError) as reused:
+            api.create_pod(
+                pod_create_payload(),
+                account_ssh_attestation=attestation,
+            )
+        self.assertEqual(
+            reused.exception.code, "account_ssh_attestation_required"
+        )
+        self.assertEqual(len(transport.requests), 2)
 
     def test_stock_uses_header_authenticated_graphql_without_query_key(self):
         response = {

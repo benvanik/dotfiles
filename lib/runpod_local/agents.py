@@ -168,10 +168,13 @@ constrained non-secret exception and is fixed to ephemeral
 profile. Shell-startup controls such as `BASH_ENV`, `ENV`, and `ZDOTDIR` are
 reserved by the reconciled SSH control plane, as are dynamic-loader controls
 such as `LD_*`, `GLIBC_TUNABLES`, and `GCONV_PATH`. `PUBLIC_KEY` is
-provider-owned; the tool validates and injects one
-profile-specific `SSH_PUBLIC_KEY`. The private/public pair is revalidated
-immediately before a fresh billable submission. Local profiles are advisory
-across machines; provider state and exact Pod IDs remain authoritative.
+provider-owned; the tool validates and injects one profile-specific
+`SSH_PUBLIC_KEY` as profile/receipt identity, not as proof of full-TCP
+authorization. Immediately before a fresh billable create, the controller
+requires the same algorithm and key body among the newline-separated keys in
+Runpod account `myself.pubKey`; comments are ignored. The private/public pair
+is also revalidated. Local profiles are advisory across machines; provider
+state and exact Pod IDs remain authoritative.
 """,
     "up": """# `runpod-up`
 
@@ -197,6 +200,13 @@ Pod is never re-submitted automatically: retry this same command later to
 reconcile. Local locks coordinate only one machine. A second machine with a
 split state root can launch another Pod; `runpod-status` exposes it as
 unmanaged here.
+
+Before entering the ambiguous submission state, `--execute` checks the
+profile's exact SSH algorithm and key body against Runpod account
+`myself.pubKey`. A missing or mismatched account key returns
+`account_ssh_key_not_authorized`, leaves the receipt in retryable `intent`, and
+sends no Pod create request. Add the configured `.pub` line to the Runpod
+account's **SSH Public Keys** field and retry the same command.
 """,
     "status": """# `runpod-status`
 

@@ -9,6 +9,7 @@ from typing import Any
 from .auth import ApiCredential
 from .errors import RunpodLocalError
 from .http import JsonHttpTransport
+from .profile import validate_ssh_public_key
 from .timeutil import utc_timestamp
 
 
@@ -51,6 +52,13 @@ query {
   }
 }
 """
+ACCOUNT_SSH_KEY_QUERY = """
+query {
+  myself {
+    pubKey
+  }
+}
+"""
 POD_POLICY_QUERY = """
 query {
   pod(input: {podId: "%s"}) {
@@ -67,6 +75,27 @@ POD_TYPE_INTERRUPTIBLE = {
     "BID": True,
     "BACKGROUND": True,
 }
+
+
+def _ssh_public_key_identity(value: str) -> tuple[str, str]:
+    fields = validate_ssh_public_key(value).split(maxsplit=2)
+    return fields[0], fields[1]
+
+
+class _AccountSshKeyAttestation:
+    """One-use proof that this API client observed an account key."""
+
+    __slots__ = ("authority", "consumed", "key_identity")
+
+    def __init__(
+        self,
+        *,
+        authority: object,
+        key_identity: tuple[str, str],
+    ) -> None:
+        self.authority = authority
+        self.consumed = False
+        self.key_identity = key_identity
 
 
 def _provider_id(value: str, *, label: str) -> str:
@@ -219,6 +248,7 @@ class RunpodApi:
         self.transport = transport or JsonHttpTransport()
         self.rest_base = rest_base.rstrip("/")
         self.graphql_url = graphql_url
+        self._account_ssh_attestation_authority = object()
 
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.credential.token}"}
@@ -284,6 +314,88 @@ class RunpodApi:
                 code="invalid_provider_response",
             )
         return [normalize_pod(pod) for pod in value]
+
+    def attest_account_ssh_key(
+        self, public_key: str
+    ) -> _AccountSshKeyAttestation:
+        """Require the profile key among the account's startup SSH keys."""
+
+        expected_identity = _ssh_public_key_identity(public_key)
+        data = self._graphql(ACCOUNT_SSH_KEY_QUERY)
+        myself = data.get("myself")
+        if not isinstance(myself, dict):
+            raise RunpodLocalError(
+                "Runpod GraphQL account response has no myself object",
+                code="invalid_provider_response",
+            )
+        account_public_keys = myself.get("pubKey")
+        if account_public_keys is not None and not isinstance(
+            account_public_keys, str
+        ):
+            raise RunpodLocalError(
+                "Runpod GraphQL account response has an invalid pubKey",
+                code="invalid_provider_response",
+            )
+        for line in (
+            account_public_keys.splitlines()
+            if isinstance(account_public_keys, str)
+            else ()
+        ):
+            if not line:
+                continue
+            try:
+                account_identity = _ssh_public_key_identity(line)
+            except RunpodLocalError:
+                continue
+            if account_identity == expected_identity:
+                return _AccountSshKeyAttestation(
+                    authority=self._account_ssh_attestation_authority,
+                    key_identity=expected_identity,
+                )
+        raise RunpodLocalError(
+            "Runpod account SSH Public Keys do not include the profile's "
+            "dedicated key. Add the configured .pub key to the SSH Public "
+            "Keys field in Runpod account settings before retrying; no Pod "
+            "create request was sent.",
+            code="account_ssh_key_not_authorized",
+        )
+
+    def _consume_account_ssh_key_attestation(
+        self,
+        payload: dict[str, Any],
+        attestation: Any,
+    ) -> None:
+        if (
+            not isinstance(attestation, _AccountSshKeyAttestation)
+            or attestation.authority
+            is not self._account_ssh_attestation_authority
+            or attestation.consumed
+        ):
+            raise RunpodLocalError(
+                "Pod creation requires a fresh Runpod account SSH-key "
+                "attestation",
+                code="account_ssh_attestation_required",
+            )
+        environment = payload.get("env") if isinstance(payload, dict) else None
+        public_key = (
+            environment.get("SSH_PUBLIC_KEY")
+            if isinstance(environment, dict)
+            else None
+        )
+        try:
+            payload_identity = _ssh_public_key_identity(public_key)
+        except RunpodLocalError as error:
+            raise RunpodLocalError(
+                "Pod creation payload has no valid SSH_PUBLIC_KEY identity",
+                code="invalid_pod_payload",
+            ) from error
+        if payload_identity != attestation.key_identity:
+            raise RunpodLocalError(
+                "Pod SSH_PUBLIC_KEY identity does not match its Runpod "
+                "account attestation",
+                code="account_ssh_attestation_mismatch",
+            )
+        attestation.consumed = True
 
     def _get_pod_policy_attestation(self, pod_id: str) -> dict[str, Any]:
         data = self._graphql(POD_POLICY_QUERY % pod_id)
@@ -372,7 +484,15 @@ class RunpodApi:
         merged.update(policy)
         return normalize_pod(merged)
 
-    def create_pod(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def create_pod(
+        self,
+        payload: dict[str, Any],
+        *,
+        account_ssh_attestation: Any = None,
+    ) -> dict[str, Any]:
+        self._consume_account_ssh_key_attestation(
+            payload, account_ssh_attestation
+        )
         value = self._rest(
             "POST",
             "pods",

@@ -25,6 +25,7 @@ from .instances import (
     validate_lease_request,
 )
 from .profile import (
+    provider_effective_environment_summary,
     validate_profile,
     validate_profile_ssh_files,
     validate_ssh_identity_file,
@@ -32,7 +33,7 @@ from .profile import (
     validate_ssh_public_key,
 )
 from .state import StateStore, validate_record_name
-from .template import environment_summary, template_contract_violations
+from .template import template_contract_violations
 from .timeutil import parse_utc_timestamp, utc_timestamp
 
 TERMINAL_PHASES = {"rolled_back", "terminated", "aborted"}
@@ -430,12 +431,13 @@ class LifecycleManager:
                 data_center_id=placement["data_center_id"],
                 provider_termination_at=provider_termination_at,
             )
-            expected_environment = environment_summary(
+            expected_environment = provider_effective_environment_summary(
                 pod_payload.get("env")
             )
             if expected_environment is None:
                 raise AssertionError(
-                    "validated profile produced an invalid Pod environment"
+                    "validated profile produced an invalid effective Pod "
+                    "environment"
                 )
             record = {
                 "schema_version": INSTANCE_SCHEMA,

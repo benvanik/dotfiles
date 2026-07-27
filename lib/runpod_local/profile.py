@@ -22,6 +22,7 @@ from .runtime_catalog import (
 )
 from .state import StateStore, validate_record_name
 from .template import (
+    environment_summary,
     template_contract_violations,
     validate_image_digest,
     validate_private_template_contract,
@@ -379,6 +380,27 @@ def validate_ssh_public_key(value: str) -> str:
         ) from error
     _ssh_public_key_blob(fields[0], decoded)
     return value
+
+
+def provider_effective_environment_summary(
+    requested_environment: Any,
+) -> dict[str, Any] | None:
+    """Fingerprint the exact environment Runpod persists for one SSH Pod."""
+
+    if (
+        not isinstance(requested_environment, dict)
+        or "PUBLIC_KEY" in requested_environment
+    ):
+        return None
+    try:
+        public_key = validate_ssh_public_key(
+            requested_environment.get("SSH_PUBLIC_KEY")
+        )
+    except RunpodLocalError:
+        return None
+    effective_environment = dict(requested_environment)
+    effective_environment["PUBLIC_KEY"] = public_key
+    return environment_summary(effective_environment)
 
 
 def load_ssh_public_key_file(value: str) -> tuple[pathlib.Path, str]:

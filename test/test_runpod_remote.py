@@ -27,8 +27,8 @@ from runpod_local.remote import (
     validate_remote_copy_path,
 )
 from runpod_local.remote_cli import _run_tunnel
+from runpod_local.profile import provider_effective_environment_summary
 from runpod_local.state import StateStore
-from runpod_local.template import environment_summary
 from runpod_local.timeutil import utc_timestamp
 
 GPU_ID = "NVIDIA RTX PRO 6000 Blackwell Server Edition"
@@ -66,11 +66,13 @@ def active_record(identity_file: pathlib.Path):
         "dataCenterId": "US-NC-2",
         "terminateAfter": utc_timestamp(provider_termination_at),
     }
-    normalized_environment = environment_summary(payload["env"])
+    normalized_environment = provider_effective_environment_summary(
+        payload["env"]
+    )
     if normalized_environment is None:
         raise AssertionError("fixture Pod environment is invalid")
     return {
-        "schema_version": "runpod.instance.v3",
+        "schema_version": "runpod.instance.v4",
         "name": "compiler",
         "operation_id": "12345678-1234-4234-8234-123456789abc",
         "remote_name": payload["name"],
@@ -133,7 +135,7 @@ def active_record(identity_file: pathlib.Path):
 
 
 def live_pod(**overrides):
-    normalized_environment = environment_summary(
+    normalized_environment = provider_effective_environment_summary(
         {"SSH_PUBLIC_KEY": SSH_PUBLIC_KEY}
     )
     if normalized_environment is None:

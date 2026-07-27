@@ -11,11 +11,10 @@ from typing import Any
 
 from .api import validate_provider_pod_snapshot
 from .errors import RunpodLocalError
-from .profile import validate_profile
+from .profile import provider_effective_environment_summary, validate_profile
 from .runtime_catalog import validate_runtime_identity
 from .state import StateStore, validate_record_name
 from .template import (
-    environment_summary,
     template_contract_violations,
     validate_image_digest,
     validate_private_template_contract,
@@ -26,7 +25,7 @@ from .timeutil import (
     utc_timestamp,
 )
 
-INSTANCE_SCHEMA = "runpod.instance.v3"
+INSTANCE_SCHEMA = "runpod.instance.v4"
 INSTANCE_PHASES = {
     "intent",
     "submitting",
@@ -546,7 +545,9 @@ def validate_instance_record(record: dict[str, Any]) -> dict[str, Any]:
             f"instance {name} has no Pod request payload",
             code="invalid_instance_record",
         )
-    payload_environment = environment_summary(pod_payload.get("env"))
+    payload_environment = provider_effective_environment_summary(
+        pod_payload.get("env")
+    )
     if (
         payload_environment is None
         or payload_environment["environment_names"]

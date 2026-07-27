@@ -73,6 +73,12 @@ attestation is one-use and bound to the create payload. A missing or mismatched
 account key leaves the receipt in its retryable `intent` phase and sends no Pod
 create request.
 
+Runpod deterministically adds its provider-owned `PUBLIC_KEY` field with the
+exact `SSH_PUBLIC_KEY` bytes. The outbound payload retains only the requested
+environment, while allocation attestation fingerprints the complete effective
+environment including that exact mirror. A missing, changed, or additional
+provider field still rejects and rolls back the allocation.
+
 Profile creation and every fresh billable submission also reject a missing,
 rotated, mismatched, broadly readable, or interactive private key. `PUBLIC_KEY`
 remains provider-owned and cannot be supplied as a second authorization

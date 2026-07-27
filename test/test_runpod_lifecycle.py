@@ -20,7 +20,10 @@ from runpod_local.instances import (
     validate_instance_record,
 )
 from runpod_local.lifecycle import LifecycleManager
-from runpod_local.profile import create_profile
+from runpod_local.profile import (
+    create_profile,
+    provider_effective_environment_summary,
+)
 from runpod_local.runtime_catalog import load_runtime
 from runpod_local.state import StateStore
 from runpod_local.template import environment_summary
@@ -190,7 +193,9 @@ class FakeApi:
 
     def pod_for_payload(self, payload):
         template = self.templates.get(payload.get("templateId"))
-        normalized_environment = environment_summary(payload["env"])
+        normalized_environment = provider_effective_environment_summary(
+            payload["env"]
+        )
         if normalized_environment is None:
             raise AssertionError("fixture Pod environment is invalid")
         return {

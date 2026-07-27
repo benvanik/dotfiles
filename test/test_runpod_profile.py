@@ -14,6 +14,7 @@ from runpod_local.profile import (
     ProfileStore,
     create_profile,
     load_ssh_public_key_file,
+    provider_effective_environment_summary,
     validate_profile,
     validate_profile_ssh_files,
     validate_ssh_key_pair,
@@ -21,7 +22,10 @@ from runpod_local.profile import (
 )
 from runpod_local.runtime_catalog import load_runtime
 from runpod_local.state import StateStore
-from runpod_local.template import build_private_template_contract
+from runpod_local.template import (
+    build_private_template_contract,
+    environment_summary,
+)
 from runpod_local.timeutil import parse_duration
 
 SSH_PUBLIC_KEY = (
@@ -79,6 +83,40 @@ def template_profile(**overrides):
 
 
 class ProfileTest(unittest.TestCase):
+    def test_provider_effective_environment_adds_only_exact_public_key_mirror(
+        self,
+    ):
+        requested = {
+            "SSH_PUBLIC_KEY": SSH_PUBLIC_KEY,
+            "MODEL_CACHE": "/workspace/models",
+        }
+
+        effective = provider_effective_environment_summary(requested)
+
+        self.assertEqual(
+            effective,
+            environment_summary(
+                {
+                    **requested,
+                    "PUBLIC_KEY": SSH_PUBLIC_KEY,
+                }
+            ),
+        )
+        self.assertNotIn("PUBLIC_KEY", requested)
+        self.assertIsNone(
+            provider_effective_environment_summary(
+                {
+                    **requested,
+                    "PUBLIC_KEY": OTHER_SSH_PUBLIC_KEY,
+                }
+            )
+        )
+        self.assertIsNone(
+            provider_effective_environment_summary(
+                {"MODEL_CACHE": "/workspace/models"}
+            )
+        )
+
     def test_profile_pins_private_cache_and_safety_policy(self):
         value = profile()
         pod = value["pod"]

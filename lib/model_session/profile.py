@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .errors import ModelSessionError
+from .ownership import owner_has_private_primary_group
 
 
 PROFILE_SCHEMA = "model-session.profile.v1"
@@ -223,6 +224,15 @@ class Profile:
         return None
 
 
+@dataclass(frozen=True)
+class ProfileRoute:
+    """Minimum current-profile authority needed to find historical runs."""
+
+    profile_root: pathlib.Path
+    profile_id: str
+    state_root: pathlib.Path
+
+
 def infrastructure_root() -> pathlib.Path:
     return pathlib.Path(__file__).resolve().parents[2]
 
@@ -393,10 +403,15 @@ def _validate_directory(
             f"{label} is not owned by the current user: {path}",
             code=error_code,
         )
-    unsafe_write_bits = stat.S_IWOTH
-    if reject_group_write:
-        unsafe_write_bits |= stat.S_IWGRP
-    if metadata.st_mode & unsafe_write_bits:
+    if metadata.st_mode & stat.S_IWOTH:
+        _fail(
+            f"{label} is writable by another principal: {path}",
+            code=error_code,
+        )
+    if metadata.st_mode & stat.S_IWGRP and (
+        reject_group_write
+        or not owner_has_private_primary_group(metadata)
+    ):
         _fail(
             f"{label} is writable by another principal: {path}",
             code=error_code,
@@ -1013,6 +1028,76 @@ def load_profile(profile_root: str | pathlib.Path) -> Profile:
     )
 
 
+def load_profile_route(profile_root: str | pathlib.Path) -> ProfileRoute:
+    """Read only the stable route fields needed by status and resume."""
+
+    root = _absolute_normalized_path(
+        str(profile_root),
+        label="profile directory",
+        must_exist=True,
+    )
+    _validate_directory(
+        root,
+        label="profile directory",
+        require_current_owner=True,
+        reject_group_write=True,
+    )
+    profile_path = _resource_path(
+        root,
+        pathlib.PurePosixPath(PROFILE_FILE_NAME),
+        label=PROFILE_FILE_NAME,
+    )
+    document = _read_owned_regular_file(
+        profile_path,
+        label=PROFILE_FILE_NAME,
+        maximum_bytes=MAX_PROFILE_BYTES,
+    )
+    try:
+        value = tomllib.loads(document.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise ModelSessionError(
+            f"{PROFILE_FILE_NAME} is not valid UTF-8 TOML: {error}",
+            code="invalid_profile",
+        ) from error
+    _reject_sensitive_fields(value)
+    if not isinstance(value, dict):
+        _fail("profile must be a TOML table")
+    if value.get("schema") != PROFILE_SCHEMA:
+        _fail(f"profile.schema must be exactly {PROFILE_SCHEMA!r}")
+    profile_id = _identifier(
+        value.get("profile_id"),
+        label="profile.profile_id",
+    )
+    state_root = _absolute_normalized_path(
+        value.get("state_root"),
+        label="profile.state_root",
+        must_exist=False,
+    )
+    dotfiles = infrastructure_root()
+    if _paths_overlap(root, dotfiles) or _paths_overlap(state_root, dotfiles):
+        _fail(
+            "profile route overlaps the dotfiles infrastructure repository",
+            code="profile_inside_infrastructure",
+        )
+    if _paths_overlap(root, state_root):
+        _fail(
+            "profile directory overlaps state_root",
+            code="overlapping_profile_paths",
+        )
+    if state_root.exists():
+        _validate_directory(
+            state_root,
+            label="state_root",
+            require_current_owner=True,
+            reject_group_write=True,
+        )
+    return ProfileRoute(
+        profile_root=root,
+        profile_id=profile_id,
+        state_root=state_root,
+    )
+
+
 def parse_locked_profile(
     document: bytes,
     *,
@@ -1034,13 +1119,15 @@ def parse_locked_profile(
 def validate_state_route(
     state_root: str | pathlib.Path,
     profile_id: str,
+    *,
+    require_existing: bool = True,
 ) -> tuple[pathlib.Path, str]:
     """Validate the minimum stable route needed to find locked sessions."""
 
     root = _absolute_normalized_path(
         str(state_root),
         label="model-session state_root",
-        must_exist=True,
+        must_exist=require_existing,
     )
     identifier = _identifier(profile_id, label="profile_id")
     if _paths_overlap(root, infrastructure_root()):
@@ -1049,10 +1136,11 @@ def validate_state_route(
             "repository",
             code="profile_inside_infrastructure",
         )
-    _validate_directory(
-        root,
-        label="model-session state_root",
-        require_current_owner=True,
-        reject_group_write=True,
-    )
+    if require_existing:
+        _validate_directory(
+            root,
+            label="model-session state_root",
+            require_current_owner=True,
+            reject_group_write=True,
+        )
     return root, identifier

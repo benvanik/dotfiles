@@ -556,7 +556,18 @@ def supervise_child(
         _signal_process_group(child.pid, signal_number)
 
     try:
-        for signal_number in (signal.SIGINT, signal.SIGTERM):
+        forwarded_signals = tuple(
+            signal_number
+            for name in (
+                "SIGINT",
+                "SIGTERM",
+                "SIGHUP",
+                "SIGQUIT",
+                "SIGWINCH",
+            )
+            if (signal_number := getattr(signal, name, None)) is not None
+        )
+        for signal_number in forwarded_signals:
             previous_handlers[signal_number] = signal.signal(
                 signal_number, forward_signal
             )

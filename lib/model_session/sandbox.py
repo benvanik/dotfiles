@@ -7,21 +7,25 @@ caller either executes the plan or closes its context.
 
 from __future__ import annotations
 
+import json
 import os
 import pathlib
 import re
+import signal
 import stat
 import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from types import TracebackType
-from typing import TYPE_CHECKING, Self
+from typing import TYPE_CHECKING, Any, Self
 
 from .attachment import (
     inference_workload_identity,
     load_inference_attachment,
 )
 from .errors import ModelSessionError
+from .lease import RunLease, RunSource
+from .ownership import owner_has_private_primary_group
 from .pi_runtime import (
     INFERENCE_RELAY_PATH,
     INFERENCE_RELAY_ROLE,
@@ -43,6 +47,7 @@ PRIVATE_HOME_BYTES = 256 * 1024 * 1024
 PRIVATE_CONFIG_BYTES = 16 * 1024 * 1024
 PRIVATE_SHM_BYTES = 256 * 1024 * 1024
 INFERENCE_SOCKET_DESTINATION = "/run/model-session/inference.sock"
+PROCESS_STAT_MAX_BYTES = 4096
 
 _VERSION_PATTERN = re.compile(
     r"^bubblewrap ([0-9]+)\.([0-9]+)\.([0-9]+)(?:[^0-9].*)?$"
@@ -53,6 +58,7 @@ _SESSION_ID_PATTERN = re.compile(
 _REQUIRED_BWRAP_OPTIONS = frozenset(
     {
         "--assert-userns-disabled",
+        "--as-pid-1",
         "--bind-fd",
         "--chmod",
         "--clearenv",
@@ -60,9 +66,11 @@ _REQUIRED_BWRAP_OPTIONS = frozenset(
         "--die-with-parent",
         "--disable-userns",
         "--hostname",
+        "--json-status-fd",
         "--new-session",
         "--proc",
         "--remount-ro",
+        "--ro-bind-data",
         "--ro-bind-fd",
         "--size",
         "--tmpfs",
@@ -175,6 +183,7 @@ def _open_absolute_no_symlinks(
     *,
     label: str,
     final_must_be_directory: bool,
+    ancestor_identities: list[tuple[int, int]] | None = None,
 ) -> int:
     """Open an absolute path one component at a time without following links."""
 
@@ -194,6 +203,11 @@ def _open_absolute_no_symlinks(
         common_flags | getattr(os, "O_DIRECTORY", 0),
     )
     try:
+        if ancestor_identities is not None:
+            root_metadata = os.fstat(current)
+            ancestor_identities.append(
+                (root_metadata.st_dev, root_metadata.st_ino)
+            )
         for index, component in enumerate(parts[1:]):
             final = index == len(parts) - 2
             flags = common_flags
@@ -218,6 +232,10 @@ def _open_absolute_no_symlinks(
                 _fail(
                     f"{label} contains a non-directory component: {path}",
                     code="unsafe_sandbox_source",
+                )
+            if not final and ancestor_identities is not None:
+                ancestor_identities.append(
+                    (metadata.st_dev, metadata.st_ino)
                 )
         return current
     except BaseException:
@@ -259,9 +277,13 @@ def _validate_descriptor(
             f"{label} permissions must be exactly {exact_mode:04o}: {path}",
             code="unsafe_sandbox_permissions",
         )
-    if reject_group_or_world_write and mode & (stat.S_IWGRP | stat.S_IWOTH):
+    unsafe_write = bool(mode & stat.S_IWOTH) or bool(
+        mode & stat.S_IWGRP
+        and not owner_has_private_primary_group(metadata)
+    )
+    if reject_group_or_world_write and unsafe_write:
         _fail(
-            f"{label} is group- or world-writable: {path}",
+            f"{label} is writable by another principal: {path}",
             code="unsafe_sandbox_permissions",
         )
 
@@ -274,11 +296,13 @@ def _open_validated(
     allowed_owners: frozenset[int],
     exact_mode: int | None = None,
     reject_group_or_world_write: bool = True,
+    ancestor_identities: list[tuple[int, int]] | None = None,
 ) -> int:
     descriptor = _open_absolute_no_symlinks(
         path,
         label=label,
         final_must_be_directory=expected_type == "directory",
+        ancestor_identities=ancestor_identities,
     )
     try:
         _validate_descriptor(
@@ -377,18 +401,240 @@ def validate_bwrap() -> tuple[int, int, int]:
     return version
 
 
+def _live_monitor_pid(monitor: subprocess.Popen[Any]) -> int:
+    """Return the PID of one exact, still-live Popen-owned bwrap monitor."""
+
+    if not isinstance(monitor, subprocess.Popen):
+        _fail(
+            "sandbox child identity requires the exact bwrap Popen monitor",
+            code="sandbox_launch_failed",
+        )
+    monitor_pid = monitor.pid
+    if (
+        isinstance(monitor_pid, bool)
+        or not isinstance(monitor_pid, int)
+        or monitor_pid <= 1
+    ):
+        _fail(
+            "bubblewrap monitor has no valid process identity",
+            code="sandbox_launch_failed",
+        )
+    try:
+        return_code = monitor.poll()
+    except OSError as error:
+        raise ModelSessionError(
+            f"cannot inspect bubblewrap monitor state: {error}",
+            code="sandbox_launch_failed",
+        ) from error
+    if return_code is not None:
+        _fail(
+            "bubblewrap monitor exited before child identity was retained",
+            code="sandbox_launch_failed",
+        )
+    return monitor_pid
+
+
+def _process_parent_pid(process_pid: int) -> int:
+    """Read one kernel-owned direct-parent relationship through procfs."""
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(f"/proc/{process_pid}/stat", flags)
+    except OSError as error:
+        raise ModelSessionError(
+            "cannot inspect bubblewrap child ancestry: "
+            f"{error.strerror or error.errno}",
+            code="sandbox_launch_failed",
+        ) from error
+    try:
+        raw_stat = os.read(descriptor, PROCESS_STAT_MAX_BYTES + 1)
+    except OSError as error:
+        raise ModelSessionError(
+            f"cannot read bubblewrap child ancestry: {error}",
+            code="sandbox_launch_failed",
+        ) from error
+    finally:
+        os.close(descriptor)
+    if (
+        not raw_stat.endswith(b"\n")
+        or len(raw_stat) > PROCESS_STAT_MAX_BYTES
+    ):
+        _fail(
+            "bubblewrap child ancestry exceeded its kernel protocol bound",
+            code="sandbox_launch_failed",
+        )
+    opening = raw_stat.find(b"(")
+    closing = raw_stat.rfind(b")")
+    fields = raw_stat[closing + 1 :].split() if closing > opening else []
+    try:
+        stat_pid = int(raw_stat[:opening].strip())
+        parent_pid = int(fields[1])
+    except (ValueError, IndexError) as error:
+        raise ModelSessionError(
+            "bubblewrap child ancestry had an invalid kernel format",
+            code="sandbox_launch_failed",
+        ) from error
+    if stat_pid != process_pid or parent_pid <= 1:
+        _fail(
+            "bubblewrap child ancestry did not identify the reported process",
+            code="sandbox_launch_failed",
+        )
+    return parent_pid
+
+
 @dataclass
 class SandboxPlan:
-    """An argv plus the descriptors it exclusively owns for one launch."""
+    """One complete launch authority, including its process-lifetime lease."""
 
     argv: tuple[str, ...]
     pass_fds: tuple[int, ...]
     _owned_descriptors: list[int] = field(repr=False)
+    _status_read_descriptor: int = field(repr=False)
+    _status_write_descriptor: int = field(repr=False)
+    _lease: RunLease = field(repr=False)
+    _lease_owner: object = field(repr=False)
+    _sandbox_child_pid: int | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+    _sandbox_child_pid_descriptor: int = field(
+        default=-1,
+        init=False,
+        repr=False,
+    )
+    _sandbox_monitor: subprocess.Popen[Any] | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
     _closed: bool = field(default=False, init=False, repr=False)
 
     @property
     def closed(self) -> bool:
         return self._closed
+
+    def sandbox_child_pid(self, monitor: subprocess.Popen[Any]) -> int:
+        """Retain bwrap's direct child under its exact live Popen monitor."""
+
+        if self._closed:
+            _fail("cannot read child identity from a closed sandbox plan")
+        if self._sandbox_child_pid is not None:
+            if monitor is not self._sandbox_monitor:
+                _fail(
+                    "sandbox child identity is bound to another bwrap monitor",
+                    code="sandbox_launch_failed",
+                )
+            return self._sandbox_child_pid
+        monitor_pid = _live_monitor_pid(monitor)
+        if self._status_write_descriptor >= 0:
+            os.close(self._status_write_descriptor)
+            self._owned_descriptors.remove(self._status_write_descriptor)
+            self._status_write_descriptor = -1
+        line = bytearray()
+        while b"\n" not in line:
+            try:
+                chunk = os.read(self._status_read_descriptor, 4096)
+            except InterruptedError:
+                continue
+            except OSError as error:
+                raise ModelSessionError(
+                    f"cannot read bubblewrap child identity: {error}",
+                    code="sandbox_launch_failed",
+                ) from error
+            if not chunk:
+                _fail(
+                    "bubblewrap exited before publishing its child identity",
+                    code="sandbox_launch_failed",
+                )
+            line.extend(chunk)
+            if len(line) > 64 * 1024:
+                _fail(
+                    "bubblewrap child identity exceeded its protocol bound",
+                    code="sandbox_launch_failed",
+                )
+        raw_line, _, _remainder = line.partition(b"\n")
+        try:
+            value = json.loads(raw_line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ModelSessionError(
+                "bubblewrap published an invalid child identity",
+                code="sandbox_launch_failed",
+            ) from error
+        child_pid = value.get("child-pid") if isinstance(value, dict) else None
+        if (
+            isinstance(child_pid, bool)
+            or not isinstance(child_pid, int)
+            or child_pid <= 1
+        ):
+            _fail(
+                "bubblewrap child identity omitted a valid outer PID",
+                code="sandbox_launch_failed",
+            )
+        if not hasattr(os, "pidfd_open") or not hasattr(
+            signal,
+            "pidfd_send_signal",
+        ):
+            _fail(
+                "safe sandbox signal forwarding requires Linux pidfds",
+                code="sandbox_platform_unsupported",
+            )
+        if _live_monitor_pid(monitor) != monitor_pid:
+            _fail(
+                "bubblewrap monitor identity changed during child publication",
+                code="sandbox_launch_failed",
+            )
+        try:
+            pid_descriptor = os.pidfd_open(child_pid, 0)
+        except OSError as error:
+            raise ModelSessionError(
+                f"cannot retain bubblewrap child process identity: {error}",
+                code="sandbox_launch_failed",
+            ) from error
+        try:
+            if _process_parent_pid(child_pid) != monitor_pid:
+                _fail(
+                    "bubblewrap reported a process outside its direct "
+                    "monitor ancestry",
+                    code="sandbox_launch_failed",
+                )
+            if _live_monitor_pid(monitor) != monitor_pid:
+                _fail(
+                    "bubblewrap monitor exited during child identity "
+                    "retention",
+                    code="sandbox_launch_failed",
+                )
+            self._owned_descriptors.append(pid_descriptor)
+        except BaseException:
+            os.close(pid_descriptor)
+            raise
+        self._sandbox_child_pid_descriptor = pid_descriptor
+        self._sandbox_child_pid = child_pid
+        self._sandbox_monitor = monitor
+        return child_pid
+
+    def signal_sandbox_child(self, signal_number: int) -> None:
+        """Signal the exact retained sandbox child without a PID-reuse race."""
+
+        if self._sandbox_child_pid_descriptor < 0:
+            _fail(
+                "sandbox child identity has not been retained",
+                code="sandbox_launch_failed",
+            )
+        try:
+            signal.pidfd_send_signal(
+                self._sandbox_child_pid_descriptor,
+                signal_number,
+            )
+        except ProcessLookupError:
+            return
+        except OSError as error:
+            raise ModelSessionError(
+                f"cannot signal the retained sandbox child: {error}",
+                code="sandbox_signal_failed",
+            ) from error
 
     def close(self) -> None:
         if self._closed:
@@ -396,11 +642,13 @@ class SandboxPlan:
         self._closed = True
         descriptors = self._owned_descriptors
         self._owned_descriptors = []
+        self._sandbox_monitor = None
         for descriptor in reversed(descriptors):
             try:
                 os.close(descriptor)
             except OSError:
                 pass
+        self._lease._close_from_plan(self._lease_owner)
 
     def __enter__(self) -> Self:
         if self._closed:
@@ -448,6 +696,25 @@ def _validate_command(command: Sequence[str]) -> tuple[str, ...]:
             "system /usr/bin/python3 relay runtime"
         )
     return arguments
+
+
+def _resource_destination(
+    relative_path: pathlib.PurePosixPath,
+) -> pathlib.PurePosixPath:
+    if relative_path.parts[0] == "profile":
+        return pathlib.PurePosixPath("/profile").joinpath(
+            *relative_path.parts[1:]
+        )
+    if relative_path.parts[0] == "runtime":
+        return pathlib.PurePosixPath("/runtime").joinpath(
+            *relative_path.parts[1:]
+        )
+    if relative_path == PI_MODELS_PATH:
+        return pathlib.PurePosixPath("/config/models.json")
+    _fail(
+        "locked resource has no sandbox destination: "
+        f"{relative_path.as_posix()}"
+    )
 
 
 def _validate_source_relationships(run: SessionRun) -> None:
@@ -598,14 +865,57 @@ def _existing_mask_destinations() -> tuple[str, ...]:
     return tuple(destinations)
 
 
+def _validate_workspace_authority(
+    workspace_descriptor: int,
+    workspace: pathlib.Path,
+) -> None:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        descriptor = os.open(".pi", flags, dir_fd=workspace_descriptor)
+    except OSError as error:
+        raise ModelSessionError(
+            "cannot open the workspace authority mask target relative to its "
+            f"retained descriptor: {workspace / '.pi'}: {error}",
+            code="unsafe_sandbox_source",
+        ) from error
+    try:
+        _validate_descriptor(
+            descriptor,
+            path=workspace / ".pi",
+            label="workspace authority mask target",
+            expected_type="directory",
+            allowed_owners=frozenset({os.getuid()}),
+            exact_mode=0o700,
+        )
+        if os.listdir(descriptor):
+            _fail(
+                "workspace authority mask target must remain empty",
+                code="unsafe_sandbox_source",
+            )
+    finally:
+        os.close(descriptor)
+
+
 def build_sandbox_plan(
-    run: SessionRun,
+    lease: RunLease,
     *,
     command: Sequence[str],
     attachment_runtime_root: os.PathLike[str] | str | None = None,
 ) -> SandboxPlan:
-    """Build one descriptor-backed invocation from a fresh live attachment."""
+    """Build from an exclusive lease without reopening run-owned host paths."""
 
+    if not isinstance(lease, RunLease):
+        _fail(
+            "sandbox construction requires an exclusive RunLease",
+            code="session_lease_required",
+        )
+    lease._require_open()
+    run = lease.run
     validate_bwrap()
     arguments = _validate_command(command)
     _validate_source_relationships(run)
@@ -634,29 +944,48 @@ def build_sandbox_plan(
         descriptors.append(descriptor)
         return descriptor
 
+    def lease_source(
+        source: RunSource,
+        *,
+        path: pathlib.Path,
+        label: str,
+        expected_type: str = "directory",
+        allowed_owners: frozenset[int] = user_only,
+        exact_mode: int | None = None,
+        reject_group_or_world_write: bool = True,
+    ) -> int:
+        descriptor = lease.duplicate_source(source)
+        try:
+            _validate_descriptor(
+                descriptor,
+                path=path,
+                label=label,
+                expected_type=expected_type,
+                allowed_owners=allowed_owners,
+                exact_mode=exact_mode,
+                reject_group_or_world_write=reject_group_or_world_write,
+            )
+        except BaseException:
+            os.close(descriptor)
+            raise
+        descriptors.append(descriptor)
+        return descriptor
+
     try:
         usr_descriptor = open_source(
             pathlib.Path("/usr"),
             label="system /usr",
             allowed_owners=frozenset({0}),
         )
-        workspace_descriptor = open_source(
-            run.workspace,
+        workspace_descriptor = lease_source(
+            RunSource.WORKSPACE,
+            path=run.workspace,
             label="session workspace",
             exact_mode=0o700,
         )
-        profile_descriptor = open_source(
-            run.snapshot_root / "profile",
-            label="locked profile resources",
-            exact_mode=0o700,
-        )
-        runtime_descriptor = open_source(
-            run.snapshot_root / "runtime",
-            label="locked model-session runtime",
-            exact_mode=0o700,
-        )
-        pi_installation_descriptor = open_source(
-            run.profile.pi.installation_root,
+        pi_installation_descriptor = lease_source(
+            RunSource.PI_INSTALLATION,
+            path=run.profile.pi.installation_root,
             label="Pi installation root",
             allowed_owners=root_or_user,
         )
@@ -671,31 +1000,42 @@ def build_sandbox_plan(
                 "Pi installation changed after the run was loaded",
                 code="pi_installation_changed",
             )
-        models = run.resource_for_role(PI_MODELS_ROLE)
-        if models is None:
-            _fail("locked Pi models resource is missing")
-        pi_models_descriptor = open_source(
-            models.path,
-            label="locked Pi models configuration",
-            expected_type="regular file",
-            exact_mode=0o600,
-        )
-        pi_sessions_descriptor = open_source(
-            run.pi_sessions,
+        resource_bindings: list[
+            tuple[int, pathlib.PurePosixPath]
+        ] = []
+        resource_directories: set[pathlib.PurePosixPath] = set()
+        for resource in run.resources:
+            descriptor = lease.duplicate_resource(resource.relative_path)
+            descriptors.append(descriptor)
+            destination = _resource_destination(resource.relative_path)
+            resource_bindings.append((descriptor, destination))
+            parent = destination.parent
+            while parent not in {
+                pathlib.PurePosixPath("/"),
+                pathlib.PurePosixPath("/config"),
+            }:
+                resource_directories.add(parent)
+                parent = parent.parent
+        pi_sessions_descriptor = lease_source(
+            RunSource.PI_SESSIONS,
+            path=run.pi_sessions,
             label="Pi sessions",
             exact_mode=0o700,
         )
-        project_descriptor = open_source(
-            run.profile.project_root,
+        project_descriptor = lease_source(
+            RunSource.PROJECT,
+            path=run.profile.project_root,
             label="project root",
         )
-        report_descriptor = open_source(
-            run.report_directory,
+        report_descriptor = lease_source(
+            RunSource.REPORT,
+            path=run.report_directory,
             label="session report directory",
             exact_mode=0o700,
         )
-        memory_descriptor = open_source(
-            run.memory_directory,
+        memory_descriptor = lease_source(
+            RunSource.MEMORY,
+            path=run.memory_directory,
             label="session memory directory",
             exact_mode=0o700,
         )
@@ -734,12 +1074,38 @@ def build_sandbox_plan(
             )
         ):
             _fail("inference socket must not be reachable through another mount")
-        socket_descriptor = open_source(
+        socket_ancestor_identities: list[tuple[int, int]] = []
+        socket_descriptor = _open_validated(
             socket_path,
             label="inference socket",
             expected_type="Unix socket",
+            allowed_owners=user_only,
             exact_mode=0o600,
+            ancestor_identities=socket_ancestor_identities,
         )
+        descriptors.append(socket_descriptor)
+        mounted_source_identities = {
+            (
+                os.fstat(descriptor).st_dev,
+                os.fstat(descriptor).st_ino,
+            )
+            for descriptor in (
+                workspace_descriptor,
+                pi_installation_descriptor,
+                pi_sessions_descriptor,
+                project_descriptor,
+                report_descriptor,
+                memory_descriptor,
+            )
+        }
+        if mounted_source_identities.intersection(
+            socket_ancestor_identities
+        ):
+            _fail(
+                "inference socket is beneath a retained sandbox mount "
+                "source",
+                code="unsafe_sandbox_source",
+            )
         socket_metadata = os.fstat(socket_descriptor)
         if (
             socket_metadata.st_dev != attachment.socket_device
@@ -764,14 +1130,21 @@ def build_sandbox_plan(
         os.close(command_mask_source)
         descriptors.remove(command_mask_source)
 
-        workspace_authority = pathlib.Path(run.workspace) / ".pi"
-        authority_descriptor = open_source(
-            workspace_authority,
-            label="workspace authority mask target",
-            exact_mode=0o700,
+        _validate_workspace_authority(
+            workspace_descriptor,
+            run.workspace,
         )
-        os.close(authority_descriptor)
-        descriptors.remove(authority_descriptor)
+        if hasattr(os, "pipe2"):
+            status_read_descriptor, status_write_descriptor = os.pipe2(
+                getattr(os, "O_CLOEXEC", 0)
+            )
+        else:
+            status_read_descriptor, status_write_descriptor = os.pipe()
+            os.set_inheritable(status_read_descriptor, False)
+            os.set_inheritable(status_write_descriptor, False)
+        descriptors.extend(
+            (status_read_descriptor, status_write_descriptor)
+        )
 
         argv = [
             os.fspath(BWRAP_BINARY),
@@ -779,8 +1152,11 @@ def build_sandbox_plan(
             "--unshare-user",
             "--disable-userns",
             "--assert-userns-disabled",
+            "--as-pid-1",
             "--new-session",
             "--die-with-parent",
+            "--json-status-fd",
+            str(status_write_descriptor),
             "--hostname",
             "model-session",
             "--clearenv",
@@ -853,9 +1229,6 @@ def build_sandbox_plan(
                 "--remount-ro",
                 "/workspace/.pi",
                 "--ro-bind-fd",
-                str(profile_descriptor),
-                "/profile",
-                "--ro-bind-fd",
                 str(pi_installation_descriptor),
                 "/opt/pi",
                 "--size",
@@ -865,12 +1238,28 @@ def build_sandbox_plan(
                 "--chmod",
                 "0700",
                 "/config",
-                "--ro-bind-fd",
-                str(pi_models_descriptor),
-                "/config/models.json",
-                "--ro-bind-fd",
-                str(runtime_descriptor),
-                "/runtime",
+            )
+        )
+        for directory in sorted(
+            resource_directories,
+            key=lambda value: (len(value.parts), value.as_posix()),
+        ):
+            argv.extend(("--dir", directory.as_posix()))
+        for descriptor, destination in sorted(
+            resource_bindings,
+            key=lambda binding: binding[1].as_posix(),
+        ):
+            argv.extend(
+                (
+                    "--perms",
+                    "0444",
+                    "--ro-bind-data",
+                    str(descriptor),
+                    destination.as_posix(),
+                )
+            )
+        argv.extend(
+            (
                 "--bind-fd",
                 str(pi_sessions_descriptor),
                 "/sessions",
@@ -906,11 +1295,25 @@ def build_sandbox_plan(
         for name, value in _FIXED_ENVIRONMENT:
             argv.extend(("--setenv", name, value))
         argv.extend(("--chdir", "/workspace", "--", *arguments))
-        return SandboxPlan(
-            argv=tuple(argv),
-            pass_fds=tuple(descriptors),
-            _owned_descriptors=descriptors,
-        )
+        lease_owner = object()
+        lease._claim_for_plan(lease_owner)
+        try:
+            return SandboxPlan(
+                argv=tuple(argv),
+                pass_fds=tuple(
+                    descriptor
+                    for descriptor in descriptors
+                    if descriptor != status_read_descriptor
+                ),
+                _owned_descriptors=descriptors,
+                _status_read_descriptor=status_read_descriptor,
+                _status_write_descriptor=status_write_descriptor,
+                _lease=lease,
+                _lease_owner=lease_owner,
+            )
+        except BaseException:
+            lease._release_plan_claim(lease_owner)
+            raise
     except BaseException:
         for descriptor in reversed(descriptors):
             try:

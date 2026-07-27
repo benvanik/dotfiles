@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
 import pathlib
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
+import model_session.materialization as materialization_module
 import model_session.runs as runs_module
 from model_session import (
     ModelSessionError,
@@ -375,6 +378,229 @@ class ModelSessionProfileTest(unittest.TestCase):
             self.assertEqual(resumed.root, first.root)
             self.assertEqual(resumed.profile.model.revision, REVISION)
 
+    def test_first_run_state_is_published_under_the_stable_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.fixture(directory)
+            profile = load_profile(fixture.profile_root)
+            profile_sessions_visible = threading.Event()
+            release_materializer = threading.Event()
+            shared_lock_attempted = threading.Event()
+            materialization_finished = threading.Event()
+            discovery_finished = threading.Event()
+            failures: list[BaseException] = []
+            materialized_runs = []
+            discovered_ids: list[tuple[str, ...]] = []
+            real_ensure = materialization_module._ensure_private_child_directory
+            real_flock = runs_module.fcntl.flock
+
+            def ensure(*args: object, **kwargs: object) -> int:
+                descriptor = real_ensure(*args, **kwargs)
+                if kwargs.get("label") == "profile sessions directory":
+                    profile_sessions_visible.set()
+                    release_materializer.wait()
+                return descriptor
+
+            def flock(descriptor: int, operation: int) -> None:
+                if operation == fcntl.LOCK_SH:
+                    shared_lock_attempted.set()
+                real_flock(descriptor, operation)
+
+            def materialize_worker() -> None:
+                try:
+                    materialized_runs.append(materialize_new_run(profile))
+                except BaseException as error:
+                    failures.append(error)
+                finally:
+                    materialization_finished.set()
+
+            def discover_worker() -> None:
+                try:
+                    discovered_ids.append(
+                        runs_module.list_run_ids_from_state(
+                            fixture.state_root,
+                            "fixture-model",
+                        )
+                    )
+                except BaseException as error:
+                    failures.append(error)
+                finally:
+                    discovery_finished.set()
+
+            with (
+                mock.patch.object(
+                    materialization_module,
+                    "_ensure_private_child_directory",
+                    side_effect=ensure,
+                ),
+                mock.patch.object(
+                    runs_module.fcntl,
+                    "flock",
+                    side_effect=flock,
+                ),
+            ):
+                materializer = threading.Thread(target=materialize_worker)
+                discovery: threading.Thread | None = None
+                materializer.start()
+                try:
+                    self.assertTrue(profile_sessions_visible.wait(timeout=2))
+                    self.assertTrue(
+                        (
+                            fixture.state_root
+                            / "locks"
+                            / "materialize.lock"
+                        ).is_file()
+                    )
+                    discovery = threading.Thread(target=discover_worker)
+                    discovery.start()
+                    self.assertTrue(shared_lock_attempted.wait(timeout=2))
+                    self.assertFalse(discovery_finished.is_set())
+                finally:
+                    release_materializer.set()
+                    materializer.join(timeout=2)
+                    if discovery is not None:
+                        discovery.join(timeout=2)
+
+            self.assertTrue(materialization_finished.is_set())
+            self.assertTrue(discovery_finished.is_set())
+            if failures:
+                raise failures[0]
+            self.assertEqual(len(materialized_runs), 1)
+            self.assertEqual(
+                discovered_ids,
+                [(materialized_runs[0].session_id,)],
+            )
+
+    def test_empty_discovery_excludes_the_first_materializer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.fixture(directory)
+            profile = load_profile(fixture.profile_root)
+            fixture.state_root.mkdir(mode=0o700)
+            missing_lock_observed = threading.Event()
+            release_discovery = threading.Event()
+            exclusive_lock_attempted = threading.Event()
+            discovery_finished = threading.Event()
+            materialization_finished = threading.Event()
+            failures: list[BaseException] = []
+            discovered_ids: list[tuple[str, ...]] = []
+            materialized_runs = []
+            real_open_optional = (
+                runs_module._open_optional_private_child_directory
+            )
+            real_flock = runs_module.fcntl.flock
+
+            def open_optional(*args: object, **kwargs: object) -> int | None:
+                descriptor = real_open_optional(*args, **kwargs)
+                if args[1] == "locks" and descriptor is None:
+                    missing_lock_observed.set()
+                    release_discovery.wait()
+                return descriptor
+
+            def flock(descriptor: int, operation: int) -> None:
+                if operation == fcntl.LOCK_EX:
+                    exclusive_lock_attempted.set()
+                real_flock(descriptor, operation)
+
+            def discover_worker() -> None:
+                try:
+                    discovered_ids.append(
+                        runs_module.list_run_ids_from_state(
+                            fixture.state_root,
+                            "fixture-model",
+                        )
+                    )
+                except BaseException as error:
+                    failures.append(error)
+                finally:
+                    discovery_finished.set()
+
+            def materialize_worker() -> None:
+                try:
+                    materialized_runs.append(materialize_new_run(profile))
+                except BaseException as error:
+                    failures.append(error)
+                finally:
+                    materialization_finished.set()
+
+            with (
+                mock.patch.object(
+                    runs_module,
+                    "_open_optional_private_child_directory",
+                    side_effect=open_optional,
+                ),
+                mock.patch.object(
+                    runs_module.fcntl,
+                    "flock",
+                    side_effect=flock,
+                ),
+            ):
+                discovery = threading.Thread(target=discover_worker)
+                discovery.start()
+                materializer: threading.Thread | None = None
+                try:
+                    self.assertTrue(missing_lock_observed.wait(timeout=2))
+                    materializer = threading.Thread(target=materialize_worker)
+                    materializer.start()
+                    self.assertTrue(exclusive_lock_attempted.wait(timeout=2))
+                    self.assertEqual(tuple(fixture.state_root.iterdir()), ())
+                    self.assertFalse(materialization_finished.is_set())
+                finally:
+                    release_discovery.set()
+                    discovery.join(timeout=2)
+                    if materializer is not None:
+                        materializer.join(timeout=2)
+
+            self.assertTrue(discovery_finished.is_set())
+            self.assertTrue(materialization_finished.is_set())
+            if failures:
+                raise failures[0]
+            self.assertEqual(discovered_ids, [()])
+            self.assertEqual(len(materialized_runs), 1)
+            self.assertTrue(materialized_runs[0].root.is_dir())
+
+    def test_replacing_marker_does_not_split_the_lock_domain(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.fixture(directory)
+            fixture.state_root.mkdir(mode=0o700)
+            flags = os.O_RDONLY | os.O_DIRECTORY
+            state_descriptor = os.open(fixture.state_root, flags)
+            competing_state_descriptor = os.open(fixture.state_root, flags)
+            replacement_descriptor: int | None = None
+            marker = (
+                fixture.state_root / "locks" / "materialize.lock"
+            )
+            try:
+                with materialization_module._materialization_lock(
+                    state_descriptor,
+                    fixture.state_root,
+                ):
+                    marker.unlink()
+                    marker.write_bytes(b"")
+                    marker.chmod(0o600)
+                    replacement_descriptor = os.open(marker, os.O_RDWR)
+                    fcntl.flock(
+                        replacement_descriptor,
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(
+                            competing_state_descriptor,
+                            fcntl.LOCK_EX | fcntl.LOCK_NB,
+                        )
+                    fcntl.flock(replacement_descriptor, fcntl.LOCK_UN)
+                    os.close(replacement_descriptor)
+                    replacement_descriptor = None
+
+                fcntl.flock(
+                    competing_state_descriptor,
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+                fcntl.flock(competing_state_descriptor, fcntl.LOCK_UN)
+            finally:
+                if replacement_descriptor is not None:
+                    os.close(replacement_descriptor)
+                os.close(competing_state_descriptor)
+                os.close(state_descriptor)
+
     def test_new_run_recovers_an_unpublished_crash_staging_record(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = self.fixture(directory)
@@ -462,9 +688,11 @@ class ModelSessionProfileTest(unittest.TestCase):
             profile = load_profile(fixture.profile_root)
             events: list[str] = []
             staging_creation_started = False
-            real_create = runs_module._create_private_child_directory
-            real_fsync = runs_module.os.fsync
-            real_make_project = runs_module._make_project_session_directories
+            real_create = materialization_module._create_private_child_directory
+            real_fsync = materialization_module.os.fsync
+            real_make_project = (
+                materialization_module._make_project_session_directories
+            )
 
             def create(*args: object, **kwargs: object) -> int:
                 nonlocal staging_creation_started
@@ -484,13 +712,17 @@ class ModelSessionProfileTest(unittest.TestCase):
 
             with (
                 mock.patch.object(
-                    runs_module,
+                    materialization_module,
                     "_create_private_child_directory",
                     side_effect=create,
                 ),
-                mock.patch.object(runs_module.os, "fsync", side_effect=fsync),
                 mock.patch.object(
-                    runs_module,
+                    materialization_module.os,
+                    "fsync",
+                    side_effect=fsync,
+                ),
+                mock.patch.object(
+                    materialization_module,
                     "_make_project_session_directories",
                     side_effect=make_project,
                 ),
@@ -580,7 +812,7 @@ class ModelSessionProfileTest(unittest.TestCase):
                 code="invalid_session_state",
             )
             with mock.patch.object(
-                runs_module,
+                materialization_module,
                 "load_run",
                 side_effect=validation_error,
             ):
@@ -608,8 +840,8 @@ class ModelSessionProfileTest(unittest.TestCase):
             fixture = self.fixture(directory)
             profile = load_profile(fixture.profile_root)
             renamed = False
-            real_rename = runs_module.os.rename
-            real_fsync = runs_module.os.fsync
+            real_rename = materialization_module.os.rename
+            real_fsync = materialization_module.os.fsync
 
             def rename(*args: object, **kwargs: object) -> None:
                 nonlocal renamed
@@ -623,12 +855,12 @@ class ModelSessionProfileTest(unittest.TestCase):
 
             with (
                 mock.patch.object(
-                    runs_module.os,
+                    materialization_module.os,
                     "rename",
                     side_effect=rename,
                 ),
                 mock.patch.object(
-                    runs_module.os,
+                    materialization_module.os,
                     "fsync",
                     side_effect=fsync,
                 ),

@@ -8,18 +8,17 @@ authority.
 
 from __future__ import annotations
 
-import grp
 import hashlib
 import json
 import os
 import pathlib
-import pwd
 import re
 import stat
 from dataclasses import dataclass, field
 from typing import Any
 
 from .errors import ModelSessionError
+from .ownership import owner_has_private_primary_group
 from .profile import ProfileContract
 
 
@@ -260,23 +259,6 @@ def _stable_stat_fields(metadata: os.stat_result) -> tuple[int, ...]:
     )
 
 
-def _private_owner_group(metadata: os.stat_result) -> bool:
-    try:
-        owner = pwd.getpwuid(metadata.st_uid)
-        group = grp.getgrgid(metadata.st_gid)
-        primary_members = {
-            entry.pw_name
-            for entry in pwd.getpwall()
-            if entry.pw_gid == metadata.st_gid
-        }
-    except KeyError:
-        return False
-    return (
-        owner.pw_gid == metadata.st_gid
-        and primary_members | set(group.gr_mem) == {owner.pw_name}
-    )
-
-
 def _validate_runtime_asset_object(
     metadata: os.stat_result,
     *,
@@ -301,7 +283,10 @@ def _validate_runtime_asset_object(
             f"{label} source is world-writable: {path}",
             code="unsafe_runtime_asset",
         )
-    if metadata.st_mode & stat.S_IWGRP and not _private_owner_group(metadata):
+    if (
+        metadata.st_mode & stat.S_IWGRP
+        and not owner_has_private_primary_group(metadata)
+    ):
         _fail(
             f"{label} source is writable by a shared group: {path}",
             code="unsafe_runtime_asset",

@@ -38,8 +38,8 @@ from .runs import (
     SessionRun,
     load_run,
     load_run_from_state,
-    materialize_new_run,
 )
+from .materialization import materialize_new_run
 
 __all__ = [
     "AGENTS_FILE_NAME",

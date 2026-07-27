@@ -9,6 +9,98 @@ source "$SCRIPT_DIR/../install-utils.sh"
 
 LLVM_DIR="$TOOLS_DIR/llvm"
 
+# LLVM's Linux release binaries are built against the libxml2.so.2 ABI. Newer
+# Linux distributions ship the incompatible libxml2.so.16 ABI instead, so keep
+# the final libxml2.so.2 release private to the LLVM installation when the host
+# cannot satisfy that dependency.
+LIBXML2_COMPAT_VERSION="2.13.9"
+LIBXML2_COMPAT_SHA256="a2c9ae7b770da34860050c309f903221c67830c86e4a7e760692b803df95143a"
+
+# Installs a private libxml2.so.2 runtime when the LLVM release requires it and
+# the host distribution does not provide it.
+install_linux_libxml2_compat() {
+    local llvm_root="$1"
+    local linker_binary="$llvm_root/bin/ld.lld"
+    if [ "$PLATFORM" != "linux" ] || [ ! -x "$linker_binary" ]; then
+        return 0
+    fi
+    if "$linker_binary" --version >/dev/null 2>&1; then
+        return 0
+    fi
+    if ! ldd "$linker_binary" 2>/dev/null | grep -q \
+        'libxml2\.so\.2 => not found'; then
+        error "ld.lld cannot execute for a reason other than missing libxml2.so.2"
+        ldd "$linker_binary" >&2 || true
+        return 1
+    fi
+
+    local source_archive="libxml2-$LIBXML2_COMPAT_VERSION.tar.xz"
+    local source_url="https://download.gnome.org/sources/libxml2/2.13/$source_archive"
+    local build_root
+    build_root=$(mktemp -d "${TMPDIR:-/tmp}/llvm-libxml2-compat.XXXXXXXX")
+    cleanup_libxml2_build() {
+        rm -rf -- "$build_root"
+    }
+    trap cleanup_libxml2_build EXIT
+
+    info "Building private libxml2.so.2 compatibility runtime..."
+    download "$source_url" "$build_root/$source_archive"
+    printf '%s  %s\n' \
+        "$LIBXML2_COMPAT_SHA256" "$build_root/$source_archive" | \
+        sha256sum --check
+    tar -xf "$build_root/$source_archive" -C "$build_root"
+    mkdir "$build_root/build"
+    (
+        cd "$build_root/build"
+        CC=/usr/bin/cc CFLAGS="-O2 -fPIC" \
+            "../libxml2-$LIBXML2_COMPAT_VERSION/configure" \
+            --without-icu \
+            --without-lzma \
+            --without-python \
+            --without-zlib
+        make -j"$(getconf _NPROCESSORS_ONLN)" libxml2.la
+    )
+
+    install -m 0755 \
+        "$build_root/build/.libs/libxml2.so.$LIBXML2_COMPAT_VERSION" \
+        "$llvm_root/lib/libxml2.so.$LIBXML2_COMPAT_VERSION"
+    ln -sfn "libxml2.so.$LIBXML2_COMPAT_VERSION" \
+        "$llvm_root/lib/libxml2.so.2"
+    install -D -m 0644 \
+        "$build_root/libxml2-$LIBXML2_COMPAT_VERSION/Copyright" \
+        "$llvm_root/share/licenses/libxml2/Copyright"
+
+    cleanup_libxml2_build
+    trap - EXIT
+}
+
+# Verifies that the installed compiler and linker can produce and run a native
+# executable. Version banners alone miss unresolved linker dependencies.
+verify_installation() {
+    local llvm_root="$1"
+    local smoke_binary
+    smoke_binary=$(mktemp "${TMPDIR:-/tmp}/llvm-link-smoke.XXXXXXXX")
+    if ! printf '%s\n' 'int main(void) { return 0; }' | \
+        "$llvm_root/bin/clang" -fuse-ld=lld -x c - -o "$smoke_binary"; then
+        rm -f -- "$smoke_binary"
+        error "LLVM host compile/link verification failed"
+        return 1
+    fi
+    if ! "$smoke_binary"; then
+        rm -f -- "$smoke_binary"
+        error "LLVM host executable verification failed"
+        return 1
+    fi
+    rm -f -- "$smoke_binary"
+}
+
+# Repairs host-runtime dependencies and verifies an installed LLVM tree.
+finalize_installation() {
+    local llvm_root="$1"
+    install_linux_libxml2_compat "$llvm_root"
+    verify_installation "$llvm_root"
+}
+
 # Fetch latest LLVM version from GitHub releases.
 # Sets FETCHED_VERSION on success.
 fetch_latest_version() {
@@ -67,6 +159,7 @@ cd "$LLVM_DIR"
 # Check if already installed.
 if version_installed "$LLVM_DIR" "$VERSION"; then
     warn "Version $VERSION already installed"
+    finalize_installation "$LLVM_DIR/$VERSION"
     update_latest "$LLVM_DIR" "$VERSION"
     exit 0
 fi
@@ -105,6 +198,10 @@ if [ ! -d "$VERSION" ]; then
     rm -f "$TARBALL"
     exit 1
 fi
+
+# Repair release-runtime dependencies and prove that host linking works before
+# publishing this version through the latest symlink.
+finalize_installation "$LLVM_DIR/$VERSION"
 
 # Update latest symlink.
 update_latest "$LLVM_DIR" "$VERSION"

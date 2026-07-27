@@ -5,14 +5,24 @@ from __future__ import annotations
 import argparse
 import pathlib
 import shlex
-from typing import Any
+from typing import Any, BinaryIO
 
 from .api import RunpodApi
 from .auth import CredentialStore
 from .errors import RunpodLocalError
+from .huggingface_credentials import (
+    REMOTE_HF_CREDENTIAL_ABSENT,
+    REMOTE_HF_CREDENTIAL_UNSAFE,
+    REMOTE_HF_TOKEN_PATH,
+    build_remote_hf_credential_argv,
+    build_remote_hf_probe_argv,
+    huggingface_token_path,
+    open_huggingface_token_file,
+)
 from .instances import InstanceStore
 from .output import print_json
 from .paths import credentials_file, state_root
+from .profile import validate_image_digest
 from .remote import (
     build_copy_argv,
     build_ssh_argv,
@@ -25,7 +35,7 @@ from .remote import (
 from .state import StateStore
 
 
-REMOTE_COMMANDS = ("ssh", "tunnel", "copy")
+REMOTE_COMMANDS = ("ssh", "tunnel", "copy", "hf-auth")
 
 
 def _add_common(parser: argparse.ArgumentParser) -> None:
@@ -49,6 +59,29 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         dest="print_only",
         help="Print the shell-escaped local argv without executing it.",
+    )
+    parser.add_argument(
+        "--agents-md",
+        action="store_true",
+        help="Print the agent operating contract and exit.",
+    )
+
+
+def _add_hf_auth_common(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--state-root",
+        metavar="PATH",
+        help="Override RUNPOD_HOME (default: ~/.local/runpod).",
+    )
+    parser.add_argument(
+        "--credentials-file",
+        metavar="PATH",
+        help="Override the mode-0600 Runpod credential file.",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Format the completed credential result as versioned JSON.",
     )
     parser.add_argument(
         "--agents-md",
@@ -128,6 +161,37 @@ def add_remote_parsers(subparsers: Any) -> None:
             action="store_true",
             help="Copy a directory tree.",
         )
+
+    hf_auth = subparsers.add_parser(
+        "hf-auth",
+        help="Manage one ephemeral Hugging Face token on an active Pod.",
+    )
+    hf_auth.add_argument(
+        "--agents-md",
+        action="store_true",
+        help="Print the agent operating contract and exit.",
+    )
+    hf_auth_actions = hf_auth.add_subparsers(dest="hf_auth_action")
+
+    hf_auth_push = hf_auth_actions.add_parser(
+        "push",
+        help="Stream the local active token over SSH into ephemeral storage.",
+    )
+    _add_hf_auth_common(hf_auth_push)
+    hf_auth_push.add_argument("name", nargs="?")
+    hf_auth_push.add_argument(
+        "--token-file",
+        metavar="PATH",
+        help="Override HF_TOKEN_PATH without placing token bytes in argv.",
+    )
+
+    for action, help_text in (
+        ("status", "Check only remote presence and private permissions."),
+        ("clear", "Remove only the ephemeral remote token file."),
+    ):
+        parser = hf_auth_actions.add_parser(action, help=help_text)
+        _add_hf_auth_common(parser)
+        parser.add_argument("name", nargs="?")
 
 
 def _state(args: argparse.Namespace) -> StateStore:
@@ -286,6 +350,163 @@ def _run_copy(args: argparse.Namespace) -> int:
     )
 
 
+def _execute_hf_auth_remote(
+    args: argparse.Namespace,
+    *,
+    endpoint: Any,
+    instances: InstanceStore,
+    remote_arguments: list[str],
+    source: str,
+    stdin: BinaryIO | None = None,
+) -> int:
+    ensure_known_hosts_file(endpoint.known_hosts_file)
+    return run_with_activity(
+        build_ssh_argv(endpoint, remote_arguments),
+        instances=instances,
+        name=args.name,
+        expected_operation_id=endpoint.operation_id,
+        expected_pod_id=endpoint.pod_id,
+        source=source,
+        stdin=stdin,
+    )
+
+
+def _hf_auth_result(
+    args: argparse.Namespace,
+    *,
+    action: str,
+    configured: bool,
+    changed: bool,
+) -> None:
+    result = {
+        "schema_version": "runpod.hf-auth.v1",
+        "action": action,
+        "instance": args.name,
+        "configured": configured,
+        "changed": changed,
+        "remote_token_path": REMOTE_HF_TOKEN_PATH,
+        "storage": "ephemeral_container",
+    }
+    if args.json:
+        print_json(result)
+        return
+    if action == "push":
+        print(
+            f"installed ephemeral Hugging Face credential for {args.name}"
+        )
+    elif action == "status":
+        state = "configured" if configured else "not configured"
+        print(f"{args.name}: Hugging Face credential {state}")
+    elif changed:
+        print(f"removed ephemeral Hugging Face credential from {args.name}")
+    else:
+        print(f"{args.name}: Hugging Face credential already absent")
+
+
+def _require_hf_auth_success(action: str, return_code: int) -> None:
+    if return_code == 0:
+        return
+    if return_code == REMOTE_HF_CREDENTIAL_UNSAFE:
+        raise RunpodLocalError(
+            "remote Hugging Face credential path or permissions are unsafe",
+            code="unsafe_remote_hf_credential",
+        )
+    raise RunpodLocalError(
+        f"remote Hugging Face credential {action} failed with exit status "
+        f"{return_code}",
+        code="remote_hf_credential_failed",
+    )
+
+
+def _require_hf_auth_image(instances: InstanceStore, name: str) -> None:
+    record = instances.load(name)
+    payload = record.get("pod_payload")
+    image_name = (
+        payload.get("imageName") if isinstance(payload, dict) else None
+    )
+    try:
+        validate_image_digest(image_name)
+    except RunpodLocalError as error:
+        raise RunpodLocalError(
+            "Hugging Face credential push requires an explicit "
+            "digest-pinned image rather than a tag or template",
+            code="hf_auth_unpinned_image",
+        ) from error
+
+
+def _run_hf_auth(args: argparse.Namespace) -> int:
+    action = args.hf_auth_action
+    if action not in {"push", "status", "clear"}:
+        raise RunpodLocalError(
+            "hf-auth action required: push, status, or clear",
+            code="missing_action",
+        )
+    _, instances, endpoint = _endpoint(args)
+
+    if action == "push":
+        _require_hf_auth_image(instances, args.name)
+        token_path = (
+            pathlib.Path(args.token_file).expanduser().absolute()
+            if args.token_file
+            else huggingface_token_path()
+        )
+        with open_huggingface_token_file(token_path) as token_file:
+            probe_return_code = _execute_hf_auth_remote(
+                args,
+                endpoint=endpoint,
+                instances=instances,
+                remote_arguments=build_remote_hf_probe_argv(),
+                source="hf_auth_host_probe",
+            )
+            if probe_return_code != 0:
+                raise RunpodLocalError(
+                    "remote Hugging Face credential host probe failed with "
+                    f"exit status {probe_return_code}",
+                    code="remote_hf_credential_probe_failed",
+                )
+            token_file.seek(0)
+            return_code = _execute_hf_auth_remote(
+                args,
+                endpoint=endpoint,
+                instances=instances,
+                remote_arguments=build_remote_hf_credential_argv("push"),
+                source="hf_auth_push",
+                stdin=token_file,
+            )
+        _require_hf_auth_success(action, return_code)
+        _hf_auth_result(
+            args,
+            action=action,
+            configured=True,
+            changed=True,
+        )
+        return 0
+
+    return_code = _execute_hf_auth_remote(
+        args,
+        endpoint=endpoint,
+        instances=instances,
+        remote_arguments=build_remote_hf_credential_argv(action),
+        source=f"hf_auth_{action}",
+    )
+    if return_code == REMOTE_HF_CREDENTIAL_ABSENT:
+        _hf_auth_result(
+            args,
+            action=action,
+            configured=False,
+            changed=False,
+        )
+        return 0
+    _require_hf_auth_success(action, return_code)
+    _hf_auth_result(
+        args,
+        action=action,
+        configured=action == "status",
+        changed=action == "clear",
+    )
+    return 0
+
+
 def run_remote_command(args: argparse.Namespace) -> int:
     if args.command == "ssh":
         return _run_ssh(args)
@@ -293,6 +514,8 @@ def run_remote_command(args: argparse.Namespace) -> int:
         return _run_tunnel(args)
     if args.command == "copy":
         return _run_copy(args)
+    if args.command == "hf-auth":
+        return _run_hf_auth(args)
     raise RunpodLocalError(
         f"unsupported remote command: {args.command}",
         code="unsupported_command",

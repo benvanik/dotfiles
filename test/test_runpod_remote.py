@@ -57,7 +57,10 @@ def active_record(identity_file: pathlib.Path):
         "locked": False,
         "minVCPUPerGPU": 8,
         "minRAMPerGPU": 32,
-        "imageName": "runpod/pytorch:fixture",
+        "imageName": (
+            "runpod/pytorch@sha256:"
+            "1111111111111111111111111111111111111111111111111111111111111111"
+        ),
         "networkVolumeId": "volume123",
     }
     return {
@@ -118,7 +121,10 @@ def live_pod(**overrides):
         "id": "pod123",
         "name": "rp-compiler-123456781234",
         "desired_status": "RUNNING",
-        "image": "runpod/pytorch:fixture",
+        "image": (
+            "runpod/pytorch@sha256:"
+            "1111111111111111111111111111111111111111111111111111111111111111"
+        ),
         "template_id": None,
         "interruptible": False,
         "locked": False,
@@ -258,6 +264,7 @@ class RemoteBoundaryTest(unittest.TestCase):
 
         self.assertEqual(argv[0], "ssh")
         self.assertEqual(argv[-2], "root@100.65.0.119")
+        self.assertIn("-T", argv)
         self.assertTrue(argv[-1].startswith("exec "))
         self.assertEqual(shlex.split(argv[-1][5:]), remote)
         self.assertEqual(argv.count("root@100.65.0.119"), 1)
@@ -561,6 +568,40 @@ class RemoteBoundaryTest(unittest.TestCase):
         record = store.load("compiler")
         self.assertEqual(record["lease"]["expires_at"], original_deadline)
         self.assertEqual(record["lease"]["activity_source"], "fixture_remote")
+
+    def test_remote_process_can_stream_one_explicit_input_file(self):
+        token_path = self.root / "token"
+        token_path.write_bytes(b"fixture-private-token")
+        token_path.chmod(0o600)
+        captured = {}
+
+        class FakeProcess:
+            def wait(self, timeout=None):
+                return 0
+
+        def popen(argv, **kwargs):
+            captured["argv"] = argv
+            captured.update(kwargs)
+            return FakeProcess()
+
+        with token_path.open("rb") as token_file:
+            result = run_with_activity(
+                ["ssh", "fixture"],
+                instances=InstanceStore(self.state),
+                name="compiler",
+                expected_operation_id=(
+                    "12345678-1234-4234-8234-123456789abc"
+                ),
+                expected_pod_id="pod123",
+                source="hf_auth_push",
+                stdin=token_file,
+                popen_factory=popen,
+            )
+
+        self.assertEqual(result, 0)
+        self.assertIs(captured["stdin"], token_file)
+        self.assertNotIn("fixture-private-token", repr(captured["argv"]))
+        self.assertNotIn("HF_TOKEN", captured["env"])
 
     def test_remote_process_cannot_heartbeat_a_reused_local_name(self):
         record = InstanceStore(self.state).load("compiler")

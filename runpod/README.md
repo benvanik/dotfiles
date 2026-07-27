@@ -21,6 +21,7 @@ The tools own:
 - crash-reconcilable Pod create/delete with post-create rollback;
 - hard and explicit-heartbeat idle TTLs;
 - exact-Pod SSH, loopback tunnels, and persistent/ephemeral file transfer;
+- ephemeral Hugging Face credential leasing over reconciled SSH;
 - read-only local/live diagnostics.
 
 They do not own Runpod account balance, secrets, SSH account settings, volume
@@ -65,6 +66,14 @@ authentication, and forwarding side channels. Each Pod has its own mode-0600
 known-hosts file and `runpod-POD_ID` host-key alias. The first connection is
 TOFU via `accept-new`; a changed key fails.
 
+The official Runpod image writes Pod environment values into a shell file that
+root's `.bashrc` sources. Profiles therefore reject controls and shell
+expansion/quoting characters in every value, reserve shell-startup variables,
+reserve dynamic-loader controls, and reject all Runpod-secret environment
+references whose expanded bytes cannot be checked locally. Complex
+configuration and credentials belong in ephemeral files, not Pod environment
+values.
+
 Pods expose only `22/tcp`. vLLM or another service should bind remote
 `127.0.0.1` and be reached through `runpod-tunnel`, which binds both ends to
 loopback.
@@ -86,10 +95,11 @@ traversal and shell syntax. The model cache is operationally writable (Hugging
 Face needs locks and metadata); this tool does not pretend the weight files are
 filesystem-read-only.
 
-## Live July 26, 2026 snapshot
+## July 26, 2026 provider snapshot
 
-The authenticated account currently has no Pods, volumes, or user templates.
-The latest read-only Secure Cloud query returned:
+These quotes and stock states are dated provider observations, not checked-in
+account state. Re-run the read-only stock and volume commands before making a
+placement decision. The Secure Cloud query returned:
 
 | GPU | VRAM | Global on-demand quote | Stock |
 |---|---:|---:|---|
@@ -111,16 +121,16 @@ No current datacenter has all five target offers. Useful current pairings are:
 
 | Datacenter | Current target stock |
 |---|---|
+| `US-NC-1` | RTX Pro 6000 Server + H200 |
 | `EUR-IS-2` | RTX Pro 6000 Server + H200 |
 | `EU-RO-1` | RTX Pro 6000 Server/Workstation + B200 |
 | `US-NC-2` | RTX Pro 6000 Server + B200 |
 | `EU-NL-1` | RTX Pro 6000 Server + B300 |
 
 A network volume pins a Pod to its datacenter. A single cache cannot currently
-cover the complete Pro/H200/B200/B300 ladder. The clean initial experiment is
-one Pro+H200 volume in `EUR-IS-2`, because that is the main 96-vs-141 GB
-decision. Add a B200 or B300 cache only after a measured experiment justifies
-its recurring cost.
+cover the complete Pro/H200/B200/B300 ladder. A Pro+H200 volume is the clean
+initial topology for the main 96-vs-141 GB decision. Add a B200 or B300 cache
+only after a measured experiment justifies its recurring cost.
 
 Runpod documents network-volume pricing as $0.07/GB-month through 1 TB and
 $0.05/GB-month beyond it. A 250 GB cache is therefore about $17.50/month; a
@@ -138,6 +148,8 @@ Sources:
 - [Runpod Pod API](https://docs.runpod.io/api-reference/pods/POST/pods)
 - [Runpod network volumes](https://docs.runpod.io/storage/network-volumes)
 - [Runpod SSH](https://docs.runpod.io/pods/configuration/use-ssh)
+- [Runpod official container startup](https://github.com/runpod/containers/blob/main/container-template/start.sh)
+- [Runpod official base image](https://github.com/runpod/containers/blob/main/official-templates/base/Dockerfile)
 - [Current Runpod PyTorch image tags](https://hub.docker.com/r/runpod/pytorch/tags)
 - [Current vLLM serve CLI](https://docs.vllm.ai/en/stable/cli/serve/)
 
@@ -152,9 +164,6 @@ runpod-auth status --check --json
 runpod-doctor --live
 ```
 
-Authentication is already configured on this machine; the first line is the
-portable bootstrap path.
-
 For unattended agent-driven sessions, use a dedicated non-interactive Ed25519
 identity rather than a general personal key:
 
@@ -167,11 +176,11 @@ chmod 644 ~/.ssh/id_ed25519_runpod.pub
 The public key is not secret. The private key never enters dotfiles or Runpod
 state.
 
-Plan a 250 GB Pro+H200 cache:
+Plan a 250 GB Pro+H200 cache in a datacenter where both offers are live:
 
 ```sh
-runpod-volume create model-cache-pro-h200 \
-  --size-gb 250 --data-center EUR-IS-2 --json
+runpod-volume create CACHE_NAME \
+  --size-gb 250 --data-center DATA_CENTER_ID --json
 ```
 
 That command performs only read-only provider checks without `--execute`. It
@@ -191,19 +200,23 @@ cross-machine idempotency key. Volume charges survive every `runpod-down`.
 Deletion is intentionally outside this suite; use Runpod's Storage console or
 volume API only after separately reviewing the exact volume ID.
 
-The account currently exposes no saved templates through the REST API, so a
-profile can use an explicit official image. As of this snapshot,
-`runpod/pytorch:1.1.0-cu1290-torch291-ubuntu2404` is a current CUDA 12.9 /
-PyTorch 2.9.1 / Ubuntu 24.04 tag. Image tags are mutable operational inputs;
-record the pulled image identity in benchmark results and move to a custom
-digest-pinned image once the runtime stack stabilizes. The Pod API currently
-reports the requested tag, not proof of the digest actually pulled.
+Explicit profile images require immutable digests; provider template IDs remain
+available for sessions that do not receive credential leases. As of this
+snapshot, the current CUDA 12.9 / PyTorch 2.9.1 / Ubuntu 24.04 tag resolves to:
 
-After volume creation, author the datacenter-specific profile:
+```text
+runpod/pytorch@sha256:e655f8dd3bdd68b0ef8d4675b63341f85812263f957f78971c56af7c42423ca6
+```
+
+The selected official image installs `/usr/bin/python3.12`, which the
+non-secret credential probe verifies before any token-bearing connection.
+Re-resolve and audit a new digest when changing the runtime stack.
+
+Author the datacenter-specific profile against the selected volume:
 
 ```sh
 runpod-profile create pro-h200 \
-  --image runpod/pytorch:1.1.0-cu1290-torch291-ubuntu2404 \
+  --image runpod/pytorch@sha256:e655f8dd3bdd68b0ef8d4675b63341f85812263f957f78971c56af7c42423ca6 \
   --network-volume-id VOLUME_ID \
   --gpu pro6000-server --gpu h200 \
   --max-hourly 4.50 --ttl 4h --cuda 12.9 \
@@ -212,10 +225,36 @@ runpod-profile create pro-h200 \
   --json
 ```
 
-For a gated/private Hugging Face model, create the token as a Runpod secret in
-the console and add `--secret-env HF_TOKEN=secret_name` to the profile. Local
-inspection and remote download are separate credential contexts; no local
-token is copied into a Pod or profile.
+Profiles fix `HF_TOKEN_PATH` to
+`/root/runpod-session/secrets/huggingface/token`, while `HF_HOME` and the model
+cache remain on `/workspace`. `HF_TOKEN` and `HUGGING_FACE_HUB_TOKEN` are
+rejected even when written as Runpod-secret references; no credential is
+stored in the profile. For a gated/private repository, authenticate locally
+and lease only the active token after the Pod is ready:
+
+```sh
+hf auth login
+runpod-hf-auth push compiler
+runpod-hf-auth status compiler --json
+```
+
+`push` first makes a non-secret SSH connection to establish the dedicated
+per-Pod host key, then streams the validated local token file as stdin on a
+second connection. That connection starts an absolute isolated system Python
+with an empty environment. The fixed remote installer writes atomically with
+mode 0600 beneath mode-0700 ephemeral storage. It never reaches argv,
+environment, provider metadata, profiles, receipts, JSON, logs, or
+`/workspace`. An interrupted atomic-install temporary is treated as unsafe by
+`status` and removed by the next valid `push` or `clear`.
+
+Browser-OAuth refresh state is deliberately not copied; push the current token
+again if the active token expires. `runpod-hf-auth clear compiler` removes the
+Pod copy but does not revoke the source credential at Hugging Face. Code
+running as Pod root can read the leased token; the boundary prevents accidental
+persistence and disclosure, not access by the selected container workload.
+`push` refuses mutable image tags and template-backed Pods; `status` and
+`clear` remain available so an existing lease can always be inspected or
+removed.
 
 The profile cap is total Pod cost, not price per GPU. Profile GPU order is
 intentional fallback order. Because the volume is datacenter-pinned, putting
@@ -368,11 +407,15 @@ runpod-copy pull compiler /root/runpod-session/profile.json ./profile.json
 
 runpod-copy push compiler ./nonsecret-tools /workspace/tools --recursive
 
+runpod-hf-auth push compiler
+runpod-hf-auth status compiler --json
+
 runpod-tunnel compiler --local-port 8000 --remote-port 8000
 ```
 
 `/workspace` is the persistent network volume; `/root/runpod-session` is
 ephemeral container storage. Tunnels are foreground-only and loopback-only.
+The Hugging Face token is always placed in the latter and is lost with the Pod.
 Merely keeping a tunnel open does not refresh idle activity. The benchmark
 driver should call `runpod-ttl touch NAME --source LABEL` after real work.
 

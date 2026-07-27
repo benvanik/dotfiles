@@ -10,6 +10,7 @@ from unittest import mock
 from runpod_local.errors import RunpodLocalError
 from runpod_local.huggingface_credentials import (
     HF_CLI_VERSION,
+    configured_huggingface_token,
     huggingface_token_path,
     load_huggingface_token,
     open_huggingface_token_file,
@@ -183,6 +184,22 @@ class HuggingFaceCredentialTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertNotIn(secret, result.stdout)
         self.assertNotIn(secret, result.stderr)
+
+    def test_model_tools_refuse_environment_tokens(self):
+        for name in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+            with self.subTest(name=name):
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {name: "fixture-environment-secret"},
+                        clear=True,
+                    ),
+                    self.assertRaises(RunpodLocalError) as caught,
+                ):
+                    configured_huggingface_token()
+                self.assertEqual(
+                    caught.exception.code, "unsafe_hf_environment_token"
+                )
 
 
 if __name__ == "__main__":

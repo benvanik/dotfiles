@@ -29,6 +29,7 @@ Session commands:
 - `runpod-ssh`: open a validated session or one quoted remote command.
 - `runpod-tunnel`: open one loopback-only tunnel without faking activity.
 - `runpod-copy`: copy persistent cache/tool data or ephemeral session data.
+- `runpod-hf-auth`: lease one local Hugging Face token to ephemeral Pod storage.
 - `runpod-doctor`: read-only local/provider integrity audit.
 
 Paid mutations always require `--execute`. `runpod-ttl set`, `extend`, and
@@ -149,17 +150,25 @@ network-volume identity, cache paths, price cap, SSH identity, and hard TTL.
 
 ```sh
 runpod-profile create nvidia-dev \\
-  --image IMAGE_OR_DIGEST --network-volume-id VOLUME_ID \\
+  --image IMAGE@sha256:DIGEST --network-volume-id VOLUME_ID \\
   --gpu pro6000-server --gpu h200 \\
   --max-hourly 4.50 --ttl 4h \\
   --identity-file ~/.ssh/id_ed25519_runpod \\
   --public-key-file ~/.ssh/id_ed25519_runpod.pub --json
 ```
 
-Literal values for environment names containing TOKEN, KEY, SECRET, PASSWORD,
-or CREDENTIAL are rejected. Use `--secret-env
-HF_TOKEN=runpod_secret_name`; the profile stores only the Runpod secret
-reference. `PUBLIC_KEY` is provider-owned; the tool validates and injects one
+Explicit profile images require immutable digests; provider template IDs remain
+available for sessions that do not receive credential leases. Environment
+names containing TOKEN, KEY, SECRET, PASSWORD, or CREDENTIAL are rejected, as
+are all Runpod-secret environment references. The official image shell-sources
+a serialized Pod environment, so controls and shell expansion/quoting
+characters are also rejected in every value. `HF_TOKEN_PATH` is the one
+constrained non-secret exception and is fixed to ephemeral
+`/root/runpod-session/secrets/huggingface/token`; credentials never belong in a
+profile. Shell-startup controls such as `BASH_ENV`, `ENV`, and `ZDOTDIR` are
+reserved by the reconciled SSH control plane, as are dynamic-loader controls
+such as `LD_*`, `GLIBC_TUNABLES`, and `GCONV_PATH`. `PUBLIC_KEY` is
+provider-owned; the tool validates and injects one
 profile-specific `SSH_PUBLIC_KEY`. The private/public pair is revalidated
 immediately before a fresh billable submission. Local profiles are advisory
 across machines; provider state and exact Pod IDs remain authoritative.
@@ -306,6 +315,39 @@ literal-segment grammar: no traversal, whitespace, globs, colons, shell syntax,
 backslashes, or tildes. Local operands are made absolute, OpenSSH
 config/proxies/agents are disabled, and every transfer uses the per-Pod
 known-hosts file. `--json` or `--print` inspects without copying.
+""",
+    "hf-auth": """# `runpod-hf-auth`
+
+Lease only the local active Hugging Face token to one active Pod:
+
+```sh
+runpod-hf-auth push compiler
+runpod-hf-auth status compiler --json
+runpod-hf-auth clear compiler
+```
+
+`push` opens `${HF_TOKEN_PATH:-~/.config/huggingface/token}` only after proving
+it is a bounded, owned, non-symlink, private regular file. A first non-secret
+SSH probe establishes the dedicated per-Pod host key; a second connection
+streams the already-open file as stdin to a fixed remote program. Token bytes
+never enter argv, environment, provider metadata, profile, receipt, JSON,
+logs, or `/workspace`.
+
+The remote program accepts one token, creates only real owner-controlled 0700
+directories below `/root/runpod-session`, and atomically installs a mode-0600
+token through absolute isolated system Python with an empty environment. An
+orphaned atomic-install temporary makes `status` fail unsafe; a valid `push` or
+`clear` removes it. The profile sets `HF_TOKEN_PATH` there before Hugging Face
+libraries import. Pod deletion removes it; `clear` removes it earlier. Neither
+action revokes the source token at Hugging Face, and browser-OAuth refresh state
+is never copied. Push the current active token again if it expires. Pod-root
+code can read the lease; this boundary prevents persistence and accidental
+disclosure rather than hiding a credential from the selected workload.
+`push` requires an explicit digest-pinned image and refuses a mutable tag or
+template; `status` and `clear` remain available for cleanup.
+
+These explicit credential actions execute immediately. `--json` formats the
+safe result; it is not a plan mode.
 """,
     "doctor": """# `runpod-doctor`
 

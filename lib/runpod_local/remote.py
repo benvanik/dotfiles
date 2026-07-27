@@ -13,7 +13,7 @@ import socket
 import stat
 import subprocess
 from dataclasses import asdict, dataclass
-from typing import Any, Callable
+from typing import Any, BinaryIO, Callable
 
 from .allocation import verify_allocated_pod
 from .api import RunpodApi
@@ -608,6 +608,9 @@ def build_ssh_argv(
     remote_argv: list[str] | None = None,
 ) -> list[str]:
     argv = ["ssh", *_ssh_options(endpoint)]
+    if remote_argv:
+        _validate_remote_arguments(remote_argv)
+        argv.append("-T")
     argv.extend(
         [
             "-i",
@@ -618,7 +621,6 @@ def build_ssh_argv(
         ]
     )
     if remote_argv:
-        _validate_remote_arguments(remote_argv)
         argv.append("exec " + shlex.join(remote_argv))
     return argv
 
@@ -797,6 +799,7 @@ def run_with_activity(
     expected_pod_id: str,
     source: str,
     maintain_activity: bool = True,
+    stdin: BinaryIO | None = None,
     popen_factory: Callable[..., Any] = subprocess.Popen,
     clock: Callable[[], datetime.datetime] | None = None,
 ) -> int:
@@ -808,11 +811,13 @@ def run_with_activity(
         expected_pod_id=expected_pod_id,
     )
     try:
-        process = popen_factory(
-            argv,
-            env=sanitized_subprocess_environment(),
-            shell=False,
-        )
+        process_arguments: dict[str, Any] = {
+            "env": sanitized_subprocess_environment(),
+            "shell": False,
+        }
+        if stdin is not None:
+            process_arguments["stdin"] = stdin
+        process = popen_factory(argv, **process_arguments)
     except OSError as error:
         raise RunpodLocalError(
             f"cannot start remote client: {error}",

@@ -69,6 +69,10 @@ class ProfileTest(unittest.TestCase):
             pod["environment"]["HF_HUB_CACHE"],
             DEFAULT_CACHE_ENVIRONMENT["HF_HUB_CACHE"],
         )
+        self.assertEqual(
+            pod["environment"]["HF_TOKEN_PATH"],
+            "/root/runpod-session/secrets/huggingface/token",
+        )
         self.assertEqual(value["limits"]["max_hourly_usd"], 8.0)
         self.assertEqual(value["lease"]["expiry_action"], "terminate")
         self.assertEqual(
@@ -78,20 +82,103 @@ class ProfileTest(unittest.TestCase):
     def test_literal_secret_is_rejected(self):
         with self.assertRaises(RunpodLocalError) as caught:
             profile(environment={"HF_TOKEN": "literal-fixture-value"})
-        self.assertEqual(caught.exception.code, "literal_secret_rejected")
+        self.assertEqual(
+            caught.exception.code, "invalid_profile_environment"
+        )
+
+    def test_hugging_face_secret_references_are_rejected(self):
+        for name in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+            with self.subTest(name=name):
+                with self.assertRaises(RunpodLocalError) as caught:
+                    profile(
+                        environment={
+                            name: "{{ RUNPOD_SECRET_huggingface }}"
+                        }
+                    )
+                self.assertEqual(
+                    caught.exception.code, "invalid_profile_environment"
+                )
+
+    def test_hugging_face_token_path_cannot_use_persistent_storage(self):
+        with self.assertRaises(RunpodLocalError) as caught:
+            profile(
+                environment={
+                    "HF_TOKEN_PATH": "/workspace/.cache/huggingface/token"
+                }
+            )
+        self.assertEqual(
+            caught.exception.code, "invalid_profile_environment"
+        )
 
     def test_non_secret_name_containing_key_letters_is_allowed(self):
         value = profile(environment={"MONKEY": "banana"})
         self.assertEqual(value["pod"]["environment"]["MONKEY"], "banana")
 
-    def test_runpod_secret_reference_is_retained(self):
+    def test_other_runpod_secret_references_are_rejected(self):
+        for value in (
+            "{{ RUNPOD_SECRET_wandb }}",
+            "prefix-{{RUNPOD_SECRET_wandb}}-suffix",
+        ):
+            with self.subTest(value=value):
+                with self.assertRaises(RunpodLocalError) as caught:
+                    profile(environment={"WANDB_API_KEY": value})
+                self.assertEqual(
+                    caught.exception.code, "invalid_profile_environment"
+                )
+
+    def test_runpod_startup_shell_metacharacters_are_rejected(self):
+        for value in (
+            "$(cat /root/runpod-session/secrets/huggingface/token)",
+            "`cat /root/runpod-session/secrets/huggingface/token`",
+            'escaped"quote',
+            "escaped\\quote",
+            "line\nbreak",
+            "carriage\rreturn",
+            "delete\x7fcharacter",
+        ):
+            with self.subTest(value=value):
+                with self.assertRaises(RunpodLocalError) as caught:
+                    profile(environment={"SAFE_NAME": value})
+                self.assertEqual(
+                    caught.exception.code, "invalid_profile_environment"
+                )
+
+    def test_simple_tool_paths_remain_valid_profile_environment(self):
         value = profile(
-            environment={"HF_TOKEN": "{{ RUNPOD_SECRET_huggingface }}"}
+            environment={
+                "PATH": "/usr/local/bin:/usr/bin:/bin",
+                "PYTHONPATH": "/workspace/tools",
+            }
         )
         self.assertEqual(
-            value["pod"]["environment"]["HF_TOKEN"],
-            "{{ RUNPOD_SECRET_huggingface }}",
+            value["pod"]["environment"]["PATH"],
+            "/usr/local/bin:/usr/bin:/bin",
         )
+
+    def test_remote_shell_startup_environment_is_reserved(self):
+        for name in (
+            "BASHOPTS",
+            "BASH_ENV",
+            "ENV",
+            "GCONV_PATH",
+            "GLIBC_TUNABLES",
+            "HOME",
+            "LD_AUDIT",
+            "LD_CUSTOM_LOADER_CONTROL",
+            "LD_LIBRARY_PATH",
+            "LD_PRELOAD",
+            "LOCPATH",
+            "PS4",
+            "SHELL",
+            "SHELLOPTS",
+            "ZDOTDIR",
+        ):
+            with self.subTest(name=name):
+                with self.assertRaises(RunpodLocalError) as caught:
+                    profile(environment={name: "fixture"})
+                self.assertEqual(
+                    caught.exception.code, "invalid_profile_environment"
+                )
 
     def test_provider_public_key_environment_is_reserved(self):
         with self.assertRaises(RunpodLocalError) as caught:
@@ -105,6 +192,21 @@ class ProfileTest(unittest.TestCase):
             profile(network_volume_id=None)
         ephemeral = profile(network_volume_id=None, ephemeral=True)
         self.assertEqual(ephemeral["pod"]["storage_mode"], "ephemeral")
+
+    def test_explicit_images_require_immutable_digests(self):
+        with self.assertRaises(RunpodLocalError) as caught:
+            profile(
+                template_id=None,
+                image_name="runpod/pytorch:mutable",
+            )
+        self.assertEqual(caught.exception.code, "invalid_profile")
+
+        image = (
+            "runpod/pytorch@sha256:"
+            "1111111111111111111111111111111111111111111111111111111111111111"
+        )
+        value = profile(template_id=None, image_name=image)
+        self.assertEqual(value["pod"]["image_name"], image)
 
     def test_profile_store_is_private_and_refuses_implicit_replacement(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -14,6 +14,7 @@ import subprocess
 from typing import Any
 
 from .errors import RunpodLocalError
+from .huggingface_credentials import REMOTE_HF_TOKEN_PATH
 from .placement import load_hardware_catalog, select_hardware
 from .state import StateStore, validate_record_name
 from .timeutil import parse_utc_timestamp, utc_timestamp
@@ -21,18 +22,51 @@ from .timeutil import parse_utc_timestamp, utc_timestamp
 
 PROFILE_SCHEMA = "runpod.profile.v1"
 PROVIDER_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,191}$")
+IMAGE_DIGEST_PATTERN = re.compile(
+    r"^[a-z0-9](?:[a-z0-9._:/-]*[a-z0-9])?"
+    r"@sha256:[0-9a-f]{64}$"
+)
 ENVIRONMENT_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 SECRET_REFERENCE_PATTERN = re.compile(
-    r"^\{\{\s*RUNPOD_SECRET_[A-Za-z0-9_]+\s*\}\}$"
+    r"\{\{\s*RUNPOD_SECRET_[A-Za-z0-9_]+\s*\}\}"
 )
 SENSITIVE_ENVIRONMENT_PATTERN = re.compile(
     r"(?:^|_)(?:TOKEN|KEY|SECRET|PASSWORD|CREDENTIALS?)(?:_|$)",
     re.IGNORECASE,
 )
-NONSECRET_KEY_ENVIRONMENT_NAMES = {"SSH_PUBLIC_KEY"}
+NONSECRET_SENSITIVE_ENVIRONMENT_NAMES = {
+    "HF_TOKEN_PATH",
+    "SSH_PUBLIC_KEY",
+}
+FORBIDDEN_HUGGING_FACE_CREDENTIAL_ENVIRONMENT_NAMES = {
+    "HF_TOKEN",
+    "HUGGING_FACE_HUB_TOKEN",
+}
+FORBIDDEN_REMOTE_SHELL_ENVIRONMENT_NAMES = {
+    "BASHOPTS",
+    "BASH_ENV",
+    "ENV",
+    "HOME",
+    "PS4",
+    "SHELL",
+    "SHELLOPTS",
+    "ZDOTDIR",
+}
+FORBIDDEN_DYNAMIC_LOADER_ENVIRONMENT_NAMES = {
+    "GCONV_PATH",
+    "GLIBC_TUNABLES",
+    "LOCPATH",
+}
+UNSAFE_RUNPOD_ENVIRONMENT_VALUE_CHARACTERS = frozenset('"$\\`')
 DEFAULT_CACHE_ENVIRONMENT = {
+    "HF_ASSETS_CACHE": "/workspace/.cache/huggingface/assets",
     "HF_HOME": "/workspace/.cache/huggingface",
     "HF_HUB_CACHE": "/workspace/.cache/huggingface/hub",
+    "HF_HUB_DISABLE_TELEMETRY": "1",
+    "HF_HUB_DISABLE_UPDATE_CHECK": "1",
+    "HF_TOKEN_PATH": REMOTE_HF_TOKEN_PATH,
+    "HF_XET_CACHE": "/workspace/.cache/huggingface/xet",
+    "HF_XET_HIGH_PERFORMANCE": "1",
     "TORCH_HOME": "/workspace/.cache/torch",
     "VLLM_CACHE_ROOT": "/workspace/.cache/vllm",
     "XDG_CACHE_HOME": "/workspace/.cache",
@@ -53,6 +87,21 @@ def _provider_id(value: str, *, label: str) -> str:
     if not isinstance(value, str) or not PROVIDER_ID_PATTERN.fullmatch(value):
         raise RunpodLocalError(
             f"invalid Runpod {label}: {value!r}",
+            code="invalid_profile",
+        )
+    return value
+
+
+def validate_image_digest(value: Any) -> str:
+    """Require one immutable OCI image reference."""
+
+    if (
+        not isinstance(value, str)
+        or not IMAGE_DIGEST_PATTERN.fullmatch(value)
+        or any(ord(character) < 32 for character in value)
+    ):
+        raise RunpodLocalError(
+            "profile image must be an immutable NAME@sha256:DIGEST reference",
             code="invalid_profile",
         )
     return value
@@ -134,20 +183,55 @@ def validate_environment(environment: dict[str, str]) -> dict[str, str]:
                 f"invalid environment variable name: {name!r}",
                 code="invalid_profile_environment",
             )
-        if not isinstance(value, str) or "\x00" in value:
+        if (
+            not isinstance(value, str)
+            or any(
+                ord(character) < 32
+                or ord(character) == 127
+                or character in UNSAFE_RUNPOD_ENVIRONMENT_VALUE_CHARACTERS
+                for character in value
+            )
+        ):
             raise RunpodLocalError(
-                f"invalid environment value for {name}",
+                f"environment value for {name} cannot be represented safely "
+                "by the Runpod image startup contract",
+                code="invalid_profile_environment",
+            )
+        if SECRET_REFERENCE_PATTERN.search(value):
+            raise RunpodLocalError(
+                "Runpod-secret environment references are unsupported because "
+                "the expanded value cannot be validated before image startup",
+                code="invalid_profile_environment",
+            )
+        if name in FORBIDDEN_HUGGING_FACE_CREDENTIAL_ENVIRONMENT_NAMES:
+            raise RunpodLocalError(
+                f"{name} is reserved; Hugging Face credentials must use the "
+                "ephemeral SSH lease",
                 code="invalid_profile_environment",
             )
         if (
-            name not in NONSECRET_KEY_ENVIRONMENT_NAMES
-            and SENSITIVE_ENVIRONMENT_PATTERN.search(name)
-            and not SECRET_REFERENCE_PATTERN.fullmatch(value)
+            name in FORBIDDEN_REMOTE_SHELL_ENVIRONMENT_NAMES
+            or name.startswith("LD_")
+            or name in FORBIDDEN_DYNAMIC_LOADER_ENVIRONMENT_NAMES
         ):
             raise RunpodLocalError(
-                f"{name} looks sensitive and must use a Runpod secret reference "
-                "such as {{ RUNPOD_SECRET_name }}",
+                f"{name} is reserved by the reconciled SSH/runtime control "
+                "plane",
+                code="invalid_profile_environment",
+            )
+        if (
+            name not in NONSECRET_SENSITIVE_ENVIRONMENT_NAMES
+            and SENSITIVE_ENVIRONMENT_PATTERN.search(name)
+        ):
+            raise RunpodLocalError(
+                f"{name} looks sensitive and cannot be stored in a launch "
+                "profile",
                 code="literal_secret_rejected",
+            )
+        if name == "HF_TOKEN_PATH" and value != REMOTE_HF_TOKEN_PATH:
+            raise RunpodLocalError(
+                f"HF_TOKEN_PATH must use ephemeral {REMOTE_HF_TOKEN_PATH}",
+                code="invalid_profile_environment",
             )
         result[name] = value
     return {name: result[name] for name in sorted(result)}
@@ -461,16 +545,8 @@ def create_profile(
             "profile requires exactly one of image_name or template_id",
             code="invalid_profile",
         )
-    if image_name is not None and (
-        not isinstance(image_name, str)
-        or not image_name
-        or any(character.isspace() for character in image_name)
-        or any(ord(character) < 32 for character in image_name)
-    ):
-        raise RunpodLocalError(
-            "profile image name must be a non-empty container reference",
-            code="invalid_profile",
-        )
+    if image_name is not None:
+        validate_image_digest(image_name)
     if template_id is not None:
         _provider_id(template_id, label="template ID")
     if not isinstance(ephemeral, bool):

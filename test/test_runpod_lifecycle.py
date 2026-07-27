@@ -34,7 +34,10 @@ def profile(**overrides):
         "gpu_names": ["pro6000", "h200"],
         "max_hourly_usd": 3.0,
         "default_ttl_seconds": 3600,
-        "image_name": "runpod/pytorch:fixture",
+        "image_name": (
+            "runpod/pytorch@sha256:"
+            "1111111111111111111111111111111111111111111111111111111111111111"
+        ),
         "network_volume_id": "volume123",
         "ssh_public_key": SSH_PUBLIC_KEY,
     }

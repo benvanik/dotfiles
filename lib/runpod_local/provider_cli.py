@@ -261,7 +261,8 @@ def add_provider_parsers(subparsers: Any) -> None:
     profile_create.add_argument("name")
     runtime_source = profile_create.add_mutually_exclusive_group(required=True)
     runtime_source.add_argument(
-        "--image", help="Explicit container tag or digest reference."
+        "--image",
+        help="Explicit immutable NAME@sha256:DIGEST container reference.",
     )
     runtime_source.add_argument(
         "--template-id", help="Exact account-visible Runpod template ID."
@@ -340,13 +341,6 @@ def add_provider_parsers(subparsers: Any) -> None:
         help="Non-secret environment value; repeat as needed.",
     )
     profile_create.add_argument(
-        "--secret-env",
-        action="append",
-        default=[],
-        metavar="NAME=RUNPOD_SECRET_NAME",
-        help="Map an environment name to a Runpod secret reference.",
-    )
-    profile_create.add_argument(
         "--replace",
         action="store_true",
         help="Atomically replace an existing profile.",
@@ -415,9 +409,7 @@ def _human_line(value: dict[str, Any]) -> str:
     return str(value)
 
 
-def _parse_environment(
-    plain_values: list[str], secret_values: list[str]
-) -> dict[str, str]:
+def _parse_environment(plain_values: list[str]) -> dict[str, str]:
     environment: dict[str, str] = {}
     for assignment in plain_values:
         if "=" not in assignment:
@@ -432,24 +424,6 @@ def _parse_environment(
                 code="duplicate_profile_environment",
             )
         environment[name] = value
-    for assignment in secret_values:
-        if "=" not in assignment:
-            raise RunpodLocalError(
-                f"secret assignment must be NAME=RUNPOD_SECRET_NAME: {assignment!r}",
-                code="invalid_profile_environment",
-            )
-        name, secret_name = assignment.split("=", 1)
-        if name in environment:
-            raise RunpodLocalError(
-                f"environment name specified more than once: {name}",
-                code="duplicate_profile_environment",
-            )
-        if not re.fullmatch(r"[A-Za-z0-9_]+", secret_name):
-            raise RunpodLocalError(
-                f"invalid Runpod secret name: {secret_name!r}",
-                code="invalid_profile_environment",
-            )
-        environment[name] = f"{{{{ RUNPOD_SECRET_{secret_name} }}}}"
     return environment
 
 
@@ -749,7 +723,7 @@ def _run_profile(args: argparse.Namespace) -> int:
     if args.profile_action == "show":
         _print_result(store.load(args.name), as_json=args.json)
         return 0
-    environment = _parse_environment(args.env, args.secret_env)
+    environment = _parse_environment(args.env)
     public_key_path, public_key = load_ssh_public_key_file(
         args.public_key_file or f"{args.identity_file}.pub"
     )

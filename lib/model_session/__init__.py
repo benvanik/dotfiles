@@ -9,6 +9,12 @@ from .attachment import (
     publish_inference_attachment,
 )
 from .errors import ModelSessionError
+from .pi_runtime import (
+    PiInstallationIdentity,
+    PiRuntimeAsset,
+    fingerprint_pi_installation,
+    pi_runtime_assets,
+)
 from .profile import (
     AGENTS_FILE_NAME,
     INPUT_MODALITIES,
@@ -48,7 +54,9 @@ __all__ = [
     "PI_TOOLS",
     "PROFILE_FILE_NAME",
     "PROFILE_SCHEMA",
+    "PiInstallationIdentity",
     "PiContract",
+    "PiRuntimeAsset",
     "Profile",
     "ProfileContract",
     "ProfileResource",
@@ -56,6 +64,7 @@ __all__ = [
     "SessionRun",
     "RuntimeContract",
     "WEIGHT_FORMATS",
+    "fingerprint_pi_installation",
     "inference_attachment_receipt_path",
     "inference_workload_identity",
     "load_inference_attachment",
@@ -63,5 +72,6 @@ __all__ = [
     "load_run",
     "load_run_from_state",
     "materialize_new_run",
+    "pi_runtime_assets",
     "publish_inference_attachment",
 ]

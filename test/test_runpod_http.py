@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import io
 import urllib.error
 import urllib.request
@@ -79,11 +80,13 @@ class HttpSecurityTest(unittest.TestCase):
             transport.request_json(
                 "POST",
                 "https://rest.example.invalid/v1/pods",
-                allowed_error_messages=frozenset({safe_message}),
+                allowed_error_responses=frozenset({(500, safe_message)}),
             )
 
         self.assertEqual(caught.exception.provider_error, safe_message)
         self.assertIn(safe_message, str(caught.exception))
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertIsNone(caught.exception.__context__)
 
     def test_http_error_discards_unapproved_provider_content(self):
         secret = "provider echoed fixture-secret"
@@ -104,11 +107,140 @@ class HttpSecurityTest(unittest.TestCase):
             transport.request_json(
                 "POST",
                 "https://rest.example.invalid/v1/pods",
-                allowed_error_messages=frozenset({"safe fixture"}),
+                allowed_error_responses=frozenset({(500, "safe fixture")}),
             )
 
         self.assertIsNone(caught.exception.provider_error)
         self.assertNotIn(secret, str(caught.exception))
+
+    def test_http_error_rejects_near_match_provider_responses(self):
+        safe_message = (
+            "create pod: There are no instances currently available"
+        )
+        cases = {
+            "wrong_status": (
+                503,
+                ('{"error":"' + safe_message + '"}').encode("utf-8"),
+            ),
+            "extra_field": (
+                500,
+                (
+                    '{"error":"'
+                    + safe_message
+                    + '","request":"fixture-secret"}'
+                ).encode("utf-8"),
+            ),
+            "message_field": (
+                500,
+                ('{"message":"' + safe_message + '"}').encode("utf-8"),
+            ),
+            "malformed": (
+                500,
+                ('{"error":"' + safe_message).encode("utf-8"),
+            ),
+            "non_object": (
+                500,
+                ('["' + safe_message + '"]').encode("utf-8"),
+            ),
+            "oversized": (
+                500,
+                ('{"error":"' + safe_message + '"}').encode("utf-8")
+                + b" " * (64 * 1024),
+            ),
+        }
+
+        for name, (status, response_body) in cases.items():
+            with self.subTest(name=name):
+                def failing_open(request, *, timeout):
+                    raise urllib.error.HTTPError(
+                        request.full_url,
+                        status,
+                        "fixture provider error",
+                        {},
+                        io.BytesIO(response_body),
+                    )
+
+                transport = JsonHttpTransport(opener=failing_open)
+                with self.assertRaises(HttpRequestError) as caught:
+                    transport.request_json(
+                        "POST",
+                        "https://rest.example.invalid/v1/pods",
+                        allowed_error_responses=frozenset(
+                            {(500, safe_message)}
+                        ),
+                    )
+
+                self.assertIsNone(caught.exception.provider_error)
+                self.assertNotIn("fixture-secret", str(caught.exception))
+
+    def test_http_error_read_failure_remains_sanitized_and_ambiguous(self):
+        safe_message = (
+            "create pod: There are no instances currently available"
+        )
+
+        class IncompleteBody:
+            def read(self, _size):
+                raise http.client.IncompleteRead(b"fixture-secret")
+
+            def close(self):
+                pass
+
+        def failing_open(request, *, timeout):
+            raise urllib.error.HTTPError(
+                request.full_url,
+                500,
+                "fixture provider error",
+                {},
+                IncompleteBody(),
+            )
+
+        transport = JsonHttpTransport(opener=failing_open)
+        with self.assertRaises(HttpRequestError) as caught:
+            transport.request_json(
+                "POST",
+                "https://rest.example.invalid/v1/pods",
+                allowed_error_responses=frozenset({(500, safe_message)}),
+            )
+
+        self.assertIsNone(caught.exception.provider_error)
+        self.assertNotIn("fixture-secret", str(caught.exception))
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertIsNone(caught.exception.__context__)
+
+    def test_http_error_close_failure_cannot_authorize_transition(self):
+        safe_message = (
+            "create pod: There are no instances currently available"
+        )
+        response_body = ('{"error":"' + safe_message + '"}').encode("utf-8")
+
+        class BrokenCloseBody:
+            def read(self, _size):
+                return response_body
+
+            def close(self):
+                raise RuntimeError("fixture-secret")
+
+        def failing_open(request, *, timeout):
+            raise urllib.error.HTTPError(
+                request.full_url,
+                500,
+                "fixture provider error",
+                {},
+                BrokenCloseBody(),
+            )
+
+        transport = JsonHttpTransport(opener=failing_open)
+        with self.assertRaises(HttpRequestError) as caught:
+            transport.request_json(
+                "POST",
+                "https://rest.example.invalid/v1/pods",
+                allowed_error_responses=frozenset({(500, safe_message)}),
+            )
+
+        self.assertIsNone(caught.exception.provider_error)
+        self.assertNotIn("fixture-secret", str(caught.exception))
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertIsNone(caught.exception.__context__)
 
 
 if __name__ == "__main__":

@@ -18,7 +18,9 @@ AVAILABLE_STOCK_STATUSES = frozenset({"High", "Medium", "Low"})
 NO_INSTANCES_AVAILABLE_ERROR = (
     "create pod: There are no instances currently available"
 )
-CREATE_POD_SAFE_ERROR_MESSAGES = frozenset({NO_INSTANCES_AVAILABLE_ERROR})
+CREATE_POD_SAFE_ERROR_RESPONSES = frozenset(
+    {(500, NO_INSTANCES_AVAILABLE_ERROR)}
+)
 GPU_TYPES_QUERY = """
 query {
   gpuTypes {
@@ -210,7 +212,7 @@ class RunpodApi:
         query: dict[str, str] | None = None,
         payload: Any | None = None,
         expected_statuses: tuple[int, ...] = (200,),
-        allowed_error_messages: frozenset[str] = frozenset(),
+        allowed_error_responses: frozenset[tuple[int, str]] = frozenset(),
     ) -> Any:
         url = f"{self.rest_base}/{path.lstrip('/')}"
         if query:
@@ -221,7 +223,7 @@ class RunpodApi:
             headers=self._headers(),
             payload=payload,
             expected_statuses=expected_statuses,
-            allowed_error_messages=allowed_error_messages,
+            allowed_error_responses=allowed_error_responses,
         )
 
     def _graphql(self, query: str) -> dict[str, Any]:
@@ -284,7 +286,7 @@ class RunpodApi:
             "pods",
             payload=payload,
             expected_statuses=(201,),
-            allowed_error_messages=CREATE_POD_SAFE_ERROR_MESSAGES,
+            allowed_error_responses=CREATE_POD_SAFE_ERROR_RESPONSES,
         )
         if not isinstance(value, dict):
             raise RunpodLocalError(

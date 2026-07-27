@@ -22,7 +22,7 @@ class FakeTransport:
         headers=None,
         payload=None,
         expected_statuses=(200,),
-        allowed_error_messages=frozenset(),
+        allowed_error_responses=frozenset(),
     ):
         self.requests.append(
             {
@@ -31,7 +31,7 @@ class FakeTransport:
                 "headers": headers,
                 "payload": payload,
                 "expected_statuses": expected_statuses,
-                "allowed_error_messages": allowed_error_messages,
+                "allowed_error_responses": allowed_error_responses,
             }
         )
         if not self.responses:
@@ -151,9 +151,14 @@ class RunpodApiTest(unittest.TestCase):
         self.assertEqual(request["method"], "POST")
         self.assertEqual(request["expected_statuses"], (201,))
         self.assertEqual(
-            request["allowed_error_messages"],
+            request["allowed_error_responses"],
             frozenset(
-                {"create pod: There are no instances currently available"}
+                {
+                    (
+                        500,
+                        "create pod: There are no instances currently available",
+                    )
+                }
             ),
         )
 

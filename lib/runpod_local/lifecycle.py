@@ -384,7 +384,11 @@ class LifecycleManager:
                 try:
                     pod = self._api().create_pod(record["pod_payload"])
                 except HttpRequestError as error:
-                    if error.provider_error == NO_INSTANCES_AVAILABLE_ERROR:
+                    if (
+                        error.status == 500
+                        and error.provider_error
+                        == NO_INSTANCES_AVAILABLE_ERROR
+                    ):
                         transition_instance(
                             record,
                             "aborted",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import urllib.error
 import urllib.parse
@@ -18,28 +19,30 @@ DEFAULT_MAX_ERROR_RESPONSE_BYTES = 64 * 1024
 
 def _allowlisted_error_message(
     error: urllib.error.HTTPError,
-    allowed_messages: frozenset[str],
+    allowed_responses: frozenset[tuple[int, str]],
 ) -> str | None:
     """Return only an exact caller-approved provider error message."""
 
-    if not allowed_messages or error.fp is None:
+    if not allowed_responses or error.fp is None:
         return None
     try:
         raw = error.read(DEFAULT_MAX_ERROR_RESPONSE_BYTES + 1)
-    except OSError:
+    except (OSError, ValueError, http.client.HTTPException):
         return None
     if len(raw) > DEFAULT_MAX_ERROR_RESPONSE_BYTES:
         return None
     try:
         value = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
         return None
-    if not isinstance(value, dict):
+    if not isinstance(value, dict) or set(value) != {"error"}:
         return None
-    for field in ("error", "message"):
-        message = value.get(field)
-        if isinstance(message, str) and message in allowed_messages:
-            return message
+    message = value["error"]
+    if (
+        isinstance(message, str)
+        and (error.code, message) in allowed_responses
+    ):
+        return message
     return None
 
 
@@ -102,7 +105,7 @@ class JsonHttpTransport:
         headers: Mapping[str, str] | None = None,
         payload: Any | None = None,
         expected_statuses: tuple[int, ...] = (200,),
-        allowed_error_messages: frozenset[str] = frozenset(),
+        allowed_error_responses: frozenset[tuple[int, str]] = frozenset(),
     ) -> Any:
         request_headers = {
             "Accept": "application/json",
@@ -120,6 +123,7 @@ class JsonHttpTransport:
             headers=request_headers,
             method=method.upper(),
         )
+        http_failure: HttpRequestError | None = None
         try:
             with self._opener(request, timeout=self.timeout_seconds) as response:
                 status = int(response.status)
@@ -132,15 +136,22 @@ class JsonHttpTransport:
         except urllib.error.HTTPError as error:
             provider_error = _allowlisted_error_message(
                 error,
-                allowed_error_messages,
+                allowed_error_responses,
             )
+            status = error.code
+            try:
+                error.close()
+            except Exception:
+                # A broken response stream must not replace the sanitized
+                # failure or authorize a definitive lifecycle transition.
+                provider_error = None
             detail = f": {provider_error}" if provider_error is not None else ""
-            raise HttpRequestError(
+            http_failure = HttpRequestError(
                 f"{method.upper()} {public_url(url)} returned HTTP "
-                f"{error.code}{detail}",
-                status=error.code,
+                f"{status}{detail}",
+                status=status,
                 provider_error=provider_error,
-            ) from error
+            )
         except urllib.error.URLError as error:
             reason = getattr(error, "reason", None)
             reason_name = type(reason).__name__ if reason is not None else "network error"
@@ -152,6 +163,8 @@ class JsonHttpTransport:
                 f"{method.upper()} {public_url(url)} timed out"
             ) from error
 
+        if http_failure is not None:
+            raise http_failure
         if len(raw) > self.max_response_bytes:
             raise HttpRequestError(
                 f"{method.upper()} {public_url(url)} exceeded the "

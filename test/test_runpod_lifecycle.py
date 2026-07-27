@@ -320,6 +320,30 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual(len(second["history"]), 1)
         self.assertEqual(second["history"][0]["phase"], "aborted")
 
+    def test_capacity_message_with_wrong_status_remains_ambiguous(self):
+        self.api.create_error = HttpRequestError(
+            "fixture provider failure",
+            status=503,
+            provider_error=NO_INSTANCES_AVAILABLE_ERROR,
+        )
+
+        with self.assertRaises(HttpRequestError):
+            self.launch()
+
+        first = InstanceStore(self.state).load("compiler")
+        self.assertEqual(first["phase"], "submitting")
+        self.api.create_error = None
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            self.launch()
+
+        self.assertEqual(caught.exception.code, "submission_ambiguous")
+        self.assertEqual(self.api.create_calls, 1)
+        self.assertEqual(
+            InstanceStore(self.state).load("compiler")["phase"],
+            "submitting",
+        )
+
     def test_duplicate_reconciliation_names_enter_conflict(self):
         self.api.create_error = HttpRequestError("fixture timeout")
         with self.assertRaises(HttpRequestError):

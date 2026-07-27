@@ -542,6 +542,7 @@ def supervise_child(
             tuple(command),
             env=child_environment,
             start_new_session=True,
+            umask=0o077,
         )
     except OSError as error:
         relay.close()
@@ -611,6 +612,7 @@ def _verify_command_version(
             stderr=subprocess.PIPE,
             env=environment,
             start_new_session=True,
+            umask=0o077,
         )
     except OSError as error:
         raise RelayConfigurationError(

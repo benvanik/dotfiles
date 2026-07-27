@@ -379,6 +379,30 @@ class ModelSessionRelayTest(unittest.TestCase):
             os.killpg(process_group, 0)
         backend.assert_clean(self)
 
+    def test_supervised_child_uses_private_file_creation_mask(self):
+        backend = self.backend(
+            lambda connection: receive_all(connection),
+            probe_connections=1,
+        )
+        created_file = self.root / "child-created"
+        child_program = (
+            "import os; "
+            f"descriptor = os.open({os.fspath(created_file)!r}, "
+            "os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666); "
+            "os.close(descriptor)"
+        )
+
+        return_code = supervise_child(
+            backend.socket_path,
+            available_loopback_port(),
+            (sys.executable, "-c", child_program),
+            environment={"PATH": os.environ["PATH"]},
+        )
+
+        self.assertEqual(return_code, 0)
+        self.assertEqual(created_file.stat().st_mode & 0o777, 0o600)
+        backend.assert_clean(self)
+
 
 if __name__ == "__main__":
     unittest.main()

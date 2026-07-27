@@ -22,6 +22,7 @@ class FakeTransport:
         headers=None,
         payload=None,
         expected_statuses=(200,),
+        allowed_error_messages=frozenset(),
     ):
         self.requests.append(
             {
@@ -30,6 +31,7 @@ class FakeTransport:
                 "headers": headers,
                 "payload": payload,
                 "expected_statuses": expected_statuses,
+                "allowed_error_messages": allowed_error_messages,
             }
         )
         if not self.responses:
@@ -131,6 +133,28 @@ class RunpodApiTest(unittest.TestCase):
                 "size": 500,
                 "dataCenterId": "US-KS-2",
             },
+        )
+
+    def test_create_pod_allowlists_only_definitive_capacity_error(self):
+        api, transport = api_with_responses(
+            {
+                "id": "pod123",
+                "name": "fixture",
+                "gpu": {"id": "NVIDIA H200", "count": 1},
+            }
+        )
+
+        pod = api.create_pod({"name": "fixture"})
+
+        self.assertEqual(pod["id"], "pod123")
+        request = transport.requests[0]
+        self.assertEqual(request["method"], "POST")
+        self.assertEqual(request["expected_statuses"], (201,))
+        self.assertEqual(
+            request["allowed_error_messages"],
+            frozenset(
+                {"create pod: There are no instances currently available"}
+            ),
         )
 
     def test_stock_uses_header_authenticated_graphql_without_query_key(self):

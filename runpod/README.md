@@ -334,6 +334,13 @@ matching Pod is visible yet, the tool does not gamble with a second POST.
 Retry the same `runpod-up ... --execute` later. One exact match is adopted;
 multiple matches become a fail-closed conflict.
 
+Runpod sometimes returns HTTP 500 when no machine satisfies the submitted
+constraints. The transport reads a bounded error document but exposes and
+classifies only Runpod's exact allowlisted no-instances message. That response
+is a definitive pre-allocation rejection, so the receipt becomes `aborted` and
+a later launch may safely create a fresh operation. Every other 5xx remains
+ambiguous and retains its reconciliation tombstone.
+
 A normal create response can also remain `provisioning` while Runpod populates
 machine, price, or port fields. Rerun the same pinned execute command until the
 receipt becomes `active`; it does not issue a second POST.

@@ -10,6 +10,7 @@ from runpod_local.allocation import (
     select_launch_placement,
     verify_allocated_pod,
 )
+from runpod_local.api import NO_INSTANCES_AVAILABLE_ERROR
 from runpod_local.errors import HttpRequestError, RunpodLocalError
 from runpod_local.instances import InstanceStore, lease_expiry_reasons
 from runpod_local.lifecycle import LifecycleManager
@@ -292,6 +293,32 @@ class LifecycleTest(unittest.TestCase):
 
         self.assertEqual(caught.exception.code, "submission_ambiguous")
         self.assertEqual(self.api.create_calls, 1)
+
+    def test_definitive_no_capacity_response_aborts_and_allows_retry(self):
+        self.api.create_error = HttpRequestError(
+            "fixture no capacity",
+            status=500,
+            provider_error=NO_INSTANCES_AVAILABLE_ERROR,
+        )
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            self.launch()
+
+        self.assertEqual(caught.exception.code, "no_provider_capacity")
+        first = InstanceStore(self.state).load("compiler")
+        self.assertEqual(first["phase"], "aborted")
+        self.assertEqual(
+            first["events"][-1]["event"],
+            "submission_rejected_no_capacity",
+        )
+
+        self.api.create_error = None
+        second = self.launch()
+
+        self.assertEqual(second["phase"], "active")
+        self.assertEqual(self.api.create_calls, 2)
+        self.assertEqual(len(second["history"]), 1)
+        self.assertEqual(second["history"][0]["phase"], "aborted")
 
     def test_duplicate_reconciliation_names_enter_conflict(self):
         self.api.create_error = HttpRequestError("fixture timeout")

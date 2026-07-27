@@ -7,7 +7,7 @@ import uuid
 from typing import Any, Callable
 
 from .allocation import select_launch_placement, verify_allocated_pod
-from .api import RunpodApi
+from .api import NO_INSTANCES_AVAILABLE_ERROR, RunpodApi
 from .errors import HttpRequestError, RunpodLocalError
 from .instances import (
     INSTANCE_SCHEMA,
@@ -383,6 +383,25 @@ class LifecycleManager:
             else:
                 try:
                     pod = self._api().create_pod(record["pod_payload"])
+                except HttpRequestError as error:
+                    if error.provider_error == NO_INSTANCES_AVAILABLE_ERROR:
+                        transition_instance(
+                            record,
+                            "aborted",
+                            at=self._now(),
+                            event="submission_rejected_no_capacity",
+                        )
+                        self.instances.save(record)
+                        raise RunpodLocalError(
+                            "Runpod reported no instances available for the "
+                            "selected launch constraints",
+                            code="no_provider_capacity",
+                        ) from error
+                    append_event(
+                        record, "submission_result_unknown", at=self._now()
+                    )
+                    self.instances.save(record)
+                    raise
                 except RunpodLocalError:
                     append_event(
                         record, "submission_result_unknown", at=self._now()

@@ -13,6 +13,34 @@ from .errors import HttpRequestError
 
 
 DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+DEFAULT_MAX_ERROR_RESPONSE_BYTES = 64 * 1024
+
+
+def _allowlisted_error_message(
+    error: urllib.error.HTTPError,
+    allowed_messages: frozenset[str],
+) -> str | None:
+    """Return only an exact caller-approved provider error message."""
+
+    if not allowed_messages or error.fp is None:
+        return None
+    try:
+        raw = error.read(DEFAULT_MAX_ERROR_RESPONSE_BYTES + 1)
+    except OSError:
+        return None
+    if len(raw) > DEFAULT_MAX_ERROR_RESPONSE_BYTES:
+        return None
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    for field in ("error", "message"):
+        message = value.get(field)
+        if isinstance(message, str) and message in allowed_messages:
+            return message
+    return None
 
 
 class CredentialSafeRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -74,6 +102,7 @@ class JsonHttpTransport:
         headers: Mapping[str, str] | None = None,
         payload: Any | None = None,
         expected_statuses: tuple[int, ...] = (200,),
+        allowed_error_messages: frozenset[str] = frozenset(),
     ) -> Any:
         request_headers = {
             "Accept": "application/json",
@@ -101,9 +130,16 @@ class JsonHttpTransport:
                     )
                 raw = response.read(self.max_response_bytes + 1)
         except urllib.error.HTTPError as error:
+            provider_error = _allowlisted_error_message(
+                error,
+                allowed_error_messages,
+            )
+            detail = f": {provider_error}" if provider_error is not None else ""
             raise HttpRequestError(
-                f"{method.upper()} {public_url(url)} returned HTTP {error.code}",
+                f"{method.upper()} {public_url(url)} returned HTTP "
+                f"{error.code}{detail}",
                 status=error.code,
+                provider_error=provider_error,
             ) from error
         except urllib.error.URLError as error:
             reason = getattr(error, "reason", None)

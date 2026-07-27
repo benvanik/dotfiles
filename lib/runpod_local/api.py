@@ -15,6 +15,10 @@ from .timeutil import utc_timestamp
 REST_BASE = "https://rest.runpod.io/v1"
 GRAPHQL_URL = "https://api.runpod.io/graphql"
 AVAILABLE_STOCK_STATUSES = frozenset({"High", "Medium", "Low"})
+NO_INSTANCES_AVAILABLE_ERROR = (
+    "create pod: There are no instances currently available"
+)
+CREATE_POD_SAFE_ERROR_MESSAGES = frozenset({NO_INSTANCES_AVAILABLE_ERROR})
 GPU_TYPES_QUERY = """
 query {
   gpuTypes {
@@ -206,6 +210,7 @@ class RunpodApi:
         query: dict[str, str] | None = None,
         payload: Any | None = None,
         expected_statuses: tuple[int, ...] = (200,),
+        allowed_error_messages: frozenset[str] = frozenset(),
     ) -> Any:
         url = f"{self.rest_base}/{path.lstrip('/')}"
         if query:
@@ -216,6 +221,7 @@ class RunpodApi:
             headers=self._headers(),
             payload=payload,
             expected_statuses=expected_statuses,
+            allowed_error_messages=allowed_error_messages,
         )
 
     def _graphql(self, query: str) -> dict[str, Any]:
@@ -274,7 +280,11 @@ class RunpodApi:
 
     def create_pod(self, payload: dict[str, Any]) -> dict[str, Any]:
         value = self._rest(
-            "POST", "pods", payload=payload, expected_statuses=(201,)
+            "POST",
+            "pods",
+            payload=payload,
+            expected_statuses=(201,),
+            allowed_error_messages=CREATE_POD_SAFE_ERROR_MESSAGES,
         )
         if not isinstance(value, dict):
             raise RunpodLocalError(

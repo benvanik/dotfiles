@@ -47,7 +47,7 @@ OPERATION_ID_PATTERN = re.compile(
 )
 INSTANCE_TRANSITIONS = {
     "intent": {"submitting", "aborted"},
-    "submitting": {"provisioning", "conflict"},
+    "submitting": {"provisioning", "conflict", "aborted"},
     "provisioning": {"active", "termination_pending", "rollback_required"},
     "active": {"termination_pending"},
     "termination_pending": {"terminated"},

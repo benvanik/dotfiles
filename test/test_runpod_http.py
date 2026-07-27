@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import urllib.error
 import urllib.request
 import unittest
@@ -56,6 +57,58 @@ class HttpSecurityTest(unittest.TestCase):
             )
         self.assertNotIn("fixture-secret", str(caught.exception))
         self.assertNotIn("api_key", str(caught.exception))
+
+    def test_http_error_reports_only_an_exact_allowlisted_message(self):
+        safe_message = (
+            "create pod: There are no instances currently available"
+        )
+
+        def failing_open(request, *, timeout):
+            raise urllib.error.HTTPError(
+                request.full_url,
+                500,
+                "Internal Server Error",
+                {},
+                io.BytesIO(
+                    ('{"error":"' + safe_message + '"}').encode("utf-8")
+                ),
+            )
+
+        transport = JsonHttpTransport(opener=failing_open)
+        with self.assertRaises(HttpRequestError) as caught:
+            transport.request_json(
+                "POST",
+                "https://rest.example.invalid/v1/pods",
+                allowed_error_messages=frozenset({safe_message}),
+            )
+
+        self.assertEqual(caught.exception.provider_error, safe_message)
+        self.assertIn(safe_message, str(caught.exception))
+
+    def test_http_error_discards_unapproved_provider_content(self):
+        secret = "provider echoed fixture-secret"
+
+        def failing_open(request, *, timeout):
+            raise urllib.error.HTTPError(
+                request.full_url,
+                500,
+                "Internal Server Error",
+                {},
+                io.BytesIO(
+                    ('{"error":"' + secret + '"}').encode("utf-8")
+                ),
+            )
+
+        transport = JsonHttpTransport(opener=failing_open)
+        with self.assertRaises(HttpRequestError) as caught:
+            transport.request_json(
+                "POST",
+                "https://rest.example.invalid/v1/pods",
+                allowed_error_messages=frozenset({"safe fixture"}),
+            )
+
+        self.assertIsNone(caught.exception.provider_error)
+        self.assertNotIn(secret, str(caught.exception))
 
 
 if __name__ == "__main__":

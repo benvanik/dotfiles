@@ -20,6 +20,8 @@ class HttpRequestError(RunpodLocalError):
         *,
         status: int | None = None,
         code: str = "http_error",
+        provider_error: str | None = None,
     ) -> None:
         super().__init__(message, code=code)
         self.status = status
+        self.provider_error = provider_error

@@ -267,19 +267,28 @@ exact operation/Pod, but never move the hard deadline.
 """,
     "tunnel": """# `runpod-tunnel`
 
-Open one foreground SSH tunnel with loopback binding on both machines.
+Open one foreground SSH tunnel to remote loopback. The local listener is
+either loopback TCP or a private Unix-domain socket.
 
 ```sh
 runpod-tunnel compiler --local-port 8000 --remote-port 8000
+runpod-tunnel compiler \\
+  --local-socket /run/user/1000/model-session/gemma4.sock \\
+  --remote-port 8000
 runpod-tunnel --json compiler --local-port 8000 --remote-port 8000
 ```
 
-The exact forwarding rule is
-`127.0.0.1:LOCAL:127.0.0.1:REMOTE`; there is no public-bind option. Run vLLM
-on remote `127.0.0.1` and expose only `22/tcp` from the Pod. The foreground
-process checks the lease but does not refresh idle activity merely because a
-tunnel exists. The request/benchmark driver should call `runpod-ttl touch`
-after real work.
+TCP uses `127.0.0.1:LOCAL:127.0.0.1:REMOTE`; there is no public-bind option.
+Unix mode requires a normalized absolute path below an owned mode-0700 real
+directory and creates missing private parent directories. It emits a
+mode-0600 socket, refuses active, foreign, permissive, symlink, and nonsocket
+paths, and removes only an unchanged owned socket after both a refused AF_UNIX
+stream connection and absence from the Linux kernel socket table. If that
+proof is unavailable, cleanup fails closed. OpenSSH itself is forbidden from
+unlinking the path. Run vLLM on remote `127.0.0.1` and expose only `22/tcp`.
+The foreground process checks the lease but does not refresh idle activity
+merely because a tunnel exists. The request/benchmark driver should call
+`runpod-ttl touch` after real work.
 """,
     "copy": """# `runpod-copy`
 

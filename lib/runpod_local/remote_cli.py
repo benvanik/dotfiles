@@ -18,6 +18,7 @@ from .remote import (
     build_ssh_argv,
     build_tunnel_argv,
     ensure_known_hosts_file,
+    prepare_local_tunnel_socket,
     resolve_endpoint,
     run_with_activity,
 )
@@ -71,11 +72,18 @@ def add_remote_parsers(subparsers: Any) -> None:
     )
     _add_common(tunnel)
     tunnel.add_argument("name", nargs="?")
-    tunnel.add_argument(
+    local_listener = tunnel.add_mutually_exclusive_group()
+    local_listener.add_argument(
         "--local-port",
         required=False,
         type=int,
         help="Local loopback port from 1 through 65535.",
+    )
+    local_listener.add_argument(
+        "--local-socket",
+        required=False,
+        metavar="PATH",
+        help="Private absolute local AF_UNIX socket path.",
     )
     tunnel.add_argument(
         "--remote-port",
@@ -219,17 +227,27 @@ def _run_ssh(args: argparse.Namespace) -> int:
 
 
 def _run_tunnel(args: argparse.Namespace) -> int:
-    if args.local_port is None or args.remote_port is None:
+    if args.remote_port is None:
         raise RunpodLocalError(
-            "tunnel requires --local-port and --remote-port",
+            "tunnel requires --remote-port",
             code="missing_tunnel_port",
+        )
+    if args.local_port is None and args.local_socket is None:
+        raise RunpodLocalError(
+            "tunnel requires --local-port or --local-socket",
+            code="missing_tunnel_listener",
         )
     _, instances, endpoint = _endpoint(args)
     argv = build_tunnel_argv(
         endpoint,
         local_port=args.local_port,
+        local_socket=args.local_socket,
         remote_port=args.remote_port,
     )
+    if args.local_socket is not None and not (
+        args.json or args.print_only
+    ):
+        prepare_local_tunnel_socket(args.local_socket)
     return _inspect_or_execute(
         args,
         endpoint=endpoint,

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import datetime
+import errno
 import ipaddress
 import os
 import pathlib
 import re
 import shlex
+import socket
 import stat
 import subprocess
 from dataclasses import asdict, dataclass
@@ -28,7 +30,11 @@ from .state import StateStore, validate_record_name
 
 PROVIDER_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,191}$")
 REMOTE_PATH_SEGMENT_PATTERN = re.compile(r"^[A-Za-z0-9._+@%=-]+$")
+LOCAL_SOCKET_PATH_SEGMENT_PATTERN = re.compile(r"^[A-Za-z0-9._+@=-]+$")
 REMOTE_COPY_ROOTS = ("/workspace", "/root/runpod-session")
+LINUX_UNIX_SOCKET_TABLE = pathlib.Path("/proc/net/unix")
+MAX_LOCAL_SOCKET_PATH_BYTES = 107
+LOCAL_SOCKET_CONNECT_TIMEOUT_SECONDS = 0.25
 SENSITIVE_ENVIRONMENT_PATTERN = re.compile(
     r"(?:^|_)(?:TOKEN|KEY|SECRET|PASSWORD|CREDENTIALS?)(?:_|$)",
     re.IGNORECASE,
@@ -111,6 +117,282 @@ def _port(value: Any, *, label: str) -> int:
             code="invalid_port",
         )
     return value
+
+
+def validate_local_tunnel_socket_path(
+    value: str | os.PathLike[str],
+) -> pathlib.Path:
+    """Return one exact OpenSSH-safe absolute Unix socket path."""
+
+    try:
+        text = os.fspath(value)
+    except TypeError as error:
+        raise RunpodLocalError(
+            "local tunnel socket must be an absolute normalized path",
+            code="invalid_local_tunnel_socket_path",
+        ) from error
+    if (
+        not isinstance(text, str)
+        or not text
+        or text.startswith("//")
+        or "\x00" in text
+        or text != os.path.normpath(text)
+    ):
+        raise RunpodLocalError(
+            "local tunnel socket must be an absolute normalized path",
+            code="invalid_local_tunnel_socket_path",
+        )
+    path = pathlib.Path(text)
+    if not path.is_absolute() or path == pathlib.Path("/"):
+        raise RunpodLocalError(
+            "local tunnel socket must be an absolute normalized path",
+            code="invalid_local_tunnel_socket_path",
+        )
+    if any(
+        not LOCAL_SOCKET_PATH_SEGMENT_PATTERN.fullmatch(part)
+        for part in path.parts[1:]
+    ):
+        raise RunpodLocalError(
+            "local tunnel socket path contains characters that OpenSSH may "
+            "interpret",
+            code="invalid_local_tunnel_socket_path",
+        )
+    if len(os.fsencode(text)) > MAX_LOCAL_SOCKET_PATH_BYTES:
+        raise RunpodLocalError(
+            "local tunnel socket path exceeds the AF_UNIX pathname limit",
+            code="invalid_local_tunnel_socket_path",
+        )
+    return path
+
+
+def _validate_canonical_existing_path(path: pathlib.Path) -> None:
+    try:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise RunpodLocalError(
+            f"cannot resolve local tunnel socket parent path {path}: {error}",
+            code="unsafe_local_tunnel_socket_parent",
+        ) from error
+    if resolved != path:
+        raise RunpodLocalError(
+            f"local tunnel socket parent path traverses a symlink: {path}",
+            code="unsafe_local_tunnel_socket_parent",
+        )
+    current_user = os.getuid() if hasattr(os, "getuid") else None
+    cursor = pathlib.Path(path.anchor)
+    for component in path.parts[1:]:
+        cursor /= component
+        try:
+            metadata = cursor.lstat()
+        except OSError as error:
+            raise RunpodLocalError(
+                f"cannot inspect local tunnel socket ancestor {cursor}: {error}",
+                code="unsafe_local_tunnel_socket_parent",
+            ) from error
+        if not stat.S_ISDIR(metadata.st_mode) or cursor.is_symlink():
+            raise RunpodLocalError(
+                f"local tunnel socket ancestor is not a real directory: "
+                f"{cursor}",
+                code="unsafe_local_tunnel_socket_parent",
+            )
+        mode = stat.S_IMODE(metadata.st_mode)
+        owner_can_replace = (
+            current_user is not None
+            and metadata.st_uid not in {0, current_user}
+            and bool(mode & stat.S_IWUSR)
+        )
+        shared_can_replace = bool(mode & (stat.S_IWGRP | stat.S_IWOTH)) and not (
+            mode & stat.S_ISVTX
+        )
+        if owner_can_replace or shared_can_replace:
+            raise RunpodLocalError(
+                f"local tunnel socket ancestor permits path replacement: "
+                f"{cursor}",
+                code="unsafe_local_tunnel_socket_parent",
+            )
+
+
+def _nearest_existing_path(path: pathlib.Path) -> pathlib.Path:
+    cursor = path
+    while True:
+        try:
+            cursor.lstat()
+            return cursor
+        except FileNotFoundError:
+            parent = cursor.parent
+            if parent == cursor:
+                raise RunpodLocalError(
+                    f"cannot find an existing parent for local socket {path}",
+                    code="unsafe_local_tunnel_socket_parent",
+                )
+            cursor = parent
+        except OSError as error:
+            raise RunpodLocalError(
+                f"cannot inspect local tunnel socket parent {cursor}: {error}",
+                code="unsafe_local_tunnel_socket_parent",
+            ) from error
+
+
+def _open_private_socket_parent(path: pathlib.Path) -> int:
+    _validate_canonical_existing_path(_nearest_existing_path(path))
+    ensure_private_directory(path)
+    _validate_canonical_existing_path(path)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise RunpodLocalError(
+            f"cannot open local tunnel socket parent {path}: {error}",
+            code="unsafe_local_tunnel_socket_parent",
+        ) from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise RunpodLocalError(
+                f"local tunnel socket parent is not a directory: {path}",
+                code="unsafe_local_tunnel_socket_parent",
+            )
+        if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+            raise RunpodLocalError(
+                f"local tunnel socket parent is not owned by the current "
+                f"user: {path}",
+                code="unsafe_local_tunnel_socket_parent",
+            )
+        if stat.S_IMODE(metadata.st_mode) != 0o700:
+            raise RunpodLocalError(
+                f"local tunnel socket parent permissions are not 0700: {path}",
+                code="unsafe_local_tunnel_socket_parent",
+            )
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _local_socket_metadata(
+    parent_descriptor: int,
+    name: str,
+) -> os.stat_result | None:
+    try:
+        return os.stat(
+            name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise RunpodLocalError(
+            f"cannot inspect existing local tunnel socket {name}: {error}",
+            code="unsafe_local_tunnel_socket",
+        ) from error
+
+
+def _validate_stale_socket_metadata(
+    path: pathlib.Path,
+    metadata: os.stat_result,
+) -> None:
+    if not stat.S_ISSOCK(metadata.st_mode):
+        raise RunpodLocalError(
+            f"local tunnel socket path already exists and is not a socket: "
+            f"{path}",
+            code="unsafe_local_tunnel_socket",
+        )
+    if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+        raise RunpodLocalError(
+            f"existing local tunnel socket is not owned by the current user: "
+            f"{path}",
+            code="unsafe_local_tunnel_socket",
+        )
+    if stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise RunpodLocalError(
+            f"existing local tunnel socket permissions are not 0600: {path}",
+            code="unsafe_local_tunnel_socket",
+        )
+
+
+def _linux_socket_path_is_bound(path: pathlib.Path) -> bool:
+    try:
+        with LINUX_UNIX_SOCKET_TABLE.open(
+            "r",
+            encoding="utf-8",
+            errors="surrogateescape",
+        ) as table:
+            next(table, None)
+            for line in table:
+                fields = line.rstrip("\n").split(maxsplit=7)
+                if len(fields) == 8 and fields[7] == str(path):
+                    return True
+    except OSError as error:
+        raise RunpodLocalError(
+            f"cannot prove refused local tunnel socket is unbound: "
+            f"{path}: {error}",
+            code="local_tunnel_socket_probe_failed",
+        ) from error
+    return False
+
+
+def prepare_local_tunnel_socket(
+    value: str | os.PathLike[str],
+) -> pathlib.Path:
+    """Create a private parent and remove only a proven stale owned socket."""
+
+    path = validate_local_tunnel_socket_path(value)
+    parent_descriptor = _open_private_socket_parent(path.parent)
+    try:
+        original = _local_socket_metadata(parent_descriptor, path.name)
+        if original is None:
+            return path
+        _validate_stale_socket_metadata(path, original)
+
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        probe.settimeout(LOCAL_SOCKET_CONNECT_TIMEOUT_SECONDS)
+        try:
+            probe.connect(str(path))
+        except OSError as error:
+            if error.errno != errno.ECONNREFUSED:
+                raise RunpodLocalError(
+                    f"cannot prove existing local tunnel socket is stale: "
+                    f"{path}: {error}",
+                    code="local_tunnel_socket_probe_failed",
+                ) from error
+        else:
+            raise RunpodLocalError(
+                f"local tunnel socket is already accepting connections: {path}",
+                code="local_tunnel_socket_in_use",
+            )
+        finally:
+            probe.close()
+
+        if _linux_socket_path_is_bound(path):
+            raise RunpodLocalError(
+                f"local tunnel socket is still bound by a local process: {path}",
+                code="local_tunnel_socket_in_use",
+            )
+        current = _local_socket_metadata(parent_descriptor, path.name)
+        if current is None:
+            return path
+        _validate_stale_socket_metadata(path, current)
+        if (current.st_dev, current.st_ino) != (
+            original.st_dev,
+            original.st_ino,
+        ):
+            raise RunpodLocalError(
+                f"local tunnel socket changed during stale cleanup: {path}",
+                code="unsafe_local_tunnel_socket",
+            )
+        try:
+            os.unlink(path.name, dir_fd=parent_descriptor)
+        except OSError as error:
+            raise RunpodLocalError(
+                f"cannot remove stale local tunnel socket {path}: {error}",
+                code="local_tunnel_socket_cleanup_failed",
+            ) from error
+        return path
+    finally:
+        os.close(parent_descriptor)
 
 
 def _known_hosts_path(state: StateStore, pod_id: str) -> pathlib.Path:
@@ -344,20 +626,41 @@ def build_ssh_argv(
 def build_tunnel_argv(
     endpoint: SshEndpoint,
     *,
-    local_port: int,
+    local_port: int | None = None,
+    local_socket: str | os.PathLike[str] | None = None,
     remote_port: int,
 ) -> list[str]:
-    local_port = _port(local_port, label="local tunnel port")
     remote_port = _port(remote_port, label="remote tunnel port")
+    if (local_port is None) == (local_socket is None):
+        raise RunpodLocalError(
+            "tunnel requires exactly one of local_port or local_socket",
+            code="invalid_tunnel_listener",
+        )
+    stream_local_options: list[str] = []
+    if local_socket is not None:
+        socket_path = validate_local_tunnel_socket_path(local_socket)
+        forward = f"{socket_path}:127.0.0.1:{remote_port}"
+        stream_local_options = [
+            "-o",
+            "StreamLocalBindMask=0177",
+            "-o",
+            "StreamLocalBindUnlink=no",
+        ]
+    else:
+        checked_local_port = _port(local_port, label="local tunnel port")
+        forward = (
+            f"127.0.0.1:{checked_local_port}:127.0.0.1:{remote_port}"
+        )
     return [
         "ssh",
         *_ssh_options(endpoint),
         "-o",
         "ExitOnForwardFailure=yes",
+        *stream_local_options,
         "-N",
         "-T",
         "-L",
-        f"127.0.0.1:{local_port}:127.0.0.1:{remote_port}",
+        forward,
         "-i",
         str(endpoint.identity_file),
         "-p",

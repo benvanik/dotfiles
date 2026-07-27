@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import argparse
 import datetime
 import os
 import pathlib
 import shlex
+import socket
 import subprocess
 import tempfile
 import unittest
@@ -18,11 +20,14 @@ from runpod_local.remote import (
     build_ssh_argv,
     build_tunnel_argv,
     ensure_known_hosts_file,
+    prepare_local_tunnel_socket,
     resolve_endpoint,
     run_with_activity,
     sanitized_subprocess_environment,
+    validate_local_tunnel_socket_path,
     validate_remote_copy_path,
 )
+from runpod_local.remote_cli import _run_tunnel
 from runpod_local.state import StateStore
 from runpod_local.timeutil import utc_timestamp
 
@@ -276,6 +281,164 @@ class RemoteBoundaryTest(unittest.TestCase):
                         remote_port=8000,
                     )
 
+    def test_tunnel_can_bind_one_private_unix_socket(self):
+        socket_path = self.root / "tunnels" / "inference.sock"
+
+        argv = build_tunnel_argv(
+            self.endpoint(),
+            local_socket=socket_path,
+            remote_port=8000,
+        )
+
+        self.assertIn(f"{socket_path}:127.0.0.1:8000", argv)
+        self.assertIn("StreamLocalBindMask=0177", argv)
+        self.assertIn("StreamLocalBindUnlink=no", argv)
+        with self.assertRaises(RunpodLocalError) as caught:
+            build_tunnel_argv(
+                self.endpoint(),
+                local_port=8000,
+                local_socket=socket_path,
+                remote_port=8000,
+            )
+        self.assertEqual(caught.exception.code, "invalid_tunnel_listener")
+
+    def test_local_tunnel_socket_path_has_exact_openssh_safe_grammar(self):
+        socket_path = self.root / "tunnels" / "inference.sock"
+        self.assertEqual(
+            validate_local_tunnel_socket_path(socket_path),
+            socket_path,
+        )
+
+        for invalid in (
+            "relative.sock",
+            str(self.root / "tunnels" / ".." / "inference.sock"),
+            str(self.root / "tunnels" / "with space.sock"),
+            str(self.root / "tunnels" / "%h.sock"),
+            str(self.root / "tunnels" / "name:8000"),
+            "/" + ("x" * 108),
+        ):
+            with self.subTest(path=invalid):
+                with self.assertRaises(RunpodLocalError) as caught:
+                    validate_local_tunnel_socket_path(invalid)
+                self.assertEqual(
+                    caught.exception.code,
+                    "invalid_local_tunnel_socket_path",
+                )
+
+    def test_local_tunnel_socket_preparation_removes_only_stale_socket(self):
+        socket_path = self.root / "tunnels" / "inference.sock"
+        prepared = prepare_local_tunnel_socket(socket_path)
+        self.assertEqual(prepared, socket_path)
+        self.assertEqual(socket_path.parent.stat().st_mode & 0o777, 0o700)
+
+        stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stale.bind(str(socket_path))
+        stale.close()
+        socket_path.chmod(0o600)
+
+        self.assertEqual(prepare_local_tunnel_socket(socket_path), socket_path)
+        self.assertFalse(socket_path.exists())
+
+    def test_stale_socket_is_preserved_without_kernel_binding_evidence(self):
+        socket_path = self.root / "tunnels" / "inference.sock"
+        prepare_local_tunnel_socket(socket_path)
+        stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stale.bind(str(socket_path))
+        stale.close()
+        socket_path.chmod(0o600)
+
+        with mock.patch(
+            "runpod_local.remote.LINUX_UNIX_SOCKET_TABLE",
+            self.root / "missing-proc-table",
+        ):
+            with self.assertRaises(RunpodLocalError) as caught:
+                prepare_local_tunnel_socket(socket_path)
+
+        self.assertEqual(
+            caught.exception.code,
+            "local_tunnel_socket_probe_failed",
+        )
+        self.assertTrue(socket_path.exists())
+
+    def test_local_tunnel_socket_preparation_preserves_live_listener(self):
+        socket_path = self.root / "tunnels" / "inference.sock"
+        prepare_local_tunnel_socket(socket_path)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(socket_path))
+        listener.listen(1)
+        socket_path.chmod(0o600)
+        self.addCleanup(listener.close)
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            prepare_local_tunnel_socket(socket_path)
+
+        self.assertEqual(caught.exception.code, "local_tunnel_socket_in_use")
+        self.assertTrue(socket_path.exists())
+
+    def test_local_tunnel_socket_preserves_bound_not_listening_endpoint(self):
+        socket_path = self.root / "tunnels" / "inference.sock"
+        prepare_local_tunnel_socket(socket_path)
+        endpoint = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        endpoint.bind(str(socket_path))
+        socket_path.chmod(0o600)
+        self.addCleanup(endpoint.close)
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            prepare_local_tunnel_socket(socket_path)
+
+        self.assertEqual(caught.exception.code, "local_tunnel_socket_in_use")
+        self.assertTrue(socket_path.exists())
+
+    def test_local_tunnel_socket_preparation_rejects_unsafe_targets(self):
+        parent = self.root / "tunnels"
+        parent.mkdir(mode=0o700)
+        socket_path = parent / "inference.sock"
+        socket_path.write_text("not a socket")
+        socket_path.chmod(0o600)
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            prepare_local_tunnel_socket(socket_path)
+        self.assertEqual(caught.exception.code, "unsafe_local_tunnel_socket")
+        self.assertTrue(socket_path.is_file())
+
+        socket_path.unlink()
+        target = parent / "target"
+        target.write_text("target")
+        socket_path.symlink_to(target)
+        with self.assertRaises(RunpodLocalError) as caught:
+            prepare_local_tunnel_socket(socket_path)
+        self.assertEqual(caught.exception.code, "unsafe_local_tunnel_socket")
+        self.assertTrue(socket_path.is_symlink())
+
+    def test_local_tunnel_socket_parent_must_be_private_and_canonical(self):
+        public_parent = self.root / "public"
+        public_parent.mkdir(mode=0o755)
+        with self.assertRaises(RunpodLocalError):
+            prepare_local_tunnel_socket(public_parent / "inference.sock")
+
+        private_parent = self.root / "private"
+        private_parent.mkdir(mode=0o700)
+        linked_parent = self.root / "linked"
+        linked_parent.symlink_to(private_parent, target_is_directory=True)
+        with self.assertRaises(RunpodLocalError) as caught:
+            prepare_local_tunnel_socket(linked_parent / "inference.sock")
+        self.assertEqual(
+            caught.exception.code,
+            "unsafe_local_tunnel_socket_parent",
+        )
+
+        shared_ancestor = self.root / "shared"
+        shared_ancestor.mkdir(mode=0o700)
+        shared_ancestor.chmod(0o777)
+        nested_parent = shared_ancestor / "private"
+        nested_parent.mkdir(mode=0o700)
+        with self.assertRaises(RunpodLocalError) as caught:
+            prepare_local_tunnel_socket(nested_parent / "inference.sock")
+        self.assertEqual(
+            caught.exception.code,
+            "unsafe_local_tunnel_socket_parent",
+        )
+
     def test_copy_is_limited_to_canonical_persistent_or_session_paths(self):
         source = self.root / "tensor.safetensors"
         source.write_bytes(b"fixture")
@@ -497,6 +660,86 @@ class RemoteBoundaryTest(unittest.TestCase):
             arguments.remote_command,
             ["printf", "%s", "hello world"],
         )
+
+    def test_cli_accepts_exactly_one_tunnel_listener(self):
+        parser = build_parser()
+        arguments = parse_arguments(
+            parser,
+            [
+                "tunnel",
+                "compiler",
+                "--local-socket",
+                "/run/user/1000/model-session/inference.sock",
+                "--remote-port",
+                "8000",
+            ],
+        )
+        self.assertIsNone(arguments.local_port)
+        self.assertEqual(
+            arguments.local_socket,
+            "/run/user/1000/model-session/inference.sock",
+        )
+
+        with self.assertRaises(SystemExit):
+            parse_arguments(
+                parser,
+                [
+                    "tunnel",
+                    "compiler",
+                    "--local-port",
+                    "8000",
+                    "--local-socket",
+                    "/run/user/1000/model-session/inference.sock",
+                    "--remote-port",
+                    "8000",
+                ],
+            )
+
+    def test_cli_prepares_unix_listener_only_for_execution(self):
+        socket_path = self.root / "tunnels" / "inference.sock"
+        endpoint = self.endpoint()
+        base_arguments = {
+            "local_port": None,
+            "local_socket": str(socket_path),
+            "remote_port": 8000,
+            "json": False,
+            "print_only": False,
+        }
+
+        with (
+            mock.patch(
+                "runpod_local.remote_cli._endpoint",
+                return_value=(
+                    self.state,
+                    InstanceStore(self.state),
+                    endpoint,
+                ),
+            ),
+            mock.patch(
+                "runpod_local.remote_cli._inspect_or_execute",
+                return_value=0,
+            ),
+            mock.patch(
+                "runpod_local.remote_cli.prepare_local_tunnel_socket"
+            ) as prepare,
+        ):
+            self.assertEqual(
+                _run_tunnel(
+                    argparse.Namespace(
+                        **base_arguments,
+                    )
+                ),
+                0,
+            )
+            prepare.assert_called_once_with(str(socket_path))
+
+            prepare.reset_mock()
+            _run_tunnel(
+                argparse.Namespace(
+                    **{**base_arguments, "json": True},
+                )
+            )
+            prepare.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -19,7 +19,7 @@ The tools own:
 - live Secure Cloud stock, datacenter, and price inspection;
 - private credentials and validated launch profiles;
 - crash-reconcilable Pod create/delete with post-create rollback;
-- hard and explicit-heartbeat idle TTLs;
+- provider-owned hard deadlines and local explicit-heartbeat idle TTLs;
 - exact-Pod SSH, loopback tunnels, and persistent/ephemeral file transfer;
 - ephemeral Hugging Face credential leasing over reconciled SSH;
 - read-only local/live diagnostics.
@@ -155,7 +155,8 @@ runpod-stock \
 
 Sources:
 
-- [Runpod Pod API](https://docs.runpod.io/api-reference/pods/POST/pods)
+- [Runpod GraphQL schema](https://graphql-spec.runpod.io/)
+- [Runpod CLI Pod create reference](https://docs.runpod.io/runpodctl/reference/runpodctl-pod)
 - [Runpod network volumes](https://docs.runpod.io/storage/network-volumes)
 - [Runpod SSH](https://docs.runpod.io/pods/configuration/use-ssh)
 - [Runpod official container startup](https://github.com/runpod/containers/blob/main/container-template/start.sh)
@@ -232,11 +233,14 @@ runpod-profile create pro-h200 \
   --image runpod/pytorch@sha256:e655f8dd3bdd68b0ef8d4675b63341f85812263f957f78971c56af7c42423ca6 \
   --network-volume-id VOLUME_ID \
   --gpu pro6000-server --gpu h200 \
-  --max-hourly 4.50 --ttl 4h --cuda 12.9 \
+  --max-hourly 4.50 --ttl 30m --cuda 12.9 \
   --identity-file ~/.ssh/id_ed25519_runpod \
   --public-key-file ~/.ssh/id_ed25519_runpod.pub \
   --json
 ```
+
+New profile defaults cannot exceed 30 minutes. A deliberate longer session is
+an explicit launch decision, not durable profile policy.
 
 Profiles fix `HF_TOKEN_PATH` to
 `/root/runpod-session/secrets/huggingface/token`, while `HF_HOME` and the model
@@ -313,8 +317,7 @@ not. `impossible` means the weight basis alone exceeds physical VRAM.
 runpod-up compiler \
   --profile pro-h200 \
   --model Qwen/Qwen3-32B \
-  --context 32768 --weight-format native \
-  --ttl 4h --idle-ttl 30m --json
+  --context 32768 --weight-format native --json
 ```
 
 Review model fit, exact GPU choice, current quote, volume/datacenter, TTL, and
@@ -327,36 +330,51 @@ runpod-up compiler \
   --profile pro-h200 \
   --model Qwen/Qwen3-32B \
   --revision RESOLVED_SHA \
-  --context 32768 --weight-format native \
-  --ttl 4h --idle-ttl 30m --execute --json
+  --context 32768 --weight-format native --execute --json
 ```
+
+The omitted TTL resolves to the profile default, capped at a
+provider-enforced 30-minute hard lifetime. It is not a 30-minute idle timeout:
+an active session is terminated at the deadline too. A deliberate longer run
+requires an explicit `runpod-up --ttl`, which also increases the
+lost-controller billing bound. Local idle enforcement is a separate mechanism
+described below.
 
 The create path:
 
-1. fsyncs a unique local intent;
-2. re-proves the private key against the injected public-key snapshot;
-3. fixes the absolute hard deadline immediately before submission;
-4. submits at most once;
+1. fixes one absolute deadline from the launch-intent clock and hashes it into
+   the exact request;
+2. fsyncs that unique local intent before any billable mutation;
+3. re-proves the private key against the injected public-key snapshot;
+4. submits the GraphQL create mutation at most once;
 5. reconciles exactly one UUID-bearing remote name after a crash/timeout;
 6. persists the immutable Pod ID;
 7. verifies allocation and total actual price;
 8. deletes the exact Pod on any contradictory result.
 
 Runpod Pod names are not unique. If a submission response is ambiguous and no
-matching Pod is visible yet, the tool does not gamble with a second POST.
+matching Pod is visible yet, the tool does not gamble with a second mutation.
 Retry the same `runpod-up ... --execute` later. One exact match is adopted;
-multiple matches become a fail-closed conflict.
+multiple matches become a fail-closed conflict with their exact Pod IDs
+recorded durably. Provider GraphQL errors remain ambiguous because an error
+response does not prove that no allocation occurred.
 
-Runpod sometimes returns HTTP 500 when no machine satisfies the submitted
-constraints. The transport reads a bounded error document but exposes and
-classifies only Runpod's exact allowlisted no-instances message. That response
-is a definitive pre-allocation rejection, so the receipt becomes `aborted` and
-a later launch may safely create a fresh operation. Every other 5xx remains
-ambiguous and retains its reconciliation tombstone.
+An `intent` receipt proves no create request has been sent. Its preflight
+therefore requires the remote name to be absent; any match is reported as an
+unmanaged collision, atomically aborts that operation, and is never adopted or
+deleted by it. A retry mints a distinct UUID name. Aborting or expiring any
+other unsubmitted intent likewise does not change its ownership proof.
+
+Before the hard deadline, an empty provider result leaves an ambiguous create
+in `submitting` and blocks both local-name reuse and a second mutation. At or
+after the deadline, an exact absence check may close the receipt because
+Runpod's `terminateAfter` owns the hard lifetime. If an exact Pod appears while
+that terminal receipt remains current, status reports it and TTL enforcement
+deletes it as a terminal leak.
 
 A normal create response can also remain `provisioning` while Runpod populates
 machine, price, or port fields. Rerun the same pinned execute command until the
-receipt becomes `active`; it does not issue a second POST.
+receipt becomes `active`; it does not issue a second create mutation.
 
 Inspect and terminate:
 
@@ -370,29 +388,41 @@ Termination fsyncs deletion intent and re-fetches the exact ID/name before
 DELETE. Transient failures remain cleanup-owned and the watcher retries them.
 Even a terminal receipt with an exact live-Pod leak can be safely retried with
 `runpod-down NAME --execute`. Pod cleanup never stops or deletes the network
-volume.
+volume. A conflict requires explicit `--execute`; every durably recorded Pod ID
+must agree with both live ID and name lookups before any member of the set is
+deleted. Duplicates first observed during teardown are captured to that exact-ID
+set before the first delete. The cleanup authorization is saved with that set,
+so a transient partial failure remains watcher-owned and retries without another
+create or any volume mutation. If another exact-name Pod ID is discovered, the
+tool expands the durable set, revokes the earlier authorization, and requires a
+new explicit cleanup after review. TTL enforcement can retry an already
+authorized set, but it cannot authorize an expanded set itself.
 
 ## TTL enforcement
 
-Hard TTL is absolute and includes provisioning. Idle TTL means no explicit
-heartbeat from these local tools or the benchmark driver. It is not inferred
-from GPU utilization or server request traffic.
+Hard TTL is absolute, starts at durable intent creation, and includes
+credential attestation plus provisioning. Its default is 30 minutes, and
+Runpod enforces it from the request's absolute `terminateAfter` even when this
+controller disappears. Idle TTL means no explicit local heartbeat. It is not
+inferred from GPU utilization, Pi, or vLLM traffic through a tunnel.
 
 ```sh
 runpod-ttl show compiler --json
 runpod-ttl touch compiler --source benchmark_driver --json
-runpod-ttl set compiler 4h --json
-runpod-ttl extend compiler 30m --json
+runpod-ttl set compiler 20m --json
+runpod-ttl extend compiler 5m --json
 runpod-ttl enforce --json
 runpod-ttl enforce --execute --json
 ```
 
-`set` changes total lifetime relative to the original submission; `extend`
-explicitly moves the current deadline. Both, and `touch`, mutate local lease
-state immediately and do not need `--execute`.
+`set` changes local total lifetime relative to the original intent; `extend`
+moves a previously shortened local deadline. Neither can pass the immutable
+provider deadline. Both, and `touch`, mutate local lease state immediately and
+do not need `--execute`.
 
-Before the first paid Pod launch, start the foreground watcher in a separate
-terminal or user-service supervisor on an awake credentialed machine:
+To use idle or deliberately shortened local expiry, start the foreground
+watcher in a separate terminal or user-service supervisor on an awake
+credentialed machine:
 
 ```sh
 runpod-ttl watch --execute --interval 30s
@@ -401,16 +431,16 @@ runpod-ttl watch --execute --interval 30s
 With `--json`, watcher output is NDJSON: one compact enforcement result per
 line. Pending deletes are retried. Every destructive retry rechecks the current
 operation ID and current expiry under its instance lock, so a stale scan cannot
-delete a refreshed or replacement Pod.
+delete a refreshed or replacement Pod. This suite does not currently install a
+persistent user service for the watcher.
 
-This is deliberately honest: `~/.local/runpod` plus a sleeping laptop is not a
-provider-side lease service. If the watcher, machine, credential, or local state
-is lost, the Pod can continue billing past its local TTL; use the Runpod console
-as the emergency source of truth and terminate the exact Pod there. Local locks
-coordinate processes on one filesystem, not split controllers on multiple
-machines. `runpod-status` and `runpod-doctor --live` expose other Pods as
-unmanaged here and never auto-delete them. `--max-hourly` is a rate cap, not a
-total budget, and excludes recurring volume cost.
+The distinction matters: losing the watcher can miss idle or locally shortened
+expiry, but it cannot move the provider-owned hard deadline for a new launch.
+An explicit longer `runpod-up --ttl` deliberately increases that failure
+exposure. Local locks coordinate processes on one filesystem, not split
+controllers on multiple machines. `runpod-status` and `runpod-doctor --live`
+expose other Pods as unmanaged here and never auto-delete them. `--max-hourly`
+is a rate cap, not a total budget, and excludes recurring volume cost.
 
 ## SSH, transfer, and private services
 
@@ -460,7 +490,9 @@ That foreground SSH command intentionally counts as activity. For meaningful
 idle cleanup, launch the server detached with its PID/log under
 `/root/runpod-session`, then let the non-heartbeating tunnel plus explicit
 benchmark-driver touches own the idle signal. The hard TTL remains the final
-bound either way.
+bound either way. A genuine Pi-facing 30-minute inactivity contract therefore
+belongs in the semantic session layer: completed model requests must emit
+heartbeats and a persistent watcher must enforce their absence.
 
 The estimator's `fp8`, `q8`, and other non-native weight formats are hypothetical
 uniform projections. They do not select `--quantization`, construct converted

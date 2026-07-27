@@ -42,6 +42,8 @@ SSH_PUBLIC_KEY = (
 
 def active_record(identity_file: pathlib.Path):
     now = datetime.datetime.now(datetime.timezone.utc)
+    created_at = now - datetime.timedelta(minutes=2)
+    provider_termination_at = created_at + datetime.timedelta(hours=1)
     payload = {
         "name": "rp-compiler-123456781234",
         "cloudType": "SECURE",
@@ -62,14 +64,16 @@ def active_record(identity_file: pathlib.Path):
             "1111111111111111111111111111111111111111111111111111111111111111"
         ),
         "networkVolumeId": "volume123",
+        "dataCenterId": "US-NC-2",
+        "terminateAfter": utc_timestamp(provider_termination_at),
     }
     return {
-        "schema_version": "runpod.instance.v1",
+        "schema_version": "runpod.instance.v2",
         "name": "compiler",
         "operation_id": "12345678-1234-4234-8234-123456789abc",
         "remote_name": payload["name"],
         "phase": "active",
-        "created_at": utc_timestamp(now - datetime.timedelta(minutes=2)),
+        "created_at": utc_timestamp(created_at),
         "updated_at": utc_timestamp(now - datetime.timedelta(minutes=1)),
         "intent_expires_at": utc_timestamp(
             now + datetime.timedelta(minutes=13)
@@ -86,6 +90,7 @@ def active_record(identity_file: pathlib.Path):
             "max_hourly_usd": 3.0,
         },
         "quoted_total_price_per_hour": 1.99,
+        "provider_termination_at": utc_timestamp(provider_termination_at),
         "pod_payload": payload,
         "pod_payload_sha256": json_document_hash(payload),
         "connection": {
@@ -98,10 +103,8 @@ def active_record(identity_file: pathlib.Path):
             "idle_timeout_seconds": 900,
         },
         "lease": {
-            "activated_at": utc_timestamp(
-                now - datetime.timedelta(minutes=1)
-            ),
-            "expires_at": utc_timestamp(now + datetime.timedelta(minutes=59)),
+            "activated_at": utc_timestamp(created_at),
+            "expires_at": utc_timestamp(provider_termination_at),
             "ttl_seconds": 3600,
             "idle_timeout_seconds": 900,
             "last_activity_at": utc_timestamp(now),

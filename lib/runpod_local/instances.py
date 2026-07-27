@@ -19,7 +19,7 @@ from .timeutil import (
 )
 
 
-INSTANCE_SCHEMA = "runpod.instance.v1"
+INSTANCE_SCHEMA = "runpod.instance.v2"
 INSTANCE_PHASES = {
     "intent",
     "submitting",
@@ -48,11 +48,16 @@ OPERATION_ID_PATTERN = re.compile(
 INSTANCE_TRANSITIONS = {
     "intent": {"submitting", "aborted"},
     "submitting": {"provisioning", "conflict", "aborted"},
-    "provisioning": {"active", "termination_pending", "rollback_required"},
-    "active": {"termination_pending"},
-    "termination_pending": {"terminated"},
-    "rollback_required": {"rolled_back"},
-    "conflict": set(),
+    "provisioning": {
+        "active",
+        "termination_pending",
+        "rollback_required",
+        "conflict",
+    },
+    "active": {"termination_pending", "conflict"},
+    "termination_pending": {"terminated", "conflict"},
+    "rollback_required": {"rolled_back", "conflict"},
+    "conflict": {"terminated"},
     "rolled_back": set(),
     "terminated": set(),
     "aborted": set(),
@@ -111,8 +116,11 @@ def build_pod_payload(
     *,
     remote_name: str,
     gpu_id: str,
+    data_center_id: str | None,
+    provider_termination_at: str,
 ) -> dict[str, Any]:
     profile = validate_profile(profile)
+    parse_utc_timestamp(provider_termination_at)
     pod = profile["pod"]
     if gpu_id not in pod["gpu_type_ids"]:
         raise RunpodLocalError(
@@ -134,7 +142,10 @@ def build_pod_payload(
         "locked": False,
         "minVCPUPerGPU": pod["min_vcpu_per_gpu"],
         "minRAMPerGPU": pod["min_ram_per_gpu"],
+        "terminateAfter": provider_termination_at,
     }
+    if data_center_id is not None:
+        payload["dataCenterId"] = data_center_id
     if pod["allowed_cuda_versions"]:
         payload["allowedCudaVersions"] = pod["allowed_cuda_versions"]
     if pod["template_id"] is not None:
@@ -189,7 +200,10 @@ def transition_instance(
     details: dict[str, Any] | None = None,
 ) -> None:
     current = record.get("phase")
-    if current not in INSTANCE_TRANSITIONS or phase not in INSTANCE_TRANSITIONS[current]:
+    if (
+        current not in INSTANCE_TRANSITIONS
+        or phase not in INSTANCE_TRANSITIONS[current]
+    ):
         raise RunpodLocalError(
             f"illegal instance transition: {current!r} -> {phase!r}",
             code="invalid_instance_transition",
@@ -205,11 +219,20 @@ def activate_lease(
     ttl_seconds: int,
     idle_timeout_seconds: int | None,
     hard_started_at: datetime.datetime,
+    hard_expires_at: datetime.datetime,
     now: datetime.datetime,
 ) -> None:
     validate_lease_request(ttl_seconds, idle_timeout_seconds)
     utc_timestamp(hard_started_at)
+    utc_timestamp(hard_expires_at)
     utc_timestamp(now)
+    if hard_expires_at != hard_started_at + datetime.timedelta(
+        seconds=ttl_seconds
+    ):
+        raise RunpodLocalError(
+            "lease deadline does not match its hard start and requested TTL",
+            code="invalid_lease",
+        )
     if now < hard_started_at:
         raise RunpodLocalError(
             "lease activity time precedes its hard start",
@@ -217,9 +240,7 @@ def activate_lease(
         )
     record["lease"] = {
         "activated_at": utc_timestamp(hard_started_at),
-        "expires_at": utc_timestamp(
-            hard_started_at + datetime.timedelta(seconds=ttl_seconds)
-        ),
+        "expires_at": utc_timestamp(hard_expires_at),
         "ttl_seconds": ttl_seconds,
         "idle_timeout_seconds": idle_timeout_seconds,
         "last_activity_at": utc_timestamp(now),
@@ -236,7 +257,19 @@ def lease_expiry_reasons(
         return ["termination_retry"]
     if record.get("phase") == "rollback_required":
         return ["rollback_retry"]
+    if (
+        record.get("phase") == "conflict"
+        and record.get("conflict_cleanup_requested_at") is not None
+    ):
+        return ["conflict_cleanup_retry"]
     if record.get("phase") == "intent":
+        reasons = []
+        provider_termination_at = record.get("provider_termination_at")
+        if (
+            isinstance(provider_termination_at, str)
+            and now >= parse_utc_timestamp(provider_termination_at)
+        ):
+            reasons.append("hard_ttl")
         deadline = record.get("intent_expires_at")
         if not isinstance(deadline, str):
             raise RunpodLocalError(
@@ -244,8 +277,8 @@ def lease_expiry_reasons(
                 code="invalid_instance_record",
             )
         if now >= parse_utc_timestamp(deadline):
-            return ["launch_intent_timeout"]
-        return []
+            reasons.append("launch_intent_timeout")
+        return reasons
     if record.get("phase") in {"submitting", "provisioning"}:
         reasons = []
         lease = record.get("lease")
@@ -394,9 +427,41 @@ def validate_instance_record(record: dict[str, Any]) -> dict[str, Any]:
         lease_request.get("ttl_seconds"),
         lease_request.get("idle_timeout_seconds"),
     )
-    if not isinstance(record.get("pod_payload"), dict):
+    pod_payload = record.get("pod_payload")
+    if not isinstance(pod_payload, dict):
         raise RunpodLocalError(
             f"instance {name} has no Pod request payload",
+            code="invalid_instance_record",
+        )
+    provider_termination_at = record.get("provider_termination_at")
+    payload_termination_at = pod_payload.get("terminateAfter")
+    if not isinstance(provider_termination_at, str):
+        raise RunpodLocalError(
+            f"instance {name} has no provider termination deadline",
+            code="invalid_instance_record",
+        )
+    provider_deadline = parse_utc_timestamp(provider_termination_at)
+    if payload_termination_at != provider_termination_at:
+        raise RunpodLocalError(
+            f"instance {name} Pod request has a different termination "
+            "deadline",
+            code="invalid_instance_record",
+        )
+    created_at = parse_utc_timestamp(record["created_at"])
+    expected_deadline = created_at + datetime.timedelta(
+        seconds=lease_request["ttl_seconds"]
+    )
+    if provider_deadline != expected_deadline:
+        raise RunpodLocalError(
+            f"instance {name} provider termination deadline does not "
+            "match its intent clock and requested TTL",
+            code="invalid_instance_record",
+        )
+    expected_data_center_id = expected.get("data_center_id")
+    payload_data_center_id = pod_payload.get("dataCenterId")
+    if payload_data_center_id != expected_data_center_id:
+        raise RunpodLocalError(
+            f"instance {name} Pod request has a different data center",
             code="invalid_instance_record",
         )
     payload_hash = record.get("pod_payload_sha256")
@@ -426,6 +491,73 @@ def validate_instance_record(record: dict[str, Any]) -> dict[str, Any]:
         )
     for event in events:
         parse_utc_timestamp(event["at"])
+    conflict_pod_ids = record.get("conflict_pod_ids")
+    if conflict_pod_ids is not None and (
+        not isinstance(conflict_pod_ids, list)
+        or len(conflict_pod_ids) < 2
+        or not all(
+            isinstance(conflict_pod_id, str) and conflict_pod_id
+            for conflict_pod_id in conflict_pod_ids
+        )
+        or conflict_pod_ids != sorted(set(conflict_pod_ids))
+        or phase not in {"conflict", "rolled_back", "terminated", "aborted"}
+    ):
+        raise RunpodLocalError(
+            f"instance {name} has invalid conflicted Pod identities",
+            code="invalid_instance_record",
+        )
+    if phase == "conflict" and conflict_pod_ids is None:
+        raise RunpodLocalError(
+            f"instance {name} is conflicted but has no Pod identities",
+            code="invalid_instance_record",
+        )
+    conflict_cleanup_requested_at = record.get(
+        "conflict_cleanup_requested_at"
+    )
+    if conflict_cleanup_requested_at is not None:
+        if (
+            conflict_pod_ids is None
+            or phase
+            not in {"conflict", "rolled_back", "terminated", "aborted"}
+            or not isinstance(conflict_cleanup_requested_at, str)
+        ):
+            raise RunpodLocalError(
+                f"instance {name} has invalid conflict cleanup intent",
+                code="invalid_instance_record",
+            )
+        parse_utc_timestamp(conflict_cleanup_requested_at)
+    conflict_review_required_at = record.get(
+        "conflict_review_required_at"
+    )
+    if conflict_review_required_at is not None:
+        if (
+            conflict_pod_ids is None
+            or phase
+            not in {"conflict", "rolled_back", "terminated", "aborted"}
+            or not isinstance(conflict_review_required_at, str)
+        ):
+            raise RunpodLocalError(
+                f"instance {name} has invalid conflict review state",
+                code="invalid_instance_record",
+            )
+        parse_utc_timestamp(conflict_review_required_at)
+    if (
+        conflict_cleanup_requested_at is not None
+        and conflict_review_required_at is not None
+    ):
+        raise RunpodLocalError(
+            f"instance {name} has conflicting cleanup authority",
+            code="invalid_instance_record",
+        )
+    if (
+        conflict_pod_ids is not None
+        and conflict_cleanup_requested_at is None
+        and conflict_review_required_at is None
+    ):
+        raise RunpodLocalError(
+            f"instance {name} has no conflict cleanup disposition",
+            code="invalid_instance_record",
+        )
     pod_id = record.get("pod_id")
     if pod_id is not None and (not isinstance(pod_id, str) or not pod_id):
         raise RunpodLocalError(
@@ -437,23 +569,90 @@ def validate_instance_record(record: dict[str, Any]) -> dict[str, Any]:
             f"instance {name} is {phase} but has no Pod ID",
             code="invalid_instance_record",
         )
-    if phase in {
-        "submitting",
-        "provisioning",
-        "active",
-        "termination_pending",
-        "rollback_required",
-    }:
-        submission_started_at = record.get("submission_started_at")
+    submission_started_at = record.get("submission_started_at")
+    lease = record.get("lease")
+    if submission_started_at is not None:
         if not isinstance(submission_started_at, str):
             raise RunpodLocalError(
-                f"instance {name} has no submission start",
+                f"instance {name} has an invalid submission start",
                 code="invalid_instance_record",
             )
         parse_utc_timestamp(submission_started_at)
-        if not isinstance(record.get("lease"), dict):
+    if phase == "intent" and (
+        submission_started_at is not None or lease is not None
+    ):
+        raise RunpodLocalError(
+            f"unsubmitted intent {name} has submission state",
+            code="invalid_instance_record",
+        )
+    if phase == "aborted" and submission_started_at is None and (
+        lease is not None
+        or pod_id is not None
+        or conflict_pod_ids is not None
+    ):
+        raise RunpodLocalError(
+            f"unsubmitted aborted receipt {name} owns provider state",
+            code="invalid_instance_record",
+        )
+    if (
+        phase not in {"intent", "aborted"}
+        and submission_started_at is None
+    ):
+        raise RunpodLocalError(
+            f"instance {name} has no submission start",
+            code="invalid_instance_record",
+        )
+    if submission_started_at is not None and not isinstance(lease, dict):
+        raise RunpodLocalError(
+            f"submitted instance {name} has no lease",
+            code="invalid_instance_record",
+        )
+    if submission_started_at is not None:
+        if not isinstance(lease, dict):
             raise RunpodLocalError(
                 f"instance {name} has no submission lease",
+                code="invalid_instance_record",
+            )
+        lease_expires_at = parse_utc_timestamp(
+            str(lease.get("expires_at", ""))
+        )
+        activated_at = parse_utc_timestamp(
+            str(lease.get("activated_at", ""))
+        )
+        if activated_at != parse_utc_timestamp(record["created_at"]):
+            raise RunpodLocalError(
+                f"instance {name} lease is not anchored to its intent clock",
+                code="invalid_instance_record",
+            )
+        lease_ttl_seconds = lease.get("ttl_seconds")
+        extensions_total_seconds = lease.get(
+            "extensions_total_seconds", 0
+        )
+        if (
+            not isinstance(lease_ttl_seconds, int)
+            or isinstance(lease_ttl_seconds, bool)
+            or not isinstance(extensions_total_seconds, int)
+            or isinstance(extensions_total_seconds, bool)
+            or extensions_total_seconds < 0
+            or lease_expires_at
+            != activated_at
+            + datetime.timedelta(
+                seconds=(
+                    lease_ttl_seconds + extensions_total_seconds
+                )
+            )
+        ):
+            raise RunpodLocalError(
+                f"instance {name} lease deadline does not match its local "
+                "TTL history",
+                code="invalid_instance_record",
+            )
+        if lease_expires_at > parse_utc_timestamp(
+            provider_termination_at
+        ):
+            raise RunpodLocalError(
+                f"instance {name} lease exceeds its provider termination "
+                "deadline",
                 code="invalid_instance_record",
             )
     if phase == "active":
@@ -516,6 +715,7 @@ class InstanceStore:
                     f"cannot set TTL while instance {name} is {record['phase']}",
                     code="instance_not_active",
                 )
+            provider_termination_at = record["provider_termination_at"]
             if lease_expiry_reasons(record, now=now):
                 raise RunpodLocalError(
                     f"cannot set TTL after instance {name} has expired",
@@ -531,8 +731,18 @@ class InstanceStore:
                     "new hard TTL would already be expired",
                     code="invalid_lease",
                 )
+            provider_deadline = parse_utc_timestamp(
+                provider_termination_at
+            )
+            if expires_at > provider_deadline:
+                raise RunpodLocalError(
+                    "new hard TTL would exceed the immutable provider "
+                    "termination deadline",
+                    code="provider_deadline_exceeded",
+                )
             lease["ttl_seconds"] = ttl_seconds
             lease["expires_at"] = utc_timestamp(expires_at)
+            lease.pop("extensions_total_seconds", None)
             append_event(
                 record,
                 "ttl_set",
@@ -559,6 +769,7 @@ class InstanceStore:
                     f"cannot extend TTL while instance {name} is {record['phase']}",
                     code="instance_not_active",
                 )
+            provider_termination_at = record["provider_termination_at"]
             if lease_expiry_reasons(record, now=now):
                 raise RunpodLocalError(
                     f"cannot extend TTL after instance {name} has expired",
@@ -567,6 +778,12 @@ class InstanceStore:
             lease = record["lease"]
             current = parse_utc_timestamp(lease["expires_at"])
             extended = current + datetime.timedelta(seconds=extension_seconds)
+            if extended > parse_utc_timestamp(provider_termination_at):
+                raise RunpodLocalError(
+                    "extended lease would exceed the immutable provider "
+                    "termination deadline",
+                    code="provider_deadline_exceeded",
+                )
             if extended - now > datetime.timedelta(
                 seconds=MAX_DURATION_SECONDS
             ):
@@ -612,7 +829,8 @@ class InstanceStore:
                 raise AssertionError("required instance unexpectedly absent")
             if record["phase"] != "active":
                 raise RunpodLocalError(
-                    f"cannot record activity while instance {name} is {record['phase']}",
+                    f"cannot record activity while instance {name} is "
+                    f"{record['phase']}",
                     code="instance_not_active",
                 )
             if (

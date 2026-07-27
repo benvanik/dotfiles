@@ -19,7 +19,7 @@ from .instances import InstanceStore, lease_expiry_reasons
 from .lifecycle import LifecycleManager
 from .output import print_json
 from .paths import credentials_file, state_root
-from .profile import ProfileStore
+from .profile import MAX_IMPLICIT_HARD_TTL_SECONDS, ProfileStore
 from .state import StateStore
 from .timeutil import parse_duration, utc_timestamp
 from .workload import (
@@ -102,13 +102,17 @@ def add_lifecycle_parsers(subparsers: Any) -> None:
     )
     up.add_argument(
         "--ttl",
-        help="Hard lifetime; defaults to the profile value.",
+        help=(
+            "Provider-enforced hard lifetime; the implicit maximum is 30m. "
+            "An explicit longer value increases lost-controller billing "
+            "exposure."
+        ),
     )
     up.add_argument(
         "--idle-ttl",
         help=(
-            "Terminate after no explicit local heartbeat "
-            "(minimum: 30s)."
+            "Local-watcher idle timeout after no explicit heartbeat "
+            "(minimum: 30s); Pi/vLLM tunnel traffic is not observed."
         ),
     )
     _add_model_options(up)
@@ -155,14 +159,19 @@ def add_lifecycle_parsers(subparsers: Any) -> None:
     ttl_show.add_argument("name", nargs="?")
 
     ttl_set = ttl_actions.add_parser(
-        "set", help="Set total hard lifetime relative to original submission."
+        "set",
+        help=(
+            "Set local lifetime from launch intent, bounded by the provider "
+            "deadline."
+        ),
     )
     _add_common(ttl_set, credentials=False)
     ttl_set.add_argument("name")
     ttl_set.add_argument("duration")
 
     ttl_extend = ttl_actions.add_parser(
-        "extend", help="Extend the existing hard deadline."
+        "extend",
+        help="Extend the local deadline without passing the provider deadline.",
     )
     _add_common(ttl_extend, credentials=False)
     ttl_extend.add_argument("name")
@@ -297,6 +306,24 @@ def _print(value: Any, *, as_json: bool) -> None:
     print_json(value)
 
 
+def _resolve_launch_ttl_seconds(
+    requested_ttl: str | None,
+    profile_default_ttl_seconds: int,
+) -> int:
+    if requested_ttl is not None:
+        return parse_duration(requested_ttl)
+    return min(
+        profile_default_ttl_seconds,
+        MAX_IMPLICIT_HARD_TTL_SECONDS,
+    )
+
+
+def _resolve_idle_timeout_seconds(requested_idle_ttl: str | None) -> int | None:
+    if requested_idle_ttl is None:
+        return None
+    return parse_duration(requested_idle_ttl)
+
+
 def _run_up(args: argparse.Namespace) -> int:
     if not args.name or not args.profile:
         raise RunpodLocalError(
@@ -305,14 +332,11 @@ def _run_up(args: argparse.Namespace) -> int:
         )
     state = _state(args)
     profile = ProfileStore(state).load(args.profile)
-    ttl_seconds = (
-        parse_duration(args.ttl)
-        if args.ttl
-        else profile["lease"]["default_ttl_seconds"]
+    ttl_seconds = _resolve_launch_ttl_seconds(
+        args.ttl,
+        profile["lease"]["default_ttl_seconds"],
     )
-    idle_timeout_seconds = (
-        parse_duration(args.idle_ttl) if args.idle_ttl else None
-    )
+    idle_timeout_seconds = _resolve_idle_timeout_seconds(args.idle_ttl)
     admitted_ids, model = _model_placement(args, profile)
     manager = LifecycleManager(_api(args), state)
     if args.execute:

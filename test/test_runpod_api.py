@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-import io
 import math
-import urllib.error
 import unittest
 
 from runpod_local.api import RunpodApi, gpu_stock_is_available, normalize_pod
 from runpod_local.auth import ApiCredential
-from runpod_local.errors import HttpRequestError, RunpodLocalError
-from runpod_local.http import JsonHttpTransport
+from runpod_local.errors import RunpodLocalError
 from runpod_local.provider_cli import standard_volume_monthly_usd
 
 
@@ -69,10 +66,43 @@ def account_ssh_key_response(public_keys=SSH_PUBLIC_KEY):
     return {"data": {"myself": {"pubKey": public_keys}}}
 
 
-def pod_create_payload(public_key=SSH_PUBLIC_KEY):
-    return {
+def pod_create_payload(public_key=SSH_PUBLIC_KEY, **overrides):
+    payload = {
         "name": "fixture",
-        "env": {"SSH_PUBLIC_KEY": public_key},
+        "cloudType": "SECURE",
+        "computeType": "GPU",
+        "gpuTypeIds": ["NVIDIA H200"],
+        "gpuTypePriority": "custom",
+        "gpuCount": 2,
+        "containerDiskInGb": 50,
+        "volumeMountPath": "/workspace",
+        "ports": ["22/tcp"],
+        "env": {
+            "SSH_PUBLIC_KEY": public_key,
+            "HF_HOME": "/workspace/.cache/huggingface",
+        },
+        "interruptible": False,
+        "locked": False,
+        "minVCPUPerGPU": 8,
+        "minRAMPerGPU": 32,
+        "allowedCudaVersions": ["12.8"],
+        "imageName": "runpod/pytorch:fixture",
+        "networkVolumeId": "volume123",
+        "dataCenterId": "US-NC-2",
+        "terminateAfter": "2026-07-28T03:30:00Z",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def pod_create_response(*, pod_id="pod123", name="fixture"):
+    return {
+        "data": {
+            "podFindAndDeployOnDemand": {
+                "id": pod_id,
+                "name": name,
+            }
+        }
     }
 
 
@@ -381,14 +411,10 @@ class RunpodApiTest(unittest.TestCase):
             },
         )
 
-    def test_create_pod_allowlists_only_definitive_capacity_error(self):
+    def test_create_pod_uses_exact_graphql_variable_contract(self):
         api, transport = api_with_responses(
             account_ssh_key_response(),
-            {
-                "id": "pod123",
-                "name": "fixture",
-                "gpu": {"id": "NVIDIA H200", "count": 1},
-            }
+            pod_create_response(),
         )
         attestation = api.attest_account_ssh_key(SSH_PUBLIC_KEY)
 
@@ -398,57 +424,189 @@ class RunpodApiTest(unittest.TestCase):
         )
 
         self.assertEqual(pod["id"], "pod123")
+        self.assertEqual(pod["name"], "fixture")
         request = transport.requests[1]
         self.assertEqual(request["method"], "POST")
-        self.assertEqual(request["expected_statuses"], (201,))
         self.assertEqual(
-            request["allowed_error_responses"],
-            frozenset(
-                {
-                    (
-                        500,
-                        "create pod: There are no instances currently available",
-                    )
+            request["url"], "https://graphql.example.invalid/query"
+        )
+        self.assertEqual(request["expected_statuses"], (200,))
+        self.assertEqual(
+            request["allowed_error_responses"], frozenset()
+        )
+        query = request["payload"]["query"]
+        self.assertIn(
+            "podFindAndDeployOnDemand(input: $input)", query
+        )
+        self.assertNotIn(SSH_PUBLIC_KEY, query)
+        self.assertNotIn("NVIDIA H200", query)
+        self.assertNotIn("2026-07-28T03:30:00Z", query)
+        self.assertEqual(
+            request["payload"]["variables"],
+            {
+                "input": {
+                    "name": "fixture",
+                    "cloudType": "SECURE",
+                    "computeType": "GPU",
+                    "gpuTypeId": "NVIDIA H200",
+                    "gpuCount": 2,
+                    "containerDiskInGb": 50,
+                    "volumeMountPath": "/workspace",
+                    "ports": "22/tcp",
+                    "env": [
+                        {
+                            "key": "HF_HOME",
+                            "value": "/workspace/.cache/huggingface",
+                        },
+                        {
+                            "key": "SSH_PUBLIC_KEY",
+                            "value": SSH_PUBLIC_KEY,
+                        },
+                    ],
+                    "startSsh": True,
+                    "minVcpuCount": 16,
+                    "minMemoryInGb": 64,
+                    "terminateAfter": "2026-07-28T03:30:00Z",
+                    "imageName": "runpod/pytorch:fixture",
+                    "networkVolumeId": "volume123",
+                    "dataCenterId": "US-NC-2",
+                    "allowedCudaVersions": ["12.8"],
                 }
-            ),
+            },
         )
 
-    def test_create_pod_accepts_exact_live_capacity_response(self):
-        safe_message = (
-            "create pod: There are no instances currently available"
-        )
-
-        def failing_open(request, *, timeout):
-            raise urllib.error.HTTPError(
-                request.full_url,
-                500,
-                "Internal Server Error",
-                {},
-                io.BytesIO(
-                    (
-                        '{"error":"'
-                        + safe_message
-                        + '","status":500}'
-                    ).encode("utf-8")
-                ),
-            )
-
-        api = RunpodApi(
-            ApiCredential("fixture-runpod-token", source="test"),
-            transport=FakeTransport(account_ssh_key_response()),
-            rest_base="https://rest.example.invalid/v1",
+    def test_create_pod_maps_template_and_ephemeral_volume(self):
+        payload = pod_create_payload()
+        del payload["imageName"]
+        del payload["networkVolumeId"]
+        payload["templateId"] = "template123"
+        payload["volumeInGb"] = 20
+        api, transport = api_with_responses(
+            account_ssh_key_response(),
+            pod_create_response(),
         )
         attestation = api.attest_account_ssh_key(SSH_PUBLIC_KEY)
-        api.transport = JsonHttpTransport(opener=failing_open)
 
-        with self.assertRaises(HttpRequestError) as caught:
+        api.create_pod(
+            payload,
+            account_ssh_attestation=attestation,
+        )
+
+        graphql_input = transport.requests[1]["payload"]["variables"]["input"]
+        self.assertEqual(graphql_input["templateId"], "template123")
+        self.assertEqual(graphql_input["volumeInGb"], 20)
+        self.assertNotIn("imageName", graphql_input)
+        self.assertNotIn("networkVolumeId", graphql_input)
+
+    def test_create_pod_requires_absolute_utc_termination_deadline(self):
+        invalid_values = (
+            None,
+            "30m",
+            "2026-07-28T03:30:00-07:00",
+            "2026-07-28T03:30:00.000Z",
+            "2026-02-30T03:30:00Z",
+        )
+        for value in invalid_values:
+            with self.subTest(value=value):
+                api, transport = api_with_responses(
+                    account_ssh_key_response()
+                )
+                attestation = api.attest_account_ssh_key(SSH_PUBLIC_KEY)
+                payload = pod_create_payload()
+                if value is None:
+                    del payload["terminateAfter"]
+                else:
+                    payload["terminateAfter"] = value
+
+                with self.assertRaises(RunpodLocalError) as caught:
+                    api.create_pod(
+                        payload,
+                        account_ssh_attestation=attestation,
+                    )
+
+                self.assertEqual(
+                    caught.exception.code, "invalid_pod_payload"
+                )
+                self.assertEqual(len(transport.requests), 1)
+
+    def test_create_pod_requires_one_selected_gpu_type(self):
+        for gpu_type_ids in ([], ["NVIDIA H200", "NVIDIA B200"], [1]):
+            with self.subTest(gpu_type_ids=gpu_type_ids):
+                api, transport = api_with_responses(
+                    account_ssh_key_response()
+                )
+                attestation = api.attest_account_ssh_key(SSH_PUBLIC_KEY)
+
+                with self.assertRaises(RunpodLocalError) as caught:
+                    api.create_pod(
+                        pod_create_payload(gpuTypeIds=gpu_type_ids),
+                        account_ssh_attestation=attestation,
+                    )
+
+                self.assertEqual(
+                    caught.exception.code, "invalid_pod_payload"
+                )
+                self.assertEqual(len(transport.requests), 1)
+
+    def test_create_pod_graphql_error_is_ambiguous_and_consumes_attestation(
+        self,
+    ):
+        api, transport = api_with_responses(
+            account_ssh_key_response(),
+            {
+                "errors": [{"message": "no instances available"}],
+                "data": None,
+            },
+        )
+        attestation = api.attest_account_ssh_key(SSH_PUBLIC_KEY)
+
+        with self.assertRaises(RunpodLocalError) as caught:
             api.create_pod(
                 pod_create_payload(),
                 account_ssh_attestation=attestation,
             )
 
-        self.assertEqual(caught.exception.status, 500)
-        self.assertEqual(caught.exception.provider_error, safe_message)
+        self.assertEqual(
+            caught.exception.code, "provider_graphql_error"
+        )
+        self.assertEqual(
+            transport.requests[1]["allowed_error_responses"], frozenset()
+        )
+        with self.assertRaises(RunpodLocalError) as reused:
+            api.create_pod(
+                pod_create_payload(),
+                account_ssh_attestation=attestation,
+            )
+        self.assertEqual(
+            reused.exception.code, "account_ssh_attestation_required"
+        )
+        self.assertEqual(len(transport.requests), 2)
+
+    def test_create_pod_rejects_invalid_graphql_response_identity(self):
+        invalid_pods = (
+            None,
+            [],
+            {"name": "fixture"},
+            {"id": "invalid pod", "name": "fixture"},
+            {"id": "pod123", "name": "other"},
+        )
+        for pod in invalid_pods:
+            with self.subTest(pod=pod):
+                api, _ = api_with_responses(
+                    account_ssh_key_response(),
+                    {"data": {"podFindAndDeployOnDemand": pod}},
+                )
+                attestation = api.attest_account_ssh_key(SSH_PUBLIC_KEY)
+
+                with self.assertRaises(RunpodLocalError) as caught:
+                    api.create_pod(
+                        pod_create_payload(),
+                        account_ssh_attestation=attestation,
+                    )
+
+                self.assertEqual(
+                    caught.exception.code, "invalid_provider_response"
+                )
 
     def test_account_ssh_key_match_is_comment_insensitive_and_multiline(self):
         account_keys = (
@@ -497,11 +655,7 @@ class RunpodApiTest(unittest.TestCase):
     def test_create_pod_requires_matching_one_use_account_attestation(self):
         api, transport = api_with_responses(
             account_ssh_key_response(),
-            {
-                "id": "pod123",
-                "name": "fixture",
-                "gpu": {"id": "NVIDIA H200", "count": 1},
-            },
+            pod_create_response(),
         )
 
         with self.assertRaises(RunpodLocalError) as missing:

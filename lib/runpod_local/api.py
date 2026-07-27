@@ -10,18 +10,12 @@ from .auth import ApiCredential
 from .errors import RunpodLocalError
 from .http import JsonHttpTransport
 from .profile import validate_ssh_public_key
-from .timeutil import utc_timestamp
+from .timeutil import parse_utc_timestamp, utc_timestamp
 
 
 REST_BASE = "https://rest.runpod.io/v1"
 GRAPHQL_URL = "https://api.runpod.io/graphql"
 AVAILABLE_STOCK_STATUSES = frozenset({"High", "Medium", "Low"})
-NO_INSTANCES_AVAILABLE_ERROR = (
-    "create pod: There are no instances currently available"
-)
-CREATE_POD_SAFE_ERROR_RESPONSES = frozenset(
-    {(500, NO_INSTANCES_AVAILABLE_ERROR)}
-)
 GPU_TYPES_QUERY = """
 query {
   gpuTypes {
@@ -56,6 +50,14 @@ ACCOUNT_SSH_KEY_QUERY = """
 query {
   myself {
     pubKey
+  }
+}
+"""
+CREATE_POD_MUTATION = """
+mutation CreatePod($input: PodFindAndDeployOnDemandInput!) {
+  podFindAndDeployOnDemand(input: $input) {
+    id
+    name
   }
 }
 """
@@ -102,7 +104,15 @@ def _provider_id(value: str, *, label: str) -> str:
     if (
         not value
         or len(value) > 191
-        or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for character in value)
+        or any(
+            character
+            not in (
+                "abcdefghijklmnopqrstuvwxyz"
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                "0123456789_-"
+            )
+            for character in value
+        )
     ):
         raise RunpodLocalError(
             f"invalid Runpod {label}: {value!r}",
@@ -122,6 +132,225 @@ def _numeric(value: Any) -> float | None:
             return None
         return result if math.isfinite(result) and result >= 0 else None
     return None
+
+
+def _pod_payload_error(message: str) -> RunpodLocalError:
+    return RunpodLocalError(message, code="invalid_pod_payload")
+
+
+def _pod_payload_string(
+    payload: dict[str, Any],
+    field: str,
+) -> str:
+    value = payload.get(field)
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 4096
+        or not value.isprintable()
+    ):
+        raise _pod_payload_error(
+            f"Pod creation payload has invalid {field}"
+        )
+    return value
+
+
+def _pod_payload_positive_integer(
+    payload: dict[str, Any],
+    field: str,
+) -> int:
+    value = payload.get(field)
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value <= 0
+    ):
+        raise _pod_payload_error(
+            f"Pod creation payload has invalid {field}"
+        )
+    return value
+
+
+def _pod_graphql_input(payload: dict[str, Any]) -> dict[str, Any]:
+    """Translate the durable REST-shaped launch intent to GraphQL input."""
+
+    if not isinstance(payload, dict):
+        raise _pod_payload_error("Pod creation payload is not an object")
+    known_fields = {
+        "allowedCudaVersions",
+        "cloudType",
+        "computeType",
+        "containerDiskInGb",
+        "dataCenterId",
+        "env",
+        "gpuCount",
+        "gpuTypeIds",
+        "gpuTypePriority",
+        "imageName",
+        "interruptible",
+        "locked",
+        "minRAMPerGPU",
+        "minVCPUPerGPU",
+        "name",
+        "networkVolumeId",
+        "ports",
+        "templateId",
+        "terminateAfter",
+        "volumeInGb",
+        "volumeMountPath",
+    }
+    unknown_fields = sorted(set(payload) - known_fields)
+    if unknown_fields:
+        raise _pod_payload_error(
+            "Pod creation payload has unsupported fields: "
+            + ", ".join(unknown_fields)
+        )
+    if payload.get("cloudType") != "SECURE":
+        raise _pod_payload_error(
+            "Pod creation payload must use secure cloud"
+        )
+    if payload.get("computeType") != "GPU":
+        raise _pod_payload_error(
+            "Pod creation payload must use GPU compute"
+        )
+    if payload.get("gpuTypePriority") != "custom":
+        raise _pod_payload_error(
+            "Pod creation payload must use custom GPU priority"
+        )
+    if payload.get("interruptible") is not False:
+        raise _pod_payload_error(
+            "Pod creation payload must be non-interruptible"
+        )
+    if payload.get("locked") is not False:
+        raise _pod_payload_error(
+            "Pod creation payload must be unlocked"
+        )
+
+    gpu_type_ids = payload.get("gpuTypeIds")
+    if (
+        not isinstance(gpu_type_ids, list)
+        or len(gpu_type_ids) != 1
+        or not isinstance(gpu_type_ids[0], str)
+        or not gpu_type_ids[0]
+        or len(gpu_type_ids[0]) > 4096
+        or not gpu_type_ids[0].isprintable()
+    ):
+        raise _pod_payload_error(
+            "Pod creation payload must select exactly one valid GPU type"
+        )
+    gpu_count = _pod_payload_positive_integer(payload, "gpuCount")
+
+    ports = payload.get("ports")
+    if (
+        not isinstance(ports, list)
+        or not ports
+        or not all(
+            isinstance(port, str)
+            and port
+            and "," not in port
+            and port.isprintable()
+            for port in ports
+        )
+    ):
+        raise _pod_payload_error(
+            "Pod creation payload has invalid ports"
+        )
+
+    environment = payload.get("env")
+    if (
+        not isinstance(environment, dict)
+        or not all(
+            isinstance(key, str)
+            and key
+            and key.isprintable()
+            and isinstance(value, str)
+            for key, value in environment.items()
+        )
+    ):
+        raise _pod_payload_error(
+            "Pod creation payload has invalid environment"
+        )
+
+    terminate_after = payload.get("terminateAfter")
+    try:
+        parse_utc_timestamp(terminate_after)
+    except RunpodLocalError as error:
+        raise _pod_payload_error(
+            "Pod creation payload requires an absolute UTC terminateAfter"
+        ) from error
+
+    has_image = "imageName" in payload
+    has_template = "templateId" in payload
+    if has_image == has_template:
+        raise _pod_payload_error(
+            "Pod creation payload requires exactly one image or template"
+        )
+    has_network_volume = "networkVolumeId" in payload
+    has_ephemeral_volume = "volumeInGb" in payload
+    if has_network_volume == has_ephemeral_volume:
+        raise _pod_payload_error(
+            "Pod creation payload requires exactly one volume source"
+        )
+
+    graphql_input: dict[str, Any] = {
+        "name": _pod_payload_string(payload, "name"),
+        "cloudType": "SECURE",
+        "computeType": "GPU",
+        "gpuTypeId": gpu_type_ids[0],
+        "gpuCount": gpu_count,
+        "containerDiskInGb": _pod_payload_positive_integer(
+            payload, "containerDiskInGb"
+        ),
+        "volumeMountPath": _pod_payload_string(
+            payload, "volumeMountPath"
+        ),
+        "ports": ",".join(ports),
+        "env": [
+            {"key": key, "value": environment[key]}
+            for key in sorted(environment)
+        ],
+        "startSsh": True,
+        "minVcpuCount": (
+            _pod_payload_positive_integer(payload, "minVCPUPerGPU")
+            * gpu_count
+        ),
+        "minMemoryInGb": (
+            _pod_payload_positive_integer(payload, "minRAMPerGPU")
+            * gpu_count
+        ),
+        "terminateAfter": terminate_after,
+    }
+    if has_image:
+        graphql_input["imageName"] = _pod_payload_string(
+            payload, "imageName"
+        )
+    else:
+        graphql_input["templateId"] = _pod_payload_string(
+            payload, "templateId"
+        )
+    if has_network_volume:
+        graphql_input["networkVolumeId"] = _pod_payload_string(
+            payload, "networkVolumeId"
+        )
+    else:
+        graphql_input["volumeInGb"] = _pod_payload_positive_integer(
+            payload, "volumeInGb"
+        )
+    if "dataCenterId" in payload:
+        graphql_input["dataCenterId"] = _pod_payload_string(
+            payload, "dataCenterId"
+        )
+    if "allowedCudaVersions" in payload:
+        cuda_versions = payload["allowedCudaVersions"]
+        if not isinstance(cuda_versions, list) or not all(
+            isinstance(version, str) and version
+            for version in cuda_versions
+        ):
+            raise _pod_payload_error(
+                "Pod creation payload has invalid allowedCudaVersions"
+            )
+        graphql_input["allowedCudaVersions"] = list(cuda_versions)
+    return graphql_input
 
 
 def gpu_stock_is_available(gpu: dict[str, Any], *, gpu_count: int) -> bool:
@@ -275,12 +504,20 @@ class RunpodApi:
             allowed_error_responses=allowed_error_responses,
         )
 
-    def _graphql(self, query: str) -> dict[str, Any]:
+    def _graphql(
+        self,
+        query: str,
+        *,
+        variables: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"query": query}
+        if variables is not None:
+            payload["variables"] = variables
         value = self.transport.request_json(
             "POST",
             self.graphql_url,
             headers=self._headers(),
-            payload={"query": query},
+            payload=payload,
         )
         if not isinstance(value, dict):
             raise RunpodLocalError(
@@ -490,19 +727,37 @@ class RunpodApi:
         *,
         account_ssh_attestation: Any = None,
     ) -> dict[str, Any]:
+        graphql_input = _pod_graphql_input(payload)
         self._consume_account_ssh_key_attestation(
             payload, account_ssh_attestation
         )
-        value = self._rest(
-            "POST",
-            "pods",
-            payload=payload,
-            expected_statuses=(201,),
-            allowed_error_responses=CREATE_POD_SAFE_ERROR_RESPONSES,
+        data = self._graphql(
+            CREATE_POD_MUTATION,
+            variables={"input": graphql_input},
         )
+        value = data.get("podFindAndDeployOnDemand")
         if not isinstance(value, dict):
             raise RunpodLocalError(
-                "Runpod Pod creation response was not an object",
+                "Runpod GraphQL Pod creation response has no Pod object",
+                code="invalid_provider_response",
+            )
+        pod_id = value.get("id")
+        if not isinstance(pod_id, str):
+            raise RunpodLocalError(
+                "Runpod GraphQL Pod creation response has no Pod ID",
+                code="invalid_provider_response",
+            )
+        try:
+            _provider_id(pod_id, label="Pod ID")
+        except RunpodLocalError as error:
+            raise RunpodLocalError(
+                "Runpod GraphQL Pod creation response has an invalid Pod ID",
+                code="invalid_provider_response",
+            ) from error
+        if value.get("name") != payload["name"]:
+            raise RunpodLocalError(
+                "Runpod GraphQL Pod creation response name did not match "
+                "the requested Pod",
                 code="invalid_provider_response",
             )
         return normalize_pod(value)

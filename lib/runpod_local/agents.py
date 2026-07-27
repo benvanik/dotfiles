@@ -33,8 +33,9 @@ Session commands:
 - `runpod-doctor`: read-only local/provider integrity audit.
 
 Paid mutations always require `--execute`. `runpod-ttl set`, `extend`, and
-`touch` are immediate local lease mutations; they do not contact Runpod.
-Network volumes outlive Pods and are never deleted by this suite.
+`touch` are immediate local lease mutations; they do not contact Runpod and
+cannot move a lease beyond the provider-owned launch deadline. Network volumes
+outlive Pods and are never deleted by this suite.
 """,
     "model": """# `runpod-model`
 
@@ -146,13 +147,14 @@ runpod-template list --search pytorch --json
 
 Profiles are non-secret, mode-0600 local policy records under
 `~/.local/runpod/profiles`. They pin allowed GPU IDs, image or template,
-network-volume identity, cache paths, price cap, SSH identity, and hard TTL.
+network-volume identity, cache paths, price cap, SSH identity, and a hard-TTL
+default no greater than 30 minutes.
 
 ```sh
 runpod-profile create nvidia-dev \\
   --image IMAGE@sha256:DIGEST --network-volume-id VOLUME_ID \\
   --gpu pro6000-server --gpu h200 \\
-  --max-hourly 4.50 --ttl 4h \\
+  --max-hourly 4.50 --ttl 30m \\
   --identity-file ~/.ssh/id_ed25519_runpod \\
   --public-key-file ~/.ssh/id_ed25519_runpod.pub --json
 ```
@@ -185,21 +187,39 @@ ports/total price, and rolls back a contradictory allocation.
 
 ```sh
 runpod-up compiler --profile pro-h200 --model Qwen/Qwen3-32B \\
-  --context 32768 --ttl 4h --idle-ttl 30m --json
+  --context 32768 --ttl 30m --json
 runpod-up compiler --profile pro-h200 --model Qwen/Qwen3-32B \\
-  --context 32768 --ttl 4h --idle-ttl 30m --execute --json
+  --context 32768 --ttl 30m --execute --json
 ```
 
 Static model placement admits only `candidate` by default.
 `--allow-indeterminate-fit` is explicit and never admits `tight` or
 `impossible`. Omitting `--model` means the profile/operator owns fit.
 
-The hard deadline starts immediately before Pod submission, so provisioning
-time counts. A submission with an ambiguous response and no visible matching
-Pod is never re-submitted automatically: retry this same command later to
-reconcile. Local locks coordinate only one machine. A second machine with a
-split state root can launch another Pod; `runpod-status` exposes it as
-unmanaged here.
+The hard deadline starts when the launch intent is durably written, so
+credential attestation and provisioning count. That one absolute timestamp is
+hashed into the receipt and sent in Runpod's create mutation as
+`terminateAfter`; Runpod terminates the Pod even if this controller, terminal,
+or UI disappears. Profiles default to 30 minutes, and an omitted launch TTL is
+capped at 30 minutes even when a stale profile from another machine contains a
+longer default. This is a hard lifetime, not inactivity detection: an active
+session also ends at 30 minutes. Longer sessions require an explicit per-launch
+TTL and deliberately increase lost-controller billing exposure.
+
+A submission with an ambiguous response and no visible matching Pod is never
+re-submitted automatically. Retry the same command only to reconcile. Once the
+provider deadline has elapsed, an exact absence check may close the receipt
+because Runpod owns the hard lifetime. If the exact Pod appears while that
+terminal receipt remains current, status reports it and TTL enforcement deletes
+it as a terminal leak. Local locks coordinate only one machine. A second
+machine with a split state root can launch another Pod; `runpod-status` exposes
+it as unmanaged here.
+
+An `intent` receipt proves no create request was sent. Its preflight requires
+the remote name to be absent; a match is an unmanaged collision, atomically
+aborts that operation, and is never adopted or deleted by it. A retry mints a
+distinct UUID name. Aborting or expiring any other unsubmitted intent likewise
+does not change its ownership proof.
 
 Before entering the ambiguous submission state, `--execute` checks the
 profile's exact SSH algorithm and key body against Runpod account
@@ -234,33 +254,49 @@ runpod-down compiler --execute --json
 ```
 
 Session cleanup never calls Pod stop and never deletes the network volume.
-Network-volume model caches survive termination. Identity conflicts and
-ambiguous submissions fail closed instead of guessing which Pod to delete.
+Network-volume model caches survive termination. A duplicate-name conflict is
+deleted only by explicit `--execute`, using its durably recorded Pod-ID set
+after every ID and name agree with live provider reads. Duplicates first seen
+during teardown are saved before the first delete, and the cleanup authorization
+is durable so the watcher retries partial failures. A newly observed ID expands
+the conflict set and revokes that authorization; no remaining member is deleted
+until the expanded set receives another explicit `--execute`. Ambiguous
+submissions fail closed before their provider deadline instead of guessing
+which Pod to delete. At or after that deadline, an exact absence check closes
+the receipt without issuing another create request.
 """,
     "ttl": """# `runpod-ttl`
 
-Hard TTL is an absolute billing guard anchored to submission. Idle TTL means no
-explicit heartbeat from these local tools; it does not inspect GPU utilization
-or vLLM requests. Heartbeats never move the hard deadline.
+Hard TTL is an absolute billing guard anchored to the durable launch intent and
+embedded in the Pod creation request as Runpod `terminateAfter`. Idle TTL means
+no explicit heartbeat from these local tools; it does not inspect GPU
+utilization, Pi, or vLLM requests through a tunnel. Long-running attached SSH
+commands heartbeat while the process remains attached, even if the human is
+idle. Heartbeats never move the hard deadline.
 
 ```sh
 runpod-ttl show compiler --json
-runpod-ttl set compiler 4h --json
-runpod-ttl extend compiler 30m --json
+runpod-ttl set compiler 20m --json
+runpod-ttl extend compiler 5m --json
 runpod-ttl touch compiler --source benchmark_driver --json
 runpod-ttl enforce --json
 runpod-ttl enforce --execute --json
 runpod-ttl watch --execute --interval 30s
 ```
 
-`set` changes total lifetime while retaining the original submission anchor;
-`extend` explicitly moves the current deadline. `enforce` is one-shot and
-plan-only without `--execute`; `watch` is a foreground enforcer and requires
-`--execute`. With `--json`, watcher output is one compact JSON object per line.
-A local deadline is not a fleet guarantee unless that credentialed process
-remains awake. Expired leases cannot be touched or extended. Pending cleanup is
-retried, stale scans recheck operation identity and expiry, and exact deletion
-always preserves the network volume.
+`set` changes local total lifetime while retaining the original intent anchor;
+`extend` moves a previously shortened local deadline. Neither may pass the
+immutable provider deadline. `enforce` is one-shot and plan-only without
+`--execute`; `watch` is a foreground enforcer and requires `--execute`. With
+`--json`, watcher output is one compact JSON object per line. Provider
+termination owns the hard fleet deadline; the credentialed local watcher is
+still required for idle or deliberately shortened expiry, and this suite does
+not install that watcher as a user service. The default provider hard lifetime
+is 30 minutes and terminates active sessions too. An explicit longer
+`runpod-up --ttl` raises the lost-controller billing bound. Expired leases
+cannot be touched or extended. Pending cleanup is retried, stale scans recheck
+operation identity and expiry, and exact deletion always preserves the network
+volume.
 """,
     "ssh": """# `runpod-ssh`
 

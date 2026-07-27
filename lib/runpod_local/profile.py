@@ -17,10 +17,12 @@ from .errors import RunpodLocalError
 from .huggingface_credentials import REMOTE_HF_TOKEN_PATH
 from .placement import load_hardware_catalog, select_hardware
 from .state import StateStore, validate_record_name
-from .timeutil import parse_utc_timestamp, utc_timestamp
+from .timeutil import parse_duration, parse_utc_timestamp, utc_timestamp
 
 
 PROFILE_SCHEMA = "runpod.profile.v1"
+DEFAULT_PROFILE_HARD_TTL = "30m"
+MAX_IMPLICIT_HARD_TTL_SECONDS = parse_duration(DEFAULT_PROFILE_HARD_TTL)
 PROVIDER_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,191}$")
 IMAGE_DIGEST_PATTERN = re.compile(
     r"^[a-z0-9](?:[a-z0-9._:/-]*[a-z0-9])?"

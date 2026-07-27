@@ -17,6 +17,8 @@ from .errors import RunpodLocalError
 from .output import print_json
 from .paths import credentials_file, state_root
 from .profile import (
+    DEFAULT_PROFILE_HARD_TTL,
+    MAX_IMPLICIT_HARD_TTL_SECONDS,
     ProfileStore,
     create_profile,
     load_ssh_public_key_file,
@@ -297,8 +299,12 @@ def add_provider_parsers(subparsers: Any) -> None:
     )
     profile_create.add_argument(
         "--ttl",
-        default="4h",
-        help="Default hard lifetime, such as 4h or 1h30m.",
+        default=DEFAULT_PROFILE_HARD_TTL,
+        help=(
+            "Default provider-enforced hard lifetime (default and maximum: "
+            "30m); longer sessions require an explicit runpod-up --ttl "
+            "override."
+        ),
     )
     profile_create.add_argument(
         "--container-disk-gb",
@@ -723,6 +729,13 @@ def _run_profile(args: argparse.Namespace) -> int:
     if args.profile_action == "show":
         _print_result(store.load(args.name), as_json=args.json)
         return 0
+    default_ttl_seconds = parse_duration(args.ttl)
+    if default_ttl_seconds > MAX_IMPLICIT_HARD_TTL_SECONDS:
+        raise RunpodLocalError(
+            "profile default hard lifetime cannot exceed 30m; longer sessions "
+            "require an explicit runpod-up --ttl override",
+            code="profile_ttl_too_long",
+        )
     environment = _parse_environment(args.env)
     public_key_path, public_key = load_ssh_public_key_file(
         args.public_key_file or f"{args.identity_file}.pub"
@@ -733,7 +746,7 @@ def _run_profile(args: argparse.Namespace) -> int:
         name=args.name,
         gpu_names=args.gpu,
         max_hourly_usd=args.max_hourly,
-        default_ttl_seconds=parse_duration(args.ttl),
+        default_ttl_seconds=default_ttl_seconds,
         image_name=args.image,
         template_id=args.template_id,
         network_volume_id=args.network_volume_id,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import io
+import json
 import pathlib
 import tempfile
 import unittest
@@ -10,10 +11,23 @@ from unittest import mock
 
 from runpod_local.cli import build_parser
 from runpod_local.errors import RunpodLocalError
+from runpod_local.profile import (
+    DEFAULT_PROFILE_HARD_TTL,
+    ProfileStore,
+)
 from runpod_local.provider_cli import (
+    _run_profile,
     _run_volume,
     created_volume_violations,
     volume_lock_scope,
+)
+from runpod_local.state import StateStore
+
+
+SSH_PUBLIC_KEY = (
+    "ssh-ed25519 "
+    "AAAAC3NzaC1lZDI1NTE5AAAAIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f "
+    "fixture@example"
 )
 
 
@@ -64,7 +78,7 @@ def volume_args(root: pathlib.Path, *, execute: bool) -> argparse.Namespace:
     )
 
 
-class ProviderVolumeCliTest(unittest.TestCase):
+class ProviderCliTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -94,6 +108,87 @@ class ProviderVolumeCliTest(unittest.TestCase):
         )
 
         self.assertEqual(args.state_root, str(self.root))
+
+    def test_profile_default_hard_ttl_is_bounded_to_thirty_minutes(self):
+        args = build_parser().parse_args(
+            [
+                "profile",
+                "create",
+                "bounded-default",
+                "--image",
+                "runpod/pytorch@sha256:" + "1" * 64,
+                "--ephemeral",
+                "--gpu",
+                "pro6000-server",
+                "--max-hourly",
+                "2.25",
+            ]
+        )
+
+        self.assertEqual(DEFAULT_PROFILE_HARD_TTL, "30m")
+        self.assertEqual(args.ttl, DEFAULT_PROFILE_HARD_TTL)
+
+    def test_profile_create_stores_the_thirty_minute_default(self):
+        args = build_parser().parse_args(
+            [
+                "profile",
+                "create",
+                "bounded-default",
+                "--image",
+                "runpod/pytorch@sha256:" + "1" * 64,
+                "--ephemeral",
+                "--gpu",
+                "pro6000-server",
+                "--max-hourly",
+                "2.25",
+                "--state-root",
+                str(self.root),
+                "--json",
+            ]
+        )
+        output = io.StringIO()
+        with mock.patch(
+            "runpod_local.provider_cli.load_ssh_public_key_file",
+            return_value=(
+                pathlib.Path("/fixture/id_ed25519_runpod.pub"),
+                SSH_PUBLIC_KEY,
+            ),
+        ), mock.patch(
+            "runpod_local.provider_cli.validate_ssh_identity_file"
+        ), mock.patch(
+            "runpod_local.provider_cli.validate_ssh_key_pair"
+        ), contextlib.redirect_stdout(output):
+            self.assertEqual(_run_profile(args), 0)
+
+        emitted = json.loads(output.getvalue())
+        stored = ProfileStore(StateStore(self.root)).load("bounded-default")
+        self.assertEqual(emitted["lease"]["default_ttl_seconds"], 1800)
+        self.assertEqual(stored["lease"]["default_ttl_seconds"], 1800)
+
+    def test_profile_create_rejects_a_default_above_thirty_minutes(self):
+        args = build_parser().parse_args(
+            [
+                "profile",
+                "create",
+                "unsafe-default",
+                "--image",
+                "runpod/pytorch@sha256:" + "1" * 64,
+                "--ephemeral",
+                "--gpu",
+                "pro6000-server",
+                "--max-hourly",
+                "2.25",
+                "--ttl",
+                "4h",
+                "--state-root",
+                str(self.root),
+            ]
+        )
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            _run_profile(args)
+        self.assertEqual(caught.exception.code, "profile_ttl_too_long")
+        self.assertFalse(self.root.exists())
 
     def test_plan_is_local_state_read_only(self):
         api = FakeVolumeApi()

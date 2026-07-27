@@ -26,6 +26,11 @@ from .state import StateStore
 from .timeutil import utc_timestamp
 
 
+TERMINAL_INSTANCE_PHASES = frozenset(
+    {"aborted", "rolled_back", "terminated"}
+)
+
+
 class CheckCollector:
     def __init__(self) -> None:
         self.checks: list[dict[str, Any]] = []
@@ -295,20 +300,48 @@ def _check_live(
     managed_ids = set()
     for record in instances:
         phase = record["phase"]
+        submission_may_have_been_sent = (
+            phase not in {"intent", "aborted"}
+            or isinstance(record.get("submission_started_at"), str)
+        )
         pod_id = record.get("pod_id")
         if isinstance(pod_id, str):
             managed_ids.add(pod_id)
+        conflict_pod_ids = record.get("conflict_pod_ids") or []
+        managed_ids.update(conflict_pod_ids)
         pod = pods_by_id.get(pod_id)
+        conflict_id_matches = [
+            pods_by_id[conflict_pod_id]
+            for conflict_pod_id in conflict_pod_ids
+            if conflict_pod_id in pods_by_id
+        ]
         name_matches = [
             candidate
             for candidate in pods
             if candidate.get("name") == record["remote_name"]
         ]
-        if pod_id is None and phase in {"intent", "submitting", "conflict"}:
-            for candidate in name_matches:
-                candidate_id = candidate.get("id")
-                if isinstance(candidate_id, str):
-                    managed_ids.add(candidate_id)
+        for candidate in name_matches:
+            candidate_id = candidate.get("id")
+            if (
+                submission_may_have_been_sent
+                and isinstance(candidate_id, str)
+            ):
+                managed_ids.add(candidate_id)
+        changed_conflict_ids = [
+            candidate.get("id")
+            for candidate in conflict_id_matches
+            if candidate.get("name") != record["remote_name"]
+        ]
+        if changed_conflict_ids:
+            collector.add(
+                f"conflict_identity_{record['name']}",
+                "error",
+                f"recorded conflict identities for {record['name']} changed",
+                pod_ids=sorted(str(pod_id) for pod_id in changed_conflict_ids),
+            )
+        if pod_id is None and phase in (
+            {"intent", "submitting", "conflict"} | TERMINAL_INSTANCE_PHASES
+        ):
             if len(name_matches) == 1:
                 pod = name_matches[0]
 
@@ -319,29 +352,33 @@ def _check_live(
                     "error",
                     f"active receipt {record['name']} has no live Pod",
                 )
-                continue
-            try:
-                endpoint = endpoint_from_record_pod(
-                    record, pod=pod, state=state
-                )
-                collector.add(
-                    f"active_pod_{record['name']}",
-                    "ok",
-                    f"active Pod {pod_id} is allocation- and SSH-ready",
-                    endpoint={
-                        "host": endpoint.host,
-                        "port": endpoint.port,
-                        "host_key_alias": endpoint.host_key_alias,
-                    },
-                )
-            except RunpodLocalError as error:
-                status = "warning" if error.code == "pod_not_ready" else "error"
-                collector.add(
-                    f"active_pod_{record['name']}",
-                    status,
-                    str(error),
-                    error_code=error.code,
-                )
+            else:
+                try:
+                    endpoint = endpoint_from_record_pod(
+                        record, pod=pod, state=state
+                    )
+                    collector.add(
+                        f"active_pod_{record['name']}",
+                        "ok",
+                        f"active Pod {pod_id} is allocation- and SSH-ready",
+                        endpoint={
+                            "host": endpoint.host,
+                            "port": endpoint.port,
+                            "host_key_alias": endpoint.host_key_alias,
+                        },
+                    )
+                except RunpodLocalError as error:
+                    status = (
+                        "warning"
+                        if error.code == "pod_not_ready"
+                        else "error"
+                    )
+                    collector.add(
+                        f"active_pod_{record['name']}",
+                        status,
+                        str(error),
+                        error_code=error.code,
+                    )
         elif phase == "submitting":
             collector.add(
                 f"submitting_pod_{record['name']}",
@@ -393,15 +430,39 @@ def _check_live(
                     else f"{phase} receipt needs local absence reconciliation"
                 ),
             )
-        elif pod is not None and phase in {
+        elif (
+            pod is not None or name_matches or conflict_id_matches
+        ) and submission_may_have_been_sent and phase in {
             "rolled_back",
             "terminated",
             "aborted",
         }:
+            live_pod_ids = sorted(
+                {
+                    str(candidate.get("id"))
+                    for candidate in name_matches + conflict_id_matches
+                    if candidate.get("id") is not None
+                }
+                | ({str(pod.get("id"))} if pod is not None else set())
+            )
             collector.add(
                 f"terminal_pod_{record['name']}",
                 "error",
-                f"terminal receipt {record['name']} still has live Pod {pod_id}",
+                f"terminal receipt {record['name']} still has live Pod(s)",
+                pod_ids=live_pod_ids,
+            )
+        elif (
+            phase == "aborted"
+            and not submission_may_have_been_sent
+            and name_matches
+        ):
+            collector.add(
+                f"unsubmitted_collision_{record['name']}",
+                "error",
+                f"unsubmitted receipt {record['name']} has a name collision",
+                pod_ids=sorted(
+                    str(candidate.get("id")) for candidate in name_matches
+                ),
             )
         elif phase == "intent" and pod is not None:
             collector.add(
@@ -418,7 +479,6 @@ def _check_live(
                     str(candidate.get("id")) for candidate in name_matches
                 ),
             )
-
     unmanaged = [
         pod for pod in pods if pod.get("id") not in managed_ids
     ]

@@ -5,7 +5,11 @@ import tempfile
 import unittest
 
 from runpod_local.auth import CredentialStore
-from runpod_local.doctor import CheckCollector, _check_live, run_doctor
+from runpod_local.doctor import (
+    CheckCollector,
+    _check_live,
+    run_doctor,
+)
 from runpod_local.state import StateStore
 
 
@@ -141,6 +145,84 @@ class DoctorTest(unittest.TestCase):
         self.assertEqual(submitting["status"], "warning")
         self.assertEqual(unmanaged["status"], "ok")
 
+    def test_unsubmitted_intent_name_collision_remains_unmanaged(self):
+        api = FakeReadOnlyApi()
+        api.list_pods = lambda: [
+            {
+                "id": "foreign123",
+                "name": "rp-compiler-123456781234",
+            }
+        ]
+        collector = CheckCollector()
+        _check_live(
+            api=api,
+            state=self.state,
+            instances=[
+                {
+                    "name": "compiler",
+                    "remote_name": "rp-compiler-123456781234",
+                    "phase": "intent",
+                    "pod_id": None,
+                    "expected": {"network_volume_id": None},
+                }
+            ],
+            collector=collector,
+        )
+        result = collector.result()
+
+        collision = next(
+            check
+            for check in result["checks"]
+            if check["id"] == "intent_pod_compiler"
+        )
+        unmanaged = next(
+            check
+            for check in result["checks"]
+            if check["id"] == "unmanaged_pods"
+        )
+        self.assertEqual(collision["status"], "error")
+        self.assertEqual(unmanaged["status"], "warning")
+        self.assertEqual(unmanaged["details"]["pod_ids"], ["foreign123"])
+
+    def test_unsubmitted_aborted_name_collision_remains_unmanaged(self):
+        api = FakeReadOnlyApi()
+        api.list_pods = lambda: [
+            {
+                "id": "foreign123",
+                "name": "rp-compiler-123456781234",
+            }
+        ]
+        collector = CheckCollector()
+        _check_live(
+            api=api,
+            state=self.state,
+            instances=[
+                {
+                    "name": "compiler",
+                    "remote_name": "rp-compiler-123456781234",
+                    "phase": "aborted",
+                    "pod_id": None,
+                    "expected": {"network_volume_id": None},
+                }
+            ],
+            collector=collector,
+        )
+        result = collector.result()
+
+        collision = next(
+            check
+            for check in result["checks"]
+            if check["id"] == "unsubmitted_collision_compiler"
+        )
+        unmanaged = next(
+            check
+            for check in result["checks"]
+            if check["id"] == "unmanaged_pods"
+        )
+        self.assertEqual(collision["status"], "error")
+        self.assertEqual(unmanaged["status"], "warning")
+        self.assertEqual(unmanaged["details"]["pod_ids"], ["foreign123"])
+
     def test_live_cleanup_pending_receipt_is_an_error(self):
         api = FakeReadOnlyApi()
         collector = CheckCollector()
@@ -166,6 +248,85 @@ class DoctorTest(unittest.TestCase):
             if check["id"] == "cleanup_pod_compiler"
         )
         self.assertEqual(cleanup["status"], "error")
+
+    def test_terminal_receipt_owns_a_late_unique_name_match(self):
+        api = FakeReadOnlyApi()
+        api.list_pods = lambda: [
+            {
+                "id": "pod123",
+                "name": "rp-compiler-123456781234",
+            }
+        ]
+        collector = CheckCollector()
+        _check_live(
+            api=api,
+            state=self.state,
+            instances=[
+                {
+                    "name": "compiler",
+                    "remote_name": "rp-compiler-123456781234",
+                    "phase": "aborted",
+                    "pod_id": None,
+                    "submission_started_at": "2026-07-26T20:00:00Z",
+                    "expected": {"network_volume_id": None},
+                }
+            ],
+            collector=collector,
+        )
+        result = collector.result()
+
+        terminal = next(
+            check
+            for check in result["checks"]
+            if check["id"] == "terminal_pod_compiler"
+        )
+        unmanaged = next(
+            check
+            for check in result["checks"]
+            if check["id"] == "unmanaged_pods"
+        )
+        self.assertEqual(terminal["status"], "error")
+        self.assertEqual(unmanaged["status"], "ok")
+
+    def test_changed_conflict_id_is_managed_and_reported(self):
+        api = FakeReadOnlyApi()
+        api.list_pods = lambda: [
+            {
+                "id": "conflict456",
+                "name": "renamed-by-another-controller",
+            },
+        ]
+        collector = CheckCollector()
+        _check_live(
+            api=api,
+            state=self.state,
+            instances=[
+                {
+                    "name": "compiler",
+                    "remote_name": "rp-compiler-operation",
+                    "phase": "terminated",
+                    "pod_id": None,
+                    "expected": {"network_volume_id": None},
+                    "conflict_pod_ids": ["conflict123", "conflict456"],
+                }
+            ],
+            collector=collector,
+        )
+        result = collector.result()
+
+        identity = next(
+            check
+            for check in result["checks"]
+            if check["id"] == "conflict_identity_compiler"
+        )
+        unmanaged = next(
+            check
+            for check in result["checks"]
+            if check["id"] == "unmanaged_pods"
+        )
+        self.assertEqual(identity["status"], "error")
+        self.assertEqual(identity["details"]["pod_ids"], ["conflict456"])
+        self.assertEqual(unmanaged["status"], "ok")
 
 
 if __name__ == "__main__":

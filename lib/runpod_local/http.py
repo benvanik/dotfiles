@@ -17,6 +17,19 @@ DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 DEFAULT_MAX_ERROR_RESPONSE_BYTES = 64 * 1024
 
 
+class _DuplicateJsonKeyError(ValueError):
+    pass
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise _DuplicateJsonKeyError(key)
+        value[key] = item
+    return value
+
+
 def _allowlisted_error_message(
     error: urllib.error.HTTPError,
     allowed_responses: frozenset[tuple[int, str]],
@@ -32,15 +45,27 @@ def _allowlisted_error_message(
     if len(raw) > DEFAULT_MAX_ERROR_RESPONSE_BYTES:
         return None
     try:
-        value = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        value = json.loads(raw, object_pairs_hook=_unique_json_object)
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        _DuplicateJsonKeyError,
+        RecursionError,
+    ):
         return None
-    if not isinstance(value, dict) or set(value) != {"error"}:
+    if not isinstance(value, dict):
         return None
-    message = value["error"]
+    message = value.get("error")
+    if not isinstance(message, str):
+        return None
+    if (error.code, message) not in allowed_responses:
+        return None
+    if set(value) == {"error"}:
+        return message
     if (
-        isinstance(message, str)
-        and (error.code, message) in allowed_responses
+        set(value) == {"error", "status"}
+        and type(value["status"]) is int
+        and value["status"] == error.code
     ):
         return message
     return None

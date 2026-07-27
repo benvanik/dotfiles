@@ -88,6 +88,39 @@ class HttpSecurityTest(unittest.TestCase):
         self.assertIsNone(caught.exception.__cause__)
         self.assertIsNone(caught.exception.__context__)
 
+    def test_http_error_accepts_matching_provider_status_document(self):
+        safe_message = (
+            "create pod: There are no instances currently available"
+        )
+
+        def failing_open(request, *, timeout):
+            raise urllib.error.HTTPError(
+                request.full_url,
+                500,
+                "Internal Server Error",
+                {},
+                io.BytesIO(
+                    (
+                        '{ "status" : 500, "error" : "'
+                        + safe_message
+                        + '" }'
+                    ).encode("utf-8")
+                ),
+            )
+
+        transport = JsonHttpTransport(opener=failing_open)
+        with self.assertRaises(HttpRequestError) as caught:
+            transport.request_json(
+                "POST",
+                "https://rest.example.invalid/v1/pods",
+                allowed_error_responses=frozenset({(500, safe_message)}),
+            )
+
+        self.assertEqual(caught.exception.provider_error, safe_message)
+        self.assertIn(safe_message, str(caught.exception))
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertIsNone(caught.exception.__context__)
+
     def test_http_error_discards_unapproved_provider_content(self):
         secret = "provider echoed fixture-secret"
 
@@ -133,6 +166,58 @@ class HttpSecurityTest(unittest.TestCase):
             "message_field": (
                 500,
                 ('{"message":"' + safe_message + '"}').encode("utf-8"),
+            ),
+            "mismatched_body_status": (
+                500,
+                (
+                    '{"error":"' + safe_message + '","status":503}'
+                ).encode("utf-8"),
+            ),
+            "mismatched_http_status": (
+                503,
+                (
+                    '{"error":"' + safe_message + '","status":500}'
+                ).encode("utf-8"),
+            ),
+            "string_body_status": (
+                500,
+                (
+                    '{"error":"' + safe_message + '","status":"500"}'
+                ).encode("utf-8"),
+            ),
+            "float_body_status": (
+                500,
+                (
+                    '{"error":"' + safe_message + '","status":500.0}'
+                ).encode("utf-8"),
+            ),
+            "boolean_body_status": (
+                500,
+                (
+                    '{"error":"' + safe_message + '","status":true}'
+                ).encode("utf-8"),
+            ),
+            "null_body_status": (
+                500,
+                (
+                    '{"error":"' + safe_message + '","status":null}'
+                ).encode("utf-8"),
+            ),
+            "duplicate_error": (
+                500,
+                (
+                    '{"error":"fixture-secret","error":"'
+                    + safe_message
+                    + '","status":500}'
+                ).encode("utf-8"),
+            ),
+            "duplicate_status": (
+                500,
+                (
+                    '{"error":"'
+                    + safe_message
+                    + '","status":503,"status":500}'
+                ).encode("utf-8"),
             ),
             "malformed": (
                 500,

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import io
 import math
+import urllib.error
 import unittest
 
 from runpod_local.api import RunpodApi, gpu_stock_is_available, normalize_pod
 from runpod_local.auth import ApiCredential
-from runpod_local.errors import RunpodLocalError
+from runpod_local.errors import HttpRequestError, RunpodLocalError
+from runpod_local.http import JsonHttpTransport
 from runpod_local.provider_cli import standard_volume_monthly_usd
 
 
@@ -161,6 +164,38 @@ class RunpodApiTest(unittest.TestCase):
                 }
             ),
         )
+
+    def test_create_pod_accepts_exact_live_capacity_response(self):
+        safe_message = (
+            "create pod: There are no instances currently available"
+        )
+
+        def failing_open(request, *, timeout):
+            raise urllib.error.HTTPError(
+                request.full_url,
+                500,
+                "Internal Server Error",
+                {},
+                io.BytesIO(
+                    (
+                        '{"error":"'
+                        + safe_message
+                        + '","status":500}'
+                    ).encode("utf-8")
+                ),
+            )
+
+        api = RunpodApi(
+            ApiCredential("fixture-runpod-token", source="test"),
+            transport=JsonHttpTransport(opener=failing_open),
+            rest_base="https://rest.example.invalid/v1",
+        )
+
+        with self.assertRaises(HttpRequestError) as caught:
+            api.create_pod({"name": "fixture"})
+
+        self.assertEqual(caught.exception.status, 500)
+        self.assertEqual(caught.exception.provider_error, safe_message)
 
     def test_stock_uses_header_authenticated_graphql_without_query_key(self):
         response = {

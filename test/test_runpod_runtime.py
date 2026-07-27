@@ -180,6 +180,7 @@ class RunpodUpstreamRuntimeTest(unittest.TestCase):
 
     def test_runtime_verifier_is_copied_in_and_manifest_driven(self):
         verifier = RUNTIME_ROOT / "verify-runtime.py"
+        verifier_source = verifier.read_text()
         completed = subprocess.run(
             [sys.executable, str(verifier), "--help"],
             check=True,
@@ -188,7 +189,11 @@ class RunpodUpstreamRuntimeTest(unittest.TestCase):
         )
 
         self.assertIn("--manifest MANIFEST", completed.stdout)
-        self.assertNotIn("/usr/local/share", verifier.read_text())
+        self.assertNotIn("/usr/local/share", verifier_source)
+        self.assertIn(
+            'versions["vllm"].partition("+")[0]',
+            verifier_source,
+        )
 
 
 class ReviewedRuntimeCatalogTest(unittest.TestCase):

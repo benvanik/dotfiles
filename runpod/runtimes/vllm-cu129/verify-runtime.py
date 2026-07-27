@@ -87,7 +87,14 @@ def main() -> int:
         import vllm._moe_C_stable_libtorch
         from vllm.model_executor.models import qwen3_5_mtp
 
-        require(vllm.__version__ == versions["vllm"], "vLLM import drift")
+        # The upstream wheel's distribution version carries its CUDA local
+        # suffix, while vllm.__version__ intentionally exposes only the public
+        # release component. Distribution metadata above still pins the full
+        # CUDA-qualified identity.
+        require(
+            vllm.__version__ == versions["vllm"].partition("+")[0],
+            "vLLM import drift",
+        )
         require(
             flashinfer.__version__ == versions["flashinfer"],
             "FlashInfer import drift",

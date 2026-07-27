@@ -32,6 +32,9 @@ class ProfileFixture:
         self.profile_root.chmod(0o755)
         self.project_root.mkdir()
         (self.pi_root / "bin").mkdir(parents=True)
+        node = self.pi_root / "bin" / "node"
+        node.write_text("#!/bin/sh\necho v24.11.1\n", encoding="utf-8")
+        node.chmod(0o755)
         target = self.pi_root / "lib" / "node_modules" / "pi" / "cli.js"
         target.parent.mkdir(parents=True)
         target.write_text("#!/usr/bin/env node\n", encoding="utf-8")
@@ -153,6 +156,10 @@ class ModelSessionProfileTest(unittest.TestCase):
                 ("text",),
             )
             self.assertEqual(profile.contract.pi.executable.as_posix(), "bin/pi")
+            self.assertEqual(
+                profile.contract.pi.node_executable_path,
+                fixture.pi_root / "bin" / "node",
+            )
             self.assertEqual(profile.contract.pi.version, "0.82.1")
             self.assertEqual(
                 profile.contract.pi.tools,
@@ -271,6 +278,13 @@ class ModelSessionProfileTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             fixture = self.fixture(directory)
+            (fixture.pi_root / "bin" / "node").unlink()
+            with self.assertRaises(ModelSessionError) as caught:
+                load_profile(fixture.profile_root)
+            self.assertEqual(caught.exception.code, "unsafe_pi_installation")
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.fixture(directory)
             executable = fixture.pi_root / "bin" / "pi"
             target = (
                 fixture.pi_root
@@ -314,8 +328,6 @@ class ModelSessionProfileTest(unittest.TestCase):
                 first.snapshot_root,
                 first.workspace,
                 first.workspace / ".pi",
-                first.pi_home,
-                first.pi_config,
                 first.pi_sessions,
                 first.report_directory,
                 first.memory_directory,
@@ -326,14 +338,39 @@ class ModelSessionProfileTest(unittest.TestCase):
                 first.snapshot_root / "lock.json",
                 first.snapshot_root / "profile" / "profile.toml",
                 first.snapshot_root / "profile" / "AGENTS.md",
+                first.snapshot_root / "pi" / "models.json",
+                first.snapshot_root / "runtime" / "relay.py",
+                first.snapshot_root / "runtime" / "session-policy.js",
                 first.workspace / "AGENTS.md",
             ):
                 self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(
+                {
+                    role: first.resource_for_role(role).relative_path.as_posix()
+                    for role in (
+                        "pi_models",
+                        "inference_relay",
+                        "session_policy",
+                    )
+                },
+                {
+                    "pi_models": "pi/models.json",
+                    "inference_relay": "runtime/relay.py",
+                    "session_policy": "runtime/session-policy.js",
+                },
+            )
             self.assertEqual(
                 (first.workspace / "AGENTS.md").read_bytes(),
                 b"fixture agents v1\n",
             )
             self.assertEqual(tuple((first.workspace / ".pi").iterdir()), ())
+            manifest = json.loads(
+                (first.snapshot_root / "lock.json").read_bytes()
+            )
+            self.assertEqual(
+                manifest["pi_installation"],
+                first.pi_installation.as_dict(),
+            )
             resumed = load_run(profile, first.session_id)
             self.assertEqual(resumed.root, first.root)
             self.assertEqual(resumed.profile.model.revision, REVISION)
@@ -631,6 +668,10 @@ class ModelSessionProfileTest(unittest.TestCase):
                 "fixture system v2\n",
                 encoding="utf-8",
             )
+            fixture.write_profile(
+                provider="updated-provider",
+                model_id="updated-model-bf16",
+            )
             updated_profile = load_profile(fixture.profile_root)
 
             resumed = load_run(updated_profile, first.session_id)
@@ -646,6 +687,17 @@ class ModelSessionProfileTest(unittest.TestCase):
                 resumed.resource_for_role("system_prompt").path.read_bytes(),
                 b"fixture system v1\n",
             )
+            first_models = json.loads(
+                resumed.resource_for_role("pi_models").path.read_bytes()
+            )
+            self.assertEqual(
+                set(first_models["providers"]),
+                {"fixture-provider"},
+            )
+            self.assertEqual(
+                first_models["providers"]["fixture-provider"]["models"][0]["id"],
+                "fixture-model-bf16",
+            )
 
             second = materialize_new_run(updated_profile)
             self.assertEqual(
@@ -656,6 +708,113 @@ class ModelSessionProfileTest(unittest.TestCase):
                 second.resource_for_role("system_prompt").path.read_bytes(),
                 b"fixture system v2\n",
             )
+            second_models = json.loads(
+                second.resource_for_role("pi_models").path.read_bytes()
+            )
+            self.assertEqual(
+                set(second_models["providers"]),
+                {"updated-provider"},
+            )
+            self.assertEqual(
+                second_models["providers"]["updated-provider"]["models"][0]["id"],
+                "updated-model-bf16",
+            )
+
+    def test_resume_rejects_changed_pi_installation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.fixture(directory)
+            profile = load_profile(fixture.profile_root)
+            run = materialize_new_run(profile)
+            executable = (
+                fixture.pi_root
+                / "lib"
+                / "node_modules"
+                / "pi"
+                / "cli.js"
+            )
+            executable.write_text(
+                "#!/usr/bin/env node\n// replaced after run creation\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o755)
+
+            with self.assertRaises(ModelSessionError) as caught:
+                load_run(profile, run.session_id)
+            self.assertEqual(caught.exception.code, "pi_installation_changed")
+
+    def test_resume_rejects_runtime_snapshot_tampering(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.fixture(directory)
+            profile = load_profile(fixture.profile_root)
+            run = materialize_new_run(profile)
+            models = run.resource_for_role("pi_models").path
+            models.write_text("{}\n", encoding="utf-8")
+            models.chmod(0o600)
+
+            with self.assertRaises(ModelSessionError) as caught:
+                load_run(profile, run.session_id)
+            self.assertEqual(caught.exception.code, "immutable_snapshot_changed")
+
+    def test_resume_rederives_generated_pi_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.fixture(directory)
+            profile = load_profile(fixture.profile_root)
+            run = materialize_new_run(profile)
+            models_path = run.resource_for_role("pi_models").path
+            models = json.loads(models_path.read_bytes())
+            models["providers"]["fixture-provider"]["baseUrl"] = (
+                "https://attacker.invalid/v1"
+            )
+            models_bytes = (
+                json.dumps(
+                    models,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                + b"\n"
+            )
+            models_path.write_bytes(models_bytes)
+            models_path.chmod(0o600)
+
+            manifest_path = run.snapshot_root / "lock.json"
+            manifest = json.loads(manifest_path.read_bytes())
+            resource = next(
+                value
+                for value in manifest["resources"]
+                if value["path"] == "pi/models.json"
+            )
+            resource["sha256"] = hashlib.sha256(models_bytes).hexdigest()
+            resource["size"] = len(models_bytes)
+            manifest_bytes = (
+                json.dumps(
+                    manifest,
+                    indent=2,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                )
+                + "\n"
+            ).encode("utf-8")
+            manifest_path.write_bytes(manifest_bytes)
+            manifest_path.chmod(0o600)
+
+            receipt_path = run.root / "run.json"
+            receipt = json.loads(receipt_path.read_bytes())
+            receipt["lock_sha256"] = hashlib.sha256(manifest_bytes).hexdigest()
+            receipt_path.write_text(
+                json.dumps(receipt, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            receipt_path.chmod(0o600)
+
+            with self.assertRaises(ModelSessionError) as caught:
+                load_run_from_state(
+                    fixture.state_root,
+                    "fixture-model",
+                    run.session_id,
+                )
+            self.assertEqual(caught.exception.code, "immutable_snapshot_changed")
 
     def test_resume_uses_snapshot_after_canonical_profile_moves(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

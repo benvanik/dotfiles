@@ -33,6 +33,7 @@ COMMIT_PATTERN = re.compile(r"^[0-9A-Fa-f]{40}$")
 PI_VERSION_PATTERN = re.compile(
     r"^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$"
 )
+PI_NODE_EXECUTABLE = pathlib.PurePosixPath("bin/node")
 RELATIVE_COMPONENT_PATTERN = re.compile(r"^[A-Za-z0-9._+-]+$")
 PI_TOOLS = frozenset({"read", "write", "edit", "bash"})
 WEIGHT_FORMATS = frozenset({"native", "bf16", "fp8", "int8", "q8"})
@@ -152,6 +153,10 @@ class PiContract:
     @property
     def executable_path(self) -> pathlib.Path:
         return self.installation_root.joinpath(*self.executable.parts)
+
+    @property
+    def node_executable_path(self) -> pathlib.Path:
+        return self.installation_root.joinpath(*PI_NODE_EXECUTABLE.parts)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -500,11 +505,17 @@ def _resource_path(
     return path
 
 
-def _resolve_pi_executable_path(contract: PiContract) -> pathlib.Path:
-    """Resolve the relocatable Pi entrypoint while rejecting absolute links."""
+def _resolve_pi_executable_path(
+    contract: PiContract,
+    executable: pathlib.PurePosixPath,
+    *,
+    label: str,
+) -> pathlib.Path:
+    """Resolve a relocatable Pi runtime executable inside its locked tree."""
 
     current = contract.installation_root
-    pending = list(contract.executable.parts)
+    pending = list(executable.parts)
+    executable_path = contract.installation_root.joinpath(*executable.parts)
     followed_links = 0
     while pending:
         component = pending.pop(0)
@@ -514,7 +525,7 @@ def _resolve_pi_executable_path(contract: PiContract) -> pathlib.Path:
             current = current.parent
             if not _path_is_within(current, contract.installation_root):
                 _fail(
-                    "Pi executable symlink escapes installation_root",
+                    f"{label} symlink escapes installation_root",
                     code="unsafe_pi_installation",
                 )
             continue
@@ -523,26 +534,26 @@ def _resolve_pi_executable_path(contract: PiContract) -> pathlib.Path:
             metadata = candidate.lstat()
         except OSError as error:
             raise ModelSessionError(
-                f"cannot resolve Pi executable {contract.executable_path}: {error}",
+                f"cannot resolve {label} {executable_path}: {error}",
                 code="unsafe_pi_installation",
             ) from error
         if stat.S_ISLNK(metadata.st_mode):
             followed_links += 1
             if followed_links > 40:
                 _fail(
-                    "Pi executable contains too many symbolic links",
+                    f"{label} contains too many symbolic links",
                     code="unsafe_pi_installation",
                 )
             try:
                 target = os.readlink(candidate)
             except OSError as error:
                 raise ModelSessionError(
-                    f"cannot inspect Pi executable symlink {candidate}: {error}",
+                    f"cannot inspect {label} symlink {candidate}: {error}",
                     code="unsafe_pi_installation",
                 ) from error
             if os.path.isabs(target):
                 _fail(
-                    "Pi executable uses an absolute symlink and cannot be "
+                    f"{label} uses an absolute symlink and cannot be "
                     "relocated into the sandbox",
                     code="unsafe_pi_installation",
                 )
@@ -551,58 +562,76 @@ def _resolve_pi_executable_path(contract: PiContract) -> pathlib.Path:
         current = candidate
     if not _path_is_within(current, contract.installation_root):
         _fail(
-            "Pi executable symlink escapes installation_root",
+            f"{label} symlink escapes installation_root",
             code="unsafe_pi_installation",
         )
     return current
 
 
-def _validate_pi_executable(contract: PiContract) -> None:
-    candidate = contract.executable_path
-    resolved = _resolve_pi_executable_path(contract)
+def _validate_pi_executable(
+    contract: PiContract,
+    executable: pathlib.PurePosixPath,
+    *,
+    label: str,
+) -> None:
+    candidate = contract.installation_root.joinpath(*executable.parts)
+    resolved = _resolve_pi_executable_path(
+        contract,
+        executable,
+        label=label,
+    )
     if not _path_is_within(resolved, contract.installation_root):
         _fail(
-            "Pi executable symlink escapes installation_root",
+            f"{label} symlink escapes installation_root",
             code="unsafe_pi_installation",
         )
     try:
         metadata = resolved.stat()
     except OSError as error:
         raise ModelSessionError(
-            f"cannot inspect Pi executable {resolved}: {error}",
+            f"cannot inspect {label} {resolved}: {error}",
             code="unsafe_pi_installation",
         ) from error
     if not stat.S_ISREG(metadata.st_mode):
         _fail(
-            "Pi executable does not resolve to a regular file",
+            f"{label} does not resolve to a regular file",
             code="unsafe_pi_installation",
         )
     if hasattr(os, "getuid") and metadata.st_uid not in {0, os.getuid()}:
         _fail(
-            "Pi executable is owned by an unexpected user",
+            f"{label} is owned by an unexpected user",
             code="unsafe_pi_installation",
         )
     if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
         _fail(
-            "Pi executable target is group- or world-writable",
+            f"{label} target is group- or world-writable",
             code="unsafe_pi_installation",
         )
     if not os.access(resolved, os.X_OK):
-        _fail("Pi executable target is not executable", code="unsafe_pi_installation")
+        _fail(f"{label} target is not executable", code="unsafe_pi_installation")
 
 
 def _validate_pi_installation_tree(contract: PiContract) -> None:
     root = contract.installation_root
-    candidate = contract.executable_path
-    resolved = _resolve_pi_executable_path(contract)
-    paths = {root, resolved}
-    for endpoint in (candidate.parent, resolved.parent):
-        cursor = endpoint
-        while _path_is_within(cursor, root):
-            paths.add(cursor)
-            if cursor == root:
-                break
-            cursor = cursor.parent
+    paths = {root}
+    for executable, label in (
+        (contract.executable, "Pi executable"),
+        (PI_NODE_EXECUTABLE, "bundled Node executable"),
+    ):
+        candidate = root.joinpath(*executable.parts)
+        resolved = _resolve_pi_executable_path(
+            contract,
+            executable,
+            label=label,
+        )
+        paths.add(resolved)
+        for endpoint in (candidate.parent, resolved.parent):
+            cursor = endpoint
+            while _path_is_within(cursor, root):
+                paths.add(cursor)
+                if cursor == root:
+                    break
+                cursor = cursor.parent
     for path in paths:
         try:
             metadata = path.stat()
@@ -902,7 +931,16 @@ def _validate_contract_paths(
         reject_group_write=True,
         error_code="unsafe_pi_installation",
     )
-    _validate_pi_executable(contract.pi)
+    _validate_pi_executable(
+        contract.pi,
+        contract.pi.executable,
+        label="Pi executable",
+    )
+    _validate_pi_executable(
+        contract.pi,
+        PI_NODE_EXECUTABLE,
+        label="bundled Node executable",
+    )
     _validate_pi_installation_tree(contract.pi)
 
 

@@ -17,6 +17,20 @@ from dataclasses import dataclass
 from typing import Any
 
 from .errors import ModelSessionError
+from .pi_runtime import (
+    INFERENCE_RELAY_PATH,
+    INFERENCE_RELAY_ROLE,
+    PI_MODELS_PATH,
+    PI_MODELS_ROLE,
+    SESSION_POLICY_PATH,
+    SESSION_POLICY_ROLE,
+    PiInstallationIdentity,
+    PiRuntimeAsset,
+    fingerprint_pi_installation,
+    generated_pi_configuration_assets,
+    parse_pi_installation_identity,
+    pi_runtime_assets,
+)
 from .profile import (
     AGENTS_FILE_NAME,
     PROFILE_FILE_NAME,
@@ -52,6 +66,7 @@ _LOCK_KEYS = {
     "profile",
     "resources",
     "project",
+    "pi_installation",
 }
 _PROJECT_KEYS = {"report_directory", "memory_directory"}
 _RESOURCE_KEYS = {"path", "roles", "sha256", "size"}
@@ -74,12 +89,11 @@ class SessionRun:
     profile: ProfileContract
     snapshot_root: pathlib.Path
     workspace: pathlib.Path
-    pi_home: pathlib.Path
-    pi_config: pathlib.Path
     pi_sessions: pathlib.Path
     report_directory: pathlib.Path
     memory_directory: pathlib.Path
     resources: tuple[LockedResource, ...]
+    pi_installation: PiInstallationIdentity
 
     def resource_for_role(self, role: str) -> LockedResource | None:
         for resource in self.resources:
@@ -821,6 +835,7 @@ def _recover_incomplete_materializations(
 
 def _snapshot_file_entries(
     profile: Profile,
+    runtime_assets: tuple[PiRuntimeAsset, ...],
 ) -> tuple[list[dict[str, Any]], dict[str, bytes]]:
     contents = {f"profile/{PROFILE_FILE_NAME}": profile.document}
     roles = {f"profile/{PROFILE_FILE_NAME}": ("profile",)}
@@ -828,6 +843,15 @@ def _snapshot_file_entries(
         relative = f"profile/{resource.relative_path.as_posix()}"
         contents[relative] = resource.content
         roles[relative] = resource.roles
+    for asset in runtime_assets:
+        relative = asset.relative_path.as_posix()
+        if relative in contents:
+            _fail(
+                f"runtime snapshot path collides with profile state: {relative}",
+                code="invalid_runtime_assets",
+            )
+        contents[relative] = asset.content
+        roles[relative] = asset.roles
     entries = []
     for relative in sorted(contents):
         content = contents[relative]
@@ -979,6 +1003,8 @@ def _materialize_staging(
     staging_descriptor: int,
     staging: pathlib.Path,
     profile: Profile,
+    runtime_assets: tuple[PiRuntimeAsset, ...],
+    pi_installation: PiInstallationIdentity,
     *,
     session_id: str,
     created_at: str,
@@ -1017,16 +1043,18 @@ def _materialize_staging(
             label="masked workspace .pi mountpoint",
         )
         os.close(workspace_pi_descriptor)
-        for name in ("home", "config", "sessions"):
-            descriptor = _create_private_child_directory(
-                pi_descriptor,
-                name,
-                path=pi_root / name,
-                label=f"private Pi {name} directory",
-            )
-            os.close(descriptor)
+        sessions_descriptor = _create_private_child_directory(
+            pi_descriptor,
+            "sessions",
+            path=pi_root / "sessions",
+            label="private Pi sessions directory",
+        )
+        os.close(sessions_descriptor)
 
-        resource_entries, contents = _snapshot_file_entries(profile)
+        resource_entries, contents = _snapshot_file_entries(
+            profile,
+            runtime_assets,
+        )
         _make_directory_tree(
             snapshot_descriptor,
             snapshot_root,
@@ -1057,6 +1085,7 @@ def _materialize_staging(
             "source_profile_root": str(profile.contract.profile_root),
             "profile": profile.contract.as_dict(),
             "resources": resource_entries,
+            "pi_installation": pi_installation.as_dict(),
             "project": {
                 "report_directory": str(report_directory),
                 "memory_directory": str(memory_directory),
@@ -1090,6 +1119,8 @@ def _materialize_staging(
 def materialize_new_run(profile: Profile) -> SessionRun:
     """Create one new run; no caller-controlled ID and no implicit resume."""
 
+    runtime_assets = pi_runtime_assets(profile.contract)
+    pi_installation = fingerprint_pi_installation(profile.contract)
     state_root = profile.contract.state_root
     sessions_root = state_root / "sessions"
     profile_sessions = sessions_root / profile.contract.profile_id
@@ -1184,6 +1215,8 @@ def materialize_new_run(profile: Profile) -> SessionRun:
                         staging_descriptor,
                         staging,
                         profile,
+                        runtime_assets,
+                        pi_installation,
                         session_id=session_id,
                         created_at=created_at,
                         report_directory=report_directory,
@@ -1297,7 +1330,6 @@ def _parse_resource_entries(
         size = entry["size"]
         if (
             not isinstance(relative, str)
-            or not relative.startswith("profile/")
             or "\\" in relative
         ):
             _fail("lock resource path is invalid")
@@ -1306,6 +1338,8 @@ def _parse_resource_entries(
             pure_path.is_absolute()
             or pure_path.as_posix() != relative
             or any(part in {"", ".", ".."} for part in pure_path.parts)
+            or len(pure_path.parts) < 2
+            or pure_path.parts[0] not in {"profile", "pi", "runtime"}
             or relative in seen_paths
         ):
             _fail("lock resource path is duplicate or non-normalized")
@@ -1435,6 +1469,13 @@ def _validate_resource_roles(
     if profile.pi.append_system_prompt_file is not None:
         path = f"profile/{profile.pi.append_system_prompt_file.as_posix()}"
         expected.setdefault(path, set()).add("append_system_prompt")
+    expected.update(
+        {
+            PI_MODELS_PATH.as_posix(): {PI_MODELS_ROLE},
+            INFERENCE_RELAY_PATH.as_posix(): {INFERENCE_RELAY_ROLE},
+            SESSION_POLICY_PATH.as_posix(): {SESSION_POLICY_ROLE},
+        }
+    )
     actual = {
         resource.relative_path.as_posix(): set(resource.roles)
         for resource in resources
@@ -1444,6 +1485,44 @@ def _validate_resource_roles(
             "locked resource paths and roles do not match profile.toml",
             code="immutable_snapshot_changed",
         )
+
+
+def _validate_generated_pi_configuration(
+    profile: ProfileContract,
+    resources: tuple[LockedResource, ...],
+    *,
+    snapshot_descriptor: int,
+    snapshot_root: pathlib.Path,
+) -> None:
+    resources_by_path = {
+        resource.relative_path: resource for resource in resources
+    }
+    for expected in generated_pi_configuration_assets(profile):
+        resource = resources_by_path.get(expected.relative_path)
+        if resource is None:
+            _fail(
+                "locked Pi configuration is incomplete",
+                code="immutable_snapshot_changed",
+            )
+        content = _read_relative_private_file(
+            snapshot_descriptor,
+            snapshot_root,
+            resource.relative_path,
+            label=(
+                "generated locked Pi configuration "
+                f"{resource.relative_path.as_posix()}"
+            ),
+        )
+        if (
+            content != expected.content
+            or resource.sha256 != expected.sha256
+            or resource.size != expected.size
+        ):
+            _fail(
+                "locked Pi configuration does not match the locked profile: "
+                f"{resource.relative_path.as_posix()}",
+                code="immutable_snapshot_changed",
+            )
 
 
 def _validate_workspace_file(
@@ -1498,8 +1577,6 @@ def _load_run(
     snapshot_root = root / "snapshot"
     workspace = root / "workspace"
     pi_root = root / "pi"
-    pi_home = pi_root / "home"
-    pi_config = pi_root / "config"
     pi_sessions = pi_root / "sessions"
 
     with contextlib.ExitStack() as descriptors:
@@ -1578,18 +1655,13 @@ def _load_run(
             label="private Pi root",
         )
         descriptors.callback(os.close, pi_descriptor)
-        for name, path, label in (
-            ("home", pi_home, "private Pi home"),
-            ("config", pi_config, "private Pi config"),
-            ("sessions", pi_sessions, "private Pi sessions"),
-        ):
-            descriptor = _open_private_child_directory(
-                pi_descriptor,
-                name,
-                path=path,
-                label=label,
-            )
-            descriptors.callback(os.close, descriptor)
+        pi_sessions_descriptor = _open_private_child_directory(
+            pi_descriptor,
+            "sessions",
+            path=pi_sessions,
+            label="private Pi sessions",
+        )
+        descriptors.callback(os.close, pi_sessions_descriptor)
         _validate_workspace_file(workspace_descriptor, workspace)
         _validate_masked_workspace_pi(workspace_descriptor, workspace)
 
@@ -1643,12 +1715,29 @@ def _load_run(
                 code="immutable_snapshot_changed",
             )
         _validate_resource_roles(locked_profile, resources)
+        _validate_generated_pi_configuration(
+            locked_profile,
+            resources,
+            snapshot_descriptor=snapshot_descriptor,
+            snapshot_root=snapshot_root,
+        )
         if locked_profile.profile_id != profile_id:
             _fail("locked profile ID does not match selected profile")
         if locked_profile.state_root != state_root:
             _fail("locked profile state_root does not match selected state")
         if receipt["project_id"] != locked_profile.project_id:
             _fail("session receipt project ID does not match locked profile")
+        pi_installation = parse_pi_installation_identity(
+            manifest["pi_installation"]
+        )
+        actual_pi_installation = fingerprint_pi_installation(locked_profile)
+        if actual_pi_installation != pi_installation:
+            _fail(
+                "Pi installation content differs from the locked session "
+                f"identity: expected {pi_installation.sha256}, got "
+                f"{actual_pi_installation.sha256}",
+                code="pi_installation_changed",
+            )
 
         project_value = manifest["project"]
         if not isinstance(project_value, dict):
@@ -1706,12 +1795,11 @@ def _load_run(
             profile=locked_profile,
             snapshot_root=snapshot_root,
             workspace=workspace,
-            pi_home=pi_home,
-            pi_config=pi_config,
             pi_sessions=pi_sessions,
             report_directory=report_directory,
             memory_directory=memory_directory,
             resources=resources,
+            pi_installation=pi_installation,
         )
 
 

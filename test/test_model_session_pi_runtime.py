@@ -15,14 +15,14 @@ from model_session.pi_runtime import (
     PI_INSTALLATION_IDENTITY_SCHEMA,
     PI_LOCAL_API_KEY,
     PI_MODELS_ROLE,
-    PI_SETTINGS_ROLE,
     SESSION_POLICY_ROLE,
     committed_pi_runtime_assets,
     fingerprint_pi_installation,
+    fingerprint_pi_installation_for_root_descriptor,
     generated_pi_configuration_assets,
+    parse_pi_installation_identity,
     pi_runtime_assets,
     render_pi_models_json,
-    render_pi_settings_json,
 )
 from model_session.profile import (
     ModelContract,
@@ -82,6 +82,10 @@ def create_installation(root: pathlib.Path) -> ProfileContract:
     (installation / "lib").mkdir()
     (installation / "lib" / "pi.js").write_bytes(b"console.log('pi');\n")
     (installation / "lib" / "pi.js").chmod(0o755)
+    (installation / "bin" / "node").write_bytes(
+        b"#!/bin/sh\necho v24.11.1\n"
+    )
+    (installation / "bin" / "node").chmod(0o755)
     (installation / "README.md").write_bytes(b"fixture installation\n")
     (installation / "README.md").chmod(0o644)
     (installation / "bin" / "pi").symlink_to("../lib/pi.js")
@@ -91,18 +95,14 @@ def create_installation(root: pathlib.Path) -> ProfileContract:
 
 
 class PiRuntimeConfigurationTest(unittest.TestCase):
-    def test_models_and_settings_are_canonical_and_exact(self) -> None:
+    def test_models_are_canonical_and_exact(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             contract = make_contract(pathlib.Path(directory))
             models_bytes = render_pi_models_json(contract)
-            settings_bytes = render_pi_settings_json(contract)
 
         self.assertTrue(models_bytes.endswith(b"\n"))
         self.assertEqual(models_bytes.count(b"\n"), 1)
-        self.assertTrue(settings_bytes.endswith(b"\n"))
-        self.assertEqual(settings_bytes.count(b"\n"), 1)
         models = json.loads(models_bytes)
-        settings = json.loads(settings_bytes)
         provider = models["providers"]["fixture-provider"]
         self.assertEqual(provider["baseUrl"], PI_INFERENCE_BASE_URL)
         self.assertEqual(provider["api"], "openai-completions")
@@ -133,18 +133,6 @@ class PiRuntimeConfigurationTest(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            settings,
-            {
-                "defaultModel": "fixture-model-bf16",
-                "defaultProjectTrust": "never",
-                "defaultProvider": "fixture-provider",
-                "enableInstallTelemetry": False,
-                "enabledModels": [
-                    "fixture-provider/fixture-model-bf16",
-                ],
-            },
-        )
-        self.assertEqual(
             models_bytes,
             json.dumps(
                 models,
@@ -155,31 +143,16 @@ class PiRuntimeConfigurationTest(unittest.TestCase):
             ).encode("utf-8")
             + b"\n",
         )
-        self.assertEqual(
-            settings_bytes,
-            json.dumps(
-                settings,
-                ensure_ascii=False,
-                allow_nan=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-            + b"\n",
-        )
-
     def test_generated_configuration_contains_no_secret_resolution_marker(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             contract = make_contract(pathlib.Path(directory))
             models = json.loads(render_pi_models_json(contract))
-            settings = render_pi_settings_json(contract)
 
         key = models["providers"]["fixture-provider"]["apiKey"]
         self.assertFalse(key.startswith("!"))
         self.assertNotIn("$", key)
-        self.assertNotIn(b"$", settings)
-        self.assertNotIn(b"!command", settings)
 
     def test_assets_have_unique_roles_paths_sizes_and_hashes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -190,7 +163,7 @@ class PiRuntimeConfigurationTest(unittest.TestCase):
 
         self.assertEqual(
             {asset.roles[0] for asset in generated},
-            {PI_MODELS_ROLE, PI_SETTINGS_ROLE},
+            {PI_MODELS_ROLE},
         )
         self.assertEqual(
             {asset.roles[0] for asset in committed},
@@ -218,14 +191,14 @@ class PiRuntimeConfigurationTest(unittest.TestCase):
                 / "session-policy.js"
             ).read_bytes(),
         )
-        self.assertEqual(len(assets), 4)
+        self.assertEqual(len(assets), 3)
         self.assertEqual(
             len({role for asset in assets for role in asset.roles}),
-            4,
+            3,
         )
         self.assertEqual(
             len({asset.relative_path for asset in assets}),
-            4,
+            3,
         )
         for asset in assets:
             self.assertEqual(asset.size, len(asset.content))
@@ -245,16 +218,34 @@ class PiInstallationIdentityTest(unittest.TestCase):
 
         self.assertEqual(first, second)
         self.assertEqual(first.schema, PI_INSTALLATION_IDENTITY_SCHEMA)
-        self.assertEqual(first.entry_count, 6)
+        self.assertEqual(first.entry_count, 7)
         self.assertEqual(first.directory_count, 3)
-        self.assertEqual(first.regular_file_count, 2)
+        self.assertEqual(first.regular_file_count, 3)
         self.assertEqual(first.symlink_count, 1)
         self.assertEqual(
             first.total_bytes,
-            len(b"console.log('pi');\n") + len(b"fixture installation\n"),
+            len(b"console.log('pi');\n")
+            + len(b"fixture installation\n")
+            + len(b"#!/bin/sh\necho v24.11.1\n"),
         )
         self.assertRegex(first.sha256, r"^[0-9a-f]{64}$")
         self.assertEqual(first.as_dict()["sha256"], first.sha256)
+        self.assertEqual(
+            parse_pi_installation_identity(first.as_dict()),
+            first,
+        )
+
+    def test_locked_identity_parser_rejects_inconsistent_representation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            contract = create_installation(pathlib.Path(directory))
+            value = fingerprint_pi_installation(contract).as_dict()
+
+        value["entry_count"] += 1
+        with self.assertRaises(ModelSessionError) as caught:
+            parse_pi_installation_identity(value)
+        self.assertEqual(caught.exception.code, "immutable_snapshot_changed")
 
     def test_content_change_changes_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -325,6 +316,50 @@ class PiInstallationIdentityTest(unittest.TestCase):
                 fingerprint_pi_installation(contract)
 
         self.assertEqual(caught.exception.code, "unsafe_pi_installation")
+
+    def test_hardlinked_regular_file_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            contract = create_installation(root)
+            source = contract.pi.installation_root / "README.md"
+            alias = root / "outside-alias.md"
+            os.link(source, alias)
+
+            with self.assertRaises(ModelSessionError) as caught:
+                fingerprint_pi_installation(contract)
+        self.assertEqual(caught.exception.code, "unsafe_pi_installation")
+
+    def test_retained_root_descriptor_is_bound_to_the_fingerprinted_tree(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            contract = create_installation(root)
+            installation = contract.pi.installation_root
+            descriptor = os.open(
+                installation,
+                os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW,
+            )
+            try:
+                self.assertEqual(
+                    fingerprint_pi_installation_for_root_descriptor(
+                        contract,
+                        descriptor,
+                    ),
+                    fingerprint_pi_installation(contract),
+                )
+                moved = root / "moved-installation"
+                installation.rename(moved)
+                installation.mkdir(mode=0o755)
+                installation.chmod(0o755)
+                with self.assertRaises(ModelSessionError) as caught:
+                    fingerprint_pi_installation_for_root_descriptor(
+                        contract,
+                        descriptor,
+                    )
+            finally:
+                os.close(descriptor)
+        self.assertEqual(caught.exception.code, "pi_installation_changed")
 
     def test_file_mutation_during_scan_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

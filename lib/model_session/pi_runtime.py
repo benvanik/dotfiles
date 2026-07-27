@@ -8,10 +8,13 @@ authority.
 
 from __future__ import annotations
 
+import grp
 import hashlib
 import json
 import os
 import pathlib
+import pwd
+import re
 import stat
 from dataclasses import dataclass, field
 from typing import Any
@@ -21,12 +24,10 @@ from .profile import ProfileContract
 
 
 PI_MODELS_ROLE = "pi_models"
-PI_SETTINGS_ROLE = "pi_settings"
 INFERENCE_RELAY_ROLE = "inference_relay"
 SESSION_POLICY_ROLE = "session_policy"
 
 PI_MODELS_PATH = pathlib.PurePosixPath("pi/models.json")
-PI_SETTINGS_PATH = pathlib.PurePosixPath("pi/settings.json")
 INFERENCE_RELAY_PATH = pathlib.PurePosixPath("runtime/relay.py")
 SESSION_POLICY_PATH = pathlib.PurePosixPath("runtime/session-policy.js")
 
@@ -36,6 +37,16 @@ PI_INSTALLATION_IDENTITY_SCHEMA = "model-session.pi-installation-tree.v1"
 
 _TREE_HASH_DOMAIN = b"model-session.pi-installation-tree.v1\0"
 _HASH_BUFFER_BYTES = 1024 * 1024
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_IDENTITY_KEYS = {
+    "schema",
+    "sha256",
+    "entry_count",
+    "directory_count",
+    "regular_file_count",
+    "symlink_count",
+    "total_bytes",
+}
 
 
 @dataclass(frozen=True)
@@ -75,6 +86,61 @@ class PiInstallationIdentity:
             "symlink_count": self.symlink_count,
             "total_bytes": self.total_bytes,
         }
+
+
+def parse_pi_installation_identity(value: Any) -> PiInstallationIdentity:
+    """Parse the exact identity representation stored in a run snapshot."""
+
+    if not isinstance(value, dict) or set(value) != _IDENTITY_KEYS:
+        _fail(
+            "locked Pi installation identity has invalid fields",
+            code="immutable_snapshot_changed",
+        )
+    if value["schema"] != PI_INSTALLATION_IDENTITY_SCHEMA:
+        _fail(
+            "locked Pi installation identity has an unsupported schema",
+            code="immutable_snapshot_changed",
+        )
+    digest = value["sha256"]
+    if not isinstance(digest, str) or not _SHA256_PATTERN.fullmatch(digest):
+        _fail(
+            "locked Pi installation identity has an invalid digest",
+            code="immutable_snapshot_changed",
+        )
+
+    counts: dict[str, int] = {}
+    for name in (
+        "entry_count",
+        "directory_count",
+        "regular_file_count",
+        "symlink_count",
+        "total_bytes",
+    ):
+        count = value[name]
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            _fail(
+                f"locked Pi installation identity has invalid {name}",
+                code="immutable_snapshot_changed",
+            )
+        counts[name] = count
+    if counts["directory_count"] < 1 or counts["entry_count"] != (
+        counts["directory_count"]
+        + counts["regular_file_count"]
+        + counts["symlink_count"]
+    ):
+        _fail(
+            "locked Pi installation identity counts are inconsistent",
+            code="immutable_snapshot_changed",
+        )
+    return PiInstallationIdentity(
+        schema=PI_INSTALLATION_IDENTITY_SCHEMA,
+        sha256=digest,
+        entry_count=counts["entry_count"],
+        directory_count=counts["directory_count"],
+        regular_file_count=counts["regular_file_count"],
+        symlink_count=counts["symlink_count"],
+        total_bytes=counts["total_bytes"],
+    )
 
 
 @dataclass
@@ -147,22 +213,6 @@ def render_pi_models_json(contract: ProfileContract) -> bytes:
     )
 
 
-def render_pi_settings_json(contract: ProfileContract) -> bytes:
-    """Render global Pi settings with one exact model in scope."""
-
-    provider = contract.runtime.provider
-    model_id = contract.runtime.model_id
-    return _canonical_json_bytes(
-        {
-            "defaultModel": model_id,
-            "defaultProjectTrust": "never",
-            "defaultProvider": provider,
-            "enableInstallTelemetry": False,
-            "enabledModels": [f"{provider}/{model_id}"],
-        }
-    )
-
-
 def _runtime_asset(
     relative_path: pathlib.PurePosixPath,
     role: str,
@@ -180,18 +230,18 @@ def _runtime_asset(
 def generated_pi_configuration_assets(
     contract: ProfileContract,
 ) -> tuple[PiRuntimeAsset, ...]:
-    """Return canonical models.json and settings.json snapshot inputs."""
+    """Return the canonical models.json snapshot input.
+
+    Pi settings are intentionally absent. Pi 0.82.1 takes a sibling lock even
+    for a read-only settings.json; launch authority is instead pinned by CLI
+    arguments, the explicit policy extension, and offline environment.
+    """
 
     return (
         _runtime_asset(
             PI_MODELS_PATH,
             PI_MODELS_ROLE,
             render_pi_models_json(contract),
-        ),
-        _runtime_asset(
-            PI_SETTINGS_PATH,
-            PI_SETTINGS_ROLE,
-            render_pi_settings_json(contract),
         ),
     )
 
@@ -210,34 +260,124 @@ def _stable_stat_fields(metadata: os.stat_result) -> tuple[int, ...]:
     )
 
 
-def _read_stable_regular_file(path: pathlib.Path, *, label: str) -> bytes:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    else:
+def _private_owner_group(metadata: os.stat_result) -> bool:
+    try:
+        owner = pwd.getpwuid(metadata.st_uid)
+        group = grp.getgrgid(metadata.st_gid)
+        primary_members = {
+            entry.pw_name
+            for entry in pwd.getpwall()
+            if entry.pw_gid == metadata.st_gid
+        }
+    except KeyError:
+        return False
+    return (
+        owner.pw_gid == metadata.st_gid
+        and primary_members | set(group.gr_mem) == {owner.pw_name}
+    )
+
+
+def _validate_runtime_asset_object(
+    metadata: os.stat_result,
+    *,
+    path: pathlib.Path,
+    label: str,
+    expected_directory: bool,
+) -> None:
+    expected = stat.S_ISDIR if expected_directory else stat.S_ISREG
+    kind = "directory" if expected_directory else "regular file"
+    if not expected(metadata.st_mode):
         _fail(
-            "runtime assets require O_NOFOLLOW",
+            f"{label} source is not a {kind}: {path}",
+            code="unsafe_runtime_asset",
+        )
+    if hasattr(os, "getuid") and metadata.st_uid not in {0, os.getuid()}:
+        _fail(
+            f"{label} source has an unexpected owner: {path}",
+            code="unsafe_runtime_asset",
+        )
+    if metadata.st_mode & stat.S_IWOTH:
+        _fail(
+            f"{label} source is world-writable: {path}",
+            code="unsafe_runtime_asset",
+        )
+    if metadata.st_mode & stat.S_IWGRP and not _private_owner_group(metadata):
+        _fail(
+            f"{label} source is writable by a shared group: {path}",
+            code="unsafe_runtime_asset",
+        )
+    if not expected_directory and metadata.st_nlink != 1:
+        _fail(
+            f"{label} source has filesystem aliases: {path}",
+            code="unsafe_runtime_asset",
+        )
+
+
+def _open_runtime_asset(path: pathlib.Path, *, label: str) -> int:
+    if (
+        not path.is_absolute()
+        or path == pathlib.Path("/")
+        or os.path.normpath(os.fspath(path)) != os.fspath(path)
+        or not hasattr(os, "O_NOFOLLOW")
+        or not hasattr(os, "O_DIRECTORY")
+    ):
+        _fail(
+            f"{label} source path cannot be opened safely: {path}",
             code="pi_runtime_platform_unsupported",
         )
+    directory_flags = (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    file_flags = (
+        os.O_RDONLY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    descriptor = os.open("/", directory_flags)
     try:
-        descriptor = os.open(path, flags)
+        _validate_runtime_asset_object(
+            os.fstat(descriptor),
+            path=pathlib.Path("/"),
+            label=label,
+            expected_directory=True,
+        )
+        current = pathlib.Path("/")
+        for index, component in enumerate(path.parts[1:]):
+            current /= component
+            final = index == len(path.parts) - 2
+            child = os.open(
+                component,
+                file_flags if final else directory_flags,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = child
+            _validate_runtime_asset_object(
+                os.fstat(descriptor),
+                path=current,
+                label=label,
+                expected_directory=not final,
+            )
+        return descriptor
     except OSError as error:
+        os.close(descriptor)
         raise ModelSessionError(
-            f"cannot open {label} {path}: {error}",
+            f"cannot open {label} source {path} without following links: {error}",
             code="unsafe_runtime_asset",
         ) from error
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _read_stable_regular_file(path: pathlib.Path, *, label: str) -> bytes:
+    descriptor = _open_runtime_asset(path, label=label)
     try:
         before = os.fstat(descriptor)
-        if not stat.S_ISREG(before.st_mode):
-            _fail(
-                f"{label} is not a regular file: {path}",
-                code="unsafe_runtime_asset",
-            )
-        if hasattr(os, "getuid") and before.st_uid not in {0, os.getuid()}:
-            _fail(
-                f"{label} has an unexpected owner: {path}",
-                code="unsafe_runtime_asset",
-            )
         chunks: list[bytes] = []
         while True:
             chunk = os.read(descriptor, _HASH_BUFFER_BYTES)
@@ -354,6 +494,13 @@ def _validate_owner_and_mode(
     if not is_symlink and metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
         _fail(
             "Pi installation object is group- or world-writable: "
+            f"{display_path}"
+        )
+    if (
+        stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
+    ) and metadata.st_nlink != 1:
+        _fail(
+            "Pi installation file has aliases outside its tree contract: "
             f"{display_path}"
         )
 
@@ -854,17 +1001,19 @@ def _verify_tree_snapshot(
     )
 
 
-def fingerprint_pi_installation(
+def _fingerprint_pi_installation(
     contract: ProfileContract,
+    *,
+    expected_root: os.stat_result | None,
 ) -> PiInstallationIdentity:
-    """Fingerprint the complete dedicated Pi tree without following links."""
-
     root = contract.pi.installation_root
     descriptor = _open_absolute_directory(root)
     try:
         before = os.fstat(descriptor)
         if not stat.S_ISDIR(before.st_mode):
             _fail(f"Pi installation_root is not a directory: {root}")
+        if expected_root is not None:
+            _assert_unchanged(expected_root, before, relative_path=b".")
         hasher = hashlib.sha256()
         hasher.update(_TREE_HASH_DOMAIN)
         counts = _TreeCounts()
@@ -899,6 +1048,8 @@ def fingerprint_pi_installation(
     try:
         current = os.fstat(verification_descriptor)
         _assert_unchanged(before, current, relative_path=b".")
+        if expected_root is not None:
+            _assert_unchanged(expected_root, current, relative_path=b".")
     finally:
         os.close(verification_descriptor)
 
@@ -911,3 +1062,44 @@ def fingerprint_pi_installation(
         symlink_count=counts.symlink_count,
         total_bytes=counts.total_bytes,
     )
+
+
+def fingerprint_pi_installation(
+    contract: ProfileContract,
+) -> PiInstallationIdentity:
+    """Fingerprint the complete dedicated Pi tree without following links."""
+
+    return _fingerprint_pi_installation(contract, expected_root=None)
+
+
+def fingerprint_pi_installation_for_root_descriptor(
+    contract: ProfileContract,
+    root_descriptor: int,
+) -> PiInstallationIdentity:
+    """Fingerprint the exact installation root already retained for launch."""
+
+    try:
+        expected_root = os.fstat(root_descriptor)
+    except OSError as error:
+        raise ModelSessionError(
+            f"cannot inspect retained Pi installation descriptor: {error}",
+            code="pi_installation_changed",
+        ) from error
+    if not stat.S_ISDIR(expected_root.st_mode):
+        _fail(
+            "retained Pi installation descriptor is not a directory",
+            code="pi_installation_changed",
+        )
+    identity = _fingerprint_pi_installation(
+        contract,
+        expected_root=expected_root,
+    )
+    try:
+        current_root = os.fstat(root_descriptor)
+    except OSError as error:
+        raise ModelSessionError(
+            f"cannot re-inspect retained Pi installation descriptor: {error}",
+            code="pi_installation_changed",
+        ) from error
+    _assert_unchanged(expected_root, current_root, relative_path=b".")
+    return identity

@@ -1,5 +1,13 @@
 """Provider-neutral, external model-profile and session-state contracts."""
 
+from .attachment import (
+    ATTACHMENT_SCHEMA,
+    InferenceAttachment,
+    inference_attachment_receipt_path,
+    inference_workload_identity,
+    load_inference_attachment,
+    publish_inference_attachment,
+)
 from .errors import ModelSessionError
 from .profile import (
     AGENTS_FILE_NAME,
@@ -29,7 +37,9 @@ from .runs import (
 
 __all__ = [
     "AGENTS_FILE_NAME",
+    "ATTACHMENT_SCHEMA",
     "INPUT_MODALITIES",
+    "InferenceAttachment",
     "KV_CACHE_DTYPES",
     "LOCK_SCHEMA",
     "LockedResource",
@@ -46,8 +56,12 @@ __all__ = [
     "SessionRun",
     "RuntimeContract",
     "WEIGHT_FORMATS",
+    "inference_attachment_receipt_path",
+    "inference_workload_identity",
+    "load_inference_attachment",
     "load_profile",
     "load_run",
     "load_run_from_state",
     "materialize_new_run",
+    "publish_inference_attachment",
 ]

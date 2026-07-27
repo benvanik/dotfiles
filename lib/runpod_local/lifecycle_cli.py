@@ -14,16 +14,18 @@ from .api import RunpodApi
 from .auth import CredentialStore
 from .cache import JsonCache
 from .errors import RunpodLocalError
-from .http import JsonHttpTransport
 from .instances import InstanceStore, lease_expiry_reasons
 from .lifecycle import LifecycleManager
-from .model import HuggingFaceClient, ModelInspector
 from .output import print_json
 from .paths import credentials_file, state_root
-from .placement import load_hardware_catalog, place_model, select_hardware
 from .profile import ProfileStore
 from .state import StateStore
 from .timeutil import parse_duration, utc_timestamp
+from .workload import (
+    HuggingFaceWorkload,
+    WorkloadPlacementRequest,
+    plan_workload,
+)
 
 
 LIFECYCLE_COMMANDS = ("up", "status", "down", "ttl")
@@ -229,68 +231,36 @@ def _model_placement(
     args: argparse.Namespace,
     profile: dict[str, Any],
 ) -> tuple[set[str] | None, dict[str, Any] | None]:
-    profile_ids = profile["pod"]["gpu_type_ids"]
-    requested_ids: set[str] | None = None
-    if args.gpu:
-        requested = select_hardware(load_hardware_catalog(), args.gpu)
-        requested_ids = {gpu["id"] for gpu in requested}
-        outside = requested_ids.difference(profile_ids)
-        if outside:
-            raise RunpodLocalError(
-                "requested GPU is not allowed by the profile: "
-                + ", ".join(sorted(outside)),
-                code="gpu_not_allowed",
-            )
-    if args.model is None:
-        return requested_ids, None
-
     root = state_root(args.state_root)
-    inspector = ModelInspector(
-        HuggingFaceClient(
-            cache=JsonCache(root / "cache" / "huggingface"),
-            transport=JsonHttpTransport(),
+    model = (
+        HuggingFaceWorkload(
+            repository=args.model,
+            revision=args.revision,
+            index_file=args.index_file,
+            context_tokens=args.context,
+            sequences=args.sequences,
+            kv_dtype=args.kv_dtype,
+            weight_format=args.weight_format,
             offline=args.offline,
             refresh=args.refresh,
         )
+        if args.model is not None
+        else None
     )
-    model = inspector.inspect(
-        args.model,
-        revision=args.revision,
-        index_file=args.index_file,
-        context_tokens=args.context,
-        sequences=args.sequences,
-        kv_dtype=args.kv_dtype,
-        weight_format=args.weight_format,
+    placement = plan_workload(
+        WorkloadPlacementRequest(
+            allowed_gpu_ids=tuple(profile["pod"]["gpu_type_ids"]),
+            requested_gpus=tuple(args.gpu),
+            model=model,
+            allow_indeterminate_fit=args.allow_indeterminate_fit,
+            gpu_count=profile["pod"]["gpu_count"],
+        ),
+        cache=JsonCache(root / "cache" / "huggingface"),
     )
-    placement = place_model(
-        model,
-        requested_gpus=profile_ids,
-        gpu_count=profile["pod"]["gpu_count"],
+    return (
+        placement.admitted_gpu_ids,
+        placement.model_summary,
     )
-    admitted_statuses = {"candidate"}
-    if args.allow_indeterminate_fit:
-        admitted_statuses.add("indeterminate")
-    admitted_ids = {
-        candidate["gpu_id"]
-        for candidate in placement["placements"]
-        if candidate["status"] in admitted_statuses
-    }
-    if requested_ids is not None:
-        admitted_ids.intersection_update(requested_ids)
-    summary = {
-        "repository": placement["model"]["repository"],
-        "requested_revision": placement["model"]["requested_revision"],
-        "resolved_revision": placement["model"]["resolved_revision"],
-        "checkpoint": placement["model"]["checkpoint"],
-        "weight_format": placement["model"]["weight_format"],
-        "weight_bytes": placement["model"]["weight_bytes"],
-        "kv_cache": placement["model"]["kv_cache"],
-        "placement_policy": placement["policy"],
-        "placements": placement["placements"],
-        "admitted_statuses": sorted(admitted_statuses),
-        "admitted_gpu_ids": sorted(admitted_ids),
-    }
-    return admitted_ids, summary
 
 
 def _print(value: Any, *, as_json: bool) -> None:

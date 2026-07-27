@@ -167,6 +167,110 @@ class ModelInspectorTest(unittest.TestCase):
             report["runtime_estimate"]["kv_cache"]["bytes"], 4_836_556_800
         )
 
+    def test_gemma4_uses_distinct_global_and_sliding_kv_geometry(self):
+        info = model_info(sibling("model.safetensors", 100))
+        layer_types = (["sliding_attention"] * 5 + ["full_attention"]) * 10
+        files = {
+            "config.json": {
+                "model_type": "gemma4",
+                "text_config": {
+                    "model_type": "gemma4_text",
+                    "attention_k_eq_v": True,
+                    "num_hidden_layers": 60,
+                    "num_attention_heads": 32,
+                    "num_key_value_heads": 16,
+                    "num_global_key_value_heads": 4,
+                    "head_dim": 256,
+                    "global_head_dim": 512,
+                    "sliding_window": 1024,
+                    "layer_types": layer_types,
+                },
+            }
+        }
+        expected_bytes = {
+            32768: 3_523_215_360,
+            65536: 6_207_569_920,
+            131072: 11_576_279_040,
+            262144: 22_313_697_280,
+        }
+        for context_tokens, expected in expected_bytes.items():
+            with self.subTest(context_tokens=context_tokens):
+                report = ModelInspector(
+                    FakeHuggingFaceClient(info, files)
+                ).inspect(
+                    "llmfan46/gemma-4-31B-it-uncensored-heretic",
+                    context_tokens=context_tokens,
+                    kv_dtype="bf16",
+                )
+                kv_cache = report["runtime_estimate"]["kv_cache"]
+                self.assertEqual(kv_cache["bytes"], expected)
+                self.assertEqual(
+                    kv_cache["gib"], round(expected / GIB, 3)
+                )
+                self.assertEqual(
+                    kv_cache["attention_layer_geometries"],
+                    {
+                        "full_attention": {
+                            "layer_count": 10,
+                            "cache_tokens_per_layer": context_tokens,
+                            "key_value_heads": 4,
+                            "head_dimension": 512,
+                            "bytes_per_token_per_layer": 8192,
+                            "bytes_per_sequence": (
+                                10 * context_tokens * 8192
+                            ),
+                        },
+                        "sliding_attention": {
+                            "layer_count": 50,
+                            "cache_tokens_per_layer": 1024,
+                            "key_value_heads": 16,
+                            "head_dimension": 256,
+                            "bytes_per_token_per_layer": 16384,
+                            "bytes_per_sequence": 50 * 1024 * 16384,
+                        },
+                    },
+                )
+
+    def test_global_kv_geometry_without_layer_types_is_unmodeled(self):
+        info = model_info(sibling("model.safetensors", 100))
+        files = {
+            "config.json": {
+                "num_hidden_layers": 2,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 2,
+                "num_global_key_value_heads": 1,
+                "head_dim": 64,
+                "global_head_dim": 128,
+            }
+        }
+        report = ModelInspector(FakeHuggingFaceClient(info, files)).inspect(
+            "example/ambiguous-global-geometry"
+        )
+        kv_cache = report["runtime_estimate"]["kv_cache"]
+        self.assertFalse(kv_cache["available"])
+        self.assertIn("without layer_types", kv_cache["reason"])
+
+    def test_invalid_global_kv_geometry_is_not_silently_ignored(self):
+        info = model_info(sibling("model.safetensors", 100))
+        files = {
+            "config.json": {
+                "num_hidden_layers": 2,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 2,
+                "num_global_key_value_heads": "1",
+                "head_dim": 64,
+                "global_head_dim": 128,
+                "sliding_window": 1024,
+                "layer_types": ["sliding_attention", "full_attention"],
+            }
+        }
+        report = ModelInspector(FakeHuggingFaceClient(info, files)).inspect(
+            "example/invalid-global-geometry"
+        )
+        kv_cache = report["runtime_estimate"]["kv_cache"]
+        self.assertFalse(kv_cache["available"])
+        self.assertIn("num_global_key_value_heads", kv_cache["reason"])
+
     def test_mla_kv_cache(self):
         info = model_info(sibling("model.safetensors", 100))
         files = {

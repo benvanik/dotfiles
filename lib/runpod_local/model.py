@@ -419,6 +419,17 @@ def _first_integer(config: dict[str, Any], *names: str) -> int | None:
     return None
 
 
+def _declared_positive_integer(
+    config: dict[str, Any], name: str
+) -> tuple[int | None, str | None]:
+    if name not in config or config[name] is None:
+        return None, None
+    value = config[name]
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None, f"configuration field {name} is not a positive integer"
+    return value, None
+
+
 def _text_config(config: dict[str, Any]) -> tuple[dict[str, Any], str]:
     for key in ("text_config", "language_config", "llm_config"):
         nested = config.get(key)
@@ -512,9 +523,41 @@ def _kv_cache_estimate(
 
     layer_types = text_config.get("layer_types")
     sliding_window = _first_integer(text_config, "sliding_window")
-    cache_token_layers = 0
+    global_key_value_heads, invalid_reason = _declared_positive_integer(
+        text_config, "num_global_key_value_heads"
+    )
+    if invalid_reason is not None:
+        return {
+            **common,
+            "available": False,
+            "reason": invalid_reason,
+        }
+    global_head_dimension, invalid_reason = _declared_positive_integer(
+        text_config, "global_head_dim"
+    )
+    if invalid_reason is not None:
+        return {
+            **common,
+            "available": False,
+            "reason": invalid_reason,
+        }
+    has_global_geometry = (
+        global_key_value_heads is not None or global_head_dimension is not None
+    )
+    if layer_types is None and has_global_geometry:
+        return {
+            **common,
+            "available": False,
+            "reason": (
+                "configuration declares global attention cache geometry "
+                "without layer_types"
+            ),
+        }
+
     method = "full_attention_upper_bound"
     confidence = "conservative_architectural_estimate"
+    full_attention_layers = layers
+    sliding_attention_layers = 0
     if layer_types is not None:
         if not isinstance(layer_types, list) or len(layer_types) != layers:
             return {
@@ -522,10 +565,10 @@ def _kv_cache_estimate(
                 "available": False,
                 "reason": "layer_types does not match the hidden-layer count",
             }
-        cache_token_layers = 0
+        full_attention_layers = 0
         for layer_type in layer_types:
             if layer_type in ("full_attention", "global_attention"):
-                cache_token_layers += context_tokens
+                full_attention_layers += 1
             elif layer_type in ("sliding_attention", "local_attention"):
                 if sliding_window is None:
                     return {
@@ -533,7 +576,7 @@ def _kv_cache_estimate(
                         "available": False,
                         "reason": "a sliding-attention layer has no sliding_window",
                     }
-                cache_token_layers += min(context_tokens, sliding_window)
+                sliding_attention_layers += 1
             else:
                 return {
                     **common,
@@ -542,21 +585,60 @@ def _kv_cache_estimate(
                 }
         method = "declared_attention_layer_types"
         confidence = "architectural_estimate"
-    else:
-        cache_token_layers = layers * context_tokens
 
-    elements_per_token_layer = 2 * key_value_heads * head_dimension
-    total_bytes = (
-        cache_token_layers
-        * elements_per_token_layer
-        * dtype_bytes
-        * sequences
+    full_key_value_heads = global_key_value_heads or key_value_heads
+    full_head_dimension = global_head_dimension or head_dimension
+    # Shared K/V projection weights still produce separate runtime cache tensors.
+    full_bytes_per_token_per_layer = (
+        2 * full_key_value_heads * full_head_dimension * dtype_bytes
     )
-    bytes_per_token = (
-        layers * elements_per_token_layer * dtype_bytes
-        if context_tokens
+    sliding_bytes_per_token_per_layer = (
+        2 * key_value_heads * head_dimension * dtype_bytes
+    )
+    sliding_cache_tokens = (
+        min(context_tokens, sliding_window)
+        if sliding_window is not None
         else 0
     )
+    full_bytes_per_sequence = (
+        full_attention_layers
+        * context_tokens
+        * full_bytes_per_token_per_layer
+    )
+    sliding_bytes_per_sequence = (
+        sliding_attention_layers
+        * sliding_cache_tokens
+        * sliding_bytes_per_token_per_layer
+    )
+    bytes_per_sequence = (
+        full_bytes_per_sequence + sliding_bytes_per_sequence
+    )
+    bytes_per_token = (
+        full_attention_layers * full_bytes_per_token_per_layer
+        + sliding_attention_layers * sliding_bytes_per_token_per_layer
+    )
+    layer_geometries: dict[str, dict[str, int]] = {}
+    if full_attention_layers:
+        layer_geometries["full_attention"] = {
+            "layer_count": full_attention_layers,
+            "cache_tokens_per_layer": context_tokens,
+            "key_value_heads": full_key_value_heads,
+            "head_dimension": full_head_dimension,
+            "bytes_per_token_per_layer": full_bytes_per_token_per_layer,
+            "bytes_per_sequence": full_bytes_per_sequence,
+        }
+    if sliding_attention_layers:
+        layer_geometries["sliding_attention"] = {
+            "layer_count": sliding_attention_layers,
+            "cache_tokens_per_layer": sliding_cache_tokens,
+            "key_value_heads": key_value_heads,
+            "head_dimension": head_dimension,
+            "bytes_per_token_per_layer": (
+                sliding_bytes_per_token_per_layer
+            ),
+            "bytes_per_sequence": sliding_bytes_per_sequence,
+        }
+    total_bytes = bytes_per_sequence * sequences
     return {
         **common,
         "available": True,
@@ -567,6 +649,7 @@ def _kv_cache_estimate(
         "key_value_heads": key_value_heads,
         "head_dimension": head_dimension,
         "bytes_per_token_per_sequence_full_attention": bytes_per_token,
+        "attention_layer_geometries": layer_geometries,
         "bytes": total_bytes,
         "gib": bytes_to_gib(total_bytes),
     }

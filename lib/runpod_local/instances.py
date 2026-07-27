@@ -9,17 +9,24 @@ import math
 import re
 from typing import Any
 
+from .api import validate_provider_pod_snapshot
 from .errors import RunpodLocalError
 from .profile import validate_profile
+from .runtime_catalog import validate_runtime_identity
 from .state import StateStore, validate_record_name
+from .template import (
+    environment_summary,
+    template_contract_violations,
+    validate_image_digest,
+    validate_private_template_contract,
+)
 from .timeutil import (
     MAX_DURATION_SECONDS,
     parse_utc_timestamp,
     utc_timestamp,
 )
 
-
-INSTANCE_SCHEMA = "runpod.instance.v2"
+INSTANCE_SCHEMA = "runpod.instance.v3"
 INSTANCE_PHASES = {
     "intent",
     "submitting",
@@ -417,6 +424,112 @@ def validate_instance_record(record: dict[str, Any]) -> dict[str, Any]:
             f"instance {name} has an invalid expected placement",
             code="invalid_instance_record",
         )
+    try:
+        expected_image = validate_image_digest(expected.get("image"))
+    except RunpodLocalError as error:
+        raise RunpodLocalError(
+            f"instance {name} has no immutable expected image",
+            code="invalid_instance_record",
+        ) from error
+    expected_ports = expected.get("ports")
+    if expected_ports != ["22/tcp"]:
+        raise RunpodLocalError(
+            f"instance {name} has an invalid expected port contract",
+            code="invalid_instance_record",
+        )
+    expected_container_disk_gb = expected.get("container_disk_gb")
+    expected_volume_in_gb = expected.get("volume_in_gb")
+    expected_volume_mount_path = expected.get("volume_mount_path")
+    expected_environment_names = expected.get("environment_names")
+    expected_environment_sha256 = expected.get("environment_sha256")
+    if (
+        not isinstance(expected_container_disk_gb, int)
+        or isinstance(expected_container_disk_gb, bool)
+        or expected_container_disk_gb < 20
+        or not isinstance(expected_volume_in_gb, int)
+        or isinstance(expected_volume_in_gb, bool)
+        or expected_volume_in_gb < 0
+        or not isinstance(expected_volume_mount_path, str)
+        or not expected_volume_mount_path.startswith("/")
+    ):
+        raise RunpodLocalError(
+            f"instance {name} has an invalid expected storage contract",
+            code="invalid_instance_record",
+        )
+    if (
+        not isinstance(expected_environment_names, list)
+        or not all(
+            isinstance(name, str) and bool(name) and name.isprintable()
+            for name in expected_environment_names
+        )
+        or expected_environment_names != sorted(set(expected_environment_names))
+        or not isinstance(expected_environment_sha256, str)
+        or not re.fullmatch(
+            r"[0-9a-f]{64}",
+            expected_environment_sha256,
+        )
+        or type(expected.get("has_registry_auth")) is not bool
+        or expected["has_registry_auth"] is not False
+    ):
+        raise RunpodLocalError(
+            f"instance {name} has an invalid expected provider environment",
+            code="invalid_instance_record",
+        )
+    template_contract = expected.get("template_contract")
+    runtime_identity = expected.get("runtime")
+    if template_contract is not None:
+        try:
+            template_contract = validate_private_template_contract(
+                template_contract,
+                require_id=True,
+            )
+        except RunpodLocalError as error:
+            raise RunpodLocalError(
+                f"instance {name} has an invalid expected template contract",
+                code="invalid_instance_record",
+            ) from error
+        try:
+            runtime = validate_runtime_identity(runtime_identity)
+        except RunpodLocalError as error:
+            raise RunpodLocalError(
+                f"instance {name} has an invalid reviewed runtime identity",
+                code="invalid_instance_record",
+            ) from error
+        expected_template = runtime.template_contract(
+            name=template_contract["name"],
+            template_id=template_contract["id"],
+        )
+        if (
+            template_contract["image"] != expected_image
+            or template_contract["docker_entrypoint"]
+            != expected.get("docker_entrypoint")
+            or template_contract["docker_start_cmd"]
+            != expected.get("docker_start_cmd")
+            or template_contract["ports"] != expected_ports
+            or template_contract["container_disk_gb"]
+            != expected_container_disk_gb
+            or template_contract["volume_mount_path"]
+            != expected_volume_mount_path
+            or template_contract["volume_in_gb"]
+            != expected_volume_in_gb
+            or template_contract_violations(
+                template_contract,
+                expected_template,
+            )
+        ):
+            raise RunpodLocalError(
+                f"instance {name} expected runtime disagrees with its template",
+                code="invalid_instance_record",
+            )
+    elif (
+        expected.get("docker_entrypoint") is not None
+        or expected.get("docker_start_cmd") is not None
+        or runtime_identity is not None
+    ):
+        raise RunpodLocalError(
+            f"instance {name} has Docker overrides without a template",
+            code="invalid_instance_record",
+        )
     lease_request = record.get("lease_request")
     if not isinstance(lease_request, dict):
         raise RunpodLocalError(
@@ -431,6 +544,75 @@ def validate_instance_record(record: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(pod_payload, dict):
         raise RunpodLocalError(
             f"instance {name} has no Pod request payload",
+            code="invalid_instance_record",
+        )
+    payload_environment = environment_summary(pod_payload.get("env"))
+    if (
+        payload_environment is None
+        or payload_environment["environment_names"]
+        != expected_environment_names
+        or payload_environment["environment_sha256"]
+        != expected_environment_sha256
+        or "containerRegistryAuthId" in pod_payload
+    ):
+        raise RunpodLocalError(
+            f"instance {name} Pod request has a different environment source",
+            code="invalid_instance_record",
+        )
+    if (
+        type(pod_payload.get("containerDiskInGb")) is not int
+        or pod_payload["containerDiskInGb"] != expected_container_disk_gb
+        or type(pod_payload.get("volumeMountPath")) is not str
+        or pod_payload["volumeMountPath"] != expected_volume_mount_path
+    ):
+        raise RunpodLocalError(
+            f"instance {name} Pod request has a different storage contract",
+            code="invalid_instance_record",
+        )
+    if template_contract is None:
+        if (
+            pod_payload.get("imageName") != expected_image
+            or "templateId" in pod_payload
+        ):
+            raise RunpodLocalError(
+                f"instance {name} Pod request has a different image source",
+                code="invalid_instance_record",
+            )
+    elif (
+        pod_payload.get("templateId") != template_contract["id"]
+        or "imageName" in pod_payload
+    ):
+        raise RunpodLocalError(
+            f"instance {name} Pod request has a different template source",
+            code="invalid_instance_record",
+        )
+    expected_network_volume_id = expected.get("network_volume_id")
+    if expected_network_volume_id is not None and not isinstance(
+        expected_network_volume_id,
+        str,
+    ):
+        raise RunpodLocalError(
+            f"instance {name} has an invalid expected network volume",
+            code="invalid_instance_record",
+        )
+    if expected_network_volume_id is not None:
+        if (
+            pod_payload.get("networkVolumeId")
+            != expected_network_volume_id
+            or "volumeInGb" in pod_payload
+            or expected_volume_in_gb != 0
+        ):
+            raise RunpodLocalError(
+                f"instance {name} Pod request has a different volume source",
+                code="invalid_instance_record",
+            )
+    elif (
+        "networkVolumeId" in pod_payload
+        or type(pod_payload.get("volumeInGb")) is not int
+        or pod_payload["volumeInGb"] != expected_volume_in_gb
+    ):
+        raise RunpodLocalError(
+            f"instance {name} Pod request has a different local volume",
             code="invalid_instance_record",
         )
     provider_termination_at = record.get("provider_termination_at")
@@ -569,6 +751,20 @@ def validate_instance_record(record: dict[str, Any]) -> dict[str, Any]:
             f"instance {name} is {phase} but has no Pod ID",
             code="invalid_instance_record",
         )
+    provider = record.get("provider")
+    if provider is not None:
+        try:
+            validate_provider_pod_snapshot(provider)
+        except RunpodLocalError as error:
+            raise RunpodLocalError(
+                f"instance {name} has an invalid durable provider snapshot",
+                code="invalid_instance_record",
+            ) from error
+        if pod_id is None:
+            raise RunpodLocalError(
+                f"instance {name} has provider evidence without a Pod ID",
+                code="invalid_instance_record",
+            )
     submission_started_at = record.get("submission_started_at")
     lease = record.get("lease")
     if submission_started_at is not None:

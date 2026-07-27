@@ -25,12 +25,14 @@ The tools own:
 - read-only local/live diagnostics.
 
 They do not own Runpod account balance, secrets, SSH account settings, volume
-deletion, model correctness, or measured performance truth. The reusable
-model-agnostic vLLM runtime image under `runpod/images/` is infrastructure;
-published image digests, model revisions, prompts, launch arguments, and
-compiled-cache identities are instantiation state outside this repository.
-Static placement produces `candidate`, never `verified`; only a recorded run
-can establish the latter.
+deletion, model correctness, an OCI image, or measured performance truth. The
+repository selects and verifies an exact official upstream runtime digest; it
+does not build, derive, publish, or distribute that runtime. Its only launch
+overlay is a small SSH bootstrap passed as Runpod template configuration.
+Model revisions, prompts, launch arguments, and accepted compiled-cache
+identities are instantiation state outside this repository. Static placement
+produces `candidate`, never `verified`; only a recorded run can establish the
+latter.
 
 ## Security boundary
 
@@ -79,13 +81,13 @@ authentication, and forwarding side channels. Each Pod has its own mode-0600
 known-hosts file and `runpod-POD_ID` host-key alias. The first connection is
 TOFU via `accept-new`; a changed key fails.
 
-The official Runpod image writes Pod environment values into a shell file that
-root's `.bashrc` sources. Profiles therefore reject controls and shell
-expansion/quoting characters in every value, reserve shell-startup variables,
-reserve dynamic-loader controls, and reject all Runpod-secret environment
-references whose expanded bytes cannot be checked locally. Complex
-configuration and credentials belong in ephemeral files, not Pod environment
-values.
+Profile values cross the provider/container launch boundary and may later be
+serialized by startup tooling or an interactive shell. Profiles therefore
+reject controls and shell expansion/quoting characters in every value, reserve
+shell-startup and dynamic-loader controls, and reject all Runpod-secret
+environment references whose expanded bytes cannot be checked locally.
+Complex configuration and credentials belong in ephemeral files, not Pod
+environment values.
 
 Pods expose only `22/tcp`. vLLM or another service should bind remote
 `127.0.0.1` and be reached through `runpod-tunnel`, which binds both ends to
@@ -93,40 +95,45 @@ loopback.
 
 Runpod network volumes are persistent model-cache storage, not a secrets or
 prompt-data vault. They are not encrypted by this tool. With a volume-backed
-profile, the whole `/workspace` tree persists—not only the cache directories:
+profile, the whole `/workspace` tree persists—not only the model cache:
 
 ```text
 /workspace/.cache/huggingface
-/workspace/.cache/torch
-/workspace/.cache/vllm
+/workspace/.cache/compiled/<explicit accepted cache identity>
 ```
 
 Use `/root/runpod-session` for private inputs, outputs, logs, and transient
-environments. That path is on container storage and is lost when the Pod is
-restarted or deleted. `runpod-copy` admits both roots while rejecting path
-traversal and shell syntax. The model cache is operationally writable (Hugging
-Face needs locks and metadata); this tool does not pretend the weight files are
+state, including generic Torch, vLLM, and XDG caches. That path is on
+container storage and is lost when the Pod is restarted or deleted.
+`runpod-copy` admits both roots while rejecting path traversal and shell
+syntax. The model cache is operationally writable (Hugging Face needs locks
+and metadata); this tool does not pretend the weight files are
 filesystem-read-only.
 
 Installed Python environments and unpacked dependency caches do not belong on
 the network volume. The network filesystem is suitable for large sequential
 model weights, but copying or importing a many-file vLLM environment from it
-turns startup into a metadata-bound operation. The candidate image boundary
-is:
+turns startup into a metadata-bound operation. The runtime boundary is:
 
-- exact CUDA/Python/Torch/vLLM/FlashInfer dependencies in one digest-pinned OCI
-  image on ephemeral local container storage;
+- the official `vllm/vllm-openai` image at one immutable digest, distributed
+  and cached by its upstream registry and Runpod;
+- a configuration-only private Runpod template that replaces the image
+  entrypoint with the exact SSH bootstrap under `runpod/bootstrap/ssh`;
+- `openssh-server` installed in seconds into ephemeral container storage at
+  boot; this is the only package overlay;
 - Hugging Face weights on the persistent network volume;
-- one content-addressed archive per accepted compiled-cache closure, copied and
-  extracted onto ephemeral local storage before vLLM starts.
+- generic small-file runtime caches on ephemeral local storage;
+- only model-specific compiled caches that have already proved a material
+  startup benefit retained explicitly on the network volume.
 
 Runpod caches Pod image layers opportunistically, but does not publish a cache
 lifetime, host-affinity guarantee, or Pod equivalent of Serverless FlashBoot.
 Every image must therefore pass a fresh-host allocated-to-healthy measurement;
-a same-host warm start is not sufficient evidence. The current runtime recipe
-has no accepted publisher: metered cross-registry workstation publication is a
-rejected path. Its build and publication gate are in
-[`images/vllm-cu129/README.md`](images/vllm-cu129/README.md).
+a same-host warm start is not sufficient evidence. There is deliberately no
+Dockerfile or publisher. The exact upstream identity and in-Pod verification
+contract are in
+[`runtimes/vllm-cu129/README.md`](runtimes/vllm-cu129/README.md); the launch
+overlay is in [`bootstrap/ssh/README.md`](bootstrap/ssh/README.md).
 
 ## July 26, 2026 provider snapshot
 
@@ -182,10 +189,10 @@ Sources:
 - [Runpod CLI Pod create reference](https://docs.runpod.io/runpodctl/reference/runpodctl-pod)
 - [Runpod network volumes](https://docs.runpod.io/storage/network-volumes)
 - [Runpod SSH](https://docs.runpod.io/pods/configuration/use-ssh)
-- [Runpod official container startup](https://github.com/runpod/containers/blob/main/container-template/start.sh)
-- [Runpod official base image](https://github.com/runpod/containers/blob/main/official-templates/base/Dockerfile)
-- [Current Runpod PyTorch image tags](https://hub.docker.com/r/runpod/pytorch/tags)
-- [Current vLLM serve CLI](https://docs.vllm.ai/en/stable/cli/serve/)
+- [Runpod Pod templates](https://docs.runpod.io/pods/templates/manage-templates)
+- [Runpod template API](https://docs.runpod.io/api-reference/templates/POST/templates)
+- [vLLM 0.25.1 Docker deployment](https://docs.vllm.ai/en/v0.25.1/deployment/docker/)
+- [vLLM 0.25.1 Dockerfile](https://github.com/vllm-project/vllm/blob/v0.25.1/docker/Dockerfile)
 
 ## First setup
 
@@ -237,26 +244,42 @@ cross-machine idempotency key. Volume charges survive every `runpod-down`.
 Deletion is intentionally outside this suite; use Runpod's Storage console or
 volume API only after separately reviewing the exact volume ID.
 
-Explicit profile images require immutable digests; provider template IDs remain
-available for sessions that do not receive credential leases. As of this
-snapshot, the current CUDA 12.9 / PyTorch 2.9.1 / Ubuntu 24.04 tag resolves to:
+Create one private, non-Serverless Runpod template over the exact official
+vLLM runtime. The template is configuration only: it contains no environment
+values or credentials, allocates no template-local persistent volume, and
+passes the repository's SSH bootstrap as the image's sole command argument.
+First inspect the exact plan, then execute the same command:
 
-```text
-runpod/pytorch@sha256:e655f8dd3bdd68b0ef8d4675b63341f85812263f957f78971c56af7c42423ca6
+```sh
+runpod-template create upstream-vllm-cu129 \
+  --runtime vllm-cu129-v0.25.1 --json
+
+runpod-template create upstream-vllm-cu129 \
+  --runtime vllm-cu129-v0.25.1 --execute --json
 ```
 
-The selected official image installs `/usr/bin/python3.12`, which the
-non-secret credential probe verifies before any token-bearing connection.
-Re-resolve and audit a new digest when changing the runtime stack.
+Record the returned template ID. Template reconciliation refuses a same-name
+contract drift; profile creation and every billable launch independently fetch
+and compare the exact image, entrypoint, command, ports, disk, privacy,
+Serverless, environment, registry-auth, and volume fields. Public command
+output reports Docker argument hashes and sizes rather than their bytes. A
+launch repeats template attestation as its final provider read before Pod
+creation, then verifies the resolved Pod and deletes it on contradiction.
+Runpod exposes no template-version compare-and-swap, so the provider-side
+interval between that final read and create cannot be made atomic.
 
 Author the datacenter-specific profile against the selected volume:
 
 ```sh
 runpod-profile create pro-h200 \
-  --image runpod/pytorch@sha256:e655f8dd3bdd68b0ef8d4675b63341f85812263f957f78971c56af7c42423ca6 \
+  --runtime vllm-cu129-v0.25.1 \
+  --template-id TEMPLATE_ID \
   --network-volume-id VOLUME_ID \
   --gpu pro6000-server --gpu h200 \
   --max-hourly 4.50 --ttl 30m --cuda 12.9 \
+  --env TORCH_HOME=/root/runpod-session/cache/torch \
+  --env VLLM_CACHE_ROOT=/root/runpod-session/cache/vllm \
+  --env XDG_CACHE_HOME=/root/runpod-session/cache \
   --identity-file ~/.ssh/id_ed25519_runpod \
   --public-key-file ~/.ssh/id_ed25519_runpod.pub \
   --json
@@ -292,9 +315,11 @@ again if the active token expires. `runpod-hf-auth clear compiler` removes the
 Pod copy but does not revoke the source credential at Hugging Face. Code
 running as Pod root can read the leased token; the boundary prevents accidental
 persistence and disclosure, not access by the selected container workload.
-`push` refuses mutable image tags and template-backed Pods; `status` and
-`clear` remain available so an existing lease can always be inspected or
-removed.
+`push` requires an immutable image digest and, for a template-backed Pod, an
+exact match among the saved profile/runtime contract and the previously
+attested live Pod allocation. It does not perform a fresh template fetch.
+`status` and `clear` remain available so an existing lease can always be
+inspected or removed.
 
 The profile cap is total Pod cost, not price per GPU. Profile GPU order is
 intentional fallback order. Because the volume is datacenter-pinned, putting
@@ -494,13 +519,12 @@ driver should call `runpod-ttl touch NAME --source LABEL` after real work.
 
 The placement receipt now retains the exact resolved commit, selected index,
 checkpoint shard identities, context/KV estimate, and memory policy. A vLLM
-launch must consume those values rather than mutable defaults. After installing
-a pinned, verified vLLM/CUDA/PyTorch build into the image or ephemeral session
-environment, the native-safetensors shape is:
+launch must consume those values rather than mutable defaults. After the
+in-Pod verifier accepts the upstream runtime, the native-safetensors shape is:
 
 ```sh
 runpod-ssh compiler -- \
-  /root/runpod-session/venv/bin/vllm serve Qwen/Qwen3-32B \
+  /usr/local/bin/vllm serve Qwen/Qwen3-32B \
   --revision RESOLVED_SHA \
   --max-model-len 32768 \
   --kv-cache-dtype bfloat16 \

@@ -22,7 +22,6 @@ from .huggingface_credentials import (
 from .instances import InstanceStore
 from .output import print_json
 from .paths import credentials_file, state_root
-from .profile import validate_image_digest
 from .remote import (
     build_copy_argv,
     build_ssh_argv,
@@ -32,8 +31,13 @@ from .remote import (
     resolve_endpoint,
     run_with_activity,
 )
+from .runtime_catalog import validate_runtime_identity
 from .state import StateStore
-
+from .template import (
+    template_contract_violations,
+    validate_image_digest,
+    validate_private_template_contract,
+)
 
 REMOTE_COMMANDS = ("ssh", "tunnel", "copy", "hf-auth")
 
@@ -421,17 +425,60 @@ def _require_hf_auth_success(action: str, return_code: int) -> None:
 def _require_hf_auth_image(instances: InstanceStore, name: str) -> None:
     record = instances.load(name)
     payload = record.get("pod_payload")
+    expected = record.get("expected")
     image_name = (
-        payload.get("imageName") if isinstance(payload, dict) else None
+        expected.get("image") if isinstance(expected, dict) else None
     )
     try:
         validate_image_digest(image_name)
     except RunpodLocalError as error:
         raise RunpodLocalError(
-            "Hugging Face credential push requires an explicit "
-            "digest-pinned image rather than a tag or template",
+            "Hugging Face credential push requires a receipt-attested "
+            "digest-pinned image",
             code="hf_auth_unpinned_image",
         ) from error
+    template_contract = (
+        expected.get("template_contract")
+        if isinstance(expected, dict)
+        else None
+    )
+    if template_contract is None:
+        source_matches = (
+            isinstance(payload, dict)
+            and payload.get("imageName") == image_name
+            and "templateId" not in payload
+            and expected.get("runtime") is None
+        )
+    else:
+        try:
+            template_contract = validate_private_template_contract(
+                template_contract,
+                require_id=True,
+            )
+            runtime = validate_runtime_identity(expected.get("runtime"))
+            expected_template = runtime.template_contract(
+                name=template_contract["name"],
+                template_id=template_contract["id"],
+            )
+        except RunpodLocalError:
+            source_matches = False
+        else:
+            source_matches = (
+                isinstance(payload, dict)
+                and payload.get("templateId") == template_contract["id"]
+                and template_contract["image"] == image_name
+                and "imageName" not in payload
+                and not template_contract_violations(
+                    template_contract,
+                    expected_template,
+                )
+            )
+    if not source_matches:
+        raise RunpodLocalError(
+            "Hugging Face credential push requires one internally "
+            "consistent image/template receipt",
+            code="hf_auth_unpinned_image",
+        )
 
 
 def _run_hf_auth(args: argparse.Namespace) -> int:

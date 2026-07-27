@@ -17,7 +17,8 @@ Planning commands:
 - `runpod-place`: apply the versioned static VRAM placement policy.
 - `runpod-stock`: query live stock and on-demand price.
 - `runpod-volume`: plan/reconcile persistent cache-volume creation.
-- `runpod-template`: inspect account-visible templates without environment data.
+- `runpod-template`: reconcile private Pod-template overlays without environment
+  data.
 - `runpod-profile`: author validated reusable launch policy.
 
 Session commands:
@@ -136,35 +137,63 @@ a separate console/API action, not session cleanup.
     "template": """# `runpod-template`
 
 List templates visible to the authenticated account while omitting all
-environment values from output. Use the resulting exact template ID when
-authoring a profile.
+environment values, or reconcile one exact private, non-serverless Pod
+template from the checked-in reviewed runtime catalog. There is no arbitrary
+image, entrypoint, or command input.
 
 ```sh
-runpod-template list --search pytorch --json
+runpod-template create upstream-vllm \\
+  --runtime vllm-cu129-v0.25.1 --json
+runpod-template create upstream-vllm \\
+  --runtime vllm-cu129-v0.25.1 --execute --json
 ```
+
+The catalog pins the official upstream image digest plus exact manifest and
+tiny SSH-bootstrap hashes. Source files are opened beneath the installed
+controller tree through owned, bounded, no-follow descriptors; unknown IDs,
+symlinks, unsafe ownership/permissions, schema drift, or hash drift fail
+closed. Creation is name-reconciled and serialized. An exact existing
+template is reused; a same-name image, entrypoint, command, port, privacy,
+Serverless, environment, registry-auth, disk, or mount mismatch fails closed.
+The template-local volume is exactly integer zero because Pod launch attaches
+its separately managed network volume. Public list/get/plan/error output never
+prints Docker argv; it exposes only argument counts, byte counts, and hashes.
 """,
     "profile": """# `runpod-profile`
 
 Profiles are non-secret, mode-0600 local policy records under
-`~/.local/runpod/profiles`. They pin allowed GPU IDs, image or template,
+`~/.local/runpod/profiles`. They always pin an immutable image digest. A
+template-backed profile additionally requires a reviewed runtime ID and
+snapshots its safe manifest/bootstrap identity plus the exact normalized
+private template contract beside its ID. Profiles also pin allowed GPU IDs,
 network-volume identity, cache paths, price cap, SSH identity, and a hard-TTL
 default no greater than 30 minutes.
 
 ```sh
 runpod-profile create nvidia-dev \\
-  --image IMAGE@sha256:DIGEST --network-volume-id VOLUME_ID \\
+  --runtime vllm-cu129-v0.25.1 --template-id TEMPLATE_ID \\
+  --network-volume-id VOLUME_ID \\
   --gpu pro6000-server --gpu h200 \\
   --max-hourly 4.50 --ttl 30m \\
   --identity-file ~/.ssh/id_ed25519_runpod \\
   --public-key-file ~/.ssh/id_ed25519_runpod.pub --json
 ```
 
-Explicit profile images require immutable digests; provider template IDs remain
-available for sessions that do not receive credential leases. Environment
+`--image` remains available only for direct-image profiles; combining it with
+`--template-id`, or using `--runtime` without `--template-id`, fails closed.
+Profile creation fetches a referenced template and accepts it only when its
+full private Pod contract matches the selected reviewed runtime. Every
+executed launch fetches that template before credential attestation, then
+fetches it again after account-key/name checks as the final provider read
+before the Pod create. Runpod exposes no template-version CAS, so provider-side
+mutation in the final read/create interval remains an unavoidable TOCTOU; the
+resolved Pod is still verified exactly and deleted on contradiction.
+Environment
 names containing TOKEN, KEY, SECRET, PASSWORD, or CREDENTIAL are rejected, as
-are all Runpod-secret environment references. The official image shell-sources
-a serialized Pod environment, so controls and shell expansion/quoting
-characters are also rejected in every value. `HF_TOKEN_PATH` is the one
+are all Runpod-secret environment references. Values cross the provider and
+container-launch boundary and may later be serialized by startup tooling or an
+interactive shell, so controls and shell expansion/quoting characters are
+also rejected in every value. `HF_TOKEN_PATH` is the one
 constrained non-secret exception and is fixed to ephemeral
 `/root/runpod-session/secrets/huggingface/token`; credentials never belong in a
 profile. Shell-startup controls such as `BASH_ENV`, `ENV`, and `ZDOTDIR` are
@@ -183,7 +212,13 @@ state and exact Pod IDs remain authoritative.
 Plan by default. `--execute` fsyncs a unique local launch intent before the
 first create request, reconciles an ambiguous request by exact UUID-bearing
 remote name, verifies the actual GPU/count/datacenter/volume/image/security/
-ports/total price, and rolls back a contradictory allocation.
+container disk/local-volume size/volume mount/Docker entrypoint/Docker
+command/effective environment/absence of registry auth/ports/total price, and
+rolls back a contradictory allocation. Environment values are never retained:
+the receipt binds the sorted names and a canonical SHA-256 of the complete
+string map. Provider audit evidence retains only match booleans, numeric or
+boolean facts, counts, and hashes; arbitrary provider strings cannot enter a
+receipt, rollback reason, event, or public error.
 
 ```sh
 runpod-up compiler --profile pro-h200 --model Qwen/Qwen3-32B \\
@@ -389,8 +424,10 @@ action revokes the source token at Hugging Face, and browser-OAuth refresh state
 is never copied. Push the current active token again if it expires. Pod-root
 code can read the lease; this boundary prevents persistence and accidental
 disclosure rather than hiding a credential from the selected workload.
-`push` requires an explicit digest-pinned image and refuses a mutable tag or
-template; `status` and `clear` remain available for cleanup.
+`push` requires the active receipt to attest an immutable image. A
+template-backed receipt is accepted only when its saved template ID, resolved
+image, reviewed runtime identity, and full Docker override snapshot agree;
+`status` and `clear` remain available for cleanup.
 
 These explicit credential actions execute immediately. `--json` formats the
 safe result; it is not a plan mode.

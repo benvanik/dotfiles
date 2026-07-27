@@ -11,6 +11,7 @@ from runpod_local.allocation import (
     select_launch_placement,
     verify_allocated_pod,
 )
+from runpod_local.api import normalize_pod
 from runpod_local.errors import HttpRequestError, RunpodLocalError
 from runpod_local.instances import (
     InstanceStore,
@@ -20,9 +21,10 @@ from runpod_local.instances import (
 )
 from runpod_local.lifecycle import LifecycleManager
 from runpod_local.profile import create_profile
+from runpod_local.runtime_catalog import load_runtime
 from runpod_local.state import StateStore
+from runpod_local.template import environment_summary
 from runpod_local.timeutil import parse_utc_timestamp
-
 
 GPU_ID = "NVIDIA RTX PRO 6000 Blackwell Server Edition"
 NOW = datetime.datetime(2026, 7, 26, 20, 0, tzinfo=datetime.timezone.utc)
@@ -32,6 +34,12 @@ SSH_PUBLIC_KEY = (
     "AAAAC3NzaC1lZDI1NTE5AAAAIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f "
     "fixture@example"
 )
+IMAGE = (
+    "runpod/pytorch@sha256:"
+    "1111111111111111111111111111111111111111111111111111111111111111"
+)
+RUNTIME_ID = "vllm-cu129-v0.25.1"
+RUNTIME = load_runtime(RUNTIME_ID)
 
 
 def profile(**overrides):
@@ -40,15 +48,27 @@ def profile(**overrides):
         "gpu_names": ["pro6000", "h200"],
         "max_hourly_usd": 3.0,
         "default_ttl_seconds": 3600,
-        "image_name": (
-            "runpod/pytorch@sha256:"
-            "1111111111111111111111111111111111111111111111111111111111111111"
-        ),
+        "image_name": IMAGE,
         "network_volume_id": "volume123",
         "ssh_public_key": SSH_PUBLIC_KEY,
     }
     arguments.update(overrides)
     return create_profile(**arguments)
+
+
+def template_profile(**overrides):
+    contract = RUNTIME.template_contract(
+        name="upstream-runtime",
+        template_id="template123",
+    )
+    arguments = {
+        "image_name": RUNTIME.image,
+        "template_id": "template123",
+        "template_contract": contract,
+        "runtime_id": RUNTIME_ID,
+    }
+    arguments.update(overrides)
+    return profile(**arguments)
 
 
 def stock():
@@ -121,6 +141,9 @@ class FakeApi:
         self.account_ssh_attestation_calls = []
         self.account_ssh_attestation_error = None
         self.account_ssh_attestation = object()
+        self.templates = {}
+        self.template_get_calls = 0
+        self.before_get_template = None
 
     def get_network_volume(self, volume_id):
         return {
@@ -132,6 +155,12 @@ class FakeApi:
 
     def stock(self, **_):
         return stock()
+
+    def get_template(self, template_id):
+        self.template_get_calls += 1
+        if self.before_get_template is not None:
+            self.before_get_template(self.template_get_calls)
+        return dict(self.templates[template_id])
 
     def list_pods(self):
         return [dict(pod) for pod in self.pods]
@@ -160,21 +189,65 @@ class FakeApi:
         return dict(pod)
 
     def pod_for_payload(self, payload):
+        template = self.templates.get(payload.get("templateId"))
+        normalized_environment = environment_summary(payload["env"])
+        if normalized_environment is None:
+            raise AssertionError("fixture Pod environment is invalid")
         return {
             "id": "pod123",
             "name": payload["name"],
             "desired_status": "RUNNING",
-            "image": payload.get("imageName"),
+            "image": (
+                template["image"]
+                if template is not None
+                else payload.get("imageName")
+            ),
             "template_id": payload.get("templateId"),
+            "docker_entrypoint_status": (
+                "valid" if template is not None else "missing"
+            ),
+            "docker_entrypoint": (
+                template["docker_entrypoint"]
+                if template is not None
+                else None
+            ),
+            "docker_start_cmd_status": (
+                "valid" if template is not None else "missing"
+            ),
+            "docker_start_cmd": (
+                template["docker_start_cmd"]
+                if template is not None
+                else None
+            ),
+            "container_disk_gb": payload["containerDiskInGb"],
+            "volume_in_gb": payload.get("volumeInGb", 0),
+            "volume_mount_path": payload["volumeMountPath"],
+            "environment_status": "valid",
+            **normalized_environment,
+            "registry_auth_status": "valid",
+            "has_registry_auth": False,
             "interruptible": False,
             "locked": False,
+            "gpu_status": "valid",
             "gpu_id": payload["gpuTypeIds"][0],
             "gpu_count": payload["gpuCount"],
+            "cost_status": "valid",
             "cost_per_hour": self.created_cost,
+            "machine_status": "valid",
             "data_center_id": "US-NC-2",
             "secure_cloud": True,
             "machine_id": "machine123",
+            "network_volume_status": (
+                "valid"
+                if payload.get("networkVolumeId") is not None
+                else "missing"
+            ),
             "network_volume_id": payload.get("networkVolumeId"),
+            "network_volume_data_center_id": (
+                "US-NC-2"
+                if payload.get("networkVolumeId") is not None
+                else None
+            ),
             "network_volume": {
                 "id": payload.get("networkVolumeId"),
                 "name": "model-cache",
@@ -182,7 +255,9 @@ class FakeApi:
                 "data_center_id": "US-NC-2",
             },
             "public_ip": None,
+            "port_mappings_status": "valid",
             "port_mappings": {},
+            "ports_status": "valid",
             "ports": ["22/tcp"],
         }
 
@@ -824,7 +899,7 @@ class LifecycleTest(unittest.TestCase):
 
     def test_changed_durable_id_cannot_hide_a_new_exact_name_id(self):
         record = self.launch()
-        renamed = dict(record["provider"])
+        renamed = self.api.pod_for_payload(record["pod_payload"])
         renamed["name"] = "renamed-by-another-controller"
         replacement = self.api.pod_for_payload(record["pod_payload"])
         replacement["id"] = "pod456"
@@ -871,9 +946,444 @@ class LifecycleTest(unittest.TestCase):
             InstanceStore(self.state).load("compiler")["phase"], "rolled_back"
         )
 
+    def test_template_launch_attests_provider_before_billable_create(self):
+        self.launch_profile = template_profile(
+            identity_file=str(self.identity)
+        )
+        contract = self.launch_profile["pod"]["template_contract"]
+        self.api.templates["template123"] = dict(contract)
+
+        record = self.launch()
+
+        self.assertEqual(record["phase"], "active")
+        self.assertEqual(
+            record["expected"]["template_contract"], contract
+        )
+        self.assertEqual(record["expected"]["image"], RUNTIME.image)
+        self.assertEqual(
+            record["expected"]["runtime"]["runtime_id"],
+            RUNTIME_ID,
+        )
+        self.assertEqual(record["expected"]["volume_in_gb"], 0)
+        self.assertEqual(record["provider"]["volume_in_gb"], 0)
+        self.assertNotIn("docker_entrypoint", record["provider"])
+        self.assertTrue(
+            record["provider"]["docker_entrypoint_summary"][
+                "valid_string_array"
+            ]
+        )
+        self.assertEqual(
+            record["provider"]["environment_sha256"],
+            record["expected"]["environment_sha256"],
+        )
+        self.assertIs(record["provider"]["has_registry_auth"], False)
+        self.assertEqual(
+            record["pod_payload"]["terminateAfter"],
+            record["provider_termination_at"],
+        )
+
+    def test_provider_runtime_mutation_rolls_back_without_persisting_secrets(
+        self,
+    ):
+        self.launch_profile = template_profile(
+            identity_file=str(self.identity)
+        )
+        contract = self.launch_profile["pod"]["template_contract"]
+        self.api.templates["template123"] = dict(contract)
+        secret = "PROVIDER_SECRET=must-not-persist"
+        expected_environment = dict(
+            self.launch_profile["pod"]["environment"]
+        )
+        mutated_environment = dict(expected_environment)
+        mutated_environment["SSH_PUBLIC_KEY"] = secret
+        mutated_summary = environment_summary(mutated_environment)
+        self.assertIsNotNone(mutated_summary)
+        self.assertEqual(
+            mutated_summary["environment_names"],
+            sorted(expected_environment),
+        )
+
+        def mutate_live_pod():
+            self.api.pods[0].update(
+                {
+                    "docker_start_cmd": [secret],
+                    "environment_status": "valid",
+                    **mutated_summary,
+                    "registry_auth_status": "valid",
+                    "has_registry_auth": True,
+                }
+            )
+
+        self.api.before_get = mutate_live_pod
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            self.launch()
+
+        self.assertEqual(caught.exception.code, "allocation_rejected")
+        self.assertEqual(self.api.delete_calls, ["pod123"])
+        receipt = InstanceStore(self.state).load("compiler")
+        self.assertEqual(receipt["phase"], "rolled_back")
+        self.assertNotEqual(
+            receipt["provider"]["environment_sha256"],
+            receipt["expected"]["environment_sha256"],
+        )
+        self.assertTrue(
+            receipt["provider"]["docker_start_cmd_summary"][
+                "valid_string_array"
+            ]
+        )
+        self.assertIs(receipt["provider"]["has_registry_auth"], True)
+        self.assertNotIn("docker_start_cmd", receipt["provider"])
+        self.assertNotIn("image", receipt["provider"])
+        serialized = self.state.record_path(
+            "instances", "compiler"
+        ).read_text()
+        self.assertNotIn(secret, serialized)
+        self.assertNotIn(secret, repr(receipt))
+        self.assertNotIn(secret, str(caught.exception))
+
+    def test_malformed_provider_evidence_cannot_block_safe_rollback(self):
+        self.launch_profile = template_profile(
+            identity_file=str(self.identity)
+        )
+        contract = self.launch_profile["pod"]["template_contract"]
+        self.api.templates["template123"] = dict(contract)
+        secret = "MALFORMED_PROVIDER_SECRET"
+        oversized = secret + "x" * 5000
+
+        def corrupt_live_pod():
+            self.api.pods[0].update(
+                {
+                    "name": secret,
+                    "desired_status": secret,
+                    "docker_start_cmd": [{"secret": secret}],
+                    "volume_mount_path": secret,
+                    "environment_status": "valid",
+                    "environment_names": [oversized],
+                    "environment_sha256": "0" * 64,
+                    "gpu_id": secret,
+                    "data_center_id": secret,
+                    "network_volume_id": secret,
+                    "cost_status": "invalid",
+                    "cost_per_hour": None,
+                    "machine_id": oversized,
+                    "network_volume": {
+                        "id": "volume123",
+                        "name": oversized,
+                        "size_gb": 500,
+                        "data_center_id": secret,
+                    },
+                    "port_mappings": {secret: "invalid"},
+                    "ports": [22, secret],
+                    "public_ip": secret + "\n",
+                }
+            )
+
+        self.api.before_get = corrupt_live_pod
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            self.launch()
+
+        self.assertEqual(caught.exception.code, "allocation_rejected")
+        self.assertEqual(self.api.delete_calls, ["pod123"])
+        receipt = InstanceStore(self.state).load("compiler")
+        self.assertEqual(receipt["phase"], "rolled_back")
+        self.assertEqual(
+            receipt["provider"]["environment_status"],
+            "invalid",
+        )
+        self.assertIsNone(
+            receipt["provider"]["environment_name_count"]
+        )
+        self.assertFalse(
+            receipt["provider"]["environment_names_match_expected"]
+        )
+        self.assertFalse(
+            receipt["provider"]["desired_status_matches_expected"]
+        )
+        self.assertFalse(
+            receipt["provider"]["volume_mount_path_matches_expected"]
+        )
+        self.assertFalse(receipt["provider"]["gpu_id_matches_expected"])
+        self.assertFalse(
+            receipt["provider"]["data_center_id_matches_expected"]
+        )
+        self.assertFalse(
+            receipt["provider"]["network_volume_id_matches_expected"]
+        )
+        self.assertEqual(receipt["provider"]["cost_status"], "invalid")
+        self.assertIsNone(receipt["provider"]["cost_per_hour"])
+        self.assertEqual(receipt["provider"]["ports_status"], "invalid")
+        self.assertIsNone(receipt["provider"]["port_count"])
+        self.assertFalse(receipt["provider"]["ports_match_expected"])
+        self.assertEqual(
+            receipt["provider"]["port_mappings_status"],
+            "invalid",
+        )
+        self.assertIsNone(receipt["provider"]["port_mapping_count"])
+        self.assertFalse(
+            receipt["provider"]["docker_start_cmd_summary"][
+                "valid_string_array"
+            ]
+        )
+        serialized = self.state.record_path(
+            "instances", "compiler"
+        ).read_text()
+        self.assertNotIn(secret, serialized)
+        self.assertNotIn(secret, repr(receipt))
+        self.assertNotIn(secret, str(caught.exception))
+
+    def test_instance_receipt_rejects_raw_provider_runtime_fields(self):
+        record = self.launch()
+        secret = "PROVIDER_SECRET=must-not-load"
+
+        for field, value in (
+            ("image", "private/secret-image"),
+            ("docker_entrypoint", ["/bin/bash", "-c"]),
+            ("docker_start_cmd", [secret]),
+            ("env", {"SSH_PUBLIC_KEY": secret}),
+            ("containerRegistryAuthId", "secret-registry-id"),
+        ):
+            with self.subTest(field=field):
+                tampered = copy.deepcopy(record)
+                tampered["provider"][field] = value
+                with self.assertRaises(RunpodLocalError) as caught:
+                    validate_instance_record(tampered)
+                self.assertEqual(
+                    caught.exception.code,
+                    "invalid_instance_record",
+                )
+
+    def test_receipt_environment_identity_is_canonical_to_pod_payload(self):
+        record = self.launch()
+
+        changed_hash = copy.deepcopy(record)
+        changed_hash["expected"]["environment_sha256"] = "0" * 64
+        with self.assertRaises(RunpodLocalError) as caught_hash:
+            validate_instance_record(changed_hash)
+        self.assertEqual(
+            caught_hash.exception.code,
+            "invalid_instance_record",
+        )
+
+        changed_auth = copy.deepcopy(record)
+        changed_auth["expected"]["has_registry_auth"] = True
+        with self.assertRaises(RunpodLocalError) as caught_auth:
+            validate_instance_record(changed_auth)
+        self.assertEqual(
+            caught_auth.exception.code,
+            "invalid_instance_record",
+        )
+
+    def test_template_drift_fails_before_account_or_create_request(self):
+        self.launch_profile = template_profile(
+            identity_file=str(self.identity)
+        )
+        drifted = dict(self.launch_profile["pod"]["template_contract"])
+        drifted["docker_start_cmd"] = ["different\n"]
+        self.api.templates["template123"] = drifted
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            self.launch()
+
+        self.assertEqual(caught.exception.code, "template_contract_drift")
+        self.assertEqual(self.api.account_ssh_attestation_calls, [])
+        self.assertEqual(self.api.create_calls, 0)
+        self.assertEqual(
+            InstanceStore(self.state).load("compiler")["phase"],
+            "intent",
+        )
+
+    def test_template_drift_during_preflight_fails_before_create_request(self):
+        self.launch_profile = template_profile(
+            identity_file=str(self.identity)
+        )
+        contract = self.launch_profile["pod"]["template_contract"]
+        self.api.templates["template123"] = dict(contract)
+
+        def drift_after_initial_attestation(call_count):
+            if call_count == 2:
+                self.api.templates["template123"][
+                    "docker_start_cmd"
+                ] = ["provider-secret=must-not-escape\n"]
+
+        self.api.before_get_template = drift_after_initial_attestation
+        with self.assertRaises(RunpodLocalError) as caught:
+            self.launch()
+
+        self.assertEqual(caught.exception.code, "template_contract_drift")
+        self.assertNotIn("must-not-escape", str(caught.exception))
+        self.assertEqual(len(self.api.account_ssh_attestation_calls), 1)
+        self.assertEqual(self.api.create_calls, 0)
+        self.assertEqual(
+            InstanceStore(self.state).load("compiler")["phase"],
+            "intent",
+        )
+
+    def test_template_allocation_attests_resolved_image_and_commands(self):
+        self.launch_profile = template_profile(
+            identity_file=str(self.identity)
+        )
+        contract = self.launch_profile["pod"]["template_contract"]
+        self.api.templates["template123"] = dict(contract)
+        record = self.launch()
+        pod = dict(self.api.pods[0])
+
+        for field, replacement in (
+            (
+                "image",
+                "private/secret-registry-material@sha256:" + "2" * 64,
+            ),
+            ("docker_entrypoint", ["/bin/sh", "-c"]),
+            (
+                "docker_start_cmd",
+                ["PROVIDER_SECRET=must-not-escape\n"],
+            ),
+        ):
+            with self.subTest(field=field):
+                drifted = dict(pod)
+                drifted[field] = replacement
+                violations, _ = verify_allocated_pod(record, drifted)
+                self.assertTrue(
+                    any(
+                        violation.startswith(f"{field}:")
+                        for violation in violations
+                    ),
+                    violations,
+                )
+                self.assertNotIn("must-not-escape", repr(violations))
+                self.assertNotIn(
+                    "secret-registry-material",
+                    repr(violations),
+                )
+
+    def test_live_allocation_rejects_boolean_integer_type_aliases(self):
+        record = self.launch()
+        baseline = dict(self.api.pods[0])
+        aliases = (
+            ("gpu_count", True),
+            ("secure_cloud", 1),
+            ("interruptible", 0),
+            ("locked", 0),
+            ("volume_in_gb", False),
+            ("volume_in_gb", 0.0),
+            ("has_registry_auth", 0),
+        )
+
+        for field, value in aliases:
+            with self.subTest(field=field, value=value):
+                pod = dict(baseline)
+                pod[field] = value
+                violations, _ = verify_allocated_pod(record, pod)
+                self.assertTrue(
+                    any(
+                        violation.startswith(f"{field}:")
+                        for violation in violations
+                    ),
+                    violations,
+                )
+
+    def test_rest_normalization_rejects_present_malformed_launch_facts(self):
+        self.launch_profile = template_profile(
+            identity_file=str(self.identity)
+        )
+        contract = self.launch_profile["pod"]["template_contract"]
+        self.api.templates["template123"] = dict(contract)
+        record = self.launch()
+        raw = {
+            "id": record["pod_id"],
+            "name": record["remote_name"],
+            "desiredStatus": "RUNNING",
+            "image": contract["image"],
+            "templateId": "template123",
+            "dockerEntrypoint": contract["docker_entrypoint"],
+            "dockerStartCmd": contract["docker_start_cmd"],
+            "containerDiskInGb": 50,
+            "volumeInGb": 0,
+            "volumeMountPath": "/workspace",
+            "env": dict(record["pod_payload"]["env"]),
+            "containerRegistryAuthId": None,
+            "interruptible": False,
+            "locked": False,
+            "gpu": {"id": GPU_ID, "count": 1},
+            "gpuCount": 1,
+            "adjustedCostPerHr": 1.99,
+            "machine": {
+                "dataCenterId": "US-NC-2",
+                "secureCloud": True,
+                "gpuTypeId": GPU_ID,
+            },
+            "networkVolume": {
+                "id": "volume123",
+                "name": "model-cache",
+                "size": 500,
+                "dataCenterId": "US-NC-2",
+            },
+            "ports": ["22/tcp"],
+            "portMappings": {},
+        }
+        secret = "NORMALIZED_PROVIDER_SECRET"
+        malformed_cases = (
+            ("dockerEntrypoint", {"secret": secret}, "docker_entrypoint"),
+            ("dockerStartCmd", [{"secret": secret}], "docker_start_cmd"),
+            ("ports", {"secret": secret}, "ports"),
+            ("portMappings", secret, "port_mappings"),
+            ("portMappings", {"22": secret}, "port_mappings"),
+            ("networkVolume", secret, "network_volume"),
+            ("machine", secret, "machine"),
+            ("gpu", secret, "gpu"),
+            ("adjustedCostPerHr", 10**4000, "cost_per_hour"),
+        )
+
+        for raw_field, malformed, violation_field in malformed_cases:
+            with self.subTest(field=raw_field):
+                candidate = dict(raw)
+                candidate[raw_field] = malformed
+                normalized = normalize_pod(candidate)
+                violations, _ = verify_allocated_pod(record, normalized)
+                self.assertTrue(
+                    any(
+                        violation.startswith(f"{violation_field}:")
+                        for violation in violations
+                    ),
+                    violations,
+                )
+                self.assertNotIn(secret, repr(normalized))
+                self.assertNotIn(secret, repr(violations))
+
+        wrong_volume_dc = copy.deepcopy(raw)
+        wrong_volume_dc["networkVolume"]["dataCenterId"] = "OTHER-DC"
+        violations, _ = verify_allocated_pod(
+            record,
+            normalize_pod(wrong_volume_dc),
+        )
+        self.assertTrue(
+            any(
+                violation.startswith(
+                    "network_volume_data_center_id:"
+                )
+                for violation in violations
+            ),
+            violations,
+        )
+
+    def test_template_receipt_cannot_change_zero_local_volume(self):
+        self.launch_profile = template_profile(
+            identity_file=str(self.identity)
+        )
+        contract = self.launch_profile["pod"]["template_contract"]
+        self.api.templates["template123"] = dict(contract)
+        record = self.launch()
+        record["expected"]["volume_in_gb"] = 20
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            validate_instance_record(record)
+
+        self.assertEqual(caught.exception.code, "invalid_instance_record")
+
     def test_allocation_verification_rejects_every_known_policy_mismatch(self):
         record = self.launch()
-        baseline = dict(record["provider"])
+        baseline = dict(self.api.pods[0])
         mismatches = {
             "id": "other-pod",
             "name": "other-name",
@@ -885,6 +1395,12 @@ class LifecycleTest(unittest.TestCase):
             "interruptible": True,
             "locked": True,
             "image": "other/image:tag",
+            "container_disk_gb": 51,
+            "volume_in_gb": 1,
+            "volume_mount_path": "/other",
+            "environment_names": ["INJECTED"],
+            "environment_sha256": "0" * 64,
+            "has_registry_auth": True,
             "desired_status": "EXITED",
             "ports": ["22/tcp", "8000/http"],
             "cost_per_hour": 3.01,
@@ -902,7 +1418,7 @@ class LifecycleTest(unittest.TestCase):
 
     def test_unknown_allocation_fields_remain_provisioning_not_mismatch(self):
         record = self.launch()
-        pod = dict(record["provider"])
+        pod = dict(self.api.pods[0])
         for field in (
             "gpu_id",
             "gpu_count",
@@ -912,28 +1428,52 @@ class LifecycleTest(unittest.TestCase):
             "interruptible",
             "locked",
             "image",
+            "container_disk_gb",
+            "volume_in_gb",
+            "volume_mount_path",
             "desired_status",
             "cost_per_hour",
         ):
             pod[field] = None
+        pod["gpu_status"] = "missing"
+        pod["machine_status"] = "missing"
+        pod["network_volume_status"] = "missing"
+        pod["cost_status"] = "missing"
+        pod["environment_status"] = "missing"
+        pod["environment_names"] = None
+        pod["environment_sha256"] = None
+        pod["registry_auth_status"] = "missing"
+        pod["has_registry_auth"] = None
+        pod["ports_status"] = "missing"
         pod["ports"] = []
 
         violations, pending = verify_allocated_pod(record, pod)
 
         self.assertEqual(violations, [])
-        self.assertIn("network_volume_id", pending)
+        self.assertIn("network_volume", pending)
+        self.assertIn("environment", pending)
+        self.assertIn("registry_auth", pending)
         self.assertIn("ports", pending)
 
     def test_ephemeral_allocation_accepts_absent_network_volume(self):
         record = self.launch()
         record["expected"]["network_volume_id"] = None
-        pod = dict(record["provider"])
+        pod = dict(self.api.pods[0])
+        pod["network_volume_status"] = "missing"
         pod["network_volume_id"] = None
+        pod["network_volume_data_center_id"] = None
+        pod["network_volume"] = None
 
         violations, pending = verify_allocated_pod(record, pod)
 
         self.assertEqual(violations, [])
         self.assertNotIn("network_volume_id", pending)
+
+        unexpected = dict(pod)
+        unexpected["network_volume_status"] = "valid"
+        unexpected["network_volume"] = {}
+        violations, _ = verify_allocated_pod(record, unexpected)
+        self.assertIn("network_volume: unexpected", violations)
 
     def test_failed_rollback_keeps_exact_pod_id_for_retry(self):
         self.api.created_cost = 3.01
@@ -1146,7 +1686,9 @@ class LifecycleTest(unittest.TestCase):
         self.launch()
         self.manager.terminate("compiler", execute=True, reason="operator")
         terminal = InstanceStore(self.state).load("compiler")
-        self.api.pods.append(dict(terminal["provider"]))
+        self.api.pods.append(
+            self.api.pod_for_payload(terminal["pod_payload"])
+        )
 
         plan = self.manager.terminate(
             "compiler", execute=False, reason="terminal_leak_recovery"

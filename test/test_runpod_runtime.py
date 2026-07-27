@@ -1,13 +1,21 @@
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import pathlib
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
 
+from runpod_local.errors import RunpodLocalError
+from runpod_local.runtime_catalog import (
+    _RUNTIME_CATALOG,
+    _load_runtime_entry,
+    load_runtime,
+)
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 BOOTSTRAP_ROOT = ROOT / "runpod" / "bootstrap" / "ssh"
@@ -17,6 +25,7 @@ BASE_IMAGE = (
     "vllm/vllm-openai@sha256:"
     "fb463d6a216c7ee82bf947f321cae7dd7105bfb5084ea35827c2ceb816994b15"
 )
+RUNTIME_ID = "vllm-cu129-v0.25.1"
 
 
 class RunpodUpstreamRuntimeTest(unittest.TestCase):
@@ -180,6 +189,210 @@ class RunpodUpstreamRuntimeTest(unittest.TestCase):
 
         self.assertIn("--manifest MANIFEST", completed.stdout)
         self.assertNotIn("/usr/local/share", verifier.read_text())
+
+
+class ReviewedRuntimeCatalogTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = pathlib.Path(self.temporary.name)
+        self.entry = _RUNTIME_CATALOG[RUNTIME_ID]
+
+    def write_catalog(
+        self,
+        *,
+        manifest_bytes: bytes | None = None,
+        bootstrap_bytes: bytes | None = None,
+    ) -> None:
+        manifest_path = self.root / self.entry.manifest_path
+        bootstrap_path = self.root / self.entry.bootstrap_path
+        manifest_path.parent.mkdir(parents=True)
+        bootstrap_path.parent.mkdir(parents=True)
+        if manifest_bytes is not None:
+            manifest_path.write_bytes(manifest_bytes)
+        if bootstrap_bytes is not None:
+            bootstrap_path.write_bytes(bootstrap_bytes)
+
+    def exact_source_bytes(self) -> tuple[bytes, bytes]:
+        return (
+            (ROOT / self.entry.manifest_path).read_bytes(),
+            (ROOT / self.entry.bootstrap_path).read_bytes(),
+        )
+
+    def test_catalog_loads_only_the_reviewed_exact_runtime(self):
+        runtime = load_runtime(RUNTIME_ID)
+
+        self.assertEqual(runtime.image, BASE_IMAGE)
+        self.assertEqual(runtime.bootstrap_path, self.entry.bootstrap_path)
+        self.assertEqual(
+            hashlib.sha256(runtime.bootstrap_text.encode()).hexdigest(),
+            self.entry.bootstrap_sha256,
+        )
+        self.assertEqual(
+            runtime.template_contract(name="fixture")["volume_in_gb"],
+            0,
+        )
+
+    def test_unknown_runtime_fails_with_a_typed_error(self):
+        for runtime_id in ("unknown", 7, None):
+            with self.subTest(runtime_id=runtime_id):
+                with self.assertRaises(RunpodLocalError) as caught:
+                    load_runtime(runtime_id)
+                self.assertEqual(caught.exception.code, "unknown_runtime")
+
+    def test_manifest_and_bootstrap_hash_drift_fail_closed(self):
+        manifest, bootstrap = self.exact_source_bytes()
+        for changed_manifest, changed_bootstrap in (
+            (manifest + b" ", bootstrap),
+            (manifest, bootstrap + b"\n"),
+        ):
+            with self.subTest(
+                manifest_changed=changed_manifest != manifest
+            ):
+                root = self.root / hashlib.sha256(
+                    changed_manifest + changed_bootstrap
+                ).hexdigest()
+                manifest_path = root / self.entry.manifest_path
+                bootstrap_path = root / self.entry.bootstrap_path
+                manifest_path.parent.mkdir(parents=True)
+                bootstrap_path.parent.mkdir(parents=True)
+                manifest_path.write_bytes(changed_manifest)
+                bootstrap_path.write_bytes(changed_bootstrap)
+                with self.assertRaises(RunpodLocalError) as caught:
+                    _load_runtime_entry(root, self.entry)
+                self.assertEqual(
+                    caught.exception.code,
+                    "runtime_catalog_drift",
+                )
+
+    def test_schema_and_runtime_field_drift_fail_after_identity_check(self):
+        manifest, bootstrap = self.exact_source_bytes()
+        for field, value, error_code in (
+            ("schema_version", "other.schema", "runtime_catalog_drift"),
+            (
+                "image",
+                "vllm/vllm-openai@sha256:" + "0" * 64,
+                "runtime_catalog_drift",
+            ),
+        ):
+            with self.subTest(field=field):
+                document = json.loads(manifest)
+                document[field] = value
+                changed = json.dumps(
+                    document,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+                entry = dataclasses.replace(
+                    self.entry,
+                    manifest_sha256=hashlib.sha256(changed).hexdigest(),
+                )
+                root = self.root / field
+                manifest_path = root / entry.manifest_path
+                bootstrap_path = root / entry.bootstrap_path
+                manifest_path.parent.mkdir(parents=True)
+                bootstrap_path.parent.mkdir(parents=True)
+                manifest_path.write_bytes(changed)
+                bootstrap_path.write_bytes(bootstrap)
+                with self.assertRaises(RunpodLocalError) as caught:
+                    _load_runtime_entry(root, entry)
+                self.assertEqual(caught.exception.code, error_code)
+
+    def test_symlinked_manifest_or_bootstrap_is_never_followed(self):
+        manifest, bootstrap = self.exact_source_bytes()
+        for symlink_field in ("manifest", "bootstrap"):
+            with self.subTest(symlink_field=symlink_field):
+                root = self.root / symlink_field
+                manifest_path = root / self.entry.manifest_path
+                bootstrap_path = root / self.entry.bootstrap_path
+                manifest_path.parent.mkdir(parents=True)
+                bootstrap_path.parent.mkdir(parents=True)
+                outside = root / f"{symlink_field}.outside"
+                if symlink_field == "manifest":
+                    outside.write_bytes(manifest)
+                    manifest_path.symlink_to(outside)
+                    bootstrap_path.write_bytes(bootstrap)
+                else:
+                    manifest_path.write_bytes(manifest)
+                    outside.write_bytes(bootstrap)
+                    bootstrap_path.symlink_to(outside)
+                with self.assertRaises(RunpodLocalError) as caught:
+                    _load_runtime_entry(root, self.entry)
+                self.assertEqual(
+                    caught.exception.code,
+                    "unsafe_runtime_catalog",
+                )
+
+    def test_private_primary_group_write_is_accepted_but_world_write_is_not(self):
+        manifest, bootstrap = self.exact_source_bytes()
+        self.write_catalog(
+            manifest_bytes=manifest,
+            bootstrap_bytes=bootstrap,
+        )
+        manifest_path = self.root / self.entry.manifest_path
+        bootstrap_path = self.root / self.entry.bootstrap_path
+        manifest_path.chmod(0o664)
+        bootstrap_path.chmod(0o664)
+        self.assertEqual(
+            _load_runtime_entry(self.root, self.entry).runtime_id,
+            RUNTIME_ID,
+        )
+
+        bootstrap_path.chmod(0o666)
+        with self.assertRaises(RunpodLocalError) as caught:
+            _load_runtime_entry(self.root, self.entry)
+        self.assertEqual(caught.exception.code, "unsafe_runtime_catalog")
+
+    def test_world_writable_or_symlinked_parent_is_not_a_trusted_source(self):
+        manifest, bootstrap = self.exact_source_bytes()
+        world_root = self.root / "world-parent"
+        manifest_path = world_root / self.entry.manifest_path
+        bootstrap_path = world_root / self.entry.bootstrap_path
+        manifest_path.parent.mkdir(parents=True)
+        bootstrap_path.parent.mkdir(parents=True)
+        manifest_path.write_bytes(manifest)
+        bootstrap_path.write_bytes(bootstrap)
+        bootstrap_path.parent.chmod(0o777)
+        with self.assertRaises(RunpodLocalError) as world_caught:
+            _load_runtime_entry(world_root, self.entry)
+        self.assertEqual(
+            world_caught.exception.code,
+            "unsafe_runtime_catalog",
+        )
+
+        symlink_root = self.root / "symlink-parent"
+        outside_root = self.root / "outside-parent"
+        outside_manifest = outside_root / self.entry.manifest_path
+        outside_bootstrap = outside_root / self.entry.bootstrap_path
+        outside_manifest.parent.mkdir(parents=True)
+        outside_bootstrap.parent.mkdir(parents=True)
+        outside_manifest.write_bytes(manifest)
+        outside_bootstrap.write_bytes(bootstrap)
+        symlink_root.mkdir()
+        (symlink_root / "runpod").symlink_to(
+            outside_root / "runpod",
+            target_is_directory=True,
+        )
+        with self.assertRaises(RunpodLocalError) as symlink_caught:
+            _load_runtime_entry(symlink_root, self.entry)
+        self.assertEqual(
+            symlink_caught.exception.code,
+            "unsafe_runtime_catalog",
+        )
+
+    def test_catalog_paths_cannot_escape_the_trusted_source_root(self):
+        manifest, bootstrap = self.exact_source_bytes()
+        self.write_catalog(
+            manifest_bytes=manifest,
+            bootstrap_bytes=bootstrap,
+        )
+        entry = dataclasses.replace(
+            self.entry,
+            manifest_path="../runtime-manifest.json",
+        )
+        with self.assertRaises(RunpodLocalError) as caught:
+            _load_runtime_entry(self.root, entry)
+        self.assertEqual(caught.exception.code, "unsafe_runtime_catalog")
 
 
 if __name__ == "__main__":

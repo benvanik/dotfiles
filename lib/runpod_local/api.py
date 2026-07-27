@@ -10,8 +10,14 @@ from .auth import ApiCredential
 from .errors import RunpodLocalError
 from .http import JsonHttpTransport
 from .profile import validate_ssh_public_key
+from .template import (
+    docker_arguments_summary,
+    environment_summary,
+    normalize_template,
+    string_summary,
+    template_create_payload,
+)
 from .timeutil import parse_utc_timestamp, utc_timestamp
-
 
 REST_BASE = "https://rest.runpod.io/v1"
 GRAPHQL_URL = "https://api.runpod.io/graphql"
@@ -77,6 +83,74 @@ POD_TYPE_INTERRUPTIBLE = {
     "BID": True,
     "BACKGROUND": True,
 }
+PROVIDER_POD_SNAPSHOT_FIELDS = frozenset(
+    {
+        "id_matches_expected",
+        "name_matches_expected",
+        "desired_status_matches_expected",
+        "template_id_matches_expected",
+        "container_disk_gb",
+        "volume_in_gb",
+        "volume_mount_path_matches_expected",
+        "environment_status",
+        "environment_name_count",
+        "environment_names_match_expected",
+        "environment_sha256",
+        "environment_sha256_matches_expected",
+        "registry_auth_status",
+        "has_registry_auth",
+        "interruptible",
+        "locked",
+        "gpu_status",
+        "gpu_id_matches_expected",
+        "gpu_count",
+        "cost_status",
+        "cost_per_hour",
+        "machine_status",
+        "data_center_id_matches_expected",
+        "secure_cloud",
+        "network_volume_status",
+        "network_volume_id_matches_expected",
+        "network_volume_present",
+        "network_volume_size_gb",
+        "network_volume_data_center_id_matches_expected",
+        "port_count",
+        "ports_status",
+        "ports_match_expected",
+        "port_mappings_status",
+        "port_mapping_count",
+        "image_matches_expected",
+        "image_summary",
+        "docker_entrypoint_status",
+        "docker_entrypoint_matches_expected",
+        "docker_entrypoint_summary",
+        "docker_start_cmd_status",
+        "docker_start_cmd_matches_expected",
+        "docker_start_cmd_summary",
+    }
+)
+PROVIDER_POD_SNAPSHOT_EXPECTED_FIELDS = frozenset(
+    {
+        "id",
+        "name",
+        "desired_status",
+        "template_id",
+        "volume_mount_path",
+        "environment_names",
+        "environment_sha256",
+        "gpu_id",
+        "data_center_id",
+        "network_volume_id",
+        "network_volume_data_center_id",
+        "ports",
+        "image",
+        "docker_entrypoint",
+        "docker_start_cmd",
+    }
+)
+PROVIDER_STATUS_VALUES = frozenset({"valid", "invalid", "missing"})
+HEX_DIGITS = frozenset("0123456789abcdef")
+MAX_PROVIDER_INTEGER = (1 << 63) - 1
 
 
 def _ssh_public_key_identity(value: str) -> tuple[str, str]:
@@ -123,7 +197,10 @@ def _provider_id(value: str, *, label: str) -> str:
 
 def _numeric(value: Any) -> float | None:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        result = float(value)
+        try:
+            result = float(value)
+        except (OverflowError, ValueError):
+            return None
         return result if math.isfinite(result) and result >= 0 else None
     if isinstance(value, str):
         try:
@@ -132,6 +209,18 @@ def _numeric(value: Any) -> float | None:
             return None
         return result if math.isfinite(result) and result >= 0 else None
     return None
+
+
+def valid_ssh_port_mappings(value: Any) -> bool:
+    return isinstance(value, dict) and (
+        not value
+        or (
+            set(value) == {"22"}
+            and isinstance(value["22"], int)
+            and not isinstance(value["22"], bool)
+            and 0 < value["22"] <= 65535
+        )
+    )
 
 
 def _pod_payload_error(message: str) -> RunpodLocalError:
@@ -372,45 +461,157 @@ def gpu_stock_is_available(gpu: dict[str, Any], *, gpu_count: int) -> bool:
 
 
 def normalize_pod(pod: dict[str, Any]) -> dict[str, Any]:
-    gpu = pod.get("gpu") if isinstance(pod.get("gpu"), dict) else {}
+    raw_gpu = pod.get("gpu")
+    if "gpu" not in pod or raw_gpu is None:
+        gpu = {}
+        gpu_status = "missing"
+    elif isinstance(raw_gpu, dict):
+        gpu = raw_gpu
+        gpu_status = "valid"
+    else:
+        gpu = {}
+        gpu_status = "invalid"
     gpu_count = gpu.get("count")
     if gpu_count is None:
         gpu_count = pod.get("gpuCount")
-    machine = (
-        pod.get("machine") if isinstance(pod.get("machine"), dict) else {}
+    raw_machine = pod.get("machine")
+    if "machine" not in pod or raw_machine is None:
+        machine = {}
+        machine_status = "missing"
+    elif isinstance(raw_machine, dict):
+        machine = raw_machine
+        machine_status = "valid"
+    else:
+        machine = {}
+        machine_status = "invalid"
+    raw_network_volume = pod.get("networkVolume")
+    if "networkVolume" not in pod or raw_network_volume is None:
+        network_volume = None
+        network_volume_status = "missing"
+    elif isinstance(raw_network_volume, dict):
+        network_volume = raw_network_volume
+        network_volume_status = "valid"
+    else:
+        network_volume = None
+        network_volume_status = "invalid"
+    raw_port_mappings = pod.get("portMappings")
+    if "portMappings" not in pod or raw_port_mappings is None:
+        port_mappings = {}
+        port_mappings_status = "missing"
+    elif isinstance(raw_port_mappings, dict):
+        if valid_ssh_port_mappings(raw_port_mappings):
+            port_mappings = dict(raw_port_mappings)
+            port_mappings_status = "valid"
+        else:
+            port_mappings = {}
+            port_mappings_status = "invalid"
+    else:
+        port_mappings = {}
+        port_mappings_status = "invalid"
+    cost_per_hour = None
+    cost_status = "missing"
+    for cost_field in ("adjustedCostPerHr", "costPerHr"):
+        if cost_field not in pod or pod[cost_field] is None:
+            continue
+        cost_per_hour = _numeric(pod[cost_field])
+        cost_status = "valid" if cost_per_hour is not None else "invalid"
+        break
+    if "env" not in pod:
+        normalized_environment = None
+        environment_status = "missing"
+    else:
+        normalized_environment = environment_summary(pod.get("env"))
+        environment_status = (
+            "valid" if normalized_environment is not None else "invalid"
+        )
+    registry_auth = pod.get("containerRegistryAuthId")
+    if (
+        "containerRegistryAuthId" not in pod
+        or registry_auth in (None, "")
+    ):
+        has_registry_auth = False
+        registry_auth_status = "valid"
+    elif isinstance(registry_auth, str):
+        has_registry_auth = True
+        registry_auth_status = "valid"
+    else:
+        has_registry_auth = None
+        registry_auth_status = "invalid"
+
+    def string_array(field: str) -> tuple[list[str] | None, str]:
+        if field not in pod or pod[field] is None:
+            return None, "missing"
+        value = pod.get(field)
+        if not isinstance(value, list) or not all(
+            isinstance(argument, str) for argument in value
+        ):
+            return None, "invalid"
+        return list(value), "valid"
+
+    docker_entrypoint, docker_entrypoint_status = string_array(
+        "dockerEntrypoint"
     )
-    network_volume = (
-        pod.get("networkVolume")
-        if isinstance(pod.get("networkVolume"), dict)
-        else None
+    docker_start_cmd, docker_start_cmd_status = string_array(
+        "dockerStartCmd"
     )
-    port_mappings = (
-        pod.get("portMappings")
-        if isinstance(pod.get("portMappings"), dict)
-        else {}
-    )
-    adjusted_cost = _numeric(pod.get("adjustedCostPerHr"))
-    cost_per_hour = (
-        adjusted_cost
-        if adjusted_cost is not None
-        else _numeric(pod.get("costPerHr"))
-    )
+    raw_ports = pod.get("ports")
+    if "ports" not in pod or raw_ports is None:
+        ports = []
+        ports_status = "missing"
+    elif isinstance(raw_ports, list) and all(
+        isinstance(port, str) for port in raw_ports
+    ):
+        ports = list(raw_ports)
+        ports_status = "valid"
+    else:
+        ports = []
+        ports_status = "invalid"
+
     return {
         "id": pod.get("id"),
         "name": pod.get("name"),
         "desired_status": pod.get("desiredStatus"),
         "image": pod.get("image", pod.get("imageName")),
         "template_id": pod.get("templateId"),
+        "docker_entrypoint_status": docker_entrypoint_status,
+        "docker_entrypoint": docker_entrypoint,
+        "docker_start_cmd_status": docker_start_cmd_status,
+        "docker_start_cmd": docker_start_cmd,
+        "container_disk_gb": pod.get("containerDiskInGb"),
+        "volume_in_gb": pod.get("volumeInGb"),
+        "volume_mount_path": pod.get("volumeMountPath"),
+        "environment_status": environment_status,
+        "environment_names": (
+            normalized_environment["environment_names"]
+            if normalized_environment is not None
+            else None
+        ),
+        "environment_sha256": (
+            normalized_environment["environment_sha256"]
+            if normalized_environment is not None
+            else None
+        ),
+        "registry_auth_status": registry_auth_status,
+        "has_registry_auth": has_registry_auth,
         "interruptible": pod.get("interruptible"),
         "locked": pod.get("locked"),
+        "gpu_status": gpu_status,
         "gpu_id": gpu.get("id", machine.get("gpuTypeId")),
         "gpu_count": gpu_count,
+        "cost_status": cost_status,
         "cost_per_hour": cost_per_hour,
+        "machine_status": machine_status,
         "data_center_id": machine.get("dataCenterId"),
         "secure_cloud": machine.get("secureCloud"),
         "machine_id": pod.get("machineId"),
+        "network_volume_status": network_volume_status,
         "network_volume_id": (
             network_volume.get("id") if network_volume is not None else None
+        ),
+        "network_volume_data_center_id": (
+            network_volume.get("dataCenterId")
+            if network_volume is not None
+            else None
         ),
         "network_volume": (
             {
@@ -423,9 +624,595 @@ def normalize_pod(pod: dict[str, Any]) -> dict[str, Any]:
             else None
         ),
         "public_ip": pod.get("publicIp"),
+        "port_mappings_status": port_mappings_status,
         "port_mappings": port_mappings,
-        "ports": pod.get("ports") if isinstance(pod.get("ports"), list) else [],
+        "ports_status": ports_status,
+        "ports": ports,
     }
+
+
+def _safe_provider_integer(value: Any) -> int | None:
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < 0
+        or value > MAX_PROVIDER_INTEGER
+    ):
+        return None
+    return value
+
+
+def _safe_provider_number(value: Any) -> int | float | None:
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or _numeric(value) is None
+    ):
+        return None
+    return value
+
+
+def _safe_provider_boolean(value: Any) -> bool | None:
+    return value if type(value) is bool else None
+
+
+def _valid_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in HEX_DIGITS for character in value)
+    )
+
+
+def _valid_environment_names(value: Any) -> bool:
+    return (
+        isinstance(value, list)
+        and all(
+            isinstance(name, str)
+            and bool(name)
+            and len(name) <= 4096
+            and name.isprintable()
+            for name in value
+        )
+        and value == sorted(set(value))
+    )
+
+
+def _valid_string_summary(value: Any) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "valid_string",
+        "utf8_bytes",
+        "sha256",
+    }:
+        return False
+    valid = value.get("valid_string")
+    byte_count = value.get("utf8_bytes")
+    digest = value.get("sha256")
+    if type(valid) is not bool:
+        return False
+    if valid:
+        return (
+            isinstance(byte_count, int)
+            and not isinstance(byte_count, bool)
+            and byte_count >= 0
+            and _valid_sha256(digest)
+        )
+    return byte_count is None and digest is None
+
+
+def _valid_docker_arguments_summary(value: Any) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "valid_string_array",
+        "argument_count",
+        "utf8_bytes",
+        "sha256",
+    }:
+        return False
+    valid = value.get("valid_string_array")
+    argument_count = value.get("argument_count")
+    byte_count = value.get("utf8_bytes")
+    digest = value.get("sha256")
+    if (
+        type(valid) is not bool
+        or (
+            argument_count is not None
+            and (
+                not isinstance(argument_count, int)
+                or isinstance(argument_count, bool)
+                or argument_count < 0
+            )
+        )
+    ):
+        return False
+    if valid:
+        return (
+            argument_count is not None
+            and isinstance(byte_count, int)
+            and not isinstance(byte_count, bool)
+            and byte_count >= 0
+            and _valid_sha256(digest)
+        )
+    return byte_count is None and digest is None
+
+
+def _strict_match(actual: Any, expected: Any) -> bool:
+    return type(actual) is type(expected) and actual == expected
+
+
+def _safe_provider_status(value: Any) -> str:
+    return (
+        value
+        if isinstance(value, str) and value in PROVIDER_STATUS_VALUES
+        else "invalid"
+    )
+
+
+def validate_provider_pod_snapshot(value: Any) -> dict[str, Any]:
+    """Require the exact secret-safe Pod shape accepted by durable receipts."""
+
+    if (
+        not isinstance(value, dict)
+        or set(value) != PROVIDER_POD_SNAPSHOT_FIELDS
+    ):
+        raise RunpodLocalError(
+            "durable provider Pod snapshot has unsupported or missing fields",
+            code="invalid_provider_snapshot",
+        )
+    required_match_fields = (
+        "id_matches_expected",
+        "name_matches_expected",
+        "desired_status_matches_expected",
+        "template_id_matches_expected",
+        "volume_mount_path_matches_expected",
+        "environment_names_match_expected",
+        "environment_sha256_matches_expected",
+        "gpu_id_matches_expected",
+        "network_volume_id_matches_expected",
+        "ports_match_expected",
+        "image_matches_expected",
+        "docker_entrypoint_matches_expected",
+        "docker_start_cmd_matches_expected",
+    )
+    optional_match_fields = (
+        "data_center_id_matches_expected",
+        "network_volume_data_center_id_matches_expected",
+    )
+    if any(type(value[field]) is not bool for field in required_match_fields):
+        raise RunpodLocalError(
+            "durable provider Pod snapshot has an invalid match result",
+            code="invalid_provider_snapshot",
+        )
+    if any(
+        value[field] is not None and type(value[field]) is not bool
+        for field in optional_match_fields
+    ):
+        raise RunpodLocalError(
+            "durable provider Pod snapshot has an invalid match result",
+            code="invalid_provider_snapshot",
+        )
+    integer_fields = (
+        "container_disk_gb",
+        "volume_in_gb",
+        "environment_name_count",
+        "gpu_count",
+        "network_volume_size_gb",
+        "port_count",
+        "port_mapping_count",
+    )
+    if any(
+        value[field] is not None
+        and _safe_provider_integer(value[field]) is None
+        for field in integer_fields
+    ):
+        raise RunpodLocalError(
+            "durable provider Pod snapshot has an invalid numeric fact",
+            code="invalid_provider_snapshot",
+        )
+    boolean_fields = (
+        "has_registry_auth",
+        "interruptible",
+        "locked",
+        "secure_cloud",
+        "network_volume_present",
+    )
+    if any(
+        value[field] is not None
+        and _safe_provider_boolean(value[field]) is None
+        for field in boolean_fields
+    ):
+        raise RunpodLocalError(
+            "durable provider Pod snapshot has an invalid boolean fact",
+            code="invalid_provider_snapshot",
+        )
+    cost_status = value["cost_status"]
+    cost_per_hour = value["cost_per_hour"]
+    if (
+        _safe_provider_status(cost_status) != cost_status
+        or (
+            cost_status == "valid"
+            and _safe_provider_number(cost_per_hour) is None
+        )
+        or (
+            cost_status != "valid"
+            and cost_per_hour is not None
+        )
+    ):
+        raise RunpodLocalError(
+            "durable provider Pod snapshot has invalid price evidence",
+            code="invalid_provider_snapshot",
+        )
+    status_fields = (
+        "gpu_status",
+        "machine_status",
+        "network_volume_status",
+        "ports_status",
+        "port_mappings_status",
+        "docker_entrypoint_status",
+        "docker_start_cmd_status",
+    )
+    if any(
+        _safe_provider_status(value[field]) != value[field]
+        for field in status_fields
+    ):
+        raise RunpodLocalError(
+            "durable provider Pod snapshot has an invalid fact status",
+            code="invalid_provider_snapshot",
+        )
+    if (
+        (
+            value["network_volume_status"] == "valid"
+            and value["network_volume_present"] is not True
+        )
+        or (
+            value["network_volume_status"] != "valid"
+            and value["network_volume_present"] is not False
+        )
+        or (
+            value["ports_status"] == "valid"
+            and value["port_count"] is None
+        )
+        or (
+            value["ports_status"] != "valid"
+            and value["port_count"] is not None
+        )
+        or (
+            value["port_mappings_status"] == "valid"
+            and value["port_mapping_count"] is None
+        )
+        or (
+            value["port_mappings_status"] != "valid"
+            and value["port_mapping_count"] is not None
+        )
+    ):
+        raise RunpodLocalError(
+            "durable provider Pod snapshot has inconsistent fact status",
+            code="invalid_provider_snapshot",
+        )
+    environment_status = value["environment_status"]
+    environment_sha256 = value["environment_sha256"]
+    if (
+        _safe_provider_status(environment_status) != environment_status
+        or (
+            environment_status == "valid"
+            and (
+                value["environment_name_count"] is None
+                or not _valid_sha256(environment_sha256)
+            )
+        )
+        or (
+            environment_status != "valid"
+            and (
+                value["environment_name_count"] is not None
+                or environment_sha256 is not None
+            )
+        )
+    ):
+        raise RunpodLocalError(
+            "durable provider Pod snapshot has an invalid environment summary",
+            code="invalid_provider_snapshot",
+        )
+    registry_auth_status = value["registry_auth_status"]
+    has_registry_auth = value["has_registry_auth"]
+    if (
+        _safe_provider_status(registry_auth_status)
+        != registry_auth_status
+        or (
+            registry_auth_status == "valid"
+            and type(has_registry_auth) is not bool
+        )
+        or (
+            registry_auth_status != "valid"
+            and has_registry_auth is not None
+        )
+    ):
+        raise RunpodLocalError(
+            "durable provider Pod snapshot has invalid registry-auth evidence",
+            code="invalid_provider_snapshot",
+        )
+    if (
+        not _valid_string_summary(value["image_summary"])
+        or not _valid_docker_arguments_summary(
+            value["docker_entrypoint_summary"]
+        )
+        or not _valid_docker_arguments_summary(
+            value["docker_start_cmd_summary"]
+        )
+    ):
+        raise RunpodLocalError(
+            "durable provider Pod snapshot has invalid byte summaries",
+            code="invalid_provider_snapshot",
+        )
+    for status_field, summary_field in (
+        ("docker_entrypoint_status", "docker_entrypoint_summary"),
+        ("docker_start_cmd_status", "docker_start_cmd_summary"),
+    ):
+        summary_is_valid = value[summary_field]["valid_string_array"]
+        if (value[status_field] == "valid") is not summary_is_valid:
+            raise RunpodLocalError(
+                "durable provider Pod snapshot has inconsistent Docker status",
+                code="invalid_provider_snapshot",
+            )
+    return value
+
+
+def provider_pod_snapshot(
+    pod: dict[str, Any],
+    *,
+    expected: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the only normalized Pod shape permitted in a durable receipt."""
+
+    if (
+        not isinstance(expected, dict)
+        or set(expected) != PROVIDER_POD_SNAPSHOT_EXPECTED_FIELDS
+    ):
+        raise RunpodLocalError(
+            "provider Pod snapshot expectations are incomplete",
+            code="invalid_provider_snapshot",
+        )
+    snapshot: dict[str, Any] = {
+        "id_matches_expected": _strict_match(
+            pod.get("id"), expected["id"]
+        ),
+        "name_matches_expected": _strict_match(
+            pod.get("name"), expected["name"]
+        ),
+        "desired_status_matches_expected": _strict_match(
+            pod.get("desired_status"), expected["desired_status"]
+        ),
+        "template_id_matches_expected": _strict_match(
+            pod.get("template_id"), expected["template_id"]
+        ),
+        "container_disk_gb": _safe_provider_integer(
+            pod.get("container_disk_gb")
+        ),
+        "volume_in_gb": _safe_provider_integer(pod.get("volume_in_gb")),
+        "volume_mount_path_matches_expected": _strict_match(
+            pod.get("volume_mount_path"),
+            expected["volume_mount_path"],
+        ),
+        "interruptible": _safe_provider_boolean(
+            pod.get("interruptible")
+        ),
+        "locked": _safe_provider_boolean(pod.get("locked")),
+        "gpu_status": _safe_provider_status(pod.get("gpu_status")),
+        "gpu_id_matches_expected": _strict_match(
+            pod.get("gpu_id"), expected["gpu_id"]
+        ),
+        "gpu_count": _safe_provider_integer(pod.get("gpu_count")),
+        "data_center_id_matches_expected": (
+            None
+            if expected["data_center_id"] is None
+            else _strict_match(
+                pod.get("data_center_id"),
+                expected["data_center_id"],
+            )
+        ),
+        "machine_status": _safe_provider_status(
+            pod.get("machine_status")
+        ),
+        "secure_cloud": _safe_provider_boolean(
+            pod.get("secure_cloud")
+        ),
+        "network_volume_id_matches_expected": _strict_match(
+            pod.get("network_volume_id"),
+            expected["network_volume_id"],
+        ),
+    }
+    observed_cost = _safe_provider_number(pod.get("cost_per_hour"))
+    observed_cost_status = _safe_provider_status(pod.get("cost_status"))
+    if observed_cost_status == "valid" and observed_cost is not None:
+        snapshot["cost_status"] = "valid"
+        snapshot["cost_per_hour"] = observed_cost
+    else:
+        snapshot["cost_status"] = (
+            "invalid"
+            if observed_cost_status == "valid"
+            else observed_cost_status
+        )
+        snapshot["cost_per_hour"] = None
+
+    environment_status = _safe_provider_status(
+        pod.get("environment_status")
+    )
+    environment_names = pod.get("environment_names")
+    environment_sha256 = pod.get("environment_sha256")
+    if (
+        environment_status == "valid"
+        and _valid_environment_names(environment_names)
+        and _valid_sha256(environment_sha256)
+    ):
+        snapshot["environment_status"] = "valid"
+        snapshot["environment_name_count"] = len(environment_names)
+        snapshot["environment_names_match_expected"] = _strict_match(
+            environment_names,
+            expected["environment_names"],
+        )
+        snapshot["environment_sha256"] = environment_sha256
+        snapshot["environment_sha256_matches_expected"] = _strict_match(
+            environment_sha256,
+            expected["environment_sha256"],
+        )
+    else:
+        snapshot["environment_status"] = (
+            "invalid"
+            if environment_status == "valid"
+            else environment_status
+        )
+        snapshot["environment_name_count"] = None
+        snapshot["environment_names_match_expected"] = False
+        snapshot["environment_sha256"] = None
+        snapshot["environment_sha256_matches_expected"] = False
+
+    registry_auth_status = _safe_provider_status(
+        pod.get("registry_auth_status")
+    )
+    has_registry_auth = pod.get("has_registry_auth")
+    if (
+        registry_auth_status == "valid"
+        and type(has_registry_auth) is bool
+    ):
+        snapshot["registry_auth_status"] = "valid"
+        snapshot["has_registry_auth"] = has_registry_auth
+    else:
+        snapshot["registry_auth_status"] = (
+            "invalid"
+            if registry_auth_status == "valid"
+            else registry_auth_status
+        )
+        snapshot["has_registry_auth"] = None
+
+    ports = pod.get("ports")
+    valid_ports = isinstance(ports, list) and all(
+        isinstance(port, str) for port in ports
+    )
+    observed_ports_status = _safe_provider_status(
+        pod.get("ports_status")
+    )
+    if observed_ports_status == "valid" and valid_ports:
+        snapshot["ports_status"] = "valid"
+        snapshot["port_count"] = len(ports)
+    else:
+        snapshot["ports_status"] = (
+            "invalid"
+            if observed_ports_status == "valid"
+            else observed_ports_status
+        )
+        snapshot["port_count"] = None
+    snapshot["ports_match_expected"] = bool(
+        snapshot["ports_status"] == "valid"
+        and sorted(ports) == sorted(expected["ports"])
+    )
+    port_mappings = pod.get("port_mappings")
+    observed_port_mappings_status = _safe_provider_status(
+        pod.get("port_mappings_status")
+    )
+    if (
+        observed_port_mappings_status == "valid"
+        and valid_ssh_port_mappings(port_mappings)
+    ):
+        snapshot["port_mappings_status"] = "valid"
+        snapshot["port_mapping_count"] = len(port_mappings)
+    else:
+        snapshot["port_mappings_status"] = (
+            "invalid"
+            if observed_port_mappings_status == "valid"
+            else observed_port_mappings_status
+        )
+        snapshot["port_mapping_count"] = None
+    network_volume = pod.get("network_volume")
+    observed_volume_status = _safe_provider_status(
+        pod.get("network_volume_status")
+    )
+    if (
+        observed_volume_status == "valid"
+        and isinstance(network_volume, dict)
+    ):
+        snapshot["network_volume_status"] = "valid"
+        snapshot["network_volume_present"] = True
+    else:
+        snapshot["network_volume_status"] = (
+            "invalid"
+            if observed_volume_status == "valid"
+            else observed_volume_status
+        )
+        snapshot["network_volume_present"] = False
+    snapshot["network_volume_size_gb"] = (
+        _safe_provider_integer(network_volume.get("size_gb"))
+        if snapshot["network_volume_status"] == "valid"
+        else None
+    )
+    expected_volume_data_center = expected[
+        "network_volume_data_center_id"
+    ]
+    snapshot["network_volume_data_center_id_matches_expected"] = (
+        None
+        if expected_volume_data_center is None
+        else bool(
+            snapshot["network_volume_status"] == "valid"
+            and _strict_match(
+                network_volume.get("data_center_id"),
+                expected_volume_data_center,
+            )
+        )
+    )
+    snapshot["image_summary"] = string_summary(pod.get("image"))
+    snapshot["image_matches_expected"] = _strict_match(
+        pod.get("image"), expected["image"]
+    )
+    docker_entrypoint = pod.get("docker_entrypoint")
+    entrypoint_summary = docker_arguments_summary(docker_entrypoint)
+    observed_entrypoint_status = _safe_provider_status(
+        pod.get("docker_entrypoint_status")
+    )
+    snapshot["docker_entrypoint_status"] = (
+        "valid"
+        if (
+            observed_entrypoint_status == "valid"
+            and entrypoint_summary["valid_string_array"]
+        )
+        else (
+            "invalid"
+            if observed_entrypoint_status == "valid"
+            else observed_entrypoint_status
+        )
+    )
+    snapshot["docker_entrypoint_summary"] = (
+        entrypoint_summary
+        if snapshot["docker_entrypoint_status"] == "valid"
+        else docker_arguments_summary(None)
+    )
+    snapshot["docker_entrypoint_matches_expected"] = _strict_match(
+        docker_entrypoint,
+        expected["docker_entrypoint"],
+    )
+    docker_start_cmd = pod.get("docker_start_cmd")
+    start_cmd_summary = docker_arguments_summary(docker_start_cmd)
+    observed_start_cmd_status = _safe_provider_status(
+        pod.get("docker_start_cmd_status")
+    )
+    snapshot["docker_start_cmd_status"] = (
+        "valid"
+        if (
+            observed_start_cmd_status == "valid"
+            and start_cmd_summary["valid_string_array"]
+        )
+        else (
+            "invalid"
+            if observed_start_cmd_status == "valid"
+            else observed_start_cmd_status
+        )
+    )
+    snapshot["docker_start_cmd_summary"] = (
+        start_cmd_summary
+        if snapshot["docker_start_cmd_status"] == "valid"
+        else docker_arguments_summary(None)
+    )
+    snapshot["docker_start_cmd_matches_expected"] = _strict_match(
+        docker_start_cmd,
+        expected["docker_start_cmd"],
+    )
+    return validate_provider_pod_snapshot(snapshot)
 
 
 def normalize_volume(volume: dict[str, Any]) -> dict[str, Any]:
@@ -839,7 +1626,42 @@ class RunpodApi:
                 "Runpod template response was not an object list",
                 code="invalid_provider_response",
             )
-        return value
+        return [normalize_template(template) for template in value]
+
+    def get_template(self, template_id: str) -> dict[str, Any]:
+        template_id = _provider_id(template_id, label="template ID")
+        value = self._rest(
+            "GET",
+            f"templates/{urllib.parse.quote(template_id, safe='')}",
+        )
+        if not isinstance(value, dict):
+            raise RunpodLocalError(
+                "Runpod template response was not an object",
+                code="invalid_provider_response",
+            )
+        normalized = normalize_template(value)
+        if normalized["id"] != template_id:
+            raise RunpodLocalError(
+                "Runpod template response ID did not match the request",
+                code="invalid_provider_response",
+            )
+        return normalized
+
+    def create_template(
+        self,
+        contract: dict[str, Any],
+    ) -> dict[str, Any]:
+        value = self._rest(
+            "POST",
+            "templates",
+            payload=template_create_payload(contract),
+        )
+        if not isinstance(value, dict):
+            raise RunpodLocalError(
+                "Runpod template creation response was not an object",
+                code="invalid_provider_response",
+            )
+        return normalize_template(value)
 
     def stock(
         self,

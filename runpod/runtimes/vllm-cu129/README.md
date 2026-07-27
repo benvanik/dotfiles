@@ -11,6 +11,14 @@ runtime. Our only launch overlay is the small, content-identified SSH bootstrap
 in `runpod/bootstrap/ssh`; model profiles and Hugging Face caches remain
 external state.
 
+The public controller surface selects this reviewed pair by catalog ID; it
+does not accept arbitrary image or bootstrap inputs:
+
+```sh
+runpod-template create upstream-vllm-cu129 \
+  --runtime vllm-cu129-v0.25.1 --json
+```
+
 After SSH becomes ready, the administration layer copies this manifest and
 `verify-runtime.py` into ephemeral container storage and runs the verifier
 before starting a model. The verification report distinguishes the requested

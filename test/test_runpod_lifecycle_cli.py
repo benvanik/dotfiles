@@ -8,6 +8,7 @@ from unittest import mock
 from runpod_local.cli import build_parser
 from runpod_local.errors import RunpodLocalError
 from runpod_local.lifecycle_cli import (
+    _print,
     _resolve_idle_timeout_seconds,
     _resolve_launch_ttl_seconds,
     _run_up,
@@ -15,6 +16,27 @@ from runpod_local.lifecycle_cli import (
 
 
 class LifecycleCliTest(unittest.TestCase):
+    def test_public_lifecycle_json_redacts_saved_docker_arguments(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            _print(
+                {
+                    "schema_version": "runpod.launch-result.v1",
+                    "instance": {
+                        "docker_entrypoint": ["/bin/bash", "-c"],
+                        "docker_start_cmd": [
+                            "PROVIDER_SECRET=must-not-escape\n"
+                        ],
+                    },
+                },
+                as_json=True,
+            )
+
+        emitted = output.getvalue()
+        self.assertNotIn("must-not-escape", emitted)
+        self.assertIn('"argument_count": 1', emitted)
+        self.assertIn('"sha256":', emitted)
+
     def test_implicit_launch_ttl_caps_stale_profile_defaults(self):
         self.assertEqual(_resolve_launch_ttl_seconds(None, 4 * 60 * 60), 1800)
 

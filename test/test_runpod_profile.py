@@ -19,15 +19,22 @@ from runpod_local.profile import (
     validate_ssh_key_pair,
     validate_ssh_public_key,
 )
+from runpod_local.runtime_catalog import load_runtime
 from runpod_local.state import StateStore
+from runpod_local.template import build_private_template_contract
 from runpod_local.timeutil import parse_duration
-
 
 SSH_PUBLIC_KEY = (
     "ssh-ed25519 "
     "AAAAC3NzaC1lZDI1NTE5AAAAIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f "
     "fixture@example"
 )
+IMAGE = (
+    "runpod/pytorch@sha256:"
+    "1111111111111111111111111111111111111111111111111111111111111111"
+)
+RUNTIME_ID = "vllm-cu129-v0.25.1"
+RUNTIME = load_runtime(RUNTIME_ID)
 
 
 def _ssh_wire_string(value: bytes) -> bytes:
@@ -49,12 +56,26 @@ def profile(**overrides):
         "gpu_names": ["pro6000", "h200", "b200", "b300"],
         "max_hourly_usd": 8.0,
         "default_ttl_seconds": 4 * 60 * 60,
-        "template_id": "template123",
+        "image_name": IMAGE,
         "network_volume_id": "volume123",
         "ssh_public_key": SSH_PUBLIC_KEY,
     }
     arguments.update(overrides)
     return create_profile(**arguments)
+
+
+def template_profile(**overrides):
+    contract = RUNTIME.template_contract(
+        name="upstream-runtime",
+        template_id="template123",
+    )
+    return profile(
+        image_name=RUNTIME.image,
+        template_id="template123",
+        template_contract=contract,
+        runtime_id=RUNTIME_ID,
+        **overrides,
+    )
 
 
 class ProfileTest(unittest.TestCase):
@@ -72,6 +93,18 @@ class ProfileTest(unittest.TestCase):
         self.assertEqual(
             pod["environment"]["HF_TOKEN_PATH"],
             "/root/runpod-session/secrets/huggingface/token",
+        )
+        self.assertEqual(
+            pod["environment"]["TORCH_HOME"],
+            "/root/runpod-session/cache/torch",
+        )
+        self.assertEqual(
+            pod["environment"]["VLLM_CACHE_ROOT"],
+            "/root/runpod-session/cache/vllm",
+        )
+        self.assertEqual(
+            pod["environment"]["XDG_CACHE_HOME"],
+            "/root/runpod-session/cache",
         )
         self.assertEqual(value["limits"]["max_hourly_usd"], 8.0)
         self.assertEqual(value["lease"]["expiry_action"], "terminate")
@@ -207,6 +240,81 @@ class ProfileTest(unittest.TestCase):
         )
         value = profile(template_id=None, image_name=image)
         self.assertEqual(value["pod"]["image_name"], image)
+
+    def test_template_profile_pins_full_provider_runtime_contract(self):
+        value = template_profile()
+
+        self.assertEqual(value["pod"]["image_name"], RUNTIME.image)
+        self.assertEqual(
+            value["pod"]["template_contract"]["docker_entrypoint"],
+            ["/bin/bash", "-c"],
+        )
+        self.assertFalse(
+            value["pod"]["template_contract"]["is_serverless"]
+        )
+
+    def test_template_profile_requires_matching_contract(self):
+        with self.assertRaises(RunpodLocalError) as missing:
+            profile(template_id="template123")
+        self.assertEqual(missing.exception.code, "invalid_profile")
+
+        contract = build_private_template_contract(
+            name="upstream-runtime",
+            image="vllm/vllm-openai@sha256:" + "2" * 64,
+            docker_entrypoint=["/bin/bash", "-c"],
+            docker_start_cmd=["exec /usr/sbin/sshd -D -e\n"],
+            template_id="template123",
+        )
+        with self.assertRaises(RunpodLocalError) as mismatch:
+            profile(
+                image_name=RUNTIME.image,
+                template_id="template123",
+                template_contract=contract,
+                runtime_id=RUNTIME_ID,
+            )
+        self.assertEqual(mismatch.exception.code, "invalid_profile")
+
+    def test_template_profile_rejects_template_local_volume(self):
+        contract = template_profile()["pod"]["template_contract"]
+        contract["volume_in_gb"] = 20
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            profile(
+                image_name=RUNTIME.image,
+                template_id="template123",
+                template_contract=contract,
+                runtime_id=RUNTIME_ID,
+            )
+
+        self.assertEqual(caught.exception.code, "invalid_profile")
+
+    def test_template_contract_tamper_invalidates_stored_profile(self):
+        value = template_profile()
+        value["pod"]["template_contract"]["image"] = (
+            "other/image@sha256:" + "2" * 64
+        )
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            validate_profile(value)
+
+        self.assertEqual(caught.exception.code, "invalid_profile")
+
+    def test_template_profile_requires_separate_network_volume(self):
+        with self.assertRaises(RunpodLocalError) as caught:
+            template_profile(
+                network_volume_id=None,
+                ephemeral=True,
+            )
+        self.assertEqual(caught.exception.code, "invalid_profile")
+
+    def test_runtime_identity_tamper_invalidates_stored_profile(self):
+        value = template_profile()
+        value["pod"]["runtime"]["manifest"]["sha256"] = "0" * 64
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            validate_profile(value)
+
+        self.assertEqual(caught.exception.code, "invalid_profile")
 
     def test_profile_store_is_private_and_refuses_implicit_replacement(self):
         with tempfile.TemporaryDirectory() as directory:

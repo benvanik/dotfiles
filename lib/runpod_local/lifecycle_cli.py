@@ -21,13 +21,13 @@ from .output import print_json
 from .paths import credentials_file, state_root
 from .profile import MAX_IMPLICIT_HARD_TTL_SECONDS, ProfileStore
 from .state import StateStore
+from .template import redact_docker_arguments
 from .timeutil import parse_duration, utc_timestamp
 from .workload import (
     HuggingFaceWorkload,
     WorkloadPlacementRequest,
     plan_workload,
 )
-
 
 LIFECYCLE_COMMANDS = ("up", "status", "down", "ttl")
 
@@ -275,6 +275,7 @@ def _model_placement(
 
 
 def _print(value: Any, *, as_json: bool) -> None:
+    value = redact_docker_arguments(value)
     if as_json:
         print_json(value)
         return

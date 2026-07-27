@@ -16,18 +16,22 @@ from typing import Any
 from .errors import RunpodLocalError
 from .huggingface_credentials import REMOTE_HF_TOKEN_PATH
 from .placement import load_hardware_catalog, select_hardware
+from .runtime_catalog import (
+    load_runtime,
+    validate_runtime_identity,
+)
 from .state import StateStore, validate_record_name
+from .template import (
+    template_contract_violations,
+    validate_image_digest,
+    validate_private_template_contract,
+)
 from .timeutil import parse_duration, parse_utc_timestamp, utc_timestamp
 
-
-PROFILE_SCHEMA = "runpod.profile.v1"
+PROFILE_SCHEMA = "runpod.profile.v2"
 DEFAULT_PROFILE_HARD_TTL = "30m"
 MAX_IMPLICIT_HARD_TTL_SECONDS = parse_duration(DEFAULT_PROFILE_HARD_TTL)
 PROVIDER_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,191}$")
-IMAGE_DIGEST_PATTERN = re.compile(
-    r"^[a-z0-9](?:[a-z0-9._:/-]*[a-z0-9])?"
-    r"@sha256:[0-9a-f]{64}$"
-)
 ENVIRONMENT_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 SECRET_REFERENCE_PATTERN = re.compile(
     r"\{\{\s*RUNPOD_SECRET_[A-Za-z0-9_]+\s*\}\}"
@@ -69,9 +73,9 @@ DEFAULT_CACHE_ENVIRONMENT = {
     "HF_TOKEN_PATH": REMOTE_HF_TOKEN_PATH,
     "HF_XET_CACHE": "/workspace/.cache/huggingface/xet",
     "HF_XET_HIGH_PERFORMANCE": "1",
-    "TORCH_HOME": "/workspace/.cache/torch",
-    "VLLM_CACHE_ROOT": "/workspace/.cache/vllm",
-    "XDG_CACHE_HOME": "/workspace/.cache",
+    "TORCH_HOME": "/root/runpod-session/cache/torch",
+    "VLLM_CACHE_ROOT": "/root/runpod-session/cache/vllm",
+    "XDG_CACHE_HOME": "/root/runpod-session/cache",
 }
 SSH_PUBLIC_KEY_TYPES = {
     "ssh-ed25519",
@@ -89,21 +93,6 @@ def _provider_id(value: str, *, label: str) -> str:
     if not isinstance(value, str) or not PROVIDER_ID_PATTERN.fullmatch(value):
         raise RunpodLocalError(
             f"invalid Runpod {label}: {value!r}",
-            code="invalid_profile",
-        )
-    return value
-
-
-def validate_image_digest(value: Any) -> str:
-    """Require one immutable OCI image reference."""
-
-    if (
-        not isinstance(value, str)
-        or not IMAGE_DIGEST_PATTERN.fullmatch(value)
-        or any(ord(character) < 32 for character in value)
-    ):
-        raise RunpodLocalError(
-            "profile image must be an immutable NAME@sha256:DIGEST reference",
             code="invalid_profile",
         )
     return value
@@ -529,6 +518,8 @@ def create_profile(
     default_ttl_seconds: int,
     image_name: str | None = None,
     template_id: str | None = None,
+    template_contract: dict[str, Any] | None = None,
+    runtime_id: str | None = None,
     network_volume_id: str | None = None,
     ephemeral: bool = False,
     container_disk_gb: int = 50,
@@ -542,15 +533,66 @@ def create_profile(
     environment: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     validate_record_name(name)
-    if (image_name is None) == (template_id is None):
+    runtime = None
+    if template_id is not None:
+        if runtime_id is None:
+            raise RunpodLocalError(
+                "template-backed profile requires a reviewed runtime ID",
+                code="invalid_profile",
+            )
+        runtime = load_runtime(runtime_id)
+        if image_name is None:
+            image_name = runtime.image
+        elif image_name != runtime.image:
+            raise RunpodLocalError(
+                "profile image disagrees with its reviewed runtime",
+                code="invalid_profile",
+            )
+        _provider_id(template_id, label="template ID")
+        try:
+            template_contract = validate_private_template_contract(
+                template_contract,
+                require_id=True,
+            )
+        except RunpodLocalError as error:
+            raise RunpodLocalError(
+                "template-backed profile requires an exact private "
+                "Pod-template contract",
+                code="invalid_profile",
+            ) from error
+        expected_template = runtime.template_contract(
+            name=template_contract["name"],
+            template_id=template_id,
+        )
+        template_mismatches = template_contract_violations(
+            template_contract,
+            expected_template,
+        )
+        if template_contract["container_disk_gb"] != container_disk_gb:
+            template_mismatches.append("container_disk_gb: mismatch")
+        if template_mismatches:
+            raise RunpodLocalError(
+                "profile and template contract disagree on: "
+                + ", ".join(template_mismatches),
+                code="invalid_profile",
+            )
+    elif template_contract is not None or runtime_id is not None:
         raise RunpodLocalError(
-            "profile requires exactly one of image_name or template_id",
+            "direct-image profile cannot carry a template or runtime contract",
             code="invalid_profile",
         )
-    if image_name is not None:
+    if image_name is None:
+        raise RunpodLocalError(
+            "profile requires an exact immutable image digest",
+            code="invalid_profile",
+        )
+    try:
         validate_image_digest(image_name)
-    if template_id is not None:
-        _provider_id(template_id, label="template ID")
+    except RunpodLocalError as error:
+        raise RunpodLocalError(
+            "profile image must be an immutable NAME@sha256:DIGEST reference",
+            code="invalid_profile",
+        ) from error
     if not isinstance(ephemeral, bool):
         raise RunpodLocalError(
             "profile ephemeral storage selector must be boolean",
@@ -559,6 +601,11 @@ def create_profile(
     if ephemeral == (network_volume_id is not None):
         raise RunpodLocalError(
             "profile requires either a network volume ID or explicit ephemeral storage",
+            code="invalid_profile",
+        )
+    if template_id is not None and network_volume_id is None:
+        raise RunpodLocalError(
+            "template-backed profile requires a separate network volume",
             code="invalid_profile",
         )
     if network_volume_id is not None:
@@ -675,6 +722,8 @@ def create_profile(
         "pod": {
             "image_name": image_name,
             "template_id": template_id,
+            "template_contract": template_contract,
+            "runtime": runtime.safe_summary() if runtime is not None else None,
             "cloud_type": "SECURE",
             "gpu_type_ids": [gpu["id"] for gpu in selected_gpus],
             "gpu_count": gpu_count,
@@ -750,6 +799,23 @@ def validate_profile(profile: dict[str, Any]) -> dict[str, Any]:
             code="invalid_profile",
         )
     parse_utc_timestamp(created_at)
+    runtime_identity = pod.get("runtime")
+    runtime_id = None
+    if pod.get("template_id") is not None:
+        try:
+            runtime_id = validate_runtime_identity(
+                runtime_identity
+            ).runtime_id
+        except RunpodLocalError as error:
+            raise RunpodLocalError(
+                "template-backed profile has an invalid reviewed runtime",
+                code="invalid_profile",
+            ) from error
+    elif runtime_identity is not None:
+        raise RunpodLocalError(
+            "direct-image profile carries a reviewed runtime identity",
+            code="invalid_profile",
+        )
     reconstructed = create_profile(
         name=name,
         gpu_names=pod.get("gpu_type_ids", []),
@@ -757,6 +823,8 @@ def validate_profile(profile: dict[str, Any]) -> dict[str, Any]:
         default_ttl_seconds=lease.get("default_ttl_seconds", 0),
         image_name=pod.get("image_name"),
         template_id=pod.get("template_id"),
+        template_contract=pod.get("template_contract"),
+        runtime_id=runtime_id,
         network_volume_id=pod.get("network_volume_id"),
         ephemeral=pod.get("storage_mode") == "ephemeral",
         container_disk_gb=pod.get("container_disk_gb", 0),

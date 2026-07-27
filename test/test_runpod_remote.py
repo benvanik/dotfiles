@@ -15,7 +15,6 @@ from runpod_local.cli import build_parser, parse_arguments
 from runpod_local.errors import RunpodLocalError
 from runpod_local.instances import InstanceStore, json_document_hash
 from runpod_local.remote import (
-    SshEndpoint,
     build_copy_argv,
     build_ssh_argv,
     build_tunnel_argv,
@@ -29,8 +28,8 @@ from runpod_local.remote import (
 )
 from runpod_local.remote_cli import _run_tunnel
 from runpod_local.state import StateStore
+from runpod_local.template import environment_summary
 from runpod_local.timeutil import utc_timestamp
-
 
 GPU_ID = "NVIDIA RTX PRO 6000 Blackwell Server Edition"
 SSH_PUBLIC_KEY = (
@@ -67,8 +66,11 @@ def active_record(identity_file: pathlib.Path):
         "dataCenterId": "US-NC-2",
         "terminateAfter": utc_timestamp(provider_termination_at),
     }
+    normalized_environment = environment_summary(payload["env"])
+    if normalized_environment is None:
+        raise AssertionError("fixture Pod environment is invalid")
     return {
-        "schema_version": "runpod.instance.v2",
+        "schema_version": "runpod.instance.v3",
         "name": "compiler",
         "operation_id": "12345678-1234-4234-8234-123456789abc",
         "remote_name": payload["name"],
@@ -88,6 +90,17 @@ def active_record(identity_file: pathlib.Path):
             "network_volume_id": "volume123",
             "data_center_id": "US-NC-2",
             "max_hourly_usd": 3.0,
+            "image": payload["imageName"],
+            "docker_entrypoint": None,
+            "docker_start_cmd": None,
+            "container_disk_gb": 50,
+            "volume_in_gb": 0,
+            "volume_mount_path": "/workspace",
+            **normalized_environment,
+            "has_registry_auth": False,
+            "ports": ["22/tcp"],
+            "runtime": None,
+            "template_contract": None,
         },
         "quoted_total_price_per_hour": 1.99,
         "provider_termination_at": utc_timestamp(provider_termination_at),
@@ -120,6 +133,11 @@ def active_record(identity_file: pathlib.Path):
 
 
 def live_pod(**overrides):
+    normalized_environment = environment_summary(
+        {"SSH_PUBLIC_KEY": SSH_PUBLIC_KEY}
+    )
+    if normalized_environment is None:
+        raise AssertionError("fixture Pod environment is invalid")
     value = {
         "id": "pod123",
         "name": "rp-compiler-123456781234",
@@ -129,15 +147,31 @@ def live_pod(**overrides):
             "1111111111111111111111111111111111111111111111111111111111111111"
         ),
         "template_id": None,
+        "docker_entrypoint_status": "missing",
+        "docker_entrypoint": None,
+        "docker_start_cmd_status": "missing",
+        "docker_start_cmd": None,
+        "container_disk_gb": 50,
+        "volume_in_gb": 0,
+        "volume_mount_path": "/workspace",
+        "environment_status": "valid",
+        **normalized_environment,
+        "registry_auth_status": "valid",
+        "has_registry_auth": False,
         "interruptible": False,
         "locked": False,
+        "gpu_status": "valid",
         "gpu_id": GPU_ID,
         "gpu_count": 1,
+        "cost_status": "valid",
         "cost_per_hour": 1.99,
+        "machine_status": "valid",
         "data_center_id": "US-NC-2",
         "secure_cloud": True,
         "machine_id": "machine123",
+        "network_volume_status": "valid",
         "network_volume_id": "volume123",
+        "network_volume_data_center_id": "US-NC-2",
         "network_volume": {
             "id": "volume123",
             "name": "model-cache",
@@ -145,7 +179,9 @@ def live_pod(**overrides):
             "data_center_id": "US-NC-2",
         },
         "public_ip": "100.65.0.119",
+        "port_mappings_status": "valid",
         "port_mappings": {"22": 22022},
+        "ports_status": "valid",
         "ports": ["22/tcp"],
     }
     value.update(overrides)
@@ -208,20 +244,20 @@ class RemoteBoundaryTest(unittest.TestCase):
             ("network_volume_id", "other-volume"),
             ("cost_per_hour", 3.01),
         ):
-            with self.subTest(field=field):
-                with self.assertRaises(RunpodLocalError):
-                    self.endpoint(live_pod(**{field: value}))
+            with self.subTest(field=field), self.assertRaises(
+                RunpodLocalError
+            ):
+                self.endpoint(live_pod(**{field: value}))
 
-    def test_endpoint_requires_the_injected_public_key_snapshot(self):
+    def test_receipt_requires_the_injected_public_key_snapshot(self):
         record = InstanceStore(self.state).load("compiler")
         del record["pod_payload"]["env"]["SSH_PUBLIC_KEY"]
         record["pod_payload_sha256"] = json_document_hash(
             record["pod_payload"]
         )
-        InstanceStore(self.state).save(record)
 
         with self.assertRaises(RunpodLocalError) as caught:
-            self.endpoint()
+            InstanceStore(self.state).save(record)
         self.assertEqual(caught.exception.code, "invalid_instance_record")
 
     def test_endpoint_rejects_unready_or_unsafe_address_and_port(self):
@@ -236,9 +272,8 @@ class RemoteBoundaryTest(unittest.TestCase):
             live_pod(port_mappings={"22": 65536}),
         )
         for pod in cases:
-            with self.subTest(pod=pod):
-                with self.assertRaises(RunpodLocalError):
-                    self.endpoint(pod)
+            with self.subTest(pod=pod), self.assertRaises(RunpodLocalError):
+                self.endpoint(pod)
 
     def test_identity_must_be_private_owned_regular_file(self):
         self.identity.chmod(0o644)
@@ -283,13 +318,14 @@ class RemoteBoundaryTest(unittest.TestCase):
         )
         self.assertIn("ExitOnForwardFailure=yes", argv)
         for invalid in (0, 65536, True, "8000"):
-            with self.subTest(port=invalid):
-                with self.assertRaises(RunpodLocalError):
-                    build_tunnel_argv(
-                        self.endpoint(),
-                        local_port=invalid,
-                        remote_port=8000,
-                    )
+            with self.subTest(port=invalid), self.assertRaises(
+                RunpodLocalError
+            ):
+                build_tunnel_argv(
+                    self.endpoint(),
+                    local_port=invalid,
+                    remote_port=8000,
+                )
 
     def test_tunnel_can_bind_one_private_unix_socket(self):
         socket_path = self.root / "tunnels" / "inference.sock"
@@ -360,9 +396,8 @@ class RemoteBoundaryTest(unittest.TestCase):
         with mock.patch(
             "runpod_local.remote.LINUX_UNIX_SOCKET_TABLE",
             self.root / "missing-proc-table",
-        ):
-            with self.assertRaises(RunpodLocalError) as caught:
-                prepare_local_tunnel_socket(socket_path)
+        ), self.assertRaises(RunpodLocalError) as caught:
+            prepare_local_tunnel_socket(socket_path)
 
         self.assertEqual(
             caught.exception.code,
@@ -487,9 +522,10 @@ class RemoteBoundaryTest(unittest.TestCase):
             "/tmp/file",
             "workspace/relative",
         ):
-            with self.subTest(path=path):
-                with self.assertRaises(RunpodLocalError):
-                    validate_remote_copy_path(path)
+            with self.subTest(path=path), self.assertRaises(
+                RunpodLocalError
+            ):
+                validate_remote_copy_path(path)
 
     def test_known_hosts_file_is_private_and_symlink_safe(self):
         path = self.state.root / "ssh" / "known-hosts" / "pod123"

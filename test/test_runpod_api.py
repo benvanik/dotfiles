@@ -3,11 +3,21 @@ from __future__ import annotations
 import math
 import unittest
 
-from runpod_local.api import RunpodApi, gpu_stock_is_available, normalize_pod
+from runpod_local.api import (
+    RunpodApi,
+    gpu_stock_is_available,
+    normalize_pod,
+    provider_pod_snapshot,
+)
 from runpod_local.auth import ApiCredential
 from runpod_local.errors import RunpodLocalError
 from runpod_local.provider_cli import standard_volume_monthly_usd
-
+from runpod_local.template import (
+    build_private_template_contract,
+    environment_summary,
+    template_contract_violations,
+    validate_private_template_contract,
+)
 
 SSH_PUBLIC_KEY = (
     "ssh-ed25519 "
@@ -19,6 +29,28 @@ OTHER_SSH_PUBLIC_KEY = (
     "AAAAC3NzaC1lZDI1NTE5AAAAIEJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJC "
     "other@example"
 )
+IMAGE = "vllm/vllm-openai@sha256:" + "1" * 64
+
+
+def raw_template(**overrides):
+    value = {
+        "id": "template123",
+        "name": "upstream-vllm",
+        "imageName": IMAGE,
+        "category": "NVIDIA",
+        "containerDiskInGb": 50,
+        "containerRegistryAuthId": None,
+        "dockerEntrypoint": ["/bin/bash", "-c"],
+        "dockerStartCmd": ["exec /usr/sbin/sshd -D -e\n"],
+        "env": {},
+        "isPublic": False,
+        "isServerless": False,
+        "ports": ["22/tcp"],
+        "volumeInGb": 0,
+        "volumeMountPath": "/workspace",
+    }
+    value.update(overrides)
+    return value
 
 
 class FakeTransport:
@@ -120,6 +152,7 @@ class RunpodApiTest(unittest.TestCase):
             "image": "example/image:tag",
             "adjustedCostPerHr": 1.99,
             "env": {"SENSITIVE_VALUE": "must-not-escape"},
+            "containerRegistryAuthId": None,
             "gpu": {
                 "id": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
                 "count": 1,
@@ -134,7 +167,21 @@ class RunpodApiTest(unittest.TestCase):
 
         self.assertEqual(pods[0]["id"], "pod123")
         self.assertEqual(pods[0]["cost_per_hour"], 1.99)
+        self.assertEqual(pods[0]["cost_status"], "valid")
         self.assertEqual(pods[0]["network_volume_id"], "volume123")
+        self.assertEqual(
+            pods[0]["environment_names"],
+            ["SENSITIVE_VALUE"],
+        )
+        self.assertEqual(
+            pods[0]["environment_sha256"],
+            environment_summary(
+                {"SENSITIVE_VALUE": "must-not-escape"}
+            )["environment_sha256"],
+        )
+        self.assertEqual(pods[0]["environment_status"], "valid")
+        self.assertEqual(pods[0]["registry_auth_status"], "valid")
+        self.assertIs(pods[0]["has_registry_auth"], False)
         self.assertNotIn("raw", pods[0])
         self.assertNotIn("must-not-escape", repr(pods))
         request = transport.requests[0]
@@ -161,6 +208,163 @@ class RunpodApiTest(unittest.TestCase):
 
         self.assertEqual(top_level["gpu_count"], 2)
         self.assertEqual(nested["gpu_count"], 1)
+
+    def test_pod_cost_distinguishes_missing_valid_and_malformed_values(self):
+        missing = normalize_pod({})
+        fallback = normalize_pod(
+            {
+                "adjustedCostPerHr": None,
+                "costPerHr": "1.99",
+            }
+        )
+        secret = "PROVIDER_COST_SECRET"
+        malformed_adjusted = normalize_pod(
+            {
+                "adjustedCostPerHr": secret,
+                "costPerHr": 1.99,
+            }
+        )
+        malformed_base = normalize_pod({"costPerHr": secret})
+        huge_integer = normalize_pod(
+            {"adjustedCostPerHr": 10**4000}
+        )
+
+        self.assertEqual(missing["cost_status"], "missing")
+        self.assertIsNone(missing["cost_per_hour"])
+        self.assertEqual(fallback["cost_status"], "valid")
+        self.assertEqual(fallback["cost_per_hour"], 1.99)
+        self.assertEqual(malformed_adjusted["cost_status"], "invalid")
+        self.assertIsNone(malformed_adjusted["cost_per_hour"])
+        self.assertEqual(malformed_base["cost_status"], "invalid")
+        self.assertIsNone(malformed_base["cost_per_hour"])
+        self.assertEqual(huge_integer["cost_status"], "invalid")
+        self.assertIsNone(huge_integer["cost_per_hour"])
+        self.assertNotIn(secret, repr(malformed_adjusted))
+        self.assertNotIn(secret, repr(malformed_base))
+
+    def test_pod_normalizes_exact_docker_overrides(self):
+        pod = normalize_pod(
+            {
+                "dockerEntrypoint": ["/bin/bash", "-c"],
+                "dockerStartCmd": ["exec /usr/sbin/sshd -D -e\n"],
+            }
+        )
+        self.assertEqual(
+            pod["docker_entrypoint"], ["/bin/bash", "-c"]
+        )
+        self.assertEqual(
+            pod["docker_start_cmd"],
+            ["exec /usr/sbin/sshd -D -e\n"],
+        )
+
+    def test_pod_normalizes_exact_storage_attestation(self):
+        pod = normalize_pod(
+            {
+                "containerDiskInGb": 50,
+                "volumeInGb": 0,
+                "volumeMountPath": "/workspace",
+            }
+        )
+
+        self.assertEqual(pod["container_disk_gb"], 50)
+        self.assertEqual(pod["volume_in_gb"], 0)
+        self.assertEqual(pod["volume_mount_path"], "/workspace")
+
+    def test_pod_environment_hash_detects_same_name_value_mutation(self):
+        expected = normalize_pod(
+            {
+                "env": {"SSH_PUBLIC_KEY": "expected-key"},
+                "containerRegistryAuthId": None,
+            }
+        )
+        mutated = normalize_pod(
+            {
+                "env": {"SSH_PUBLIC_KEY": "mutated-secret-value"},
+                "containerRegistryAuthId": None,
+            }
+        )
+
+        self.assertEqual(
+            expected["environment_names"],
+            mutated["environment_names"],
+        )
+        self.assertNotEqual(
+            expected["environment_sha256"],
+            mutated["environment_sha256"],
+        )
+        self.assertNotIn("mutated-secret-value", repr(mutated))
+
+    def test_pod_registry_auth_accepts_omitted_null_or_empty_as_no_auth(self):
+        absent = normalize_pod({"env": {}})
+        none = normalize_pod(
+            {"env": {}, "containerRegistryAuthId": None}
+        )
+        empty = normalize_pod(
+            {"env": {}, "containerRegistryAuthId": ""}
+        )
+        configured = normalize_pod(
+            {
+                "env": {},
+                "containerRegistryAuthId": "registry-secret-id",
+            }
+        )
+
+        self.assertEqual(absent["registry_auth_status"], "valid")
+        self.assertIs(absent["has_registry_auth"], False)
+        self.assertEqual(none["registry_auth_status"], "valid")
+        self.assertIs(none["has_registry_auth"], False)
+        self.assertEqual(empty["registry_auth_status"], "valid")
+        self.assertIs(empty["has_registry_auth"], False)
+        self.assertEqual(configured["registry_auth_status"], "valid")
+        self.assertIs(configured["has_registry_auth"], True)
+        self.assertNotIn("registry-secret-id", repr(configured))
+
+    def test_durable_provider_snapshot_never_contains_raw_runtime_bytes(self):
+        secret = "PROVIDER_SECRET=must-not-persist"
+        normalized = normalize_pod(
+            {
+                "image": "private/secret-image",
+                "dockerEntrypoint": ["/bin/bash", "-c"],
+                "dockerStartCmd": [secret],
+                "env": {"INJECTED": secret},
+                "containerRegistryAuthId": "secret-registry-id",
+            }
+        )
+
+        snapshot = provider_pod_snapshot(
+            normalized,
+            expected={
+                "id": None,
+                "name": None,
+                "desired_status": None,
+                "template_id": None,
+                "volume_mount_path": None,
+                "environment_names": normalized["environment_names"],
+                "environment_sha256": normalized[
+                    "environment_sha256"
+                ],
+                "gpu_id": None,
+                "data_center_id": None,
+                "network_volume_id": None,
+                "network_volume_data_center_id": None,
+                "ports": [],
+                "image": "private/secret-image",
+                "docker_entrypoint": ["/bin/bash", "-c"],
+                "docker_start_cmd": [secret],
+            },
+        )
+
+        self.assertNotIn("image", snapshot)
+        self.assertNotIn("docker_entrypoint", snapshot)
+        self.assertNotIn("docker_start_cmd", snapshot)
+        self.assertNotIn(secret, repr(snapshot))
+        self.assertNotIn("secret-registry-id", repr(snapshot))
+        self.assertTrue(snapshot["image_matches_expected"])
+        self.assertTrue(snapshot["docker_start_cmd_matches_expected"])
+        self.assertTrue(
+            snapshot["docker_start_cmd_summary"]["valid_string_array"]
+        )
+        self.assertIs(snapshot["has_registry_auth"], True)
 
     def test_get_pod_merges_exact_graphql_policy_attestation(self):
         pod_types = {
@@ -411,6 +615,129 @@ class RunpodApiTest(unittest.TestCase):
             },
         )
 
+    def test_template_list_and_get_normalize_without_environment_values(self):
+        provider = raw_template(
+            env={"SENSITIVE_TOKEN": "must-not-escape"}
+        )
+        api, transport = api_with_responses([provider], provider)
+
+        listed = api.list_templates()
+        fetched = api.get_template("template123")
+
+        self.assertEqual(listed, [fetched])
+        self.assertEqual(fetched["image"], IMAGE)
+        self.assertEqual(
+            fetched["environment_names"], ["SENSITIVE_TOKEN"]
+        )
+        self.assertNotIn("must-not-escape", repr(listed))
+        self.assertEqual(
+            transport.requests[1]["url"],
+            "https://rest.example.invalid/v1/templates/template123",
+        )
+
+    def test_create_template_uses_exact_private_pod_contract(self):
+        contract = build_private_template_contract(
+            name="upstream-vllm",
+            image=IMAGE,
+            docker_entrypoint=["/bin/bash", "-c"],
+            docker_start_cmd=["exec /usr/sbin/sshd -D -e\n"],
+        )
+        api, transport = api_with_responses(raw_template())
+
+        created = api.create_template(contract)
+
+        self.assertEqual(created["id"], "template123")
+        self.assertEqual(
+            transport.requests[0]["payload"],
+            {
+                "imageName": IMAGE,
+                "name": "upstream-vllm",
+                "category": "NVIDIA",
+                "containerDiskInGb": 50,
+                "dockerEntrypoint": ["/bin/bash", "-c"],
+                "dockerStartCmd": ["exec /usr/sbin/sshd -D -e\n"],
+                "env": {},
+                "isPublic": False,
+                "isServerless": False,
+                "ports": ["22/tcp"],
+                "readme": "",
+                "volumeInGb": 0,
+                "volumeMountPath": "/workspace",
+            },
+        )
+
+    def test_template_contract_rejects_python_numeric_boolean_aliases(self):
+        for value in (False, 0.0):
+            with self.subTest(volume_in_gb=value):
+                with self.assertRaises(RunpodLocalError) as caught:
+                    build_private_template_contract(
+                        name="upstream-vllm",
+                        image=IMAGE,
+                        docker_entrypoint=["/bin/bash", "-c"],
+                        docker_start_cmd=["bootstrap\n"],
+                        volume_in_gb=value,
+                    )
+                self.assertEqual(
+                    caught.exception.code,
+                    "invalid_template_contract",
+                )
+
+        contract = build_private_template_contract(
+            name="upstream-vllm",
+            image=IMAGE,
+            docker_entrypoint=["/bin/bash", "-c"],
+            docker_start_cmd=["bootstrap\n"],
+        )
+        for field, value in (
+            ("is_public", 0),
+            ("is_serverless", 0),
+            ("volume_in_gb", False),
+        ):
+            with self.subTest(field=field):
+                drifted = dict(contract)
+                drifted[field] = value
+                with self.assertRaises(RunpodLocalError) as caught:
+                    validate_private_template_contract(
+                        drifted,
+                        require_id=False,
+                    )
+                self.assertEqual(
+                    caught.exception.code,
+                    "invalid_template_contract",
+                )
+
+    def test_template_contract_rejects_non_string_id_without_type_error(self):
+        with self.assertRaises(RunpodLocalError) as caught:
+            build_private_template_contract(
+                name="upstream-vllm",
+                image=IMAGE,
+                docker_entrypoint=["/bin/bash", "-c"],
+                docker_start_cmd=["bootstrap\n"],
+                template_id=7,
+            )
+        self.assertEqual(
+            caught.exception.code,
+            "invalid_template_contract",
+        )
+
+    def test_template_drift_diagnostics_never_disclose_docker_arguments(self):
+        expected = build_private_template_contract(
+            name="upstream-vllm",
+            image=IMAGE,
+            docker_entrypoint=["/bin/bash", "-c"],
+            docker_start_cmd=["approved-bootstrap\n"],
+        )
+        observed = {
+            **expected,
+            "id": "template123",
+            "docker_start_cmd": ["SECRET=must-not-escape\n"],
+        }
+
+        violations = template_contract_violations(observed, expected)
+
+        self.assertIn("docker_start_cmd: mismatch", violations)
+        self.assertNotIn("must-not-escape", repr(violations))
+
     def test_create_pod_uses_exact_graphql_variable_contract(self):
         api, transport = api_with_responses(
             account_ssh_key_response(),
@@ -495,6 +822,9 @@ class RunpodApiTest(unittest.TestCase):
         graphql_input = transport.requests[1]["payload"]["variables"]["input"]
         self.assertEqual(graphql_input["templateId"], "template123")
         self.assertEqual(graphql_input["volumeInGb"], 20)
+        self.assertEqual(
+            graphql_input["terminateAfter"], "2026-07-28T03:30:00Z"
+        )
         self.assertNotIn("imageName", graphql_input)
         self.assertNotIn("networkVolumeId", graphql_input)
 

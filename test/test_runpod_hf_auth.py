@@ -24,6 +24,13 @@ from runpod_local.huggingface_credentials import (
 )
 from runpod_local.remote import SshEndpoint
 from runpod_local.remote_cli import _run_hf_auth
+from runpod_local.runtime_catalog import load_runtime
+
+IMAGE = (
+    "runpod/pytorch@sha256:"
+    "1111111111111111111111111111111111111111111111111111111111111111"
+)
+RUNTIME = load_runtime("vllm-cu129-v0.25.1")
 
 
 class RemoteHuggingFaceCredentialProgramTest(unittest.TestCase):
@@ -366,13 +373,11 @@ class HuggingFaceAuthCliTest(unittest.TestCase):
         )
         self.instances = mock.Mock()
         self.instances.load.return_value = {
-            "pod_payload": {
-                "imageName": (
-                    "runpod/pytorch@sha256:"
-                    "111111111111111111111111111111111111111111111111"
-                    "1111111111111111"
-                )
-            }
+            "pod_payload": {"imageName": IMAGE},
+            "expected": {
+                "image": IMAGE,
+                "template_contract": None,
+            },
         }
 
     def test_parser_exposes_push_status_clear_and_agent_help(self):
@@ -518,7 +523,7 @@ class HuggingFaceAuthCliTest(unittest.TestCase):
         self.assertEqual(run_remote.call_count, 1)
         self.assertIsNone(run_remote.call_args.kwargs["stdin"])
 
-    def test_push_rejects_tagged_and_template_images_before_ssh(self):
+    def test_push_rejects_unattested_image_sources_before_ssh(self):
         arguments = parse_arguments(
             build_parser(),
             [
@@ -529,14 +534,24 @@ class HuggingFaceAuthCliTest(unittest.TestCase):
                 str(self.token_path),
             ],
         )
-        for payload in (
-            {"imageName": "runpod/pytorch:mutable"},
-            {"templateId": "template123"},
+        for record in (
+            {
+                "pod_payload": {"imageName": "runpod/pytorch:mutable"},
+                "expected": {
+                    "image": "runpod/pytorch:mutable",
+                    "template_contract": None,
+                },
+            },
+            {
+                "pod_payload": {"templateId": "template123"},
+                "expected": {
+                    "image": IMAGE,
+                    "template_contract": None,
+                },
+            },
         ):
-            with self.subTest(payload=payload):
-                self.instances.load.return_value = {
-                    "pod_payload": payload
-                }
+            with self.subTest(record=record):
+                self.instances.load.return_value = record
                 with (
                     mock.patch(
                         "runpod_local.remote_cli._endpoint",
@@ -557,6 +572,49 @@ class HuggingFaceAuthCliTest(unittest.TestCase):
                     caught.exception.code, "hf_auth_unpinned_image"
                 )
                 run_remote.assert_not_called()
+
+    def test_push_accepts_template_with_attested_exact_image(self):
+        contract = RUNTIME.template_contract(
+            name="upstream-vllm",
+            template_id="template123",
+        )
+        self.instances.load.return_value = {
+            "pod_payload": {"templateId": "template123"},
+            "expected": {
+                "image": RUNTIME.image,
+                "runtime": RUNTIME.safe_summary(),
+                "template_contract": contract,
+            },
+        }
+        arguments = parse_arguments(
+            build_parser(),
+            [
+                "hf-auth",
+                "push",
+                "compiler",
+                "--token-file",
+                str(self.token_path),
+            ],
+        )
+        with (
+            mock.patch(
+                "runpod_local.remote_cli._endpoint",
+                return_value=(
+                    mock.sentinel.state,
+                    self.instances,
+                    self.endpoint,
+                ),
+            ),
+            mock.patch(
+                "runpod_local.remote_cli.ensure_known_hosts_file"
+            ),
+            mock.patch(
+                "runpod_local.remote_cli.run_with_activity",
+                side_effect=(0, 0),
+            ) as run_remote,
+        ):
+            self.assertEqual(_run_hf_auth(arguments), 0)
+        self.assertEqual(run_remote.call_count, 2)
 
     def test_clear_reports_change_and_unsafe_status_fails_closed(self):
         clear = parse_arguments(

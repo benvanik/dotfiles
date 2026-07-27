@@ -19,15 +19,21 @@ from .paths import credentials_file, state_root
 from .profile import (
     DEFAULT_PROFILE_HARD_TTL,
     MAX_IMPLICIT_HARD_TTL_SECONDS,
+    PROFILE_SCHEMA,
     ProfileStore,
     create_profile,
     load_ssh_public_key_file,
     validate_ssh_identity_file,
     validate_ssh_key_pair,
 )
+from .runtime_catalog import available_runtime_ids, load_runtime
 from .state import StateStore
+from .template import (
+    redact_docker_arguments,
+    template_contract_violations,
+    validate_private_template_contract,
+)
 from .timeutil import parse_duration
-
 
 PROVIDER_COMMANDS = ("auth", "stock", "volume", "template", "profile")
 STANDARD_VOLUME_PRICING = {
@@ -56,6 +62,11 @@ def standard_volume_monthly_usd(size_gb: int) -> float:
 def volume_lock_scope(name: str) -> str:
     digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:32]
     return f"volume-{digest}"
+
+
+def template_lock_scope(name: str) -> str:
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:32]
+    return f"template-{digest}"
 
 
 def created_volume_violations(
@@ -239,6 +250,30 @@ def add_provider_parsers(subparsers: Any) -> None:
     template_list.add_argument(
         "--search", help="Case-insensitive substring over name, ID, and image."
     )
+    template_get = template_subparsers.add_parser(
+        "get", help="Get one normalized template contract."
+    )
+    _add_common_provider_arguments(template_get)
+    template_get.add_argument("template_id")
+    template_create = template_subparsers.add_parser(
+        "create", help="Plan or create one private Pod-template overlay."
+    )
+    _add_common_provider_arguments(template_create, state=True)
+    template_create.add_argument("name")
+    template_create.add_argument(
+        "--runtime",
+        required=True,
+        metavar="ID",
+        help=(
+            "Reviewed upstream runtime ID. Available: "
+            + ", ".join(available_runtime_ids())
+        ),
+    )
+    template_create.add_argument(
+        "--execute",
+        action="store_true",
+        help="Create the template; otherwise print the exact request plan.",
+    )
 
     profile_parser = subparsers.add_parser(
         "profile", help="Create and inspect validated local launch profiles."
@@ -257,16 +292,23 @@ def add_provider_parsers(subparsers: Any) -> None:
     profile_create = profile_subparsers.add_parser(
         "create", help="Create a validated local launch profile."
     )
-    _add_common_provider_arguments(
-        profile_create, state=True, credentials=False
-    )
+    _add_common_provider_arguments(profile_create, state=True)
     profile_create.add_argument("name")
-    runtime_source = profile_create.add_mutually_exclusive_group(required=True)
-    runtime_source.add_argument(
+    profile_create.add_argument(
         "--image",
-        help="Explicit immutable NAME@sha256:DIGEST container reference.",
+        help=(
+            "Explicit immutable NAME@sha256:DIGEST for a direct-image profile."
+        ),
     )
-    runtime_source.add_argument(
+    profile_create.add_argument(
+        "--runtime",
+        metavar="ID",
+        help=(
+            "Reviewed runtime required with --template-id. Available: "
+            + ", ".join(available_runtime_ids())
+        ),
+    )
+    profile_create.add_argument(
         "--template-id", help="Exact account-visible Runpod template ID."
     )
     storage = profile_create.add_mutually_exclusive_group(required=True)
@@ -375,6 +417,7 @@ def _profile_store(args: argparse.Namespace) -> ProfileStore:
 
 
 def _print_result(value: Any, *, as_json: bool) -> None:
+    value = redact_docker_arguments(value)
     if as_json:
         print_json(value)
         return
@@ -406,7 +449,7 @@ def _human_line(value: dict[str, Any]) -> str:
             f"{value.get('id')}  {value.get('size_gb')} GB  "
             f"{value.get('data_center_id')}  {value.get('name')}"
         )
-    if value.get("schema_version") == "runpod.profile.v1":
+    if value.get("schema_version") == PROFILE_SCHEMA:
         pod = value["pod"]
         return (
             f"{value['name']}: {pod['gpu_count']}x {', '.join(pod['gpu_type_ids'])}; "
@@ -672,48 +715,99 @@ def _run_volume(args: argparse.Namespace) -> int:
     )
 
 
-def _safe_template(template: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "id": template.get("id"),
-        "name": template.get("name"),
-        "image_name": template.get("imageName", template.get("image")),
-        "container_disk_gb": template.get("containerDiskInGb"),
-        "volume_mount_path": template.get("volumeMountPath"),
-        "ports": template.get("ports")
-        if isinstance(template.get("ports"), list)
-        else [],
-        "is_public": template.get("isPublic"),
-    }
-
-
 def _run_template(args: argparse.Namespace) -> int:
-    if args.template_action != "list":
+    if args.template_action not in {"list", "get", "create"}:
         raise RunpodLocalError(
-            "template action required: list",
+            "template action required: list, get, or create",
             code="missing_action",
         )
-    templates = [_safe_template(value) for value in _api(args).list_templates()]
-    if args.search:
-        needle = args.search.casefold()
-        templates = [
-            template
-            for template in templates
-            if needle
-            in (
-                f"{template.get('id', '')} {template.get('name', '')} "
-                f"{template.get('image_name', '')}"
-            ).casefold()
-        ]
-    if args.json:
-        print_json(
-            {
-                "schema_version": "runpod.template-list.v1",
-                "templates": templates,
-            }
+    if args.template_action == "list":
+        templates = _api(args).list_templates()
+        if args.search:
+            needle = args.search.casefold()
+            templates = [
+                template
+                for template in templates
+                if needle
+                in (
+                    f"{template.get('id', '')} {template.get('name', '')} "
+                    f"{template.get('image', '')}"
+                ).casefold()
+            ]
+        if args.json:
+            _print_result(
+                {
+                    "schema_version": "runpod.template-list.v1",
+                    "templates": templates,
+                },
+                as_json=True,
+            )
+        else:
+            _print_result(templates, as_json=False)
+        return 0
+    if args.template_action == "get":
+        _print_result(
+            _api(args).get_template(args.template_id),
+            as_json=args.json,
         )
-    else:
-        _print_result(templates, as_json=False)
-    return 0
+        return 0
+
+    runtime = load_runtime(args.runtime)
+    request = runtime.template_contract(name=args.name)
+    lock = (
+        StateStore(state_root(args.state_root)).locked(
+            template_lock_scope(args.name)
+        )
+        if args.execute
+        else contextlib.nullcontext()
+    )
+    with lock:
+        api = _api(args)
+        same_name = [
+            template
+            for template in api.list_templates()
+            if template.get("name") == args.name
+        ]
+        exact_matches = [
+            template
+            for template in same_name
+            if not template_contract_violations(template, request)
+        ]
+        if len(same_name) > 1 or (same_name and not exact_matches):
+            raise RunpodLocalError(
+                f"template name {args.name!r} is ambiguous or belongs to a "
+                "different runtime contract",
+                code="template_name_conflict",
+            )
+        result = {
+            "schema_version": "runpod.plan.v1",
+            "action": (
+                "reuse_private_template"
+                if exact_matches
+                else "create_private_template"
+            ),
+            "request": request,
+            "runtime": runtime.safe_summary(),
+            "executed": False,
+        }
+        if exact_matches:
+            result["template"] = exact_matches[0]
+            result["reconciled_existing"] = True
+        elif args.execute:
+            created = api.create_template(request)
+            violations = template_contract_violations(created, request)
+            result["template"] = created
+            result["executed"] = True
+            result["verification"] = {
+                "status": "error" if violations else "verified",
+                "violations": violations,
+            }
+    _print_result(result, as_json=args.json)
+    return (
+        1
+        if result.get("verification", {}).get("status") == "error"
+        else 0
+    )
 
 
 def _run_profile(args: argparse.Namespace) -> int:
@@ -736,19 +830,64 @@ def _run_profile(args: argparse.Namespace) -> int:
             "require an explicit runpod-up --ttl override",
             code="profile_ttl_too_long",
         )
+    if args.template_id is not None:
+        if args.runtime is None or args.image is not None:
+            raise RunpodLocalError(
+                "template-backed profile requires --runtime and rejects "
+                "--image",
+                code="invalid_profile_source",
+            )
+    elif args.runtime is not None or args.image is None:
+        raise RunpodLocalError(
+            "direct-image profile requires --image and rejects --runtime",
+            code="invalid_profile_source",
+        )
     environment = _parse_environment(args.env)
     public_key_path, public_key = load_ssh_public_key_file(
         args.public_key_file or f"{args.identity_file}.pub"
     )
     validate_ssh_identity_file(args.identity_file)
     validate_ssh_key_pair(args.identity_file, public_key)
+    template_contract = None
+    runtime_id = None
+    image_name = args.image
+    if args.template_id is not None:
+        runtime = load_runtime(args.runtime)
+        template_contract = _api(args).get_template(args.template_id)
+        try:
+            template_contract = validate_private_template_contract(
+                template_contract,
+                require_id=True,
+            )
+        except RunpodLocalError as error:
+            raise RunpodLocalError(
+                "profile template is not an exact private Pod-template "
+                "overlay",
+                code="template_contract_drift",
+            ) from error
+        expected_template = runtime.template_contract(
+            name=template_contract["name"],
+            template_id=args.template_id,
+        )
+        if template_contract_violations(
+            template_contract,
+            expected_template,
+        ):
+            raise RunpodLocalError(
+                "profile template drifted from the selected reviewed runtime",
+                code="template_contract_drift",
+            )
+        runtime_id = runtime.runtime_id
+        image_name = runtime.image
     profile = create_profile(
         name=args.name,
         gpu_names=args.gpu,
         max_hourly_usd=args.max_hourly,
         default_ttl_seconds=default_ttl_seconds,
-        image_name=args.image,
+        image_name=image_name,
         template_id=args.template_id,
+        template_contract=template_contract,
+        runtime_id=runtime_id,
         network_volume_id=args.network_volume_id,
         ephemeral=args.ephemeral,
         container_disk_gb=args.container_disk_gb,

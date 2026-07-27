@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import datetime
 import uuid
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from .allocation import select_launch_placement, verify_allocated_pod
-from .api import RunpodApi
+from .api import RunpodApi, provider_pod_snapshot
 from .errors import HttpRequestError, RunpodLocalError
 from .instances import (
     INSTANCE_SCHEMA,
@@ -16,9 +17,9 @@ from .instances import (
     activate_lease,
     append_event,
     build_pod_payload,
-    lease_expiry_reasons,
-    json_document_hash,
     instance_lock_scope,
+    json_document_hash,
+    lease_expiry_reasons,
     profile_hash,
     transition_instance,
     validate_lease_request,
@@ -31,8 +32,8 @@ from .profile import (
     validate_ssh_public_key,
 )
 from .state import StateStore, validate_record_name
+from .template import environment_summary, template_contract_violations
 from .timeutil import parse_utc_timestamp, utc_timestamp
-
 
 TERMINAL_PHASES = {"rolled_back", "terminated", "aborted"}
 LAUNCH_PHASES = {"intent", "submitting", "provisioning"}
@@ -50,6 +51,38 @@ def _provider_termination_deadline(
             code="invalid_instance_record",
         )
     return parse_utc_timestamp(timestamp)
+
+
+def _durable_provider_snapshot(
+    record: dict[str, Any],
+    pod: dict[str, Any],
+) -> dict[str, Any]:
+    expected = record["expected"]
+    payload = record["pod_payload"]
+    return provider_pod_snapshot(
+        pod,
+        expected={
+            "id": record["pod_id"],
+            "name": record["remote_name"],
+            "desired_status": "RUNNING",
+            "template_id": payload.get("templateId"),
+            "volume_mount_path": expected["volume_mount_path"],
+            "environment_names": expected["environment_names"],
+            "environment_sha256": expected["environment_sha256"],
+            "gpu_id": expected["gpu_id"],
+            "data_center_id": expected["data_center_id"],
+            "network_volume_id": expected["network_volume_id"],
+            "network_volume_data_center_id": (
+                expected["data_center_id"]
+                if expected["network_volume_id"] is not None
+                else None
+            ),
+            "ports": expected["ports"],
+            "image": expected["image"],
+            "docker_entrypoint": expected["docker_entrypoint"],
+            "docker_start_cmd": expected["docker_start_cmd"],
+        },
+    )
 
 
 def _operation_summary(record: dict[str, Any]) -> dict[str, Any]:
@@ -155,6 +188,19 @@ class LifecycleManager:
         )
         self.key_pair_validator(str(identity_path), public_key)
         return public_key
+
+    def _attest_record_template(self, record: dict[str, Any]) -> None:
+        contract = record["expected"].get("template_contract")
+        if contract is None:
+            return
+        observed = self._api().get_template(contract["id"])
+        violations = template_contract_violations(observed, contract)
+        if violations:
+            raise RunpodLocalError(
+                "Runpod template drifted from the launch receipt: "
+                + "; ".join(violations),
+                code="template_contract_drift",
+            )
 
     def _volume_for_profile(
         self, profile: dict[str, Any]
@@ -377,6 +423,20 @@ class LifecycleManager:
                 history = list(record.get("history", []))
                 history.append(_operation_summary(record))
                 history = history[-MAX_OPERATION_HISTORY:]
+            pod_payload = build_pod_payload(
+                profile,
+                remote_name=remote_name,
+                gpu_id=gpu_id,
+                data_center_id=placement["data_center_id"],
+                provider_termination_at=provider_termination_at,
+            )
+            expected_environment = environment_summary(
+                pod_payload.get("env")
+            )
+            if expected_environment is None:
+                raise AssertionError(
+                    "validated profile produced an invalid Pod environment"
+                )
             record = {
                 "schema_version": INSTANCE_SCHEMA,
                 "name": name,
@@ -400,18 +460,45 @@ class LifecycleManager:
                     ),
                     "data_center_id": placement["data_center_id"],
                     "max_hourly_usd": profile["limits"]["max_hourly_usd"],
+                    "image": profile["pod"]["image_name"],
+                    "container_disk_gb": profile["pod"][
+                        "container_disk_gb"
+                    ],
+                    "volume_in_gb": (
+                        0
+                        if profile["pod"]["network_volume_id"] is not None
+                        else 20
+                    ),
+                    "volume_mount_path": profile["pod"][
+                        "volume_mount_path"
+                    ],
+                    **expected_environment,
+                    "has_registry_auth": False,
+                    "docker_entrypoint": (
+                        profile["pod"]["template_contract"][
+                            "docker_entrypoint"
+                        ]
+                        if profile["pod"]["template_contract"] is not None
+                        else None
+                    ),
+                    "docker_start_cmd": (
+                        profile["pod"]["template_contract"][
+                            "docker_start_cmd"
+                        ]
+                        if profile["pod"]["template_contract"] is not None
+                        else None
+                    ),
+                    "ports": profile["pod"]["ports"],
+                    "runtime": profile["pod"]["runtime"],
+                    "template_contract": profile["pod"][
+                        "template_contract"
+                    ],
                 },
                 "quoted_total_price_per_hour": selected[
                     "total_price_per_hour"
                 ],
                 "provider_termination_at": provider_termination_at,
-                "pod_payload": build_pod_payload(
-                    profile,
-                    remote_name=remote_name,
-                    gpu_id=gpu_id,
-                    data_center_id=placement["data_center_id"],
-                    provider_termination_at=provider_termination_at,
-                ),
+                "pod_payload": pod_payload,
                 "connection": {
                     "user": profile["ssh"]["user"],
                     "identity_file": profile["ssh"]["identity_file"],
@@ -450,6 +537,7 @@ class LifecycleManager:
         account_ssh_attestation: Any = None
         matches: list[dict[str, Any]] | None = None
         if phase == "intent":
+            self._attest_record_template(record)
             public_key = self._validate_record_ssh_identity(record)
             account_ssh_attestation = self._api().attest_account_ssh_key(
                 public_key
@@ -488,6 +576,10 @@ class LifecycleManager:
                     f"expired: {', '.join(reasons)}",
                     code="launch_expired",
                 )
+            # This is deliberately the final provider read before the create.
+            # The following receipt transition/fsync records ambiguity before
+            # the billable request without opening another network TOCTOU.
+            self._attest_record_template(record)
             transition_instance(
                 record,
                 "submitting",
@@ -589,7 +681,7 @@ class LifecycleManager:
                 )
             now = self._now()
             record["pod_id"] = pod_id
-            record["provider"] = pod
+            record["provider"] = _durable_provider_snapshot(record, pod)
             transition_instance(
                 record,
                 "provisioning",
@@ -612,7 +704,7 @@ class LifecycleManager:
                     return record
                 raise
             violations, pending = verify_allocated_pod(record, pod)
-            record["provider"] = pod
+            record["provider"] = _durable_provider_snapshot(record, pod)
             if violations:
                 return self._rollback(record, violations)
             if pending:

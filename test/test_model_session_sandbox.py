@@ -248,6 +248,15 @@ class SandboxPlanTests(unittest.TestCase):
             self.assertGreater(root_read_only, socket_bind)
 
             self.assertLess(argv.index("--clearenv"), argv.index("--setenv"))
+            environment = {
+                argv[index + 1]: argv[index + 2]
+                for index, value in enumerate(argv)
+                if value == "--setenv"
+            }
+            self.assertEqual(
+                environment["PI_CODING_AGENT_SESSION_DIR"],
+                "/tmp/pi-sessions",
+            )
             rendered = "\0".join(argv)
             for forbidden in (
                 "SSH_AUTH_SOCK",

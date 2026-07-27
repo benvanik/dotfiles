@@ -69,6 +69,7 @@ fi
 [ "$MODEL_SESSION_INFERENCE_SOCKET" = \
 "/run/model-session/inference.sock" ] || exit 32
 [ -r /workspace/AGENTS.md ] || exit 33
+[ "$PI_CODING_AGENT_SESSION_DIR" = "/tmp/pi-sessions" ] || exit 34
 printf '%s\n' "$@" > /workspace/pi-argv
 """,
             encoding="utf-8",
@@ -312,6 +313,10 @@ class ModelSessionLauncherTest(unittest.TestCase):
         )
         self.assertEqual(command[command.index("--provider") + 1], "fixture-provider")
         self.assertEqual(command[command.index("--model") + 1], "fixture-model")
+        self.assertEqual(
+            command[command.index("--session-dir") + 1],
+            "/sessions",
+        )
         self.assertEqual(command[command.index("--session-id") + 1], run.session_id)
         self.assertEqual(
             command[command.index("--tools") + 1],

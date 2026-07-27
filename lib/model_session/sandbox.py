@@ -141,7 +141,10 @@ _FIXED_ENVIRONMENT = (
     ("NO_PROXY", "127.0.0.1,localhost"),
     ("PATH", "/opt/pi/bin:/usr/bin:/bin"),
     ("PI_CODING_AGENT_DIR", "/config"),
-    ("PI_CODING_AGENT_SESSION_DIR", "/sessions"),
+    # The outer Pi receives an explicit `--session-dir /sessions`. A Pi
+    # process launched by the model inherits only this default, so keep its
+    # disposable transcript out of the wrapper-owned resume directory.
+    ("PI_CODING_AGENT_SESSION_DIR", "/tmp/pi-sessions"),
     ("PI_OFFLINE", "1"),
     ("PI_SKIP_VERSION_CHECK", "1"),
     ("PI_TELEMETRY", "0"),

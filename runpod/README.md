@@ -25,9 +25,12 @@ The tools own:
 - read-only local/live diagnostics.
 
 They do not own Runpod account balance, secrets, SSH account settings, volume
-deletion, image construction, vLLM package compatibility, model correctness, or
-measured performance truth. Static placement produces `candidate`, never
-`verified`; only a recorded run can establish the latter.
+deletion, model correctness, or measured performance truth. The reusable
+model-agnostic vLLM runtime image under `runpod/images/` is infrastructure;
+published image digests, model revisions, prompts, launch arguments, and
+compiled-cache identities are instantiation state outside this repository.
+Static placement produces `candidate`, never `verified`; only a recorded run
+can establish the latter.
 
 ## Security boundary
 
@@ -104,6 +107,26 @@ restarted or deleted. `runpod-copy` admits both roots while rejecting path
 traversal and shell syntax. The model cache is operationally writable (Hugging
 Face needs locks and metadata); this tool does not pretend the weight files are
 filesystem-read-only.
+
+Installed Python environments and unpacked dependency caches do not belong on
+the network volume. The network filesystem is suitable for large sequential
+model weights, but copying or importing a many-file vLLM environment from it
+turns startup into a metadata-bound operation. The candidate image boundary
+is:
+
+- exact CUDA/Python/Torch/vLLM/FlashInfer dependencies in one digest-pinned OCI
+  image on ephemeral local container storage;
+- Hugging Face weights on the persistent network volume;
+- one content-addressed archive per accepted compiled-cache closure, copied and
+  extracted onto ephemeral local storage before vLLM starts.
+
+Runpod caches Pod image layers opportunistically, but does not publish a cache
+lifetime, host-affinity guarantee, or Pod equivalent of Serverless FlashBoot.
+Every image must therefore pass a fresh-host allocated-to-healthy measurement;
+a same-host warm start is not sufficient evidence. The current runtime recipe
+has no accepted publisher: metered cross-registry workstation publication is a
+rejected path. Its build and publication gate are in
+[`images/vllm-cu129/README.md`](images/vllm-cu129/README.md).
 
 ## July 26, 2026 provider snapshot
 

@@ -635,6 +635,23 @@ class RunpodApiTest(unittest.TestCase):
             "https://rest.example.invalid/v1/templates/template123",
         )
 
+    def test_template_normalizes_omitted_provider_zero_values(self):
+        provider = raw_template()
+        for field in ("env", "isPublic", "isServerless", "volumeInGb"):
+            del provider[field]
+        api, _ = api_with_responses(provider)
+
+        fetched = api.get_template("template123")
+
+        self.assertEqual(fetched["environment_names"], [])
+        self.assertIs(fetched["is_public"], False)
+        self.assertIs(fetched["is_serverless"], False)
+        self.assertEqual(fetched["volume_in_gb"], 0)
+        self.assertEqual(
+            validate_private_template_contract(fetched, require_id=True),
+            fetched,
+        )
+
     def test_create_template_uses_exact_private_pod_contract(self):
         contract = build_private_template_contract(
             name="upstream-vllm",
@@ -647,6 +664,10 @@ class RunpodApiTest(unittest.TestCase):
         created = api.create_template(contract)
 
         self.assertEqual(created["id"], "template123")
+        self.assertEqual(
+            transport.requests[0]["expected_statuses"],
+            (200, 201),
+        )
         self.assertEqual(
             transport.requests[0]["payload"],
             {

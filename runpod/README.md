@@ -268,6 +268,13 @@ creation, then verifies the resolved Pod and deletes it on contradiction.
 Runpod exposes no template-version compare-and-swap, so the provider-side
 interval between that final read and create cannot be made atomic.
 
+The live REST implementation returns `201 Created` for template creation and
+omits empty/false/zero template fields from subsequent GET responses. The
+controller accepts both documented `200` and observed `201` creation success,
+and normalizes omitted `env`, `isPublic`, `isServerless`, and `volumeInGb` to
+their exact empty/false/false/zero states. Nonzero drift remains observable and
+fails reconciliation.
+
 Author the datacenter-specific profile against the selected volume:
 
 ```sh

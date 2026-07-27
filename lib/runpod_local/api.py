@@ -1655,6 +1655,7 @@ class RunpodApi:
             "POST",
             "templates",
             payload=template_create_payload(contract),
+            expected_statuses=(200, 201),
         )
         if not isinstance(value, dict):
             raise RunpodLocalError(

@@ -305,10 +305,12 @@ def normalize_template(template: dict[str, Any]) -> dict[str, Any]:
     """Normalize a provider template without retaining environment values."""
 
     environment = template.get("env")
-    if isinstance(environment, dict) and all(
+    if "env" not in template:
+        environment_names: list[str] | None = []
+    elif isinstance(environment, dict) and all(
         isinstance(name, str) for name in environment
     ):
-        environment_names: list[str] | None = sorted(environment)
+        environment_names = sorted(environment)
     else:
         environment_names = None
     registry_auth = template.get("containerRegistryAuthId")
@@ -336,9 +338,13 @@ def normalize_template(template: dict[str, Any]) -> dict[str, Any]:
         "docker_entrypoint": string_array("dockerEntrypoint"),
         "docker_start_cmd": string_array("dockerStartCmd"),
         "ports": string_array("ports"),
-        "is_public": template.get("isPublic"),
-        "is_serverless": template.get("isServerless"),
-        "volume_in_gb": template.get("volumeInGb"),
+        # Runpod's live REST implementation omits zero-value fields even
+        # though its published response schema shows them as explicit.
+        # Nonempty env, true booleans, and positive volume sizes remain
+        # observable; omission is therefore the exact empty/false/zero state.
+        "is_public": template.get("isPublic", False),
+        "is_serverless": template.get("isServerless", False),
+        "volume_in_gb": template.get("volumeInGb", 0),
         "volume_mount_path": template.get("volumeMountPath"),
         "environment_names": environment_names,
         "has_registry_auth": has_registry_auth,

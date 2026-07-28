@@ -34,6 +34,92 @@ identities are instantiation state outside this repository. Static placement
 produces `candidate`, never `verified`; only a recorded run can establish the
 latter.
 
+## Host, service, and project ownership
+
+The Runpod launch profile and instance receipt are host-control contracts.
+They own compatible hardware, the reviewed upstream runtime, storage
+attachment, SSH identity, price bounds, and the billable Pod lease. A Pod is
+not a project or a model instance.
+
+The first Pi-facing vertical slice currently places two different kinds of
+external state in one model-profile directory: copyable project configuration
+(`profile.toml`, `AGENTS.md`, and prompts) and one concrete inference service's
+remote controls, staging/cache tools, smoke tests, benchmarks, and evidence.
+That layout is not the retained ownership boundary. The immediate separation
+is:
+
+```text
+~/.dotfiles/                              reusable control-plane infrastructure
+~/.local/runpod/                          private host policy and allocation state
+~/.local/share/model-services/SERVICE/    external service instantiation
+~/.local/share/model-profiles/PROFILE/    copyable Pi project configuration
+/mnt/dev/model-session-state/             retained isolated session state
+/mnt/dev/model-projects/PROJECT/          project memory and reports
+```
+
+An inference service owns the exact checkpoint/runtime launch, model staging,
+compiled-cache identity, remote process state, private tunnel socket, service
+tests, and deployment/benchmark evidence. A Pi profile owns its prompts,
+tools, project/session routes, sandbox/storage policy, and expected inference
+contract. Its model and runtime fields describe what endpoint it will accept;
+they grant no provider or service-administration authority.
+
+An administrator may validate one live service socket against several Pi
+profiles and publish a separate short-lived attachment for each. The
+attachments remain explicitly project-scoped even when they name the same
+socket. Copying a profile can therefore fork an agent's prompts, workspace,
+history, memory, and reports without copying or restarting the service. A
+service never needs a project ID, and a project never starts, stops, or owns a
+Pod.
+
+The three lifetimes are independent:
+
+- the host lease owns provider billing and Pod termination;
+- the service deployment owns its remote process and endpoint;
+- the project session owns its local sandbox and retained history.
+
+Ending a project session does not imply stopping a shared service or Pod.
+Stopping a service does not imply deleting its compatible host. Host activity
+aggregation and service reuse are administration-layer concerns, not Pi
+profile behavior.
+
+## Extension envelope
+
+The next implementation proves only the inference-service/project split. It
+does not introduce a universal workload manifest, router, multi-process
+scheduler, or fleet manager. The broader use cases establish these pressures
+for later measured slices:
+
+- LoRA training and fine-tuning are finite jobs with progress, resumable
+  checkpoints, and explicitly retained output artifacts.
+- CUDA tests, NVIDIA gold captures, and vLLM/llama.cpp/PyTorch reference runs
+  are finite evidence-producing jobs. Clean performance witnesses require an
+  explicit exclusive-host mode and exact GPU, driver, runtime, input, output,
+  and cache-state identity.
+- Individual agents and agent swarms are project consumers. Many isolated
+  profiles may share one service; their local session limits must not become
+  provider-lifecycle authority.
+- Model constellations are deployments of several named services, potentially
+  using different protocols and resource envelopes. Aggregate admission,
+  routing, per-service ports, and shared-host activity accounting belong to a
+  later deployment layer.
+- Custom Python servers and ComfyUI are private services rather than model
+  profiles. ComfyUI outputs and training checkpoints are retained artifacts,
+  not Hugging Face cache entries.
+
+These pressures imply two eventual remote workload shapes without selecting a
+general orchestration design prematurely:
+
+```text
+host lease -> service deployment -> endpoint attachment -> consumer
+host lease -> finite job run -> evidence and retained artifacts
+```
+
+The reviewed vLLM image remains one runtime family. CUDA development,
+training, llama.cpp, custom Python services, and ComfyUI require their own
+measured and pinned upstream runtime contracts; they must not accrete as
+unreviewed packages in the vLLM image or on the network volume.
+
 ## Security boundary
 
 `runpod-auth login` reads the API key from a no-echo terminal and stores it at:

@@ -45,24 +45,40 @@ The first Pi-facing vertical slice currently places two different kinds of
 external state in one model-profile directory: copyable project configuration
 (`profile.toml`, `AGENTS.md`, and prompts) and one concrete inference service's
 remote controls, staging/cache tools, smoke tests, benchmarks, and evidence.
-That layout is not the retained ownership boundary. The immediate separation
-is:
+That layout is not the retained ownership boundary. Setup, staging, launch,
+supervision, cache management, probing, attachment, and benchmarking are
+reusable mechanisms and belong in this infrastructure repository. They must
+not be copied or forked per model. The immediate separation is:
 
 ```text
-~/.dotfiles/                              reusable control-plane infrastructure
-~/.local/runpod/                          private host policy and allocation state
-~/.local/share/model-services/SERVICE/    external service instantiation
-~/.local/share/model-profiles/PROFILE/    copyable Pi project configuration
-/mnt/dev/model-session-state/             retained isolated session state
-/mnt/dev/model-projects/PROJECT/          project memory and reports
+~/.dotfiles/                               generic control/runtime implementations
+~/.local/share/model-services/MODEL.toml   sole authored per-model object
+~/.local/share/model-profiles/PROFILE/     copyable Pi project configuration
+~/.local/runpod/                           host/deployment/cache receipt state
+/mnt/dev/model-session-state/              retained isolated session state
+/mnt/dev/model-projects/PROJECT/           project memory and reports
 ```
 
-An inference service owns the exact checkpoint/runtime launch, model staging,
-compiled-cache identity, remote process state, private tunnel socket, service
-tests, and deployment/benchmark evidence. A Pi profile owns its prompts,
-tools, project/session routes, sandbox/storage policy, and expected inference
-contract. Its model and runtime fields describe what endpoint it will accept;
-they grant no provider or service-administration authority.
+One model file owns only declarative differences: exact model identity, served
+API identity, runtime-adapter selection, typed launch parameters, and the
+requested resource envelope. It contains no executable code and has no
+per-model companion directory. The generic controller resolves that recipe
+into an immutable deployment manifest and owns model staging, remote process
+state, private tunnel sockets, service tests, and cache operations.
+
+Hugging Face closure manifests, local-stage receipts, compiled-cache
+inventories, process receipts, and benchmark evidence are generated state, not
+model definitions. Weight storage is shared and keyed by the Hugging Face
+repository and immutable revision. A compiled-cache entry is keyed by the
+resolved model closure, complete typed launch configuration, runtime image,
+GPU architecture, and exact driver. These mechanisms may produce bytes for
+each model or launch shape, but they never produce a second copy of their
+implementation.
+
+A Pi profile owns its prompts, tools, project/session routes, sandbox/storage
+policy, and expected inference contract. Its model and runtime fields describe
+what endpoint it will accept; they grant no provider or
+service-administration authority.
 
 An administrator may validate one live service socket against several Pi
 profiles and publish a separate short-lived attachment for each. The

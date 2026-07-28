@@ -13,12 +13,16 @@ from typing import Any
 from runpod_local.errors import RunpodLocalError
 from runpod_local.service_compile_cache import build_compile_cache_contract
 
+from .compile_cache_document import (
+    COMPILE_CACHE_STAGE_SCHEMA,
+    compile_cache_receipt_path,
+)
+from .compile_cache_files import COMPILE_CACHE_SUBDIRECTORIES
 from .document import DeploymentManifest
 from .layout import RuntimeLayout
 from .state import read_private_json
 
 
-COMPILE_CACHE_STAGE_SCHEMA = "runpod.local-vllm-compile-cache-stage.v1"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _RECEIPT_FIELDS = frozenset(
     {
@@ -35,15 +39,6 @@ _RECEIPT_FIELDS = frozenset(
     }
 )
 _DIRECTORY_STAT_FIELDS = frozenset({"device", "inode", "mtime_ns", "ctime_ns", "mode"})
-COMPILE_CACHE_SUBDIRECTORIES = (
-    "cuda",
-    "flashinfer",
-    "torch",
-    "torchinductor",
-    "triton",
-    "vllm",
-    "xdg",
-)
 
 
 def _fail(message: str) -> None:
@@ -112,20 +107,19 @@ def compile_cache_contract(
     *,
     manifest: DeploymentManifest,
     observed_gpu: dict[str, Any],
+    runtime_execution_environment: dict[str, Any],
 ) -> dict[str, Any]:
     return build_compile_cache_contract(
         driver=manifest.service["driver"],
         runtime=manifest.runtime,
+        runtime_execution_environment=runtime_execution_environment,
+        implementation_bundle_sha256=(
+            manifest.implementation_bundle_sha256
+        ),
         huggingface_closure_sha256=manifest.closure_sha256,
         compile_affecting_launch_sha256=(manifest.compile_affecting_launch_sha256),
         observed_gpu=observed_gpu,
     )
-
-
-def compile_cache_receipt_path(
-    contract: dict[str, Any],
-) -> pathlib.PurePosixPath:
-    return pathlib.PurePosixPath(f"{contract['local_root']}.stage.json")
 
 
 def verify_compile_cache_stage(

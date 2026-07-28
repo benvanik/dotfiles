@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import hashlib
 import json
 import math
 import re
+from collections.abc import Callable, Iterator
 from typing import Any
 
 from .api import validate_provider_pod_snapshot
@@ -1066,7 +1068,30 @@ class InstanceStore:
         expected_operation_id: str,
         expected_pod_id: str,
     ) -> dict[str, Any]:
+        with self.locked_active_lease(
+            name,
+            expected_operation_id=expected_operation_id,
+            expected_pod_id=expected_pod_id,
+            clock=lambda: now,
+        ) as record:
+            return record
+
+    @contextlib.contextmanager
+    def locked_active_lease(
+        self,
+        name: str,
+        *,
+        expected_operation_id: str,
+        expected_pod_id: str,
+        clock: Callable[[], datetime.datetime] | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Hold the instance CAS boundary while a dependent receipt commits."""
+
+        current_time = clock or (
+            lambda: datetime.datetime.now(datetime.timezone.utc)
+        )
         with self.state.locked(instance_lock_scope(name)):
+            now = current_time()
             record = self.load(name)
             if record is None:
                 raise AssertionError("required instance unexpectedly absent")
@@ -1089,4 +1114,4 @@ class InstanceStore:
                     "instance lease has expired: " + ", ".join(reasons),
                     code="lease_expired",
                 )
-            return record
+            yield record

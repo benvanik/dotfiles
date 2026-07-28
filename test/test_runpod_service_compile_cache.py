@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import pathlib
 import unittest
 
@@ -24,6 +26,21 @@ GPU = {
 }
 CLOSURE_SHA256 = "3" * 64
 LAUNCH_SHA256 = "4" * 64
+IMPLEMENTATION_BUNDLE_SHA256 = "5" * 64
+RUNTIME_EXECUTION_ENVIRONMENT = {
+    "schema_version": "runpod.runtime-execution-environment.v1",
+    "values": {"LD_LIBRARY_PATH": "/usr/local/nvidia/lib64"},
+    "sha256": hashlib.sha256(
+        (
+            json.dumps(
+                {"LD_LIBRARY_PATH": "/usr/local/nvidia/lib64"},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("ascii")
+    ).hexdigest(),
+}
 
 
 def contract(
@@ -32,10 +49,17 @@ def contract(
     closure_sha256: str = CLOSURE_SHA256,
     launch_sha256: str = LAUNCH_SHA256,
     gpu: dict[str, object] | None = None,
+    execution_environment: dict[str, object] | None = None,
+    implementation_bundle_sha256: str = IMPLEMENTATION_BUNDLE_SHA256,
 ) -> dict[str, object]:
     return build_compile_cache_contract(
         driver="vllm-openai.v1",
         runtime=runtime or copy.deepcopy(RUNTIME),
+        runtime_execution_environment=(
+            execution_environment
+            or copy.deepcopy(RUNTIME_EXECUTION_ENVIRONMENT)
+        ),
+        implementation_bundle_sha256=implementation_bundle_sha256,
         huggingface_closure_sha256=closure_sha256,
         compile_affecting_launch_sha256=launch_sha256,
         observed_gpu=gpu or copy.deepcopy(GPU),
@@ -82,6 +106,13 @@ class ServiceCompileCacheTest(unittest.TestCase):
 
         variants.append(contract(closure_sha256="5" * 64))
         variants.append(contract(launch_sha256="6" * 64))
+        variants.append(contract(implementation_bundle_sha256="9" * 64))
+        changed_environment = copy.deepcopy(RUNTIME_EXECUTION_ENVIRONMENT)
+        changed_environment["values"]["LD_LIBRARY_PATH"] = "/usr/local/cuda/lib64"
+        changed_environment["sha256"] = hashlib.sha256(
+            b'{"LD_LIBRARY_PATH":"/usr/local/cuda/lib64"}\n'
+        ).hexdigest()
+        variants.append(contract(execution_environment=changed_environment))
         changed_runtime = copy.deepcopy(RUNTIME)
         changed_runtime["manifest"]["sha256"] = "7" * 64
         variants.append(contract(runtime=changed_runtime))
@@ -102,6 +133,16 @@ class ServiceCompileCacheTest(unittest.TestCase):
             with self.subTest(identity=variant["identity"]):
                 self.assertNotEqual(variant["cache_id"], baseline)
 
+    def test_implementation_bundle_change_invalidates_cache_identity(self):
+        first = contract(implementation_bundle_sha256="a" * 64)
+        second = contract(implementation_bundle_sha256="b" * 64)
+
+        self.assertNotEqual(first["cache_id"], second["cache_id"])
+        self.assertEqual(
+            second["identity"]["implementation_bundle_sha256"],
+            "b" * 64,
+        )
+
     def test_physical_gpu_uuid_is_deliberately_not_an_input(self):
         unexpected = copy.deepcopy(GPU)
         unexpected["uuid"] = "GPU-physical-instance"
@@ -119,6 +160,10 @@ class ServiceCompileCacheTest(unittest.TestCase):
             lambda: build_compile_cache_contract(
                 driver="other.v1",
                 runtime=copy.deepcopy(RUNTIME),
+                runtime_execution_environment=copy.deepcopy(
+                    RUNTIME_EXECUTION_ENVIRONMENT
+                ),
+                implementation_bundle_sha256=IMPLEMENTATION_BUNDLE_SHA256,
                 huggingface_closure_sha256=CLOSURE_SHA256,
                 compile_affecting_launch_sha256=LAUNCH_SHA256,
                 observed_gpu=copy.deepcopy(GPU),

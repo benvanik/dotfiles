@@ -100,9 +100,8 @@ class ServiceControllerPlanTest(unittest.TestCase):
                 "source_path": str(SOURCE_PATH),
                 "bytes": len(CONFIG),
                 "sha256": hashlib.sha256(CONFIG).hexdigest(),
-                "remote_path": (
-                    "/root/runpod-session/services/fixture-service/service.toml"
-                ),
+                "scope": "local-planning-only",
+                "remote_path": None,
                 "companion_inputs": 0,
             },
         )
@@ -129,12 +128,27 @@ class ServiceControllerPlanTest(unittest.TestCase):
         )
         self.assertEqual(
             plan["remote_controller_requirement"]["status"],
-            "unresolved",
+            "available-after-materialization",
+        )
+        self.assertIs(
+            plan["remote_controller_requirement"]["generic_implementation_required"],
+            False,
+        )
+        self.assertEqual(
+            plan["remote_controller_requirement"]["authored_remote_input_count"],
+            0,
         )
         deployment = plan["deployment"]
         self.assertEqual(
             deployment["service_root"],
             "/root/runpod-session/services/fixture-service",
+        )
+        self.assertEqual(
+            deployment["manifest_path_template"],
+            (
+                "/root/runpod-session/services/fixture-service/deployments/"
+                "{deployment_id}/deployment.json"
+            ),
         )
         self.assertNotIn(
             deployment["service_root"],
@@ -152,7 +166,17 @@ class ServiceControllerPlanTest(unittest.TestCase):
         self.assertIsNone(deployment["compile_cache_identity_inputs"]["observed_gpu"])
         self.assertEqual(
             deployment["compile_cache_identity_inputs"]["status"],
-            "requires-huggingface-closure-and-observed-gpu",
+            "requires-materialization-and-remote-observation",
+        )
+        self.assertIsNone(
+            deployment["compile_cache_identity_inputs"][
+                "implementation_bundle_sha256"
+            ]
+        )
+        self.assertIsNone(
+            deployment["compile_cache_identity_inputs"][
+                "runtime_execution_environment"
+            ]
         )
         self.assertEqual(
             deployment["compile_cache_identity_inputs"]["persistent_root_prefix"],

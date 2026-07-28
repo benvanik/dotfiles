@@ -9,11 +9,33 @@ from typing import Any
 
 from runpod_local.errors import RunpodLocalError
 
+from .compile_cache_document import (
+    CompileCacheMode,
+    VLLM_CACHE_EVIDENCE_SCHEMA,
+    validate_cache_evidence,
+)
+from .compile_cache_files import (
+    fail,
+    read_exact_file,
+    safe_relative,
+)
+
 
 DRIVER_ID = "vllm-openai.v1"
 VLLM_EXECUTABLE = "/usr/local/bin/vllm"
 LOOPBACK_HOST = "127.0.0.1"
 LOCAL_API_KEY = "model-session-local-no-secret"
+MAX_VLLM_LOG_BYTES = 128 * 1024 * 1024
+_AOT_LOAD_MARKER = "Directly load AOT compilation from path "
+_AOT_SAVE_MARKER = "saved AOT compiled function to "
+_COLD_COMPILE_MARKERS = (
+    _AOT_SAVE_MARKER,
+    "unable to save AOT compiled function to ",
+    "Compiling model again due to a load failure",
+    "torch.compile and initial profiling/warmup run together took ",
+    "Compiling a graph for compile range ",
+    "Cache the graph of compile range ",
+)
 FORBIDDEN_INHERITED_ENVIRONMENT = frozenset(
     {
         "CONDA_PREFIX",
@@ -155,24 +177,31 @@ def build_vllm_environment(
     service_id: str,
     process_nonce: str,
     manifest_sha256: str,
+    cache_mode: CompileCacheMode,
 ) -> dict[str, str]:
     """Return fixed additions to a sanitized inherited environment."""
 
+    if cache_mode not in {
+        "ephemeral",
+        "author",
+        "candidate-proof",
+        "accepted",
+    }:
+        raise RunpodLocalError(
+            "vLLM cache mode is unsupported",
+            code="unsupported_service_cache_mode",
+        )
     hf_root = session_root / "cache" / "hf-runtime"
-    return {
+    environment = {
         "CUDA_CACHE_DISABLE": "0",
         "CUDA_CACHE_MAXSIZE": "4294967296",
         "CUDA_CACHE_PATH": str(compile_root / "cuda"),
-        "DO_NOT_TRACK": "1",
         "FLASHINFER_WORKSPACE_BASE": str(compile_root / "flashinfer"),
         "HF_ASSETS_CACHE": str(hf_root / "assets"),
         "HF_HOME": str(hf_root),
         "HF_HUB_CACHE": str(hf_root / "hub"),
-        "HF_HUB_DISABLE_TELEMETRY": "1",
-        "HF_HUB_DISABLE_UPDATE_CHECK": "1",
         "HF_HUB_OFFLINE": "1",
         "HF_XET_CACHE": str(hf_root / "xet"),
-        "PYTHONDONTWRITEBYTECODE": "1",
         "RUNPOD_SERVICE_ID": service_id,
         "RUNPOD_SERVICE_MANIFEST_SHA256": manifest_sha256,
         "RUNPOD_SERVICE_PROCESS_NONCE": process_nonce,
@@ -182,8 +211,84 @@ def build_vllm_environment(
         "TRITON_CACHE_DIR": str(compile_root / "triton"),
         "VLLM_CACHE_ROOT": str(compile_root / "vllm"),
         "VLLM_DISABLE_COMPILE_CACHE": "0",
-        "VLLM_FORCE_AOT_LOAD": "1",
         "VLLM_NO_USAGE_STATS": "1",
         "VLLM_USE_AOT_COMPILE": "1",
         "XDG_CACHE_HOME": str(compile_root / "xdg"),
     }
+    if cache_mode in {"candidate-proof", "accepted"}:
+        environment["VLLM_FORCE_AOT_LOAD"] = "1"
+    return environment
+
+
+def _observed_artifact_paths(
+    *,
+    log_text: str,
+    marker: str,
+    cache_root: pathlib.PurePosixPath,
+    inventory: dict[str, Any],
+) -> list[str]:
+    inventory_paths = {record["path"] for record in inventory["files"]}
+    observed: set[str] = set()
+    root_prefix = f"{cache_root}/"
+    for line in log_text.splitlines():
+        if marker not in line:
+            continue
+        path_text = line.split(marker, 1)[1].strip()
+        if not path_text.startswith(root_prefix):
+            fail("vLLM cache marker names an artifact outside the local cache")
+        relative_text = path_text[len(root_prefix) :]
+        relative = safe_relative(
+            relative_text,
+            label="vLLM cache marker path",
+        ).as_posix()
+        if relative not in inventory_paths:
+            fail("vLLM cache marker names an artifact outside the exact inventory")
+        observed.add(relative)
+    return sorted(observed)
+
+
+def read_vllm_cache_evidence(
+    *,
+    log_path: pathlib.Path,
+    cache_root: pathlib.PurePosixPath,
+    inventory: dict[str, Any],
+    mode: CompileCacheMode,
+) -> dict[str, Any]:
+    """Normalize the proven vLLM AOT save/load markers into typed evidence."""
+
+    payload, _ = read_exact_file(
+        log_path,
+        mode=0o600,
+        maximum_bytes=MAX_VLLM_LOG_BYTES,
+    )
+    log_text = payload.decode("utf-8", errors="replace")
+    saved = _observed_artifact_paths(
+        log_text=log_text,
+        marker=_AOT_SAVE_MARKER,
+        cache_root=cache_root,
+        inventory=inventory,
+    )
+    loaded = _observed_artifact_paths(
+        log_text=log_text,
+        marker=_AOT_LOAD_MARKER,
+        cache_root=cache_root,
+        inventory=inventory,
+    )
+    evidence = {
+        "schema_version": VLLM_CACHE_EVIDENCE_SCHEMA,
+        "driver": DRIVER_ID,
+        "mode": mode,
+        "cache_root": str(cache_root),
+        "produced_artifacts": saved,
+        "loaded_artifacts": loaded,
+        "cold_compile_observed": any(
+            marker in log_text for marker in _COLD_COMPILE_MARKERS
+        ),
+        "unexpected_cache_paths": [],
+    }
+    return validate_cache_evidence(
+        evidence,
+        driver=DRIVER_ID,
+        cache_root=str(cache_root),
+        mode=mode,
+    )

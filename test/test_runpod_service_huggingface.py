@@ -26,6 +26,10 @@ from runpod_local.service_huggingface import (
     resolve_huggingface_closure,
     write_huggingface_closure,
 )
+from runpod_local.service_huggingface_policy import (
+    MAX_HUGGINGFACE_LOADER_ASSET_BYTES,
+    is_huggingface_loader_asset,
+)
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 REPOSITORY = "fixture-lab/fixture-model"
@@ -159,13 +163,15 @@ class FakeMetadataClient:
 
 def indexed_siblings() -> list[dict[str, Any]]:
     return [
-        lfs("weights/model-00002-of-00002.safetensors", "b", 2_000),
+        lfs("model-00002-of-00002.safetensors", "b", 2_000),
         blob("README.md", "2", None),
+        lfs("exports/model.onnx", "7", 100_000_000_000),
+        lfs("training/corpus.parquet", "8", 80_000_000_000),
         lfs("pytorch_model.bin", "d", 7_000),
         blob("configuration_fixture.py", "4", 400),
-        blob("weights/model.safetensors.index.json", "5", 500),
+        blob("model.safetensors.index.json", "5", 500),
         blob("config.json", "3", 300),
-        lfs("weights/model-00001-of-00002.safetensors", "a", 1_000),
+        lfs("model-00001-of-00002.safetensors", "a", 1_000),
         lfs("alternate.safetensors", "e", 8_000),
         lfs("tokenizer.json", "c", 600),
     ]
@@ -175,7 +181,7 @@ def indexed_client() -> FakeMetadataClient:
     return FakeMetadataClient(
         indexed_siblings(),
         json_files={
-            "weights/model.safetensors.index.json": {
+            "model.safetensors.index.json": {
                 "metadata": {"total_size": 3_000},
                 "weight_map": {
                     "layer.1": "model-00002-of-00002.safetensors",
@@ -220,11 +226,14 @@ class HuggingFaceClosureResolutionTest(unittest.TestCase):
             )
         )
 
+    def test_canonical_preprocessor_config_is_a_loader_asset(self):
+        self.assertTrue(is_huggingface_loader_asset("preprocessor_config.json"))
+
     def test_indexed_resolution_preserves_exact_runtime_closure(self):
         client = indexed_client()
 
         closure = resolve_huggingface_closure(
-            self.definition(checkpoint="weights/model.safetensors.index.json"),
+            self.definition(checkpoint="model.safetensors.index.json"),
             client=client,
         )
         document = closure.as_dict()
@@ -240,24 +249,22 @@ class HuggingFaceClosureResolutionTest(unittest.TestCase):
         self.assertEqual(
             document["checkpoint"],
             {
-                "requested_selector": ("weights/model.safetensors.index.json"),
-                "resolved_index": ("weights/model.safetensors.index.json"),
+                "requested_selector": ("model.safetensors.index.json"),
+                "resolved_index": ("model.safetensors.index.json"),
                 "weight_files": [
-                    "weights/model-00001-of-00002.safetensors",
-                    "weights/model-00002-of-00002.safetensors",
+                    "model-00001-of-00002.safetensors",
+                    "model-00002-of-00002.safetensors",
                 ],
             },
         )
         self.assertEqual(
             [member["path"] for member in document["files"]],
             [
-                "README.md",
                 "config.json",
-                "configuration_fixture.py",
+                "model-00001-of-00002.safetensors",
+                "model-00002-of-00002.safetensors",
+                "model.safetensors.index.json",
                 "tokenizer.json",
-                "weights/model-00001-of-00002.safetensors",
-                "weights/model-00002-of-00002.safetensors",
-                "weights/model.safetensors.index.json",
             ],
         )
         self.assertNotIn(
@@ -268,18 +275,25 @@ class HuggingFaceClosureResolutionTest(unittest.TestCase):
             "pytorch_model.bin",
             [member["path"] for member in document["files"]],
         )
+        self.assertNotIn(
+            "exports/model.onnx",
+            [member["path"] for member in document["files"]],
+        )
+        self.assertNotIn(
+            "training/corpus.parquet",
+            [member["path"] for member in document["files"]],
+        )
         by_path = {member["path"]: member for member in document["files"]}
         self.assertEqual(
             by_path["config.json"]["identity"],
             {"algorithm": "git-blob-sha1", "digest": "3" * 40},
         )
         self.assertEqual(
-            by_path["weights/model-00001-of-00002.safetensors"]["identity"],
+            by_path["model-00001-of-00002.safetensors"]["identity"],
             {"algorithm": "sha256", "digest": "a" * 64},
         )
-        self.assertEqual(by_path["README.md"]["bytes"], 200)
-        self.assertEqual(document["file_count"], 7)
-        self.assertEqual(document["total_bytes"], 5_000)
+        self.assertEqual(document["file_count"], 5)
+        self.assertEqual(document["total_bytes"], 4_400)
         self.assertRegex(document["closure_sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(
             client.calls,
@@ -289,18 +303,95 @@ class HuggingFaceClosureResolutionTest(unittest.TestCase):
                     "json_file",
                     REPOSITORY,
                     REVISION,
-                    "weights/model.safetensors.index.json",
+                    "model.safetensors.index.json",
                     False,
                 ),
-                ("file_size", REPOSITORY, REVISION, "README.md"),
             ],
+        )
+
+    def test_loader_asset_member_and_aggregate_limits_fail_loud(self):
+        definition = self.definition(checkpoint="model.safetensors")
+        oversized_member = FakeMetadataClient(
+            [
+                blob(
+                    "tokenizer.json",
+                    "2",
+                    MAX_HUGGINGFACE_LOADER_ASSET_BYTES + 1,
+                ),
+                lfs("model.safetensors", "a", 1_000),
+            ]
+        )
+        aggregate_assets = [
+            "config.json",
+            "generation_config.json",
+            "special_tokens_map.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+        ]
+        oversized_aggregate = FakeMetadataClient(
+            [
+                *[
+                    blob(path, f"{position + 2:x}", MAX_HUGGINGFACE_LOADER_ASSET_BYTES)
+                    for position, path in enumerate(aggregate_assets)
+                ],
+                lfs("model.safetensors", "a", 1_000),
+            ]
+        )
+
+        for client, expected_message in (
+            (oversized_member, "member limit"),
+            (oversized_aggregate, "aggregate limit"),
+        ):
+            with self.subTest(expected_message=expected_message):
+                with self.assertRaises(RunpodLocalError) as caught:
+                    resolve_huggingface_closure(
+                        definition,
+                        client=client,
+                    )
+                self.assertEqual(
+                    caught.exception.code,
+                    "invalid_huggingface_closure",
+                )
+                self.assertIn(expected_message, str(caught.exception))
+
+    def test_qwen_nvfp4_loader_asset_classes_remain_admitted(self):
+        loader_assets = [
+            "chat_template.jinja",
+            "config.json",
+            "generation_config.json",
+            "hf_quant_config.json",
+            "preprocessor_config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "video_preprocessor_config.json",
+        ]
+        client = FakeMetadataClient(
+            [
+                blob(".gitattributes", "2", 100),
+                blob("README.md", "3", 200),
+                *[
+                    blob(path, f"{position + 4:x}", 300 + position)
+                    for position, path in enumerate(loader_assets)
+                ],
+                lfs("model.safetensors", "a", 20_559_273_912),
+            ]
+        )
+
+        closure = resolve_huggingface_closure(
+            self.definition(checkpoint="model.safetensors"),
+            client=client,
+        )
+
+        self.assertEqual(
+            [member.path for member in closure.files],
+            sorted([*loader_assets, "model.safetensors"]),
         )
 
     def test_resolution_is_independent_of_hub_sibling_order(self):
         first_client = indexed_client()
         second_client = indexed_client()
         second_client.info["siblings"] = list(reversed(second_client.info["siblings"]))
-        definition = self.definition(checkpoint="weights/model.safetensors.index.json")
+        definition = self.definition(checkpoint="model.safetensors.index.json")
 
         first = resolve_huggingface_closure(
             definition,
@@ -457,17 +548,16 @@ class HuggingFaceClosureResolutionTest(unittest.TestCase):
                     )
                 self.assertEqual(caught.exception.code, expected_code)
 
-    def test_index_requires_every_shard_to_resolve_uniquely(self):
+    def test_index_rejects_a_non_root_shard_the_vllm_loader_cannot_see(self):
         client = FakeMetadataClient(
             [
-                blob("weights/model.safetensors.index.json", "2", 200),
-                lfs("model-00001.safetensors", "a", 1_000),
+                blob("model.safetensors.index.json", "2", 200),
                 lfs("weights/model-00001.safetensors", "b", 1_000),
             ],
             json_files={
-                "weights/model.safetensors.index.json": {
+                "model.safetensors.index.json": {
                     "weight_map": {
-                        "tensor": "model-00001.safetensors",
+                        "tensor": "weights/model-00001.safetensors",
                     }
                 }
             },
@@ -475,7 +565,7 @@ class HuggingFaceClosureResolutionTest(unittest.TestCase):
 
         with self.assertRaises(RunpodLocalError) as caught:
             resolve_huggingface_closure(
-                self.definition(checkpoint="weights/model.safetensors.index.json"),
+                self.definition(checkpoint="model.safetensors.index.json"),
                 client=client,
             )
 
@@ -483,7 +573,7 @@ class HuggingFaceClosureResolutionTest(unittest.TestCase):
             caught.exception.code,
             "invalid_huggingface_closure",
         )
-        self.assertIn("uniquely", str(caught.exception))
+        self.assertIn("vLLM root loader", str(caught.exception))
 
     def test_index_rejects_shards_from_another_checkpoint_family(self):
         malformed_indexes = (
@@ -532,7 +622,7 @@ class HuggingFaceClosureResolutionTest(unittest.TestCase):
 
     def test_manifest_parser_rejects_semantic_and_digest_tampering(self):
         closure = resolve_huggingface_closure(
-            self.definition(checkpoint="weights/model.safetensors.index.json"),
+            self.definition(checkpoint="model.safetensors.index.json"),
             client=indexed_client(),
         )
 
@@ -549,8 +639,8 @@ class HuggingFaceClosureResolutionTest(unittest.TestCase):
         wrong_digest = copy.deepcopy(closure.as_dict())
         wrong_digest["closure_sha256"] = "0" * 64
         mixed_index = copy.deepcopy(closure.as_dict())
-        original_path = "weights/model-00001-of-00002.safetensors"
-        mixed_path = "weights/model-00001-of-00002.bin"
+        original_path = "model-00001-of-00002.safetensors"
+        mixed_path = "model-00001-of-00002.bin"
         mixed_index["checkpoint"]["weight_files"][0] = mixed_path
         for member in mixed_index["files"]:
             if member["path"] == original_path:
@@ -762,6 +852,35 @@ class HuggingFaceClosureFileTest(unittest.TestCase):
 
 
 class HuggingFaceClosureCliTest(unittest.TestCase):
+    def test_cli_rejects_nonderived_closure_output_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            config = root / "service.toml"
+            config.write_bytes(service_payload(checkpoint="model.safetensors"))
+            config.chmod(0o600)
+            completed = subprocess.run(
+                [
+                    str(ROOT / "bin" / "runpod-service"),
+                    "resolve",
+                    str(config),
+                    "--output",
+                    str(root / "beside-config.json"),
+                ],
+                cwd=ROOT,
+                env={
+                    "HOME": str(root),
+                    "PATH": os.environ["PATH"],
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                },
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("unrecognized arguments: --output", completed.stderr)
+            self.assertFalse((root / "beside-config.json").exists())
+
     def test_offline_cli_resolves_cached_metadata_without_model_download(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)

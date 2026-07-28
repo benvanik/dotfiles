@@ -12,8 +12,6 @@ Planning commands:
 
 - `runpod-model`: resolve an exact Hugging Face revision and checkpoint.
 - `runpod-place`: apply the versioned static VRAM placement policy.
-- `runpod-service`: validate, resolve, plan, or bundle one config-only
-  inference service.
 - `runpod-stock`: query live stock and on-demand price.
 - `runpod-volume`: plan/reconcile persistent cache-volume creation.
 - `runpod-template`: reconcile private Pod-template overlays without environment
@@ -30,6 +28,8 @@ Session commands:
 - `runpod-tunnel`: open one loopback-only tunnel without faking activity.
 - `runpod-copy`: copy persistent cache/tool data or ephemeral session data.
 - `runpod-hf-auth`: lease one local Hugging Face token to ephemeral Pod storage.
+- `runpod-service`: validate, resolve, materialize, install, and operate one
+  config-only inference service on an already-active Pod.
 - `runpod-doctor`: read-only local/provider integrity audit.
 
 Paid mutations always require `--execute`. `runpod-ttl set`, `extend`, and
@@ -40,29 +40,76 @@ outlive Pods and are never deleted by this suite.
     "service": """# `runpod-service`
 
 Validate one declarative inference-service TOML file, resolve its generated
-Hugging Face closure, or produce non-executing deployment and bundle plans.
-The model file is the sole authored per-model object. Generic controller/runtime
-code and generated artifact, process, cache, and benchmark state are never
-copied beside it.
+Hugging Face closure, materialize and install the generic runtime, or operate
+that exact deployment on an already-active Pod. The model file is the sole
+authored per-model object. Generic controller/runtime code and generated
+artifact, process, cache, and benchmark state are never copied beside it.
 
 ```sh
-runpod-service validate ~/.local/share/model-services/MODEL.toml --json
-runpod-service plan ~/.local/share/model-services/MODEL.toml --json
-runpod-service resolve ~/.local/share/model-services/MODEL.toml --json
-runpod-service bundle ~/.local/share/model-services/MODEL.toml \
-  --closure ~/.local/runpod/closures/huggingface/HASH/closure.json --json
+CONFIG=~/.local/share/model-services/MODEL.toml
+CLOSURE=~/.local/runpod/closures/huggingface/HASH/closure.json
+NAME=compiler
+
+runpod-service validate "$CONFIG" --json
+runpod-service resolve "$CONFIG" --json
+runpod-service materialize "$CONFIG" --closure "$CLOSURE" --json
+runpod-service install "$CONFIG" "$NAME" --closure "$CLOSURE"
+
+runpod-hf-auth push "$NAME"
+runpod-service stage-snapshot "$CONFIG" "$NAME" --closure "$CLOSURE"
+runpod-hf-auth clear "$NAME"
+runpod-service prepare-cache "$CONFIG" "$NAME" --closure "$CLOSURE" \\
+  --cache-mode ephemeral
+runpod-service setup "$CONFIG" "$NAME" --closure "$CLOSURE" \\
+  --cache-mode ephemeral
+runpod-service start "$CONFIG" "$NAME" --closure "$CLOSURE" \\
+  --cache-mode ephemeral
+runpod-service status "$CONFIG" "$NAME"
+runpod-service stop "$CONFIG" "$NAME"
 ```
 
-All four actions are non-billable and never contact Runpod or SSH. `validate`
-and `plan` are read-only and do not contact Hugging Face. `resolve` reads only
-Hugging Face metadata, downloads no model bytes, and writes one private
-content-addressed generated closure. `bundle` is read-only: it revalidates that
-closure, inventories the exact generic remote implementation with target modes
-and content hashes, and emits one private-mode generated deployment manifest as
-the sole model-specific runtime input. The manifest binds the shared snapshot
-root and typed vLLM argv while leaving the compile-cache contract explicitly
-blocked on exact remote GPU observation. No action copies files, starts a
-process, or invokes the generic runtime's setup/start/status/stop entrypoint.
+`validate` and `plan` are read-only and do not contact Hugging Face. `resolve`
+reads only Hugging Face metadata, downloads no model bytes, and writes one
+private content-addressed generated closure beneath RUNPOD_HOME; callers
+cannot redirect it beside the authored TOML. `bundle` and
+`materialize --json` are non-writing plans. Plain `materialize` publishes the
+exact local transfer closure. `install --json` revalidates the active endpoint
+and reports the local materialization required before transfer; it publishes
+no local files and opens no SSH process. Plain `install` performs that local
+publication and four content-bound SSH/SCP installation steps, then atomically
+records the exact Pod operation, service request, implementation, deployment
+manifest, and local materialization in a private generated installation
+receipt.
+
+Every runtime action with `--json` revalidates the active endpoint and emits
+the exact SSH argv from that installed receipt without materializing, changing
+the receipt, or executing it. Without `--json`, the command invokes only the
+receipt's installed content-addressed entrypoint with its generated
+`deployment.json`. Local controller/runtime source upgrades therefore cannot
+retarget an already-installed service. Each generated manifest has an
+immutable deployment-ID path beneath the stable service root. Installing a
+changed version requires the service lifecycle and serving leases to be free
+and no process receipt to remain; old generated versions stay addressable.
+`stage-snapshot`, `prepare-cache`, `setup`, and `start` fail when the requested
+TOML, closure, or port differs from the receipt. `status` and `stop`
+deliberately remain available for the installed deployment during that drift
+and need no closure unless the caller wants the JSON plan to compare a
+still-available desired closure.
+
+If an installation succeeded but its local receipt was lost, recover with
+`--installed-materialization` and the exact generated materialization SHA-256
+or its path beneath RUNPOD_HOME. Both planned and executing runtime actions
+leave installation state unchanged; only a successful `install` publishes a
+receipt. No service action creates, deletes, starts, or stops a Pod or volume.
+The Runpod API is used only to reconcile the named active Pod before SSH.
+
+`prepare-cache`, `setup`, and `start` require exactly one explicit cache mode:
+`ephemeral`, `author`, `candidate-proof`, or `accepted`. The other runtime
+actions reject a cache mode. Hugging Face authentication is a separate
+ephemeral file lease used only while staging; clear it before start.
+Neither credential can appear in the generated manifest, local/remote argv,
+or child environment. `start` owns readiness and may remain foreground for up
+to five minutes before it stops and reports an unready process.
 """,
     "model": """# `runpod-model`
 

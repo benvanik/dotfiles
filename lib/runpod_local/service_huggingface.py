@@ -26,6 +26,11 @@ from .model import (
 )
 from .paths import ensure_private_directory
 from .service_definition import InferenceServiceDefinition
+from .service_huggingface_policy import (
+    HuggingFaceSnapshotPolicyError,
+    is_huggingface_loader_asset,
+    validate_huggingface_nonweight_assets,
+)
 
 HUGGINGFACE_CLOSURE_SCHEMA = "runpod.huggingface-closure.v1"
 HUGGINGFACE_CLOSURE_IDENTITY_SCHEMA = "runpod.huggingface-closure-identity.v1"
@@ -282,6 +287,10 @@ def _is_checkpoint_index(path: str) -> bool:
     return path.endswith(_WEIGHT_INDEX_SUFFIXES)
 
 
+def _is_root_checkpoint_path(path: str) -> bool:
+    return "/" not in path
+
+
 def parse_huggingface_closure(value: Any) -> HuggingFaceClosure:
     """Validate a generated closure document and verify its canonical digest."""
 
@@ -354,8 +363,13 @@ def parse_huggingface_closure(value: Any) -> HuggingFaceClosure:
         _fail("Hugging Face closure weight_files must be unique and sorted")
     if any(not _is_checkpoint_weight(path) for path in normalized_weight_files):
         _fail("Hugging Face closure has an unsupported checkpoint weight")
-    if resolved_index is not None and not _is_checkpoint_index(resolved_index):
-        _fail("Hugging Face closure has an unsupported checkpoint index")
+    if any(not _is_root_checkpoint_path(path) for path in normalized_weight_files):
+        _fail("Hugging Face closure has an unsupported non-root checkpoint weight")
+    if resolved_index is not None:
+        if not _is_checkpoint_index(resolved_index):
+            _fail("Hugging Face closure has an unsupported checkpoint index")
+        if not _is_root_checkpoint_path(resolved_index):
+            _fail("Hugging Face closure has an unsupported non-root checkpoint index")
     if resolved_index is not None:
         expected_weight_suffix = (
             ".safetensors"
@@ -463,6 +477,14 @@ def parse_huggingface_closure(value: Any) -> HuggingFaceClosure:
     ]
     if index_members != ([] if resolved_index is None else [resolved_index]):
         _fail("Hugging Face closure checkpoint index role does not match")
+    try:
+        validate_huggingface_nonweight_assets(
+            (member.path, member.bytes)
+            for member in members
+            if member.role != "checkpoint-weight"
+        )
+    except HuggingFaceSnapshotPolicyError as error:
+        _fail(str(error))
 
     closure = HuggingFaceClosure(
         repository=repository,
@@ -725,6 +747,11 @@ def _checkpoint_shards(
                 f"checkpoint index {index_path} does not resolve {shard_name} uniquely"
             )
         resolved_path = available[0]
+        if not _is_root_checkpoint_path(resolved_path):
+            _fail(
+                f"checkpoint index {index_path} references a non-root shard "
+                "that the vLLM root loader cannot load"
+            )
         if not resolved_path.endswith(expected_weight_suffix):
             _fail(
                 f"checkpoint index {index_path} references a shard from "
@@ -760,6 +787,8 @@ def _resolve_checkpoint(
     revision = definition.model.revision
     requested = definition.model.checkpoint
     if requested is not None:
+        if not _is_root_checkpoint_path(requested):
+            _fail("requested checkpoint must name a root-level file")
         if requested not in siblings:
             _fail(f"requested checkpoint does not exist: {requested}")
         if not _checkpoint_path_admitted(definition, requested):
@@ -917,6 +946,8 @@ def resolve_huggingface_closure(
         elif path in selected_weights:
             role = "checkpoint-weight"
         elif _is_weight_artifact(path):
+            continue
+        elif not is_huggingface_loader_asset(path):
             continue
         else:
             role = "snapshot"

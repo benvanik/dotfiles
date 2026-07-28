@@ -1,9 +1,10 @@
 """Content identity for reusable vLLM compilation caches.
 
 The cache contract is generated deployment state. It combines the model
-closure, typed compile-affecting launch plan, exact runtime, observed NVIDIA
-driver, and reusable GPU product identity. No model definition owns a cache
-path or cache-management implementation.
+closure, typed compile-affecting launch plan, exact runtime, observed runtime
+execution environment, NVIDIA driver, exact implementation bundle, and
+reusable GPU product identity. No model definition owns a cache path or
+cache-management implementation.
 """
 
 from __future__ import annotations
@@ -31,6 +32,9 @@ _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _DRIVER_VERSION_PATTERN = re.compile(r"^[0-9]+(?:[.][0-9]+)+$")
 _IMAGE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*@sha256:[0-9a-f]{64}$")
 _RUNTIME_ID_PATTERN = re.compile(r"^[a-z][a-z0-9]*(?:[._+-][a-z0-9]+)*$")
+_RUNTIME_EXECUTION_ENVIRONMENT_SCHEMA = (
+    "runpod.runtime-execution-environment.v1"
+)
 
 
 def _fail(message: str) -> None:
@@ -190,10 +194,54 @@ def _runtime_identity(value: Any) -> dict[str, str]:
     }
 
 
+def _runtime_execution_environment_identity(value: Any) -> dict[str, Any]:
+    """Validate the complete typed environment that can affect compilation."""
+
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version",
+        "values",
+        "sha256",
+    }:
+        _fail("runtime execution environment document is malformed")
+    values = value["values"]
+    if (
+        value["schema_version"] != _RUNTIME_EXECUTION_ENVIRONMENT_SCHEMA
+        or not isinstance(values, dict)
+        or not all(
+            isinstance(name, str)
+            and name
+            and isinstance(item, str)
+            and item
+            for name, item in values.items()
+        )
+    ):
+        _fail("runtime execution environment document is malformed")
+    normalized_values = {name: values[name] for name in sorted(values)}
+    payload = (
+        json.dumps(
+            normalized_values,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
+        + "\n"
+    ).encode("ascii")
+    digest = hashlib.sha256(payload).hexdigest()
+    if value["sha256"] != digest:
+        _fail("runtime execution environment digest is mismatched")
+    return {
+        "schema_version": _RUNTIME_EXECUTION_ENVIRONMENT_SCHEMA,
+        "values": normalized_values,
+        "sha256": digest,
+    }
+
+
 def build_compile_cache_contract(
     *,
     driver: str,
     runtime: dict[str, Any],
+    runtime_execution_environment: dict[str, Any],
+    implementation_bundle_sha256: str,
     huggingface_closure_sha256: str,
     compile_affecting_launch_sha256: str,
     observed_gpu: dict[str, Any],
@@ -207,6 +255,15 @@ def build_compile_cache_contract(
         "schema_version": COMPILE_CACHE_SCHEMA,
         "driver": driver,
         "runtime": _runtime_identity(runtime),
+        "runtime_execution_environment": (
+            _runtime_execution_environment_identity(
+                runtime_execution_environment
+            )
+        ),
+        "implementation_bundle_sha256": _required_sha256(
+            implementation_bundle_sha256,
+            label="implementation bundle",
+        ),
         "huggingface_closure_sha256": _required_sha256(
             huggingface_closure_sha256,
             label="Hugging Face closure",

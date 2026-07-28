@@ -8,7 +8,7 @@ import os
 import pathlib
 import re
 import stat
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any
 
@@ -21,6 +21,8 @@ from .template import (
 RUNTIME_MANIFEST_SCHEMA = "runpod.upstream-runtime.v1"
 MAX_RUNTIME_MANIFEST_BYTES = 64 * 1024
 MAX_RUNTIME_BOOTSTRAP_BYTES = 16 * 1024
+MAX_RUNTIME_VERIFIER_BYTES = 1024 * 1024
+REMOTE_RUNTIME_CONTROL_ROOT = "/root/runpod-session/control/runtime-verifier"
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 MANIFEST_FIELDS = frozenset(
     {
@@ -62,6 +64,8 @@ class _RuntimeCatalogEntry:
     runtime_id: str
     manifest_path: str
     manifest_sha256: str
+    verifier_path: str
+    verifier_sha256: str
     bootstrap_id: str
     bootstrap_path: str
     bootstrap_sha256: str
@@ -78,6 +82,10 @@ class RuntimeDefinition:
     runtime_id: str
     manifest_path: str
     manifest_sha256: str
+    manifest_bytes: bytes = field(repr=False)
+    verifier_path: str
+    verifier_sha256: str
+    verifier_bytes: bytes = field(repr=False)
     bootstrap_id: str
     bootstrap_path: str
     bootstrap_sha256: str
@@ -111,7 +119,15 @@ class RuntimeDefinition:
             "image": self.image,
             "manifest": {
                 "path": self.manifest_path,
+                "remote_path": (f"{REMOTE_RUNTIME_CONTROL_ROOT}/runtime-manifest.json"),
                 "sha256": self.manifest_sha256,
+                "bytes": len(self.manifest_bytes),
+            },
+            "verifier": {
+                "path": self.verifier_path,
+                "remote_path": (f"{REMOTE_RUNTIME_CONTROL_ROOT}/verify-runtime.py"),
+                "sha256": self.verifier_sha256,
+                "bytes": len(self.verifier_bytes),
             },
             "launch_overlay": {
                 "bootstrap_id": self.bootstrap_id,
@@ -135,18 +151,18 @@ _RUNTIME_CATALOG = MappingProxyType(
     {
         "vllm-cu129-v0.25.1": _RuntimeCatalogEntry(
             runtime_id="vllm-cu129-v0.25.1",
-            manifest_path=(
-                "runpod/runtimes/vllm-cu129/runtime-manifest.json"
-            ),
+            manifest_path=("runpod/runtimes/vllm-cu129/runtime-manifest.json"),
             manifest_sha256=(
-                "4d77609df0e21a1776d66b6bb504dadf"
-                "9f9fb38300bb26af4f95438ef4347f5a"
+                "4d77609df0e21a1776d66b6bb504dadf9f9fb38300bb26af4f95438ef4347f5a"
+            ),
+            verifier_path=("runpod/runtimes/vllm-cu129/verify-runtime.py"),
+            verifier_sha256=(
+                "d2628b9e9ef2f4ae0d77c3830097793370fd8bee85a9662ac92562319b0cbb22"
             ),
             bootstrap_id="ubuntu-openssh-server-v1",
             bootstrap_path="runpod/bootstrap/ssh/bootstrap.sh",
             bootstrap_sha256=(
-                "53debc1afa74b41fcc03855eb8047abf6"
-                "6daf2015e4bc29b73df2a3523b763ee"
+                "53debc1afa74b41fcc03855eb8047abf66daf2015e4bc29b73df2a3523b763ee"
             ),
             image=(
                 "vllm/vllm-openai@sha256:"
@@ -232,17 +248,14 @@ def _read_catalog_file(
     """Read one owned regular source file through one no-follow descriptor."""
 
     if not all(
-        hasattr(os, name)
-        for name in ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW")
+        hasattr(os, name) for name in ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW")
     ):
         raise RunpodLocalError(
             "this platform cannot safely open the runtime catalog",
             code="unsafe_runtime_catalog",
         )
     parts = _safe_relative_parts(relative_path)
-    directory_flags = (
-        os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
-    )
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
     file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
     descriptors: list[int] = []
     try:
@@ -297,7 +310,19 @@ def _read_catalog_file(
                     code="unsafe_runtime_catalog",
                 )
         value = b"".join(chunks)
-        if len(value) != metadata.st_size:
+        final = os.fstat(file_descriptor)
+        if (
+            len(value) != metadata.st_size
+            or final.st_dev != metadata.st_dev
+            or final.st_ino != metadata.st_ino
+            or not stat.S_ISREG(final.st_mode)
+            or final.st_uid != metadata.st_uid
+            or final.st_nlink != metadata.st_nlink
+            or stat.S_IMODE(final.st_mode) != stat.S_IMODE(metadata.st_mode)
+            or final.st_size != metadata.st_size
+            or final.st_mtime_ns != metadata.st_mtime_ns
+            or final.st_ctime_ns != metadata.st_ctime_ns
+        ):
             raise RunpodLocalError(
                 f"{label} changed while it was being read",
                 code="runtime_catalog_drift",
@@ -349,8 +374,7 @@ def _parse_manifest(
         or not isinstance(versions, dict)
         or set(versions) != VERSION_FIELDS
         or not all(
-            isinstance(version, str) and version
-            for version in versions.values()
+            isinstance(version, str) and version for version in versions.values()
         )
     ):
         raise RunpodLocalError(
@@ -364,8 +388,7 @@ def _parse_manifest(
         or manifest.get("image") != entry.image
         or manifest.get("oci_entrypoint") != ["vllm", "serve"]
         or manifest.get("oci_working_directory") != "/vllm-workspace"
-        or manifest.get("upstream_source")
-        != "https://github.com/vllm-project/vllm"
+        or manifest.get("upstream_source") != "https://github.com/vllm-project/vllm"
         or not isinstance(manifest.get("upstream_revision"), str)
         or not re.fullmatch(
             r"[0-9a-f]{40}",
@@ -377,8 +400,7 @@ def _parse_manifest(
         or overlay.get("bootstrap_id") != entry.bootstrap_id
         or overlay.get("bootstrap_path") != entry.bootstrap_path
         or overlay.get("bootstrap_sha256") != entry.bootstrap_sha256
-        or overlay.get("docker_entrypoint")
-        != list(entry.docker_entrypoint)
+        or overlay.get("docker_entrypoint") != list(entry.docker_entrypoint)
     ):
         raise RunpodLocalError(
             "reviewed runtime manifest drifted from its catalog entry",
@@ -398,6 +420,17 @@ def _load_runtime_entry(
         maximum_bytes=MAX_RUNTIME_MANIFEST_BYTES,
     )
     manifest = _parse_manifest(manifest_bytes, entry=entry)
+    verifier_bytes = _read_catalog_file(
+        source_root,
+        entry.verifier_path,
+        label="reviewed runtime verifier",
+        maximum_bytes=MAX_RUNTIME_VERIFIER_BYTES,
+    )
+    if hashlib.sha256(verifier_bytes).hexdigest() != entry.verifier_sha256:
+        raise RunpodLocalError(
+            "reviewed runtime verifier identity drifted",
+            code="runtime_catalog_drift",
+        )
     bootstrap_bytes = _read_catalog_file(
         source_root,
         entry.bootstrap_path,
@@ -405,9 +438,7 @@ def _load_runtime_entry(
         maximum_bytes=MAX_RUNTIME_BOOTSTRAP_BYTES,
     )
     observed_bootstrap_hash = hashlib.sha256(bootstrap_bytes).hexdigest()
-    manifest_bootstrap_hash = manifest["launch_overlay"][
-        "bootstrap_sha256"
-    ]
+    manifest_bootstrap_hash = manifest["launch_overlay"]["bootstrap_sha256"]
     if (
         observed_bootstrap_hash != entry.bootstrap_sha256
         or observed_bootstrap_hash != manifest_bootstrap_hash
@@ -428,6 +459,10 @@ def _load_runtime_entry(
         runtime_id=entry.runtime_id,
         manifest_path=entry.manifest_path,
         manifest_sha256=entry.manifest_sha256,
+        manifest_bytes=manifest_bytes,
+        verifier_path=entry.verifier_path,
+        verifier_sha256=entry.verifier_sha256,
+        verifier_bytes=verifier_bytes,
         bootstrap_id=entry.bootstrap_id,
         bootstrap_path=entry.bootstrap_path,
         bootstrap_sha256=entry.bootstrap_sha256,

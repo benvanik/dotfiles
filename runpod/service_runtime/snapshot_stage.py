@@ -63,25 +63,6 @@ def _stat_identity(value: os.stat_result) -> dict[str, int]:
     }
 
 
-def _boot_id() -> str:
-    try:
-        value = pathlib.Path("/proc/sys/kernel/random/boot_id").read_text(
-            encoding="ascii"
-        )
-    except OSError as error:
-        raise RunpodLocalError(
-            "kernel boot identity is unavailable",
-            code="service_runtime_platform_error",
-        ) from error
-    value = value.strip()
-    if len(value) != 36:
-        raise RunpodLocalError(
-            "kernel boot identity is malformed",
-            code="service_runtime_platform_error",
-        )
-    return value
-
-
 def _read_private_receipt(path: pathlib.Path) -> tuple[dict[str, Any], str]:
     try:
         path_stat = path.lstat()
@@ -310,21 +291,20 @@ def verify_snapshot_stage(
     canonical_snapshot_root: pathlib.PurePosixPath,
     local_snapshot_root: pathlib.Path,
     receipt_path: pathlib.Path,
-    boot_id: str | None = None,
+    boot_id: str,
 ) -> SnapshotStage:
     """Verify receipt-bound file stats without rehashing multi-GB weights."""
 
     receipt, receipt_sha256 = _read_private_receipt(receipt_path)
     if set(receipt) != _RECEIPT_FIELDS:
         _fail("snapshot stage receipt fields are malformed")
-    expected_boot_id = _boot_id() if boot_id is None else boot_id
     if (
         receipt["schema_version"] != SNAPSHOT_STAGE_SCHEMA
         or receipt["closure_sha256"] != closure["closure_sha256"]
         or receipt["source"] != closure["source"]
         or receipt["checkpoint"] != closure["checkpoint"]
         or receipt["snapshot_root"] != str(canonical_snapshot_root)
-        or receipt["boot_id"] != expected_boot_id
+        or receipt["boot_id"] != boot_id
         or receipt["file_count"] != closure["file_count"]
         or receipt["total_bytes"] != closure["total_bytes"]
     ):

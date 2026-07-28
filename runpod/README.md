@@ -70,10 +70,10 @@ Hugging Face closure manifests, local-stage receipts, compiled-cache
 inventories, process receipts, and benchmark evidence are generated state, not
 model definitions. Weight storage is shared and keyed by the Hugging Face
 repository and immutable revision. A compiled-cache entry is keyed by the
-resolved model closure, complete typed launch configuration, runtime image,
-GPU architecture, and exact driver. These mechanisms may produce bytes for
-each model or launch shape, but they never produce a second copy of their
-implementation.
+resolved model closure, complete typed launch configuration, reviewed
+implementation bundle, exact observed runtime execution environment, GPU
+identity, and driver. These mechanisms may produce bytes for each model or
+launch shape, but they never produce a second copy of their implementation.
 
 A Pi profile owns its prompts, tools, project/session routes, sandbox/storage
 policy, and expected inference contract. Its model and runtime fields describe
@@ -101,7 +101,7 @@ profile behavior.
 
 ## Extension envelope
 
-The next implementation proves only the inference-service/project split. It
+The current implementation proves only the inference-service/project split. It
 does not introduce a universal workload manifest, router, multi-process
 scheduler, or fleet manager. The broader use cases establish these pressures
 for later measured slices:
@@ -147,6 +147,30 @@ unreviewed packages in the vLLM image or on the network volume.
 The directory is mode 0700 and the file is mode 0600. The key is sent only in
 an Authorization header. It never appears in URLs, command arguments, launch
 profiles, receipts, JSON output, or SSH/SCP child environments.
+
+The content hashes, no-follow reads, exact modes, and no-replace publication
+protect the service implementation against transfer drift, path substitution
+by another account, partial publication, and accidental local mutation. They
+do not establish immutability against a hostile process already running as the
+same `root` UID: such a process can mutate a verified file between hashing and
+Python import. The current Pod contract therefore admits only
+administrator-controlled root processes during installation and launch. A
+stronger adversarial boundary requires a separate unprivileged serving UID and
+a root-owned read-only implementation mount (or implementation bytes supplied
+by the immutable runtime image); hashes alone cannot supply that isolation.
+
+The same administrator-controlled-process boundary applies while the Hugging
+Face CLI populates `/workspace`. The remote stager holds one private,
+Pod-local writer lease across every managed download and rechecks the missing
+closure after acquiring it. That lease does not coordinate a second Pod or an
+unmanaged process. While a download is active, the network volume therefore
+has one writable attachment and no interactive or background process may
+mutate its Hugging Face cache. The controller cannot prove that provider-level
+attachment invariant from inside the Pod. A violation may redirect the
+path-based upstream CLI before post-download validation; the runtime claims
+neither write confinement nor safe recovery in that state. With the invariant
+held, every consumed blob is reopened without following links, streamed into
+private ephemeral storage, and checked against the exact closure digest.
 
 The official Hugging Face CLI is independently pinned under `~/tools/hf`:
 
@@ -231,8 +255,8 @@ turns startup into a metadata-bound operation. The runtime boundary is:
   boot; this is the only package overlay;
 - Hugging Face weights on the persistent network volume;
 - generic small-file runtime caches on ephemeral local storage;
-- only model-specific compiled caches that have already proved a material
-  startup benefit retained explicitly on the network volume.
+- only content-addressed compiled-cache artifacts that have already proved a
+  material startup benefit retained explicitly on the network volume.
 
 Runpod caches Pod image layers opportunistically, but does not publish a cache
 lifetime, host-affinity guarantee, or Pod equivalent of Serverless FlashBoot.
@@ -632,10 +656,183 @@ The Hugging Face token is always placed in the latter and is lost with the Pod.
 Merely keeping a tunnel open does not refresh idle activity. The benchmark
 driver should call `runpod-ttl touch NAME --source LABEL` after real work.
 
-The placement receipt now retains the exact resolved commit, selected index,
-checkpoint shard identities, context/KV estimate, and memory policy. A vLLM
-launch must consume those values rather than mutable defaults. After the
-in-Pod verifier accepts the upstream runtime, the native-safetensors shape is:
+## Generic inference-service operation
+
+One service needs one authored TOML file and one generated exact Hugging Face
+closure. It has no model-specific script directory:
+
+```sh
+CONFIG=~/.local/share/model-services/MODEL.toml
+CLOSURE=~/.local/runpod/closures/huggingface/HASH/closure.json
+NAME=compiler
+
+runpod-service validate "$CONFIG" --json
+runpod-service resolve "$CONFIG" --json
+runpod-service materialize "$CONFIG" --closure "$CLOSURE" --json
+runpod-service install "$CONFIG" "$NAME" --closure "$CLOSURE" --json
+```
+
+`resolve` is the deliberate exception to the general JSON-plan convention: it
+performs metadata-only Hugging Face resolution and writes the generated
+mode-0600 closure named in its result at the one content-derived path beneath
+RUNPOD_HOME. There is no caller-selected output path that can mix generated
+state with the authored model definition. `materialize --json` computes the
+exact transfer closure without publishing it. `install --json` additionally
+performs the reconciled read-only active-Pod lookup, but publishes no local
+files, opens no SSH process, and makes no provider mutation. Its
+`remote_installation` status remains `available-after-materialization` because
+the exact SCP source paths do not exist in a non-writing plan.
+
+The closure is a runnable vLLM allowlist, not a mirror of the repository. Its
+checkpoint selector, index, and selected weight shards must all be root-level
+files because the pinned vLLM loader receives the snapshot root and has no
+subfolder route. Nonselected weight families and alternate ONNX, OpenVINO,
+TensorRT, GGUF, archive, dataset, and media exports are excluded.
+Documentation, `.gitattributes`, and arbitrary Python or JSON files are also
+excluded.
+
+The admitted non-weight basenames are `config.json`,
+`generation_config.json`, tokenizer vocabulary/configuration files,
+`chat_template.json` and `chat_template[.*].jinja`, processor and preprocessor
+configuration files, Sentence Transformers module/pooling configuration, and
+quantization configuration matching `quant_config.json`,
+`quantization_config.json`, `quantize_config.json`, or
+`*_quant_config.json`/`*_quantization_config.json`. The shared policy module
+contains the complete exact-name set used by both local resolution and remote
+manifest validation. A loader asset or selected index may be at most 256 MiB;
+at most 512 such files and 1 GiB total non-weight bytes are admitted. An
+allowlisted asset over either byte bound fails resolution rather than being
+silently omitted. The selected weight files are instead bounded by their
+exact checkpoint closure and placement contract.
+
+Plain `materialize` publishes the content-addressed local transfer tree under
+`~/.local/runpod/service-materializations/`. Plain `install` performs that
+same local publication and then runs the four exact installer/SCP steps
+against the already-active Pod. Only after all four steps succeed does it
+atomically publish a private installation receipt binding the exact Pod
+operation and Pod ID to the service request, implementation bundle, deployment
+manifest, and local materialization:
+
+```sh
+runpod-service materialize "$CONFIG" --closure "$CLOSURE"
+runpod-service install "$CONFIG" "$NAME" --closure "$CLOSURE"
+```
+
+The remote installer derives an immutable deployment ID from every exact
+pre-path input and publishes
+`services/SERVICE/deployments/DEPLOYMENT_ID/deployment.json` last with an
+atomic no-replace operation. An identical complete retry is a no-op. A new
+version takes the stable service lifecycle lock and an exclusive serving lock,
+then proves that no process receipt remains before publishing anything.
+Running, stopping, and installing therefore share one service-wide ownership
+contract even though every generated manifest retains its own immutable path.
+
+The remote installation contains one reusable content-addressed implementation
+bundle, the reviewed runtime verifier and manifest, and one or more immutable
+generated deployment manifests. The current installation receipt selects one
+exact manifest; older content-addressed materializations retain their prior
+paths and remain explicitly selectable. The TOML is never copied. With the
+same reviewed runtime and controller bytes, another model reuses the
+implementation identity and contributes only its generated deployment
+manifest.
+
+The shortest no-persistent-compile-cache launch is:
+
+```sh
+runpod-hf-auth push "$NAME"
+runpod-service stage-snapshot "$CONFIG" "$NAME" --closure "$CLOSURE"
+runpod-hf-auth clear "$NAME"
+
+runpod-service prepare-cache "$CONFIG" "$NAME" --closure "$CLOSURE" \
+  --cache-mode ephemeral
+runpod-service setup "$CONFIG" "$NAME" --closure "$CLOSURE" \
+  --cache-mode ephemeral
+runpod-service start "$CONFIG" "$NAME" --closure "$CLOSURE" \
+  --cache-mode ephemeral
+runpod-service status "$CONFIG" "$NAME"
+runpod-service stop "$CONFIG" "$NAME"
+```
+
+`stage-snapshot` reads the ephemeral remote Hugging Face token file when the
+shared persistent snapshot is absent. Token bytes are never placed in argv or
+an inherited environment. Start requires that token lease to have been
+cleared. Before any download, `/workspace` must have the exact bytes of the
+missing closure members plus a named 4 GiB safety reserve. Before any copy,
+ephemeral storage must have the uncopied bytes of the interrupted stage plus
+its own 4 GiB reserve. Both checks use an opened directory identity and
+descriptor-bound filesystem capacity; an error, path replacement, or
+insufficient capacity stops before the first download or member copy. The
+`hf download` invocation places options before a `--` delimiter, so a
+repository member can never be reinterpreted as a CLI option.
+
+`prepare-cache`, `setup`, and `start` require the same explicit mode.
+`ephemeral` admits an empty local cache and never publishes one to the network
+volume. `author` measures a cold compile and stop may seal its exact sequential
+archive as an unaccepted candidate. A later Pod boot uses `candidate-proof`;
+only an exact cache-load witness on that distinct boot allows stop to accept
+the candidate. Within one Pod, every author publication holds one
+workspace-wide lease from recovery and free-space measurement through durable
+atomic publication. An interrupted exact prefix is charged only for its
+remaining archive and document tails. This lease prevents two different cache
+IDs on that Pod from independently spending the same observed headroom; it
+does not replace the single-writable-Pod volume invariant above.
+
+Both proof modes are one-attempt operations on a Pod. Immediately before
+spawning vLLM, start durably consumes a private receipt named by the cache
+identity and bound to the boot, manifest, mode, prerequisite, process nonce,
+and start time. A failed spawn, early exit, or five-minute readiness timeout
+leaves that receipt in place, so a warm or partially mutated local cache cannot
+be retried and mislabeled as a cold author or distinct-boot proof. Failed start
+cleanup signals the dedicated launch group and separately enumerates exact
+service-, nonce-, and manifest-tagged descendants that escaped that group;
+state is removed only after neither set remains. A fresh proof needs a fresh
+Pod/session root. Subsequent boots use `accepted`; `ephemeral` and `accepted`
+launches ignore proof-attempt receipts and remain restartable. Snapshot,
+status, and stop reject a cache mode.
+
+Every lifecycle action with `--json` performs only active-endpoint
+reconciliation and returns the exact SSH argv with `executed: false` and
+`provider_mutation: false`. It reads but never changes the generated
+installation receipt. Without `--json`, it runs the exact hashed entrypoint
+and deployment manifest named by that receipt; it does not rebuild or publish
+the current controller source. This keeps `status` and `stop` usable across a
+local controller/runtime upgrade and prevents an upgrade from silently
+retargeting a running deployment.
+
+`stage-snapshot`, `prepare-cache`, `setup`, and `start` additionally require
+the requested TOML plan, Hugging Face closure, and remote port to match the
+installed receipt. A mismatch fails with
+`service_installation_request_drift` and requires an explicit `install`.
+`status` and `stop` intentionally operate the installed request even when the
+current request differs. They need only the TOML's service ID and the fresh Pod
+identity; omit `--closure` when the old generated closure is unavailable.
+Supplying a closure asks the JSON plan to report whether that desired request
+matches the installed one.
+
+If remote installation succeeded but receipt publication was interrupted,
+recover from the exact retained generated materialization:
+
+```sh
+runpod-service status "$CONFIG" "$NAME" \
+  --installed-materialization MATERIALIZATION_SHA256 --json
+runpod-service status "$CONFIG" "$NAME" \
+  --installed-materialization MATERIALIZATION_SHA256
+```
+
+The JSON form proves the exact planned argv without changing state. Executing
+the action also leaves installation state unchanged: inspection is not
+authority to adopt a receipt. Rerunning a successful `install` is the only way
+to publish the binding. The selector also accepts the exact corresponding path
+beneath `~/.local/runpod/service-materializations/`, and rejects every other
+path.
+Service operation cannot create, start, stop, or delete a Pod or volume; host
+billing remains bounded by the independently managed instance lease.
+
+The placement receipt retains the exact resolved commit, selected index,
+checkpoint shard identities, context/KV estimate, and memory policy. A raw
+vLLM launch must consume those values rather than mutable defaults. After the
+in-Pod verifier accepts the upstream runtime, the native-safetensors escape
+hatch is:
 
 ```sh
 runpod-ssh compiler -- \
@@ -674,8 +871,11 @@ Private local state defaults to:
 ```text
 ~/.local/runpod/
 ├── cache/huggingface/       exact metadata cache
+├── closures/huggingface/    generated exact model closures
 ├── profiles/                non-secret launch policy
 ├── instances/               intent, receipt, events, leases
+├── service-materializations/ generated exact transfer closures
+├── service-installations/   installed service/Pod bindings
 ├── locks/                   same-host advisory locks
 └── ssh/known-hosts/         one host-key file per Pod ID
 ```

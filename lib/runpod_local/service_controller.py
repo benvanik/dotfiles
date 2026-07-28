@@ -147,16 +147,12 @@ def _config_input(
     *,
     source_path: pathlib.Path,
 ) -> dict[str, Any]:
-    service_id = definition.normalized_plan()["service_id"]
     return {
         "source_path": str(source_path),
         "bytes": definition.source_size,
         "sha256": definition.source_sha256,
-        "remote_path": str(
-            pathlib.PurePosixPath("/root/runpod-session/services")
-            / service_id
-            / "service.toml"
-        ),
+        "scope": "local-planning-only",
+        "remote_path": None,
         "companion_inputs": 0,
     }
 
@@ -204,16 +200,25 @@ def build_service_deployment_plan(
         remote_port=remote_port,
     )
     remote_controller_requirement = {
-        "status": "unresolved",
+        "status": "available-after-materialization",
         "required_capabilities": [
+            "stage-snapshot",
+            "prepare-cache",
             "setup",
             "start",
             "status",
             "stop",
         ],
-        "generic_implementation_required": True,
-        "config_input_count": 1,
-        "definition_path": deployment["definition_path"],
+        "generic_implementation_required": False,
+        "generic_implementation_status": "repository-bundled",
+        "remaining_requirements": [
+            "generated-huggingface-closure",
+            "local-content-materialization",
+            "remote-installation",
+        ],
+        "authored_remote_input_count": 0,
+        "generated_deployment_manifest_count": 1,
+        "manifest_path_template": deployment["manifest_path_template"],
         "driver": deployment["driver"],
     }
     identity = {

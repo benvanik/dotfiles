@@ -37,13 +37,19 @@ class ServicePaths:
 def canonical_service_paths(
     *,
     service_id: str,
+    deployment_id: str,
     closure_sha256: str,
 ) -> ServicePaths:
     service_root = REMOTE_SERVICES_ROOT / service_id
     snapshot_root = REMOTE_SNAPSHOTS_ROOT / closure_sha256
     return ServicePaths(
         service_root=service_root,
-        manifest=service_root / "deployment.json",
+        manifest=(
+            service_root
+            / "deployments"
+            / deployment_id
+            / "deployment.json"
+        ),
         process_state=service_root / "process.json",
         service_log=service_root / "service.log",
         lifecycle_lock=service_root / "lifecycle.lock",
@@ -83,10 +89,12 @@ class RuntimeLayout:
         self,
         *,
         service_id: str,
+        deployment_id: str,
         closure_sha256: str,
     ) -> tuple[ServicePaths, dict[str, pathlib.Path]]:
         canonical = canonical_service_paths(
             service_id=service_id,
+            deployment_id=deployment_id,
             closure_sha256=closure_sha256,
         )
         localized = {

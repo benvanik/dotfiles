@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .errors import RunpodLocalError
+from .runtime_catalog import RuntimeDefinition
 from .service_compile_cache import COMPILE_CACHE_SCHEMA
 from .service_definition import InferenceServiceDefinition
 from .service_huggingface import (
@@ -25,7 +26,9 @@ from .service_vllm import (
 
 BUNDLE_PLAN_SCHEMA = "runpod.inference-service-bundle-plan.v1"
 IMPLEMENTATION_BUNDLE_SCHEMA = "runpod.inference-service-implementation-bundle.v1"
+IMPLEMENTATION_RECEIPT_SCHEMA = "runpod.inference-service-implementation-receipt.v1"
 DEPLOYMENT_MANIFEST_SCHEMA = "runpod.inference-service-deployment-manifest.v1"
+DEPLOYMENT_IDENTITY_SCHEMA = "runpod.inference-service-deployment-identity.v1"
 IMPLEMENTATION_ID = "runpod-inference-service-runtime-v1"
 REMOTE_IMPLEMENTATION_PARENT = pathlib.PurePosixPath(
     "/root/runpod-session/control/inference-service-runtime"
@@ -33,7 +36,15 @@ REMOTE_IMPLEMENTATION_PARENT = pathlib.PurePosixPath(
 REMOTE_SERVICE_PARENT = pathlib.PurePosixPath("/root/runpod-session/services")
 REMOTE_SNAPSHOT_PARENT = pathlib.PurePosixPath("/root/runpod-session/model-snapshots")
 RELATIVE_ENTRYPOINT = pathlib.PurePosixPath("bin/runpod-service-runtime")
-ENTRYPOINT_ACTIONS = ("setup", "start", "status", "stop")
+RELATIVE_BUNDLE_RECEIPT = pathlib.PurePosixPath("bundle.json")
+ENTRYPOINT_ACTIONS = (
+    "stage-snapshot",
+    "prepare-cache",
+    "setup",
+    "start",
+    "status",
+    "stop",
+)
 MAX_IMPLEMENTATION_FILE_BYTES = 256 * 1024
 MAX_IMPLEMENTATION_BUNDLE_BYTES = 1024 * 1024
 
@@ -64,6 +75,26 @@ IMPLEMENTATION_MEMBERS = (
         "0644",
     ),
     ImplementationMember(
+        "runpod/service_runtime/compile_cache_archive.py",
+        "service_runtime/compile_cache_archive.py",
+        "0644",
+    ),
+    ImplementationMember(
+        "runpod/service_runtime/compile_cache_document.py",
+        "service_runtime/compile_cache_document.py",
+        "0644",
+    ),
+    ImplementationMember(
+        "runpod/service_runtime/compile_cache_files.py",
+        "service_runtime/compile_cache_files.py",
+        "0644",
+    ),
+    ImplementationMember(
+        "runpod/service_runtime/compile_cache_stage.py",
+        "service_runtime/compile_cache_stage.py",
+        "0644",
+    ),
+    ImplementationMember(
         "runpod/service_runtime/controller.py",
         "service_runtime/controller.py",
         "0644",
@@ -71,6 +102,11 @@ IMPLEMENTATION_MEMBERS = (
     ImplementationMember(
         "runpod/service_runtime/document.py",
         "service_runtime/document.py",
+        "0644",
+    ),
+    ImplementationMember(
+        "runpod/service_runtime/execution_environment.py",
+        "service_runtime/execution_environment.py",
         "0644",
     ),
     ImplementationMember(
@@ -86,6 +122,11 @@ IMPLEMENTATION_MEMBERS = (
     ImplementationMember(
         "runpod/service_runtime/snapshot_stage.py",
         "service_runtime/snapshot_stage.py",
+        "0644",
+    ),
+    ImplementationMember(
+        "runpod/service_runtime/snapshot_stager.py",
+        "service_runtime/snapshot_stager.py",
         "0644",
     ),
     ImplementationMember(
@@ -106,6 +147,11 @@ IMPLEMENTATION_MEMBERS = (
     ImplementationMember(
         "lib/runpod_local/errors.py",
         "runpod_local/errors.py",
+        "0644",
+    ),
+    ImplementationMember(
+        "lib/runpod_local/service_huggingface_policy.py",
+        "runpod_local/service_huggingface_policy.py",
         "0644",
     ),
     ImplementationMember(
@@ -249,9 +295,15 @@ def _read_implementation_member(
         os.close(descriptor)
     if (
         observed_bytes != metadata.st_size
+        or not stat.S_ISREG(final.st_mode)
+        or final.st_dev != opened.st_dev
+        or final.st_ino != opened.st_ino
         or final.st_size != opened.st_size
         or final.st_mtime_ns != opened.st_mtime_ns
         or final.st_ctime_ns != opened.st_ctime_ns
+        or final.st_uid != opened.st_uid
+        or final.st_nlink != opened.st_nlink
+        or stat.S_IMODE(final.st_mode) != stat.S_IMODE(opened.st_mode)
     ):
         raise RunpodLocalError(
             f"implementation member changed while reading: {member.source_path}",
@@ -298,6 +350,20 @@ def build_implementation_bundle(
     }
     bundle_sha256 = _sha256(content_identity)
     remote_root = REMOTE_IMPLEMENTATION_PARENT / bundle_sha256
+    receipt_document = {
+        "schema_version": IMPLEMENTATION_RECEIPT_SCHEMA,
+        "bundle_sha256": bundle_sha256,
+        "implementation": content_identity,
+    }
+    receipt_payload = _canonical_bytes(receipt_document)
+    receipt = {
+        "bundle_path": str(RELATIVE_BUNDLE_RECEIPT),
+        "remote_path": str(remote_root / RELATIVE_BUNDLE_RECEIPT),
+        "mode": "0600",
+        "bytes": len(receipt_payload),
+        "sha256": hashlib.sha256(receipt_payload).hexdigest(),
+        "document": receipt_document,
+    }
     return {
         **content_identity,
         "files": files,
@@ -310,6 +376,7 @@ def build_implementation_bundle(
         "bundle_sha256": bundle_sha256,
         "remote_root": str(remote_root),
         "entrypoint": str(remote_root / RELATIVE_ENTRYPOINT),
+        "receipt": receipt,
     }
 
 
@@ -353,14 +420,17 @@ def _validated_closure(
 def _compile_cache_requirement(
     *,
     deployment: dict[str, Any],
+    implementation_bundle_sha256: str,
     closure_sha256: str,
 ) -> dict[str, Any]:
     return {
-        "status": "requires-observed-gpu",
+        "status": "requires-runtime-execution-environment-and-observed-gpu",
         "contract_schema_version": COMPILE_CACHE_SCHEMA,
         "inputs": {
             "driver": deployment["driver"],
             "runtime": deployment["runtime"],
+            "runtime_execution_environment": None,
+            "implementation_bundle_sha256": implementation_bundle_sha256,
             "huggingface_closure_sha256": closure_sha256,
             "compile_affecting_launch_sha256": deployment["launch"][
                 "compile_affecting_sha256"
@@ -373,25 +443,30 @@ def _compile_cache_requirement(
 def build_deployment_manifest(
     definition: InferenceServiceDefinition,
     *,
-    runtime: dict[str, Any],
+    runtime: RuntimeDefinition,
     closure: HuggingFaceClosure,
     implementation_bundle: dict[str, Any],
     remote_port: int = DEFAULT_REMOTE_PORT,
 ) -> dict[str, Any]:
-    """Generate the sole model-specific input consumed by the remote runtime."""
+    """Generate the sole model-bound document consumed by the generic runtime."""
 
+    if not isinstance(runtime, RuntimeDefinition):
+        raise RunpodLocalError(
+            "service bundle requires one reviewed RuntimeDefinition",
+            code="invalid_service_bundle_runtime",
+        )
     validated_closure, closure_document = _validated_closure(
         definition,
         closure,
     )
     service = definition.normalized_plan()
+    runtime_summary = runtime.safe_summary()
     deployment_plan = build_vllm_deployment_plan(
         definition,
-        runtime=runtime,
+        runtime=runtime_summary,
         remote_port=remote_port,
     )
     service_root = REMOTE_SERVICE_PARENT / service["service_id"]
-    manifest_path = service_root / "deployment.json"
     snapshot_root = REMOTE_SNAPSHOT_PARENT / validated_closure.closure_sha256
     arguments = list(
         build_vllm_argv(
@@ -400,9 +475,8 @@ def build_deployment_manifest(
             remote_port=remote_port,
         )
     )
-    deployment = {
+    deployment_core = {
         "service_root": str(service_root),
-        "manifest_path": str(manifest_path),
         "process": deployment_plan["process"],
         "model_snapshot": {
             "root": str(snapshot_root),
@@ -413,15 +487,19 @@ def build_deployment_manifest(
             "argv": arguments,
         },
     }
-    deployment["launch"].pop("argv_template")
-    deployment["launch"].pop("api_key_source")
+    deployment_core["launch"].pop("argv_template")
+    deployment_core["launch"].pop("api_key_source")
     implementation = {
         "implementation_id": implementation_bundle["implementation_id"],
         "bundle_sha256": implementation_bundle["bundle_sha256"],
         "remote_root": implementation_bundle["remote_root"],
         "entrypoint": implementation_bundle["entrypoint"],
+        "receipt": {
+            key: implementation_bundle["receipt"][key]
+            for key in ("remote_path", "bytes", "sha256")
+        },
     }
-    return {
+    manifest_core = {
         "schema_version": DEPLOYMENT_MANIFEST_SCHEMA,
         "definition": {
             "source_sha256": definition.source_sha256,
@@ -429,14 +507,32 @@ def build_deployment_manifest(
             "service_plan_sha256": definition.plan_sha256,
             "service": service,
         },
-        "runtime": runtime,
+        "runtime": runtime_summary,
         "huggingface_closure": closure_document,
         "implementation": implementation,
-        "deployment": deployment,
+        "deployment": deployment_core,
         "compile_cache": _compile_cache_requirement(
             deployment=deployment_plan,
+            implementation_bundle_sha256=implementation["bundle_sha256"],
             closure_sha256=validated_closure.closure_sha256,
         ),
+    }
+    deployment_id = _sha256(
+        {
+            "schema_version": DEPLOYMENT_IDENTITY_SCHEMA,
+            "manifest": manifest_core,
+        }
+    )
+    manifest_path = (
+        service_root / "deployments" / deployment_id / "deployment.json"
+    )
+    return {
+        **manifest_core,
+        "deployment": {
+            **deployment_core,
+            "deployment_id": deployment_id,
+            "manifest_path": str(manifest_path),
+        },
     }
 
 
@@ -444,12 +540,17 @@ def build_service_bundle_plan(
     definition: InferenceServiceDefinition,
     *,
     source_root: pathlib.Path,
-    runtime: dict[str, Any],
+    runtime: RuntimeDefinition,
     closure: HuggingFaceClosure,
     remote_port: int = DEFAULT_REMOTE_PORT,
 ) -> dict[str, Any]:
     """Build a bundle and manifest plan without local or remote mutation."""
 
+    if not isinstance(runtime, RuntimeDefinition):
+        raise RunpodLocalError(
+            "service bundle requires one reviewed RuntimeDefinition",
+            code="invalid_service_bundle_runtime",
+        )
     _validated_closure(definition, closure)
     implementation_bundle = build_implementation_bundle(source_root=source_root)
     manifest = build_deployment_manifest(

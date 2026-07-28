@@ -207,14 +207,13 @@ def _require_checkpoint(value: Any) -> str:
         maximum_bytes=4096,
     )
     if (
-        checkpoint.startswith("/")
+        "/" in checkpoint
         or "\\" in checkpoint
-        or any(component in {"", ".", ".."} for component in checkpoint.split("/"))
         or not checkpoint.endswith(_CHECKPOINT_SUFFIXES)
     ):
         _fail(
-            "model.checkpoint must be a relative safetensors or PyTorch bin "
-            "file or index"
+            "model.checkpoint must name a root-level safetensors or PyTorch "
+            "bin file or index"
         )
     return checkpoint
 

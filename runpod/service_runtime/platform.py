@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import pathlib
+import secrets
 import signal
 import stat
 import subprocess
@@ -19,13 +20,26 @@ from typing import Any, Iterable
 
 from runpod_local.errors import RunpodLocalError
 
+from .execution_environment import (
+    RuntimeExecutionEnvironment,
+    runtime_execution_environment,
+    validate_runtime_execution_environment,
+)
 from .layout import REMOTE_RUNTIME_CONTROL_ROOT, RuntimeLayout
-from .state import ProcessState
+from .state import (
+    ProcessState,
+    atomic_write_private_json,
+    ensure_private_directory,
+    open_advisory_lock,
+    read_private_json,
+)
 from .vllm import LOCAL_API_KEY
 
 
 MAX_RUNTIME_VERIFICATION_BYTES = 1024 * 1024
 MAX_PROCESS_ENVIRONMENT_BYTES = 1024 * 1024
+RUNTIME_INSTANCE_SCHEMA = "runpod.runtime-instance.v1"
+RUNTIME_INSTANCE_ID_BYTES = 32
 
 
 def _fail(message: str, *, code: str = "service_runtime_platform_error") -> None:
@@ -86,6 +100,9 @@ def _safe_control_file(
         final = os.fstat(descriptor)
         if (
             len(payload) > maximum_bytes
+            or not stat.S_ISREG(final.st_mode)
+            or final.st_dev != opened.st_dev
+            or final.st_ino != opened.st_ino
             or final.st_size != opened.st_size
             or final.st_mtime_ns != opened.st_mtime_ns
             or final.st_ctime_ns != opened.st_ctime_ns
@@ -128,6 +145,18 @@ class ProbeResult:
 class SystemPlatform:
     """Production implementation of every mutable OS/process boundary."""
 
+    @staticmethod
+    def monotonic_ns() -> int:
+        """Read the clock used for measured service lifecycle durations."""
+
+        return time.monotonic_ns()
+
+    @staticmethod
+    def sleep(seconds: float) -> None:
+        """Yield between readiness observations."""
+
+        time.sleep(seconds)
+
     def require_runtime_account(self) -> None:
         if os.geteuid() != 0:
             _fail(
@@ -135,20 +164,45 @@ class SystemPlatform:
                 code="invalid_service_runtime_account",
             )
 
-    def boot_id(self) -> str:
-        try:
-            value = (
-                pathlib.Path("/proc/sys/kernel/random/boot_id")
-                .read_text(encoding="ascii")
-                .strip()
-            )
-            parsed = uuid.UUID(value)
-        except (OSError, ValueError) as error:
-            raise RunpodLocalError(
-                "kernel boot identity is unavailable or malformed",
-                code="service_runtime_platform_error",
-            ) from error
-        return str(parsed)
+    def boot_id(self, *, layout: RuntimeLayout) -> str:
+        """Return the private ephemeral-container instance identity.
+
+        Lifecycle documents retain the historical ``boot_id`` field name, but
+        it denotes this session-root identity, never the shared host kernel
+        boot UUID. A new container session root therefore cannot inherit cache
+        proof authority merely because RunPod reused the same host.
+        """
+
+        ensure_private_directory(layout.session_root, create=False)
+        control_root = layout.session_root / "control"
+        ensure_private_directory(control_root, create=True)
+        identity_path = control_root / "runtime-instance.json"
+        lock_path = control_root / "runtime-instance.lock"
+        with open_advisory_lock(lock_path, create=True) as lock:
+            lock.exclusive()
+            if not os.path.lexists(identity_path):
+                document = {
+                    "schema_version": RUNTIME_INSTANCE_SCHEMA,
+                    "runtime_instance_id": secrets.token_hex(RUNTIME_INSTANCE_ID_BYTES),
+                }
+                try:
+                    atomic_write_private_json(identity_path, document)
+                except RunpodLocalError as error:
+                    raise RunpodLocalError(
+                        "cannot persist private runtime instance identity",
+                        code="service_runtime_platform_error",
+                    ) from error
+            document, _ = read_private_json(identity_path)
+        identity = document.get("runtime_instance_id")
+        if (
+            set(document) != {"schema_version", "runtime_instance_id"}
+            or document["schema_version"] != RUNTIME_INSTANCE_SCHEMA
+            or not isinstance(identity, str)
+            or len(identity) != RUNTIME_INSTANCE_ID_BYTES * 2
+            or any(character not in "0123456789abcdef" for character in identity)
+        ):
+            _fail("private runtime instance identity is malformed")
+        return identity
 
     def process_nonce(self) -> str:
         try:
@@ -218,16 +272,29 @@ class SystemPlatform:
             "driver_version": driver,
         }
 
+    def execution_environment(self) -> RuntimeExecutionEnvironment:
+        return runtime_execution_environment()
+
     def verify_runtime(
         self,
         *,
         expected_runtime: dict[str, Any],
         layout: RuntimeLayout,
+        execution_environment: RuntimeExecutionEnvironment,
     ) -> dict[str, Any]:
         control_root = REMOTE_RUNTIME_CONTROL_ROOT
         verifier = layout.localize(control_root / "verify-runtime.py")
         manifest = layout.localize(control_root / "runtime-manifest.json")
-        _safe_control_file(
+        if expected_runtime["verifier"]["remote_path"] != str(
+            control_root / "verify-runtime.py"
+        ) or expected_runtime["manifest"]["remote_path"] != str(
+            control_root / "runtime-manifest.json"
+        ):
+            _fail(
+                "runtime control paths do not match the deployment",
+                code="runtime_verification_failed",
+            )
+        verifier_payload = _safe_control_file(
             verifier,
             maximum_bytes=1024 * 1024,
         )
@@ -235,10 +302,16 @@ class SystemPlatform:
             manifest,
             maximum_bytes=1024 * 1024,
         )
+        expected_verifier_sha256 = expected_runtime["verifier"]["sha256"]
         expected_manifest_sha256 = expected_runtime["manifest"]["sha256"]
-        if hashlib.sha256(manifest_payload).hexdigest() != expected_manifest_sha256:
+        if (
+            len(verifier_payload) != expected_runtime["verifier"]["bytes"]
+            or hashlib.sha256(verifier_payload).hexdigest() != expected_verifier_sha256
+            or len(manifest_payload) != expected_runtime["manifest"]["bytes"]
+            or hashlib.sha256(manifest_payload).hexdigest() != expected_manifest_sha256
+        ):
             _fail(
-                "runtime manifest does not match the deployment",
+                "runtime control closure does not match the deployment",
                 code="runtime_verification_failed",
             )
         arguments = [
@@ -254,17 +327,9 @@ class SystemPlatform:
                 check=True,
                 capture_output=True,
                 timeout=180,
-                env={
-                    "DO_NOT_TRACK": "1",
-                    "HF_HUB_DISABLE_TELEMETRY": "1",
-                    "HF_HUB_DISABLE_UPDATE_CHECK": "1",
-                    "LANG": "C.UTF-8",
-                    "LC_ALL": "C.UTF-8",
-                    "PATH": (
-                        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-                    ),
-                    "PYTHONDONTWRITEBYTECODE": "1",
-                },
+                env=validate_runtime_execution_environment(
+                    execution_environment.normalized()
+                ).values,
             )
         except (OSError, subprocess.SubprocessError) as error:
             raise RunpodLocalError(
@@ -372,6 +437,9 @@ class SystemPlatform:
     def process_is_owned(self, state: ProcessState) -> bool:
         observation = self.observe_process(state.pid)
         environment = self._process_environment(state.pid)
+        runtime_environment = validate_runtime_execution_environment(
+            state.runtime_execution_environment
+        )
         return bool(
             observation is not None
             and observation.start_ticks == state.process_start_ticks
@@ -380,6 +448,10 @@ class SystemPlatform:
             and environment.get("RUNPOD_SERVICE_PROCESS_NONCE") == state.process_nonce
             and environment.get("RUNPOD_SERVICE_MANIFEST_SHA256")
             == state.manifest_sha256
+            and all(
+                environment.get(name) == value
+                for name, value in runtime_environment.values.items()
+            )
         )
 
     def list_service_processes(
@@ -421,61 +493,141 @@ class SystemPlatform:
                 processes.append(observation)
         return sorted(processes, key=lambda item: item.pid)
 
-    def _base_environment(self) -> dict[str, str]:
-        environment = {
-            "HOME": "/root",
-            "LANG": "C.UTF-8",
-            "LC_ALL": "C.UTF-8",
-            "LOGNAME": "root",
-            "PATH": ("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
-            "USER": "root",
-        }
-        for name in (
-            "CUDA_VISIBLE_DEVICES",
-            "LD_LIBRARY_PATH",
-            "NVIDIA_DRIVER_CAPABILITIES",
-            "NVIDIA_VISIBLE_DEVICES",
-            "TZ",
-        ):
-            value = os.environ.get(name)
-            if value is not None:
-                environment[name] = value
-        return environment
+    @staticmethod
+    def _signal_fresh_process_group(
+        process_group_id: int,
+        signal_number: signal.Signals,
+    ) -> None:
+        """Signal the dedicated group created by this exact Popen operation."""
+
+        try:
+            os.killpg(process_group_id, signal_number)
+        except ProcessLookupError:
+            pass
 
     @staticmethod
-    def _reap_rejected_spawn(process: subprocess.Popen[bytes]) -> None:
-        """Boundedly stop a child that cannot receive a process receipt."""
+    def _fresh_process_group_exists(process_group_id: int) -> bool:
+        try:
+            os.killpg(process_group_id, 0)
+        except ProcessLookupError:
+            return False
+        return True
 
-        try:
-            process.terminate()
-        except ProcessLookupError:
-            pass
+    def _wait_for_fresh_process_group_exit(
+        self,
+        process_group_id: int,
+        *,
+        timeout_seconds: float,
+    ) -> bool:
+        deadline = time.monotonic() + timeout_seconds
+        while self._fresh_process_group_exists(process_group_id):
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.1)
+        return True
+
+    def _reap_rejected_spawn(
+        self,
+        process: subprocess.Popen[bytes],
+        *,
+        service_id: str,
+        process_nonce: str,
+        manifest_sha256: str,
+    ) -> None:
+        """Boundedly stop an unreceipted process group and tagged descendants."""
+
+        self._signal_fresh_process_group(process.pid, signal.SIGTERM)
         try:
             process.wait(timeout=10)
-            return
+            leader_exited = True
         except subprocess.TimeoutExpired:
-            pass
-        try:
-            process.kill()
-        except ProcessLookupError:
-            pass
-        try:
-            process.wait(timeout=10)
-        except subprocess.TimeoutExpired as error:
+            leader_exited = False
+
+        tagged = self.list_service_processes(
+            service_id=service_id,
+            process_nonce=process_nonce,
+            manifest_sha256=manifest_sha256,
+        )
+        if tagged:
+            self.signal_processes(
+                processes=tagged,
+                signal_number=signal.SIGTERM,
+            )
+            self.wait_for_exit(processes=tagged, timeout_seconds=10)
+
+        remaining = self.list_service_processes(
+            service_id=service_id,
+            process_nonce=process_nonce,
+            manifest_sha256=manifest_sha256,
+        )
+        group_exited = not self._fresh_process_group_exists(process.pid)
+        if not leader_exited or not group_exited or remaining:
+            self._signal_fresh_process_group(process.pid, signal.SIGKILL)
+            if remaining:
+                self.signal_processes(
+                    processes=remaining,
+                    signal_number=signal.SIGKILL,
+                )
+            if not leader_exited:
+                try:
+                    process.wait(timeout=10)
+                    leader_exited = True
+                except subprocess.TimeoutExpired:
+                    pass
+            if remaining:
+                self.wait_for_exit(processes=remaining, timeout_seconds=10)
+            group_exited = self._wait_for_fresh_process_group_exit(
+                process.pid,
+                timeout_seconds=10,
+            )
+
+        survivors = self.list_service_processes(
+            service_id=service_id,
+            process_nonce=process_nonce,
+            manifest_sha256=manifest_sha256,
+        )
+        if not leader_exited or not group_exited or survivors:
             raise RunpodLocalError(
-                "unaccepted vLLM child survived TERM and KILL",
+                "unaccepted vLLM process group survived TERM and KILL",
                 code="ambiguous_failed_service_start",
-            ) from error
+            )
 
     def spawn(
         self,
         *,
         argv: tuple[str, ...],
         environment_additions: dict[str, str],
+        execution_environment: RuntimeExecutionEnvironment,
         log_path: pathlib.Path,
         serving_lease_descriptor: int,
     ) -> SpawnedProcess:
-        environment = self._base_environment()
+        environment = dict(
+            validate_runtime_execution_environment(
+                execution_environment.normalized()
+            ).values
+        )
+        if set(environment) & set(environment_additions):
+            _fail(
+                "typed launch additions overlap the verified runtime environment",
+                code="invalid_service_launch_environment",
+            )
+        ownership_names = {
+            "service_id": "RUNPOD_SERVICE_ID",
+            "process_nonce": "RUNPOD_SERVICE_PROCESS_NONCE",
+            "manifest_sha256": "RUNPOD_SERVICE_MANIFEST_SHA256",
+        }
+        ownership = {
+            field: environment_additions.get(name)
+            for field, name in ownership_names.items()
+        }
+        if any(
+            not isinstance(value, str) or not value
+            for value in ownership.values()
+        ):
+            _fail(
+                "typed launch additions omit process ownership fields",
+                code="invalid_service_launch_environment",
+            )
         environment.update(environment_additions)
         flags = os.O_WRONLY | getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -530,7 +682,12 @@ class SystemPlatform:
             or observation.process_group_id != process.pid
             or observation.session_id != process.pid
         ):
-            self._reap_rejected_spawn(process)
+            self._reap_rejected_spawn(
+                process,
+                service_id=ownership["service_id"],
+                process_nonce=ownership["process_nonce"],
+                manifest_sha256=ownership["manifest_sha256"],
+            )
             _fail(
                 "vLLM did not enter its dedicated process group and session",
                 code="service_start_failed",

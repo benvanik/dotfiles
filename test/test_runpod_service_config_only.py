@@ -18,10 +18,14 @@ from runpod_local.service_huggingface import (
     HuggingFaceClosureFile,
 )
 from runpod_local.service_vllm import build_vllm_argv
+from runpod_service_test_fixture import (
+    SERVICE_FIXTURE,
+    SOURCE_SERVICE_FIXTURE,
+)
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 FIXTURE_ROOT = ROOT / "test" / "fixtures" / "runpod-services"
-SECOND_SERVICE = FIXTURE_ROOT / "dense-text-second-service.toml"
+SECOND_SERVICE = SERVICE_FIXTURE
 SERVICE_ID = "fixture-dense-text"
 MODEL_REPOSITORY = "fixture-org/fixture-dense-text-7b"
 MODEL_REVISION = "2222222222222222222222222222222222222222"
@@ -122,12 +126,12 @@ class ConfigOnlySecondServiceAcceptanceTest(unittest.TestCase):
     def test_fixture_is_one_nonexecutable_configuration_file(self):
         entries = list(FIXTURE_ROOT.iterdir())
 
-        self.assertEqual(entries, [SECOND_SERVICE])
-        metadata = SECOND_SERVICE.lstat()
+        self.assertEqual(entries, [SOURCE_SERVICE_FIXTURE])
+        metadata = SOURCE_SERVICE_FIXTURE.lstat()
         self.assertTrue(stat.S_ISREG(metadata.st_mode))
         self.assertFalse(stat.S_ISLNK(metadata.st_mode))
         self.assertEqual(stat.S_IMODE(metadata.st_mode) & 0o111, 0)
-        self.assertEqual(SECOND_SERVICE.suffix, ".toml")
+        self.assertEqual(SOURCE_SERVICE_FIXTURE.suffix, ".toml")
 
     def test_config_alone_defines_a_distinct_vllm_launch(self):
         fixture_root_before = FIXTURE_ROOT.lstat()
@@ -145,7 +149,7 @@ class ConfigOnlySecondServiceAcceptanceTest(unittest.TestCase):
         self.assertEqual(plan["model"]["revision"], MODEL_REVISION)
         self.assertEqual(
             plan["model"]["checkpoint"],
-            "weights/model.safetensors",
+            "model.safetensors",
         )
         self.assertNotIn("closure_sha256", plan["model"])
         self.assertFalse(plan["endpoint"]["reasoning"])
@@ -173,7 +177,7 @@ class ConfigOnlySecondServiceAcceptanceTest(unittest.TestCase):
             arguments[:3],
             ["/usr/local/bin/vllm", "serve", model_path],
         )
-        self.assertNotIn("weights/model.safetensors", arguments)
+        self.assertNotIn("model.safetensors", arguments)
         self.assertEqual(
             flag_value(arguments, "--served-model-name"),
             SERVICE_ID,
@@ -314,26 +318,40 @@ class ConfigOnlySecondServiceAcceptanceTest(unittest.TestCase):
         self.assertNotIn("controller_bundle", second_plan)
         self.assertEqual(
             second_plan["remote_controller_requirement"]["status"],
-            "unresolved",
+            "available-after-materialization",
         )
         self.assertIs(
             second_plan["remote_controller_requirement"][
                 "generic_implementation_required"
             ],
-            True,
+            False,
         )
         self.assertEqual(
-            second_plan["remote_controller_requirement"]["config_input_count"],
+            second_plan["remote_controller_requirement"]["authored_remote_input_count"],
+            0,
+        )
+        self.assertEqual(
+            second_plan["remote_controller_requirement"][
+                "generated_deployment_manifest_count"
+            ],
             1,
         )
         self.assertEqual(second_plan["config_input"]["companion_inputs"], 0)
+        self.assertEqual(
+            second_plan["config_input"]["scope"],
+            "local-planning-only",
+        )
         self.assertNotEqual(
             second_plan["config_input"]["sha256"],
             comparison_plan["config_input"]["sha256"],
         )
-        self.assertNotEqual(
+        self.assertEqual(
             second_plan["config_input"]["remote_path"],
             comparison_plan["config_input"]["remote_path"],
+        )
+        self.assertNotEqual(
+            second_plan["deployment"]["manifest_path_template"],
+            comparison_plan["deployment"]["manifest_path_template"],
         )
         self.assertNotEqual(
             second_plan["deployment"]["service_root"],

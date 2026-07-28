@@ -240,6 +240,7 @@ class InferenceServiceDefinitionTest(unittest.TestCase):
             service_toml(revision="main"),
             service_toml(revision="A" * 40),
             service_toml(checkpoint_line='checkpoint = "../model.safetensors"'),
+            service_toml(checkpoint_line='checkpoint = "weights/model.safetensors"'),
             service_toml(checkpoint_line='checkpoint = "model.gguf"'),
         )
         for payload in invalid_definitions:
@@ -250,6 +251,19 @@ class InferenceServiceDefinitionTest(unittest.TestCase):
                     caught.exception.code,
                     "invalid_service_definition",
                 )
+
+    def test_checkpoint_selector_names_only_a_root_loader_file(self):
+        with self.assertRaises(RunpodLocalError) as caught:
+            parse_inference_service_toml(
+                service_toml(
+                    checkpoint_line=(
+                        'checkpoint = "weights/model.safetensors.index.json"'
+                    )
+                )
+            )
+
+        self.assertEqual(caught.exception.code, "invalid_service_definition")
+        self.assertIn("root-level", str(caught.exception))
 
     def test_cross_field_invariants_fail_closed(self):
         invalid_definitions = (

@@ -13,10 +13,19 @@ from dataclasses import dataclass
 from typing import Any
 
 from runpod_local.errors import RunpodLocalError
+from runpod_local.service_huggingface_policy import (
+    HuggingFaceSnapshotPolicyError,
+    validate_huggingface_nonweight_assets,
+)
 
-from . import DEPLOYMENT_MANIFEST_SCHEMA, IMPLEMENTATION_ID
+from . import (
+    DEPLOYMENT_IDENTITY_SCHEMA,
+    DEPLOYMENT_MANIFEST_SCHEMA,
+    IMPLEMENTATION_ID,
+)
 from .layout import (
     REMOTE_IMPLEMENTATIONS_ROOT,
+    REMOTE_RUNTIME_CONTROL_ROOT,
     canonical_service_paths,
 )
 from .vllm import (
@@ -148,6 +157,18 @@ def _relative_path(
     return text
 
 
+def _root_checkpoint_path(
+    value: Any,
+    *,
+    label: str,
+    suffixes: tuple[str, ...],
+) -> str:
+    path = _relative_path(value, label=label, suffixes=suffixes)
+    if len(pathlib.PurePosixPath(path).parts) != 1:
+        _fail(f"{label} must name a root-level checkpoint file")
+    return path
+
+
 def _canonical_bytes(value: Any, *, newline: bool) -> bytes:
     suffix = "\n" if newline else ""
     return (
@@ -224,7 +245,7 @@ def _normalized_service(value: Any) -> dict[str, Any]:
         _fail("definition.service.model.revision is not an exact commit")
     checkpoint = model["checkpoint"]
     if checkpoint is not None:
-        _relative_path(
+        _root_checkpoint_path(
             checkpoint,
             label="definition.service.model.checkpoint",
             suffixes=(
@@ -427,6 +448,7 @@ def _runtime_selection(value: Any, *, expected_runtime_id: str) -> dict[str, Any
                 "runtime_id",
                 "image",
                 "manifest",
+                "verifier",
                 "launch_overlay",
                 "container_disk_gb",
                 "volume_in_gb",
@@ -445,10 +467,37 @@ def _runtime_selection(value: Any, *, expected_runtime_id: str) -> dict[str, Any
     manifest = _exact_fields(
         runtime["manifest"],
         label="runtime.manifest",
-        fields=frozenset({"path", "sha256"}),
+        fields=frozenset({"path", "remote_path", "sha256", "bytes"}),
     )
     _relative_path(manifest["path"], label="runtime.manifest.path")
     _sha256(manifest["sha256"], label="runtime.manifest.sha256")
+    _integer(
+        manifest["bytes"],
+        label="runtime manifest bytes",
+        minimum=1,
+        maximum=1024 * 1024,
+    )
+    if manifest["remote_path"] != str(
+        REMOTE_RUNTIME_CONTROL_ROOT / "runtime-manifest.json"
+    ):
+        _fail("runtime manifest remote path is unsupported")
+    verifier = _exact_fields(
+        runtime["verifier"],
+        label="runtime.verifier",
+        fields=frozenset({"path", "remote_path", "sha256", "bytes"}),
+    )
+    _relative_path(verifier["path"], label="runtime.verifier.path")
+    _sha256(verifier["sha256"], label="runtime.verifier.sha256")
+    _integer(
+        verifier["bytes"],
+        label="runtime verifier bytes",
+        minimum=1,
+        maximum=1024 * 1024,
+    )
+    if verifier["remote_path"] != str(
+        REMOTE_RUNTIME_CONTROL_ROOT / "verify-runtime.py"
+    ):
+        _fail("runtime verifier remote path is unsupported")
     overlay = _exact_fields(
         runtime["launch_overlay"],
         label="runtime.launch_overlay",
@@ -557,7 +606,7 @@ def _huggingface_closure(
     if checkpoint["requested_selector"] != model["checkpoint"]:
         _fail("Hugging Face closure checkpoint selector does not match")
     if checkpoint["resolved_index"] is not None:
-        _relative_path(
+        _root_checkpoint_path(
             checkpoint["resolved_index"],
             label="Hugging Face resolved checkpoint index",
             suffixes=(".safetensors.index.json", ".bin.index.json"),
@@ -600,7 +649,7 @@ def _huggingface_closure(
     if weight_suffix == ".bin" and load_format != "auto":
         _fail("PyTorch checkpoint closures require vLLM load_format=auto")
     for path in weight_files:
-        _relative_path(
+        _root_checkpoint_path(
             path,
             label="Hugging Face checkpoint weight",
             suffixes=(weight_suffix,),
@@ -685,6 +734,14 @@ def _huggingface_closure(
     )
     if index_members != ([] if resolved_index is None else [resolved_index]):
         _fail("Hugging Face closure resolved index role does not match")
+    try:
+        validate_huggingface_nonweight_assets(
+            (path, files[index]["bytes"])
+            for index, path in enumerate(observed_paths)
+            if roles[path] != "checkpoint-weight"
+        )
+    except HuggingFaceSnapshotPolicyError as error:
+        _fail(str(error))
     if closure["file_count"] != len(files) or closure["total_bytes"] != total_bytes:
         _fail("Hugging Face closure counts do not match its files")
     closure_sha256 = _sha256(
@@ -737,8 +794,16 @@ class DeploymentManifest:
         return self.value["definition"]["service_plan_sha256"]
 
     @property
+    def deployment_id(self) -> str:
+        return self.value["deployment"]["deployment_id"]
+
+    @property
     def runtime(self) -> dict[str, Any]:
         return self.value["runtime"]
+
+    @property
+    def implementation_bundle_sha256(self) -> str:
+        return self.value["implementation"]["bundle_sha256"]
 
     @property
     def closure(self) -> dict[str, Any]:
@@ -823,8 +888,27 @@ def parse_deployment_manifest(payload: bytes) -> DeploymentManifest:
         model=service["model"],
         load_format=service["vllm"]["load_format"],
     )
+    deployment = _exact_fields(
+        document["deployment"],
+        label="deployment",
+        fields=frozenset(
+            {
+                "deployment_id",
+                "service_root",
+                "manifest_path",
+                "process",
+                "model_snapshot",
+                "launch",
+            }
+        ),
+    )
+    deployment_id = _sha256(
+        deployment["deployment_id"],
+        label="deployment identity",
+    )
     paths = canonical_service_paths(
         service_id=service["service_id"],
+        deployment_id=deployment_id,
         closure_sha256=closure["closure_sha256"],
     )
 
@@ -832,7 +916,13 @@ def parse_deployment_manifest(payload: bytes) -> DeploymentManifest:
         document["implementation"],
         label="implementation",
         fields=frozenset(
-            {"implementation_id", "bundle_sha256", "remote_root", "entrypoint"}
+            {
+                "implementation_id",
+                "bundle_sha256",
+                "remote_root",
+                "entrypoint",
+                "receipt",
+            }
         ),
     )
     if implementation["implementation_id"] != IMPLEMENTATION_ID:
@@ -850,20 +940,24 @@ def parse_deployment_manifest(payload: bytes) -> DeploymentManifest:
         expected_implementation_root / "bin" / "runpod-service-runtime"
     ):
         _fail("deployment implementation paths are not content-derived")
-
-    deployment = _exact_fields(
-        document["deployment"],
-        label="deployment",
-        fields=frozenset(
-            {
-                "service_root",
-                "manifest_path",
-                "process",
-                "model_snapshot",
-                "launch",
-            }
-        ),
+    receipt = _exact_fields(
+        implementation["receipt"],
+        label="implementation.receipt",
+        fields=frozenset({"remote_path", "bytes", "sha256"}),
     )
+    if receipt["remote_path"] != str(expected_implementation_root / "bundle.json"):
+        _fail("deployment implementation receipt path is not content-derived")
+    _integer(
+        receipt["bytes"],
+        label="deployment implementation receipt bytes",
+        minimum=1,
+        maximum=1024 * 1024,
+    )
+    _sha256(
+        receipt["sha256"],
+        label="deployment implementation receipt identity",
+    )
+
     if deployment["service_root"] != str(paths.service_root) or deployment[
         "manifest_path"
     ] != str(paths.manifest):
@@ -952,24 +1046,46 @@ def parse_deployment_manifest(payload: bytes) -> DeploymentManifest:
             {
                 "driver",
                 "runtime",
+                "runtime_execution_environment",
+                "implementation_bundle_sha256",
                 "huggingface_closure_sha256",
                 "compile_affecting_launch_sha256",
             }
         ),
     )
     if (
-        compile_cache["status"] != "requires-observed-gpu"
+        compile_cache["status"]
+        != "requires-runtime-execution-environment-and-observed-gpu"
         or compile_cache["contract_schema_version"] != COMPILE_CACHE_SCHEMA
         or compile_cache["observed_gpu"] is not None
         or inputs
         != {
             "driver": DRIVER_ID,
             "runtime": runtime,
+            "runtime_execution_environment": None,
+            "implementation_bundle_sha256": bundle_sha256,
             "huggingface_closure_sha256": closure["closure_sha256"],
             "compile_affecting_launch_sha256": expected_launch_hash,
         }
     ):
         _fail("compile-cache requirement is not bound to this deployment")
+    manifest_core = {
+        **document,
+        "deployment": {
+            key: item
+            for key, item in deployment.items()
+            if key not in {"deployment_id", "manifest_path"}
+        },
+    }
+    expected_deployment_id = _canonical_sha256(
+        {
+            "schema_version": DEPLOYMENT_IDENTITY_SCHEMA,
+            "manifest": manifest_core,
+        },
+        newline=True,
+    )
+    if deployment_id != expected_deployment_id:
+        _fail("deployment identity does not match its exact pre-path inputs")
     return DeploymentManifest(
         value=document,
         payload=payload,

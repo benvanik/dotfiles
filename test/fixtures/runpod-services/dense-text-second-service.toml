@@ -7,7 +7,7 @@ runtime_id = "vllm-cu129-v0.25.1"
 source = "huggingface"
 repository = "fixture-org/fixture-dense-text-7b"
 revision = "2222222222222222222222222222222222222222"
-checkpoint = "weights/model.safetensors"
+checkpoint = "model.safetensors"
 
 [endpoint]
 input_modalities = ["text"]

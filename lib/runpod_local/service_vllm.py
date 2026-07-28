@@ -183,7 +183,12 @@ def build_vllm_deployment_plan(
     model = service["model"]
     port = _remote_port(remote_port)
     service_root = REMOTE_SERVICES_ROOT / service_id
-    definition_path = service_root / "service.toml"
+    manifest_path_template = (
+        service_root
+        / "deployments"
+        / "{deployment_id}"
+        / "deployment.json"
+    )
     snapshot_root = SHARED_SNAPSHOT_ROOT_TEMPLATE
     arguments = list(
         build_vllm_argv(
@@ -204,7 +209,7 @@ def build_vllm_deployment_plan(
         "runtime": runtime,
         "remote_port": port,
         "service_root": str(service_root),
-        "definition_path": str(definition_path),
+        "manifest_path_template": str(manifest_path_template),
         "process": {
             "state_path": str(service_root / "process.json"),
             "log_path": str(service_root / "service.log"),
@@ -230,10 +235,12 @@ def build_vllm_deployment_plan(
         },
         "compile_cache_identity_inputs": {
             "contract_schema_version": COMPILE_CACHE_SCHEMA,
-            "status": "requires-huggingface-closure-and-observed-gpu",
+            "status": "requires-materialization-and-remote-observation",
             "driver": DRIVER_ID,
             "generated_huggingface_closure_sha256": None,
             "exact_runtime": runtime,
+            "implementation_bundle_sha256": None,
+            "runtime_execution_environment": None,
             "compile_affecting_launch_sha256": (compile_affecting_launch_sha256),
             "observed_gpu": None,
             "persistent_root_prefix": str(PERSISTENT_COMPILE_ROOT),

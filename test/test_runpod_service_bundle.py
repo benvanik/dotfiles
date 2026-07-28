@@ -15,6 +15,7 @@ from runpod_local.runtime_catalog import load_runtime
 from runpod_local.service_bundle import (
     BUNDLE_PLAN_SCHEMA,
     DEPLOYMENT_MANIFEST_SCHEMA,
+    ENTRYPOINT_ACTIONS,
     IMPLEMENTATION_BUNDLE_SCHEMA,
     IMPLEMENTATION_MEMBERS,
     RELATIVE_ENTRYPOINT,
@@ -33,12 +34,11 @@ from runpod_local.service_huggingface import (
 )
 
 from runpod.service_runtime.document import parse_deployment_manifest
+from runpod_service_test_fixture import SERVICE_FIXTURE
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-FIXTURE = (
-    ROOT / "test" / "fixtures" / "runpod-services" / "dense-text-second-service.toml"
-)
-RUNTIME = load_runtime("vllm-cu129-v0.25.1").safe_summary()
+FIXTURE = SERVICE_FIXTURE
+RUNTIME = load_runtime("vllm-cu129-v0.25.1")
 
 
 def closure_for(
@@ -136,7 +136,7 @@ class ServiceBundlePlanTest(unittest.TestCase):
             "implementation_id": bundle["implementation_id"],
             "relative_entrypoint": str(RELATIVE_ENTRYPOINT),
             "entrypoint_contract": {
-                "actions": ["setup", "start", "status", "stop"],
+                "actions": list(ENTRYPOINT_ACTIONS),
                 "manifest_argument": "--manifest",
                 "instantiation_input_count": 1,
                 "instantiation_schema_version": (DEPLOYMENT_MANIFEST_SCHEMA),
@@ -168,7 +168,7 @@ class ServiceBundlePlanTest(unittest.TestCase):
         self.assertEqual(
             bundle["entrypoint_contract"],
             {
-                "actions": ["setup", "start", "status", "stop"],
+                "actions": list(ENTRYPOINT_ACTIONS),
                 "manifest_argument": "--manifest",
                 "instantiation_input_count": 1,
                 "instantiation_schema_version": (DEPLOYMENT_MANIFEST_SCHEMA),
@@ -241,7 +241,9 @@ class ServiceBundlePlanTest(unittest.TestCase):
     def test_content_bundle_has_a_real_relocated_entrypoint(self):
         bundle = build_implementation_bundle(source_root=ROOT)
         with tempfile.TemporaryDirectory() as directory:
-            bundle_root = pathlib.Path(directory)
+            temporary_root = pathlib.Path(directory)
+            bundle_root = temporary_root / bundle["bundle_sha256"]
+            bundle_root.mkdir(mode=0o700)
             for entry in bundle["files"]:
                 source = ROOT / entry["source_path"]
                 payload = source.read_bytes()
@@ -253,22 +255,111 @@ class ServiceBundlePlanTest(unittest.TestCase):
                     *pathlib.PurePosixPath(entry["bundle_path"]).parts
                 )
                 target.parent.mkdir(parents=True, exist_ok=True)
+                for parent in target.parents:
+                    if parent == temporary_root:
+                        break
+                    parent.chmod(0o700)
                 target.write_bytes(payload)
                 target.chmod(int(entry["mode"], 8))
+            receipt = bundle["receipt"]
+            receipt_path = bundle_root / "bundle.json"
+            receipt_path.write_bytes(
+                (
+                    json.dumps(
+                        receipt["document"],
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=True,
+                    )
+                    + "\n"
+                ).encode("ascii")
+            )
+            receipt_path.chmod(0o600)
             entrypoint = bundle_root.joinpath(*RELATIVE_ENTRYPOINT.parts)
+            manifest_path = temporary_root / "deployment.json"
+            manifest = {
+                "implementation": {
+                    "bundle_sha256": bundle["bundle_sha256"],
+                    "remote_root": str(bundle_root),
+                    "entrypoint": str(entrypoint),
+                    "receipt": {
+                        "remote_path": str(receipt_path),
+                        "bytes": receipt["bytes"],
+                        "sha256": receipt["sha256"],
+                    },
+                }
+            }
+            manifest_path.write_text(
+                json.dumps(
+                    manifest,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n",
+                encoding="ascii",
+            )
+            manifest_path.chmod(0o600)
             completed = subprocess.run(
-                [sys.executable, str(entrypoint), "--help"],
+                [
+                    sys.executable,
+                    str(entrypoint),
+                    "--help",
+                    "--manifest",
+                    str(manifest_path),
+                ],
                 cwd=bundle_root,
                 env={
                     "PATH": os.environ["PATH"],
                     "PYTHONDONTWRITEBYTECODE": "1",
                 },
-                check=True,
+                check=False,
                 capture_output=True,
                 text=True,
             )
+            rejected_invocations = (
+                ["--help", f"--manifest={manifest_path}"],
+                [
+                    "--help",
+                    "--manifest",
+                    str(manifest_path),
+                    "--manifest",
+                    str(manifest_path),
+                ],
+                [
+                    "status",
+                    "--manifest",
+                    str(manifest_path),
+                    "--man",
+                    str(manifest_path),
+                ],
+                [
+                    "status",
+                    "--manifest",
+                    str(manifest_path),
+                    "--cache",
+                    "ephemeral",
+                ],
+            )
+            for arguments in rejected_invocations:
+                rejected = subprocess.run(
+                    [sys.executable, str(entrypoint), *arguments],
+                    cwd=bundle_root,
+                    env={
+                        "PATH": os.environ["PATH"],
+                        "PYTHONDONTWRITEBYTECODE": "1",
+                    },
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                with self.subTest(arguments=arguments):
+                    self.assertNotEqual(rejected.returncode, 0)
 
-        self.assertIn("{setup,start,status,stop}", completed.stdout)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn(
+            "{" + ",".join(ENTRYPOINT_ACTIONS) + "}",
+            completed.stdout,
+        )
         self.assertIn("--manifest", completed.stdout)
 
     def test_manifest_is_the_only_generated_instantiation_input(self):
@@ -331,9 +422,16 @@ class ServiceBundlePlanTest(unittest.TestCase):
         requirement = manifest["compile_cache"]
         self.assertEqual(
             requirement["status"],
-            "requires-observed-gpu",
+            "requires-runtime-execution-environment-and-observed-gpu",
         )
         self.assertIsNone(requirement["observed_gpu"])
+        self.assertEqual(
+            requirement["inputs"]["implementation_bundle_sha256"],
+            plan["implementation_bundle"]["bundle_sha256"],
+        )
+        self.assertIsNone(
+            requirement["inputs"]["runtime_execution_environment"]
+        )
         self.assertEqual(
             requirement["inputs"]["huggingface_closure_sha256"],
             closure.closure_sha256,
@@ -350,10 +448,10 @@ class ServiceBundlePlanTest(unittest.TestCase):
             revision=definition.model.revision,
             requested_selector=definition.model.checkpoint,
             resolved_index=None,
-            weight_files=("weights/model.safetensors",),
+            weight_files=("model.safetensors",),
             files=(
                 HuggingFaceClosureFile(
-                    path="weights/model.safetensors",
+                    path="model.safetensors",
                     bytes=1,
                     role="checkpoint-weight",
                     identity_algorithm="sha256",
@@ -375,10 +473,26 @@ class ServiceBundlePlanTest(unittest.TestCase):
             "mismatched_service_huggingface_closure",
         )
 
+    def test_bundle_rejects_an_unreviewed_runtime_summary(self):
+        definition = load_inference_service(FIXTURE)
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            build_service_bundle_plan(
+                definition,
+                source_root=ROOT,
+                runtime=RUNTIME.safe_summary(),  # type: ignore[arg-type]
+                closure=closure_for(definition, identity_digit="8"),
+            )
+
+        self.assertEqual(
+            caught.exception.code,
+            "invalid_service_bundle_runtime",
+        )
+
     def test_safetensors_service_rejects_auto_resolved_bin_closure(self):
         definition = parse_inference_service_toml(
             FIXTURE.read_bytes().replace(
-                b'checkpoint = "weights/model.safetensors"\n',
+                b'checkpoint = "model.safetensors"\n',
                 b"",
                 1,
             )

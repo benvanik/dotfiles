@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import datetime
 import os
-import pathlib
 import shutil
 import stat
 from typing import Any

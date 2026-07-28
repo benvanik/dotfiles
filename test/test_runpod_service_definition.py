@@ -173,6 +173,36 @@ class InferenceServiceDefinitionTest(unittest.TestCase):
         self.assertIsNone(definition.model.checkpoint)
         self.assertIsNone(definition.normalized_plan()["model"]["checkpoint"])
 
+    def test_pytorch_checkpoint_requires_explicit_auto_load_format(self):
+        for checkpoint in (
+            "pytorch_model.bin",
+            "pytorch_model.bin.index.json",
+        ):
+            with self.subTest(checkpoint=checkpoint):
+                definition = parse_inference_service_toml(
+                    service_toml(
+                        checkpoint_line=f'checkpoint = "{checkpoint}"',
+                        load_format="auto",
+                    )
+                )
+                self.assertEqual(definition.model.checkpoint, checkpoint)
+
+                with self.assertRaises(RunpodLocalError) as caught:
+                    parse_inference_service_toml(
+                        service_toml(
+                            checkpoint_line=f'checkpoint = "{checkpoint}"',
+                            load_format="safetensors",
+                        )
+                    )
+                self.assertEqual(
+                    caught.exception.code,
+                    "invalid_service_definition",
+                )
+                self.assertIn(
+                    "requires vllm.load_format = auto",
+                    str(caught.exception),
+                )
+
     def test_unknown_fields_fail_closed_in_every_table(self):
         mutations = {
             "top": b'\nunknown = "value"\n',

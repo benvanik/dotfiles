@@ -1,0 +1,17 @@
+#!/usr/bin/python3.12
+"""Relocated entrypoint for the content-addressed runtime bundle."""
+
+from __future__ import annotations
+
+import pathlib
+import sys
+
+
+ENTRYPOINT = pathlib.Path(__file__).resolve()
+BUNDLE_ROOT = ENTRYPOINT.parents[1]
+sys.path.insert(0, str(BUNDLE_ROOT))
+
+from service_runtime.controller import main  # noqa: E402
+
+
+raise SystemExit(main(invoked_entrypoint=ENTRYPOINT))

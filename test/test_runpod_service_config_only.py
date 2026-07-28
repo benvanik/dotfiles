@@ -9,8 +9,13 @@ import tempfile
 import unittest
 
 from runpod_local.service_definition import (
+    InferenceServiceDefinition,
     load_inference_service,
     parse_inference_service_toml,
+)
+from runpod_local.service_huggingface import (
+    HuggingFaceClosure,
+    HuggingFaceClosureFile,
 )
 from runpod_local.service_vllm import build_vllm_argv
 
@@ -47,6 +52,70 @@ def run_service_command(*arguments: str) -> dict[str, object]:
     if not isinstance(value, dict):
         raise TypeError("service command did not emit a JSON object")
     return value
+
+
+def comparison_payload(payload: bytes) -> bytes:
+    return (
+        payload.replace(
+            b'service_id = "fixture-dense-text"',
+            b'service_id = "fixture-dense-chat"',
+            1,
+        )
+        .replace(
+            b'repository = "fixture-org/fixture-dense-text-7b"',
+            b'repository = "fixture-org/fixture-dense-chat-13b"',
+            1,
+        )
+        .replace(
+            b'revision = "2222222222222222222222222222222222222222"',
+            b'revision = "3333333333333333333333333333333333333333"',
+            1,
+        )
+        .replace(
+            b"max_model_len = 8192",
+            b"max_model_len = 4096",
+            1,
+        )
+        .replace(
+            b"prefix_caching = true",
+            b"prefix_caching = false",
+            1,
+        )
+    )
+
+
+def closure_for_service(
+    definition: InferenceServiceDefinition,
+    *,
+    identity_digit: str,
+) -> HuggingFaceClosure:
+    model = definition.normalized_plan()["model"]
+    checkpoint = model["checkpoint"]
+    if not isinstance(checkpoint, str):
+        raise TypeError("acceptance fixture requires a checkpoint")
+    return HuggingFaceClosure(
+        repository=model["repository"],
+        revision=model["revision"],
+        requested_selector=checkpoint,
+        resolved_index=None,
+        weight_files=(checkpoint,),
+        files=(
+            HuggingFaceClosureFile(
+                path="config.json",
+                bytes=128,
+                role="snapshot",
+                identity_algorithm="git-blob-sha1",
+                identity_digest=identity_digit * 40,
+            ),
+            HuggingFaceClosureFile(
+                path=checkpoint,
+                bytes=1024,
+                role="checkpoint-weight",
+                identity_algorithm="sha256",
+                identity_digest=identity_digit * 64,
+            ),
+        ),
+    )
 
 
 class ConfigOnlySecondServiceAcceptanceTest(unittest.TestCase):
@@ -208,34 +277,7 @@ class ConfigOnlySecondServiceAcceptanceTest(unittest.TestCase):
         payload = SECOND_SERVICE.read_bytes()
         with tempfile.TemporaryDirectory() as directory:
             comparison_path = pathlib.Path(directory) / "comparison.toml"
-            comparison_payload = (
-                payload.replace(
-                    b'service_id = "fixture-dense-text"',
-                    b'service_id = "fixture-dense-chat"',
-                    1,
-                )
-                .replace(
-                    b'repository = "fixture-org/fixture-dense-text-7b"',
-                    b'repository = "fixture-org/fixture-dense-chat-13b"',
-                    1,
-                )
-                .replace(
-                    b'revision = "2222222222222222222222222222222222222222"',
-                    b'revision = "3333333333333333333333333333333333333333"',
-                    1,
-                )
-                .replace(
-                    b"max_model_len = 8192",
-                    b"max_model_len = 4096",
-                    1,
-                )
-                .replace(
-                    b"prefix_caching = true",
-                    b"prefix_caching = false",
-                    1,
-                )
-            )
-            comparison_path.write_bytes(comparison_payload)
+            comparison_path.write_bytes(comparison_payload(payload))
             comparison_path.chmod(0o644)
             second_plan = run_service_command(
                 "plan",
@@ -321,6 +363,83 @@ class ConfigOnlySecondServiceAcceptanceTest(unittest.TestCase):
         ):
             with self.subTest(service_specific_value=service_specific_value):
                 self.assertNotIn(service_specific_value, generic_planner)
+
+    def test_cli_bundles_two_configs_with_one_generic_implementation(self):
+        first_definition = load_inference_service(SECOND_SERVICE)
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            second_config = root / "comparison.toml"
+            second_config.write_bytes(comparison_payload(SECOND_SERVICE.read_bytes()))
+            second_config.chmod(0o600)
+            second_definition = load_inference_service(second_config)
+            first_closure = root / "first-closure.json"
+            second_closure = root / "second-closure.json"
+            first_closure.write_text(
+                json.dumps(
+                    closure_for_service(
+                        first_definition,
+                        identity_digit="8",
+                    ).as_dict(),
+                    sort_keys=True,
+                ),
+                encoding="ascii",
+            )
+            second_closure.write_text(
+                json.dumps(
+                    closure_for_service(
+                        second_definition,
+                        identity_digit="9",
+                    ).as_dict(),
+                    sort_keys=True,
+                ),
+                encoding="ascii",
+            )
+            first_closure.chmod(0o600)
+            second_closure.chmod(0o600)
+
+            first = run_service_command(
+                "bundle",
+                str(SECOND_SERVICE),
+                "--closure",
+                str(first_closure),
+                "--remote-port",
+                "8123",
+                "--json",
+            )
+            second = run_service_command(
+                "bundle",
+                str(second_config),
+                "--closure",
+                str(second_closure),
+                "--remote-port",
+                "8123",
+                "--json",
+            )
+
+        self.assertEqual(
+            first["schema_version"],
+            "runpod.inference-service-bundle-plan.v1",
+        )
+        self.assertIs(first["executed"], False)
+        self.assertEqual(
+            first["implementation_bundle"],
+            second["implementation_bundle"],
+        )
+        self.assertNotEqual(
+            first["deployment_manifest"],
+            second["deployment_manifest"],
+        )
+        for result in (first, second):
+            with self.subTest(manifest=result["deployment_manifest"]["sha256"]):
+                self.assertEqual(
+                    result["deployment_manifest"]["mode"],
+                    "0600",
+                )
+                self.assertTrue(
+                    result["implementation_bundle"]["entrypoint"].endswith(
+                        "/bin/runpod-service-runtime"
+                    )
+                )
 
     def test_fixture_identity_is_absent_from_reusable_executable_sources(self):
         production_sources = [

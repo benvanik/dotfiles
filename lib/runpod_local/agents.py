@@ -1,8 +1,5 @@
 """Agent-facing command contracts."""
 
-from __future__ import annotations
-
-
 AGENT_DOCS = {
     "root": """# Runpod local control plane
 
@@ -15,7 +12,8 @@ Planning commands:
 
 - `runpod-model`: resolve an exact Hugging Face revision and checkpoint.
 - `runpod-place`: apply the versioned static VRAM placement policy.
-- `runpod-service`: validate or plan one config-only inference service.
+- `runpod-service`: validate, resolve, plan, or bundle one config-only
+  inference service.
 - `runpod-stock`: query live stock and on-demand price.
 - `runpod-volume`: plan/reconcile persistent cache-volume creation.
 - `runpod-template`: reconcile private Pod-template overlays without environment
@@ -41,23 +39,30 @@ outlive Pods and are never deleted by this suite.
 """,
     "service": """# `runpod-service`
 
-Validate one declarative inference-service TOML file or resolve a non-executing
-deployment plan. The model file is the sole authored per-model object. Generic
-controller/runtime code and generated artifact, process, cache, and benchmark
-state are never copied beside it.
+Validate one declarative inference-service TOML file, resolve its generated
+Hugging Face closure, or produce non-executing deployment and bundle plans.
+The model file is the sole authored per-model object. Generic controller/runtime
+code and generated artifact, process, cache, and benchmark state are never
+copied beside it.
 
 ```sh
 runpod-service validate ~/.local/share/model-services/MODEL.toml --json
 runpod-service plan ~/.local/share/model-services/MODEL.toml --json
+runpod-service resolve ~/.local/share/model-services/MODEL.toml --json
+runpod-service bundle ~/.local/share/model-services/MODEL.toml \
+  --closure ~/.local/runpod/closures/huggingface/HASH/closure.json --json
 ```
 
-Both actions are local and non-billable. `plan` inventories the exact reusable
-local planning-source closure, binds the one config input, and marks the generic
-remote controller as an unresolved execution requirement. Service process
-paths remain separate from the shared content-addressed snapshot store.
-Hugging Face closure, driver, compute-capability, and GPU cache inputs remain
-explicitly unresolved. It does not contact Runpod, Hugging Face, or SSH and
-does not start a process.
+All four actions are non-billable and never contact Runpod or SSH. `validate`
+and `plan` are read-only and do not contact Hugging Face. `resolve` reads only
+Hugging Face metadata, downloads no model bytes, and writes one private
+content-addressed generated closure. `bundle` is read-only: it revalidates that
+closure, inventories the exact generic remote implementation with target modes
+and content hashes, and emits one private-mode generated deployment manifest as
+the sole model-specific runtime input. The manifest binds the shared snapshot
+root and typed vLLM argv while leaving the compile-cache contract explicitly
+blocked on exact remote GPU observation. No action copies files, starts a
+process, or invokes the generic runtime's setup/start/status/stop entrypoint.
 """,
     "model": """# `runpod-model`
 

@@ -94,6 +94,12 @@ _VLLM_SAFETENSORS_LOAD_STRATEGIES = frozenset({"lazy", "eager"})
 _VLLM_MAMBA_CACHE_MODES = frozenset({"none", "all"})
 _VLLM_SPECULATIVE_METHODS = frozenset({"none", "mtp"})
 _VLLM_GENERATION_CONFIGS = frozenset({"auto", "vllm"})
+_CHECKPOINT_SUFFIXES = (
+    ".safetensors",
+    ".safetensors.index.json",
+    ".bin",
+    ".bin.index.json",
+)
 
 
 def _fail(message: str, *, code: str = "invalid_service_definition") -> None:
@@ -204,10 +210,26 @@ def _require_checkpoint(value: Any) -> str:
         checkpoint.startswith("/")
         or "\\" in checkpoint
         or any(component in {"", ".", ".."} for component in checkpoint.split("/"))
-        or not checkpoint.endswith((".safetensors", ".safetensors.index.json"))
+        or not checkpoint.endswith(_CHECKPOINT_SUFFIXES)
     ):
-        _fail("model.checkpoint must be a relative safetensors file or index")
+        _fail(
+            "model.checkpoint must be a relative safetensors or PyTorch bin "
+            "file or index"
+        )
     return checkpoint
+
+
+def _validate_model_load_format(
+    model: HuggingFaceModelDefinition,
+    vllm: VllmLaunchPlan,
+) -> None:
+    checkpoint = model.checkpoint
+    if (
+        checkpoint is not None
+        and checkpoint.endswith((".bin", ".bin.index.json"))
+        and vllm.load_format == "safetensors"
+    ):
+        _fail("a PyTorch bin checkpoint requires vllm.load_format = auto")
 
 
 def _require_compute_capability(value: Any) -> tuple[int, int]:
@@ -638,6 +660,7 @@ def parse_inference_service_toml(
     endpoint = _parse_endpoint(document["endpoint"])
     compatibility = _parse_compatibility(document["compatibility"])
     vllm = _parse_vllm(document["vllm"], endpoint=endpoint)
+    _validate_model_load_format(model, vllm)
     return InferenceServiceDefinition(
         service_id=service_id,
         driver=driver,

@@ -9,6 +9,10 @@ import pathlib
 from typing import Any, Protocol
 
 from .errors import RunpodLocalError
+from .service_compile_cache import (
+    COMPILE_CACHE_SCHEMA,
+    PERSISTENT_COMPILE_ROOT,
+)
 
 DRIVER_ID = "vllm-openai.v1"
 DEFAULT_REMOTE_PORT = 8000
@@ -17,15 +21,6 @@ REMOTE_SESSION_ROOT = pathlib.PurePosixPath("/root/runpod-session")
 REMOTE_SERVICES_ROOT = REMOTE_SESSION_ROOT / "services"
 SHARED_SNAPSHOT_ROOT_TEMPLATE = (
     "/root/runpod-session/model-snapshots/{generated_huggingface_closure_sha256}"
-)
-PERSISTENT_COMPILE_ROOT_TEMPLATE = (
-    "/workspace/.cache/compiled/vllm-openai/"
-    "{runtime_manifest_sha256}/"
-    "{generated_huggingface_closure_sha256}/"
-    "{compile_affecting_launch_sha256}/"
-    "{gpu_compute_capability}/"
-    "{gpu_identity_sha256}/"
-    "{driver_version}"
 )
 MODEL_SNAPSHOT_ARGUMENT = SHARED_SNAPSHOT_ROOT_TEMPLATE
 
@@ -234,13 +229,13 @@ def build_vllm_deployment_plan(
             "api_key_source": "controller-owned-local-nonsecret",
         },
         "compile_cache_identity_inputs": {
-            "semantic_service_plan_sha256": definition.plan_sha256,
+            "contract_schema_version": COMPILE_CACHE_SCHEMA,
+            "status": "requires-huggingface-closure-and-observed-gpu",
+            "driver": DRIVER_ID,
             "generated_huggingface_closure_sha256": None,
             "exact_runtime": runtime,
             "compile_affecting_launch_sha256": (compile_affecting_launch_sha256),
-            "observed_driver_version": None,
-            "observed_compute_capability": None,
-            "observed_gpu_identity_sha256": None,
-            "persistent_root_template": PERSISTENT_COMPILE_ROOT_TEMPLATE,
+            "observed_gpu": None,
+            "persistent_root_prefix": str(PERSISTENT_COMPILE_ROOT),
         },
     }

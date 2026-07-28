@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import pathlib
+import tempfile
 import unittest
+from unittest import mock
 
 from runpod_local.errors import RunpodLocalError
 from runpod_local.service_controller import (
@@ -147,8 +149,14 @@ class ServiceControllerPlanTest(unittest.TestCase):
             deployment["launch"]["argv_template"],
         )
         self.assertIsNone(deployment["model_snapshot"]["generated_closure_sha256"])
-        self.assertIsNone(
-            deployment["compile_cache_identity_inputs"]["observed_driver_version"]
+        self.assertIsNone(deployment["compile_cache_identity_inputs"]["observed_gpu"])
+        self.assertEqual(
+            deployment["compile_cache_identity_inputs"]["status"],
+            "requires-huggingface-closure-and-observed-gpu",
+        )
+        self.assertEqual(
+            deployment["compile_cache_identity_inputs"]["persistent_root_prefix"],
+            "/workspace/.cache/compiled/vllm-openai/v1",
         )
 
     def test_compile_affecting_hash_is_known_and_tracks_typed_vllm_plan(self):
@@ -200,6 +208,32 @@ class ServiceControllerPlanTest(unittest.TestCase):
         self.assertNotIn("fixture-service", encoded)
         self.assertNotIn("example/Model-7B", encoded)
         self.assertRegex(closure["source_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_planning_source_rejects_world_writes_and_hardlinks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            source = root / "planner.py"
+            source.write_text("GENERIC = True\n", encoding="utf-8")
+            with mock.patch(
+                "runpod_local.service_controller.PLANNING_SOURCE_FILES",
+                ("planner.py",),
+            ):
+                source.chmod(0o666)
+                with self.assertRaises(RunpodLocalError) as writable:
+                    build_planning_source_closure(source_root=root)
+                self.assertEqual(
+                    writable.exception.code,
+                    "unsafe_service_planning_source",
+                )
+
+                source.chmod(0o644)
+                (root / "second-link.py").hardlink_to(source)
+                with self.assertRaises(RunpodLocalError) as hardlinked:
+                    build_planning_source_closure(source_root=root)
+                self.assertEqual(
+                    hardlinked.exception.code,
+                    "unsafe_service_planning_source",
+                )
 
     def test_adapter_rejects_nonabsolute_snapshot_and_invalid_port(self):
         definition = self.definition()

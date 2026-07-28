@@ -54,6 +54,7 @@ def _trusted_source_bytes(
         resolved != expected
         or path.is_symlink()
         or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
         or metadata.st_size < 1
         or metadata.st_size > MAX_PLANNING_SOURCE_BYTES
         or metadata.st_mode & 0o002

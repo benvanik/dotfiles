@@ -15,6 +15,7 @@ Planning commands:
 
 - `runpod-model`: resolve an exact Hugging Face revision and checkpoint.
 - `runpod-place`: apply the versioned static VRAM placement policy.
+- `runpod-service`: validate or plan one config-only inference service.
 - `runpod-stock`: query live stock and on-demand price.
 - `runpod-volume`: plan/reconcile persistent cache-volume creation.
 - `runpod-template`: reconcile private Pod-template overlays without environment
@@ -37,6 +38,26 @@ Paid mutations always require `--execute`. `runpod-ttl set`, `extend`, and
 `touch` are immediate local lease mutations; they do not contact Runpod and
 cannot move a lease beyond the provider-owned launch deadline. Network volumes
 outlive Pods and are never deleted by this suite.
+""",
+    "service": """# `runpod-service`
+
+Validate one declarative inference-service TOML file or resolve a non-executing
+deployment plan. The model file is the sole authored per-model object. Generic
+controller/runtime code and generated artifact, process, cache, and benchmark
+state are never copied beside it.
+
+```sh
+runpod-service validate ~/.local/share/model-services/MODEL.toml --json
+runpod-service plan ~/.local/share/model-services/MODEL.toml --json
+```
+
+Both actions are local and non-billable. `plan` inventories the exact reusable
+local planning-source closure, binds the one config input, and marks the generic
+remote controller as an unresolved execution requirement. Service process
+paths remain separate from the shared content-addressed snapshot store.
+Hugging Face closure, driver, compute-capability, and GPU cache inputs remain
+explicitly unresolved. It does not contact Runpod, Hugging Face, or SSH and
+does not start a process.
 """,
     "model": """# `runpod-model`
 

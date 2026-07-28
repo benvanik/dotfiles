@@ -36,6 +36,11 @@ from .remote_cli import (
     add_remote_parsers,
     run_remote_command,
 )
+from .service_cli import (
+    SERVICE_COMMANDS,
+    add_service_parser,
+    run_service_command,
+)
 
 
 def _add_model_arguments(parser: argparse.ArgumentParser) -> None:
@@ -171,6 +176,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_provider_parsers(subparsers)
     add_lifecycle_parsers(subparsers)
     add_remote_parsers(subparsers)
+    add_service_parser(subparsers)
     add_doctor_parser(subparsers)
     return parser
 
@@ -256,6 +262,8 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         return run_lifecycle_command(args)
     if args.command in REMOTE_COMMANDS:
         return run_remote_command(args)
+    if args.command in SERVICE_COMMANDS:
+        return run_service_command(args)
     if args.command in DOCTOR_COMMANDS:
         return run_doctor_command(args)
     raise RunpodLocalError(

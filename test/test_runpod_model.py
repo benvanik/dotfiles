@@ -198,7 +198,7 @@ class ModelInspectorTest(unittest.TestCase):
                 report = ModelInspector(
                     FakeHuggingFaceClient(info, files)
                 ).inspect(
-                    "llmfan46/gemma-4-31B-it-uncensored-heretic",
+                    "fixture-org/fixture-gemma4",
                     context_tokens=context_tokens,
                     kv_dtype="bf16",
                 )

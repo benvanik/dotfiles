@@ -14,6 +14,7 @@ from model_session.errors import ModelSessionError
 from model_session.launch_authority import (
     SESSION_USE_ACCEPTED_SCHEMA,
     SESSION_USE_ADMISSION_SCHEMA,
+    SESSION_USE_ERROR_SCHEMA,
     attest_workload,
     process_start_time,
     read_session_use_authority,
@@ -210,6 +211,60 @@ class SessionUseAuthorityTest(unittest.TestCase):
         for response in responses:
             with self.subTest(size=len(response)):
                 with self._channel(response) as (descriptor, _requests):
+                    with self.assertRaises(ModelSessionError) as caught:
+                        read_session_use_authority(
+                            descriptor,
+                            self.route,
+                        )
+                self.assertEqual(
+                    caught.exception.code,
+                    "invalid_model_lab_use_authority",
+                )
+
+    def test_supervisor_error_preserves_its_operator_surface(self) -> None:
+        response = {
+            "schema": SESSION_USE_ERROR_SCHEMA,
+            "code": "service_start_failed",
+            "message": "remote vLLM did not become ready",
+        }
+        with self._channel(_canonical(response)) as (descriptor, _requests):
+            with self.assertRaises(ModelSessionError) as caught:
+                read_session_use_authority(
+                    descriptor,
+                    self.route,
+                )
+
+        self.assertEqual(caught.exception.code, "service_start_failed")
+        self.assertEqual(
+            str(caught.exception),
+            "remote vLLM did not become ready",
+        )
+
+    def test_malformed_supervisor_error_is_not_trusted(self) -> None:
+        responses = (
+            {
+                "schema": SESSION_USE_ERROR_SCHEMA,
+                "code": "UPPERCASE",
+                "message": "not a valid error code",
+            },
+            {
+                "schema": SESSION_USE_ERROR_SCHEMA,
+                "code": "service_start_failed",
+                "message": "",
+            },
+            {
+                "schema": SESSION_USE_ERROR_SCHEMA,
+                "code": "service_start_failed",
+                "message": "failure",
+                "extra": True,
+            },
+        )
+        for response in responses:
+            with self.subTest(response=response):
+                with self._channel(_canonical(response)) as (
+                    descriptor,
+                    _requests,
+                ):
                     with self.assertRaises(ModelSessionError) as caught:
                         read_session_use_authority(
                             descriptor,

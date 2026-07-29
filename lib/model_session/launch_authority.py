@@ -24,10 +24,12 @@ from .errors import ModelSessionError
 
 SESSION_USE_ADMISSION_SCHEMA = "model-lab.session-use-admit.v1"
 SESSION_USE_ACCEPTED_SCHEMA = "model-lab.session-use-accepted.v1"
+SESSION_USE_ERROR_SCHEMA = "model-lab.supervisor-error.v1"
 MAX_SUPERVISOR_FRAME_BYTES = 16 * 1024
 
 _IDENTIFIER_PATTERN = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
 _OPAQUE_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,255}$")
+_ERROR_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _PROCESS_START_TIME_PATTERN = re.compile(r"^[0-9]{1,32}$")
 _ACCEPTED_KEYS = {
@@ -42,6 +44,7 @@ _ACCEPTED_KEYS = {
     "session_pid",
     "session_start_time",
 }
+_ERROR_KEYS = {"schema", "code", "message"}
 
 
 class ProfileRoute(Protocol):
@@ -357,7 +360,12 @@ def _parse_accepted(
     session_start_time: str,
 ) -> SessionUseAuthority:
     if set(value) != _ACCEPTED_KEYS:
-        _fail("model-lab session-use acceptance has unsupported fields")
+        missing = sorted(_ACCEPTED_KEYS.difference(value))
+        unsupported = sorted(set(value).difference(_ACCEPTED_KEYS))
+        _fail(
+            "model-lab session-use acceptance fields do not match the "
+            f"protocol; missing={missing!r}, unsupported={unsupported!r}"
+        )
     if value["schema"] != SESSION_USE_ACCEPTED_SCHEMA:
         _fail(
             "model-lab session-use acceptance schema must be "
@@ -428,6 +436,22 @@ def _parse_accepted(
     )
 
 
+def _raise_supervisor_error(value: dict[str, Any]) -> None:
+    if set(value) != _ERROR_KEYS:
+        _fail("model-lab supervisor error has unsupported fields")
+    code = value["code"]
+    message = value["message"]
+    if (
+        not isinstance(code, str)
+        or not _ERROR_CODE_PATTERN.fullmatch(code)
+        or not isinstance(message, str)
+        or not message
+        or len(message.encode("utf-8")) > 4096
+    ):
+        _fail("model-lab supervisor error is invalid")
+    raise ModelSessionError(message, code=code)
+
+
 def read_session_use_authority(
     descriptor: int | None,
     route: ProfileRoute,
@@ -447,6 +471,8 @@ def read_session_use_authority(
     try:
         channel.sendall(_canonical_json_bytes(request))
         response = _strict_json_object(_read_frame(channel))
+        if response.get("schema") == SESSION_USE_ERROR_SCHEMA:
+            _raise_supervisor_error(response)
         return _parse_accepted(
             response,
             route=route,

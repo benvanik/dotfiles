@@ -97,6 +97,15 @@ class HostControl(Protocol):
 
     def acquire(self, request: HostClaimRequest) -> HostClaim: ...
 
+    def wait_ready(
+        self,
+        claim: HostClaim,
+        *,
+        renewal_ttl_seconds: int,
+    ) -> HostClaim:
+        """Attest provider routing and SSH for the exact claimed operation."""
+        ...
+
     def find(self, request: HostClaimRequest) -> HostClaim | None: ...
 
     def renew(

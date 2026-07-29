@@ -365,9 +365,17 @@ class FakeHosts:
         self.condition = threading.Condition()
         self.find_result = None
         self.find_requests = []
+        self.readiness_claims = []
 
     def acquire(self, request):
         self.requests.append(request)
+        return self.claim
+
+    def wait_ready(self, claim, *, renewal_ttl_seconds):
+        self.assert_identity(claim.host_name, claim.claim_id)
+        self.readiness_claims.append(
+            (claim.operation_id, claim.provider_resource_id, renewal_ttl_seconds)
+        )
         return self.claim
 
     def find(self, request):
@@ -692,12 +700,75 @@ class ControllerTest(unittest.TestCase):
         self.assertEqual(request.mode, "gpu-exclusive")
         self.assertEqual(request.gpu_memory_bytes, 32 * 1024**3)
         self.assertEqual(request.endpoint_names, ("openai",))
+        self.assertEqual(
+            self.hosts.readiness_claims,
+            [("operation-one", "pod-one", 120)],
+        )
 
         self.controller.release_profile_use(self.service, use)
         retained = self.store.load("fixture-chat")
         self.assertIsNotNone(retained)
         self.assertEqual(retained.phase, "idle")
         self.assertEqual(self.hosts.releases, [])
+
+    def test_ssh_readiness_failure_releases_claim_before_deployment_publish(self):
+        def fail_after_renewal(claim, *, renewal_ttl_seconds):
+            self.hosts.claim = dataclasses.replace(
+                claim,
+                generation=2,
+            )
+            raise ModelLabError(
+                "controlled SSH readiness timeout",
+                code="service_host_ssh_not_ready",
+            )
+
+        self.hosts.wait_ready = mock.Mock(side_effect=fail_after_renewal)
+
+        with self.assertRaises(ModelLabError) as caught:
+            self.controller.ensure_ready(self.service)
+
+        self.assertEqual(
+            caught.exception.code,
+            "service_host_ssh_not_ready",
+        )
+        self.assertIsNone(self.store.load(self.service.service_id))
+        self.assertEqual(self.runtime.starts, 0)
+        self.assertEqual(self.hosts.releases, [(2, True)])
+        self.assertIsNone(
+            self.controller.preparations.load(self.service.service_id)
+        )
+
+    def test_crash_before_failed_readiness_release_recovers_from_intent(self):
+        self.hosts.wait_ready = mock.Mock(
+            side_effect=ModelLabError(
+                "controlled SSH readiness timeout",
+                code="service_host_ssh_not_ready",
+            )
+        )
+        release = self.hosts.release
+        self.hosts.release = mock.Mock(
+            side_effect=SystemExit(
+                "controlled crash before readiness claim release"
+            )
+        )
+
+        with self.assertRaisesRegex(SystemExit, "before readiness claim"):
+            self.controller.ensure_ready(self.service)
+
+        intent = self.controller.preparations.load(
+            self.service.service_id
+        )
+        self.assertIsNotNone(intent)
+        self.assertIsNone(self.store.load(self.service.service_id))
+        self.hosts.release = release
+        self.hosts.find_result = self.hosts.claim
+
+        self.controller.reconcile_acquire_intent(intent)
+
+        self.assertEqual(self.hosts.releases, [(1, True)])
+        self.assertIsNone(
+            self.controller.preparations.load(self.service.service_id)
+        )
 
     def test_now_on_pi_exit_stops_service_and_releases_host_claim_now(self):
         use = self.controller.acquire_for_profile(

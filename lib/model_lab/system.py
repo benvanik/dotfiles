@@ -61,8 +61,13 @@ def build_controller(
         lifecycle=lifecycle,
         profiles=ProfileStore(runpod_root()),
     )
-    hosts = RunpodHostControlAdapter(generic_control)
     instances = InstanceStore(generic_state)
+    hosts = RunpodHostControlAdapter(
+        generic_control,
+        runpod_state=generic_state,
+        api=api,
+        instances=instances,
+    )
     model_state = StateStore(state_root)
     deployments = DeploymentStore(state_root)
     backend = ProductionModelServiceBackend(

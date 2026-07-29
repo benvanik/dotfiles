@@ -374,29 +374,51 @@ class ModelLabController:
             ),
         )
         claim = self.hosts.acquire(intent.claim_request)
-        now_text = format_timestamp(utc_now())
-        preparing = Deployment(
-            service_id=service.service_id,
-            deployment_id=intent.deployment_id,
-            workload_sha256=service.workload_sha256,
-            service_sha256=service.service_sha256,
-            host_name=claim.host_name,
-            claim_id=claim.claim_id,
-            claim_generation=claim.generation,
-            endpoint_receipt_path=None,
-            phase="preparing",
-            created_at=now_text,
-            updated_at=now_text,
-            last_inference_at=now_text,
-            idle_deadline=None,
-            host_release_mode=None,
-            use_leases=(),
-        )
         try:
+            claim = self.hosts.wait_ready(
+                claim,
+                renewal_ttl_seconds=self.lab.lease.renewal_ttl_seconds,
+            )
+            now_text = format_timestamp(utc_now())
+            preparing = Deployment(
+                service_id=service.service_id,
+                deployment_id=intent.deployment_id,
+                workload_sha256=service.workload_sha256,
+                service_sha256=service.service_sha256,
+                host_name=claim.host_name,
+                claim_id=claim.claim_id,
+                claim_generation=claim.generation,
+                endpoint_receipt_path=None,
+                phase="preparing",
+                created_at=now_text,
+                updated_at=now_text,
+                last_inference_at=now_text,
+                idle_deadline=None,
+                host_release_mode=None,
+                use_leases=(),
+            )
             self.deployments.publish_preparing(preparing)
             self.preparations.complete(intent)
         except BaseException as original:
             try:
+                current_claim = self.hosts.get(
+                    claim.host_name,
+                    claim.claim_id,
+                )
+                if (
+                    current_claim.host_name != claim.host_name
+                    or current_claim.claim_id != claim.claim_id
+                    or current_claim.operation_id != claim.operation_id
+                    or current_claim.provider_resource_id
+                    != claim.provider_resource_id
+                    or current_claim.generation < claim.generation
+                ):
+                    raise ModelLabError(
+                        "host claim identity changed before failed readiness "
+                        "could release it",
+                        code="service_host_claim_mismatch",
+                    )
+                claim = current_claim
                 self.hosts.release(
                     claim.host_name,
                     claim.claim_id,

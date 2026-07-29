@@ -75,6 +75,14 @@ from .service_runtime import PreparedService, TransportBinding
 
 TUNNEL_START_SECONDS = 20.0
 TUNNEL_POLL_SECONDS = 0.05
+HOST_SSH_READINESS_SECONDS = 5 * 60.0
+HOST_PROVIDER_RECONCILIATION_ALLOWANCE_SECONDS = 2 * 30.0
+HOST_SSH_CONNECT_ALLOWANCE_SECONDS = 15.0
+HOST_FINAL_READINESS_ATTEMPT_SECONDS = (
+    HOST_PROVIDER_RECONCILIATION_ALLOWANCE_SECONDS
+    + HOST_SSH_CONNECT_ALLOWANCE_SECONDS
+)
+HOST_SSH_READINESS_POLL_SECONDS = 1.0
 
 
 def _translate(error: BaseException) -> ModelLabError:
@@ -87,8 +95,33 @@ def _translate(error: BaseException) -> ModelLabError:
 class RunpodHostControlAdapter:
     """Translate generic RunPod failures without interpreting host policy."""
 
-    def __init__(self, control: Any) -> None:
+    def __init__(
+        self,
+        control: Any,
+        *,
+        runpod_state: StateStore,
+        api: RunpodApi,
+        instances: InstanceStore,
+        popen_factory: Callable[..., Any] = subprocess.Popen,
+        monotonic: Callable[[], float] = time.monotonic,
+        poll_waiter: Callable[[float], None] = time.sleep,
+        ssh_readiness_seconds: float = HOST_SSH_READINESS_SECONDS,
+        ssh_probe: Callable[[SshEndpoint], bool] | None = None,
+    ) -> None:
+        if ssh_readiness_seconds <= HOST_FINAL_READINESS_ATTEMPT_SECONDS:
+            raise ValueError(
+                "SSH readiness budget must exceed one bounded provider and "
+                "SSH attempt"
+            )
         self.control = control
+        self.runpod_state = runpod_state
+        self.api = api
+        self.instances = instances
+        self.popen_factory = popen_factory
+        self.monotonic = monotonic
+        self.poll_waiter = poll_waiter
+        self.ssh_readiness_seconds = ssh_readiness_seconds
+        self.ssh_probe = ssh_probe or self._probe_ssh
 
     def _call(self, method: str, *arguments: Any, **keywords: Any) -> Any:
         try:
@@ -98,6 +131,124 @@ class RunpodHostControlAdapter:
 
     def acquire(self, request: HostClaimRequest) -> HostClaim:
         return self._call("acquire", request)
+
+    @staticmethod
+    def _attest_wait_identity(
+        expected: HostClaim,
+        observed: HostClaim,
+    ) -> None:
+        if (
+            observed.host_name != expected.host_name
+            or observed.claim_id != expected.claim_id
+            or observed.operation_id != expected.operation_id
+            or observed.provider_resource_id != expected.provider_resource_id
+            or observed.generation < expected.generation
+        ):
+            raise ModelLabError(
+                "host claim identity changed while waiting for SSH",
+                code="service_host_claim_mismatch",
+            )
+
+    def _probe_ssh(self, endpoint: SshEndpoint) -> bool:
+        try:
+            ensure_known_hosts_file(endpoint.known_hosts_file)
+            return (
+                run_with_activity(
+                    build_ssh_argv(endpoint, ["/usr/bin/true"]),
+                    instances=self.instances,
+                    name=endpoint.instance_name,
+                    expected_operation_id=endpoint.operation_id,
+                    expected_pod_id=endpoint.pod_id,
+                    source="host-ssh-readiness",
+                    popen_factory=self.popen_factory,
+                )
+                == 0
+            )
+        except RunpodLocalError as error:
+            raise _translate(error) from error
+
+    def wait_ready(
+        self,
+        claim: HostClaim,
+        *,
+        renewal_ttl_seconds: int,
+    ) -> HostClaim:
+        if (
+            not isinstance(renewal_ttl_seconds, int)
+            or isinstance(renewal_ttl_seconds, bool)
+            or renewal_ttl_seconds <= 0
+        ):
+            raise ModelLabError(
+                "host SSH wait requires a positive claim renewal TTL",
+                code="invalid_host_claim",
+            )
+        started = self.monotonic()
+        # One exact provider reconciliation is a 30-second REST request plus a
+        # 30-second GraphQL policy attestation. OpenSSH then has a 15-second
+        # ConnectTimeout. Stop starting attempts one full allowance early so
+        # the final provider observation and handshake stay in the five-minute
+        # controller budget.
+        probe_deadline = (
+            started
+            + self.ssh_readiness_seconds
+            - HOST_FINAL_READINESS_ATTEMPT_SECONDS
+        )
+        renewal_interval = max(1.0, renewal_ttl_seconds / 3)
+        next_renewal = started + renewal_interval
+        current = claim
+        last_observation = "provider SSH routing is not populated"
+        while True:
+            observed = self.get(current.host_name, current.claim_id)
+            self._attest_wait_identity(claim, observed)
+            current = observed
+            now = self.monotonic()
+            if now >= next_renewal:
+                current = self.renew(
+                    current.host_name,
+                    current.claim_id,
+                    current.generation,
+                    renewal_ttl_seconds,
+                )
+                self._attest_wait_identity(claim, current)
+                next_renewal = now + renewal_interval
+            try:
+                endpoint = resolve_endpoint(
+                    current.host_name,
+                    instances=self.instances,
+                    api=self.api,
+                    state=self.runpod_state,
+                )
+            except RunpodLocalError as error:
+                if error.code != "pod_not_ready":
+                    raise _translate(error) from error
+                last_observation = str(error)
+            else:
+                if (
+                    endpoint.operation_id != claim.operation_id
+                    or endpoint.pod_id != claim.provider_resource_id
+                ):
+                    raise ModelLabError(
+                        "resolved SSH endpoint differs from the exact host claim",
+                        code="service_host_claim_mismatch",
+                    )
+                if self.ssh_probe(endpoint):
+                    observed = self.get(
+                        current.host_name,
+                        current.claim_id,
+                    )
+                    self._attest_wait_identity(current, observed)
+                    return observed
+                last_observation = "SSH endpoint did not accept /usr/bin/true"
+            remaining = probe_deadline - self.monotonic()
+            if remaining <= 0:
+                raise ModelLabError(
+                    "RunPod host did not become SSH-ready for the exact "
+                    f"claimed operation within "
+                    f"{self.ssh_readiness_seconds:g} seconds: "
+                    f"{last_observation}",
+                    code="service_host_ssh_not_ready",
+                )
+            self.poll_waiter(min(HOST_SSH_READINESS_POLL_SECONDS, remaining))
 
     def find(self, request: HostClaimRequest) -> HostClaim | None:
         return self._call("find", request)
@@ -196,6 +347,12 @@ class ProductionModelServiceBackend:
 
     def _endpoint_for_claim(self, claim: HostClaim) -> SshEndpoint:
         try:
+            self.instances.check_active_lease(
+                claim.host_name,
+                now=datetime.datetime.now(datetime.timezone.utc),
+                expected_operation_id=claim.operation_id,
+                expected_pod_id=claim.provider_resource_id,
+            )
             endpoint = resolve_endpoint(
                 claim.host_name,
                 instances=self.instances,

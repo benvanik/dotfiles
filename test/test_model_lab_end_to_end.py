@@ -75,6 +75,15 @@ class _HostControl:
             )
         return self.claim
 
+    def wait_ready(
+        self,
+        claim: HostClaim,
+        *,
+        renewal_ttl_seconds: int,
+    ) -> HostClaim:
+        del renewal_ttl_seconds
+        return self.get(claim.host_name, claim.claim_id)
+
     def find(self, request: HostClaimRequest) -> HostClaim | None:
         return self.claim
 

@@ -5,23 +5,23 @@ from __future__ import annotations
 
 AGENTS_MD = """# `pi` model-session launcher
 
-Each concrete model profile lives outside the dotfiles repository. Its
-directory contains `profile.toml`, `AGENTS.md`, optional prompt files, and a
-symlink named `pi` to `~/.dotfiles/bin/model-session`. Model-session state,
-project memory/reports, the Pi installation, credentials, and provider
-administration also remain outside dotfiles.
+Each active profile is a `model-session.profile.v3` directory at
+`<model-lab-root>/profiles/<profile-id>`. It contains `profile.toml`,
+`AGENTS.md`, and optional prompt files. The profile names a model-lab service;
+model identity, provider administration, credentials, and service lifetime do
+not belong in the profile or this launcher.
 
-The intentionally small session interface is:
+The normal user surface is the model-lab front end, which acquires the service
+before invoking this launcher and releases its use lease afterward:
 
 ```sh
-./pi
-./pi resume
-./pi resume SESSION_ID
-./pi status
-./pi status --json
+model-lab pi PROFILE
+model-lab pi PROFILE resume
+model-lab pi PROFILE resume SESSION_ID
 ```
 
-`./pi` (equivalently `./pi new`) validates the complete current profile,
+`model-session --profile DIRECTORY` remains the provider-neutral inner
+launcher and diagnostic surface. `new` validates the complete current profile,
 materializes an immutable prompt/runtime snapshot, and starts a new isolated
 Pi session. `resume` reads only the current profile's stable state route and
 launches the exact selected snapshot. Editing a prompt therefore affects new
@@ -38,10 +38,11 @@ inference Unix socket, and the exact Pi/runtime snapshot. It receives no
 Runpod controls, cloud credentials, SSH authority, host network, or host
 configuration.
 
-An administrator must publish a matching, short-lived inference attachment
-before launch. That administration layer owns model placement, service and
-tunnel setup, provider billing lifetime, and shutdown; this launcher neither
-holds provider credentials nor mutates provider resources.
+Model-lab must publish a matching short-lived, service-scoped endpoint at
+`$XDG_RUNTIME_DIR/model-lab/services/<service-id>.{json,sock}` before launch.
+It owns model placement, service and tunnel setup, provider billing lifetime,
+and shutdown; this launcher neither holds provider credentials nor mutates
+provider resources.
 
 `status --json` emits `model-session.history.v1`. Display titles are
 non-authoritative metadata, and malformed per-run Pi history is reported as

@@ -17,6 +17,7 @@ import stat
 from dataclasses import dataclass, field
 from typing import Any
 
+from .attachment import ServiceEndpointBinding
 from .errors import ModelSessionError
 from .ownership import owner_has_private_primary_group
 from .profile import ProfileContract
@@ -175,11 +176,39 @@ def _canonical_json_bytes(value: Any) -> bytes:
     )
 
 
-def render_pi_models_json(contract: ProfileContract) -> bytes:
-    """Render the single fixed local provider admitted by a profile."""
+def render_pi_models_json(
+    contract: ProfileContract,
+    service_binding: ServiceEndpointBinding | None = None,
+) -> bytes:
+    """Render the single fixed local provider admitted by a locked run."""
 
-    provider = contract.runtime.provider
-    model_id = contract.runtime.model_id
+    if service_binding is None:
+        if contract.runtime is None or contract.model is None:
+            _fail(
+                "profile v3 Pi configuration requires a frozen service binding",
+                code="invalid_runtime_assets",
+            )
+        provider = contract.runtime.provider
+        model_id = contract.runtime.model_id
+        context_tokens = contract.model.context_tokens
+        max_output_tokens = contract.model.max_output_tokens
+        input_modalities = contract.runtime.input_modalities
+        reasoning = contract.runtime.reasoning
+    else:
+        if (
+            contract.service_id is None
+            or service_binding.service_id != contract.service_id
+        ):
+            _fail(
+                "frozen service binding does not match the profile service",
+                code="invalid_runtime_assets",
+            )
+        provider = service_binding.workload.provider
+        model_id = service_binding.workload.model_id
+        context_tokens = service_binding.workload.context_tokens
+        max_output_tokens = service_binding.workload.max_output_tokens
+        input_modalities = service_binding.input_modalities
+        reasoning = service_binding.workload.reasoning
     return _canonical_json_bytes(
         {
             "providers": {
@@ -193,7 +222,7 @@ def render_pi_models_json(contract: ProfileContract) -> bytes:
                     },
                     "models": [
                         {
-                            "contextWindow": contract.model.context_tokens,
+                            "contextWindow": context_tokens,
                             "cost": {
                                 "cacheRead": 0,
                                 "cacheWrite": 0,
@@ -201,9 +230,9 @@ def render_pi_models_json(contract: ProfileContract) -> bytes:
                                 "output": 0,
                             },
                             "id": model_id,
-                            "input": list(contract.runtime.input_modalities),
-                            "maxTokens": contract.model.max_output_tokens,
-                            "reasoning": contract.runtime.reasoning,
+                            "input": list(input_modalities),
+                            "maxTokens": max_output_tokens,
+                            "reasoning": reasoning,
                         }
                     ],
                 }
@@ -228,6 +257,7 @@ def _runtime_asset(
 
 def generated_pi_configuration_assets(
     contract: ProfileContract,
+    service_binding: ServiceEndpointBinding | None = None,
 ) -> tuple[PiRuntimeAsset, ...]:
     """Return the canonical models.json snapshot input.
 
@@ -240,7 +270,7 @@ def generated_pi_configuration_assets(
         _runtime_asset(
             PI_MODELS_PATH,
             PI_MODELS_ROLE,
-            render_pi_models_json(contract),
+            render_pi_models_json(contract, service_binding),
         ),
     )
 
@@ -283,9 +313,8 @@ def _validate_runtime_asset_object(
             f"{label} source is world-writable: {path}",
             code="unsafe_runtime_asset",
         )
-    if (
-        metadata.st_mode & stat.S_IWGRP
-        and not owner_has_private_primary_group(metadata)
+    if metadata.st_mode & stat.S_IWGRP and not owner_has_private_primary_group(
+        metadata
     ):
         _fail(
             f"{label} source is writable by a shared group: {path}",
@@ -311,10 +340,7 @@ def _open_runtime_asset(path: pathlib.Path, *, label: str) -> int:
             code="pi_runtime_platform_unsupported",
         )
     directory_flags = (
-        os.O_RDONLY
-        | os.O_DIRECTORY
-        | os.O_NOFOLLOW
-        | getattr(os, "O_CLOEXEC", 0)
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
     )
     file_flags = (
         os.O_RDONLY
@@ -407,11 +433,14 @@ def committed_pi_runtime_assets() -> tuple[PiRuntimeAsset, ...]:
     )
 
 
-def pi_runtime_assets(contract: ProfileContract) -> tuple[PiRuntimeAsset, ...]:
+def pi_runtime_assets(
+    contract: ProfileContract,
+    service_binding: ServiceEndpointBinding | None = None,
+) -> tuple[PiRuntimeAsset, ...]:
     """Return every generated and repository-owned runtime snapshot input."""
 
     assets = (
-        *generated_pi_configuration_assets(contract),
+        *generated_pi_configuration_assets(contract, service_binding),
         *committed_pi_runtime_assets(),
     )
     roles = [role for asset in assets for role in asset.roles]
@@ -431,12 +460,7 @@ def _directory_open_flags() -> int:
             "Pi installation identity requires O_DIRECTORY and O_NOFOLLOW",
             code="pi_runtime_platform_unsupported",
         )
-    return (
-        os.O_RDONLY
-        | os.O_DIRECTORY
-        | os.O_NOFOLLOW
-        | getattr(os, "O_CLOEXEC", 0)
-    )
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 
 
 def _open_absolute_directory(path: pathlib.Path) -> int:
@@ -477,10 +501,7 @@ def _validate_owner_and_mode(
     # Linux symlinks report mode 0777 regardless of their access policy. Their
     # ownership is validated, and they are never followed during this scan.
     if not is_symlink and metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-        _fail(
-            "Pi installation object is group- or world-writable: "
-            f"{display_path}"
-        )
+        _fail(f"Pi installation object is group- or world-writable: {display_path}")
     if (
         stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
     ) and metadata.st_nlink != 1:
@@ -570,8 +591,7 @@ def _assert_unchanged(
 ) -> None:
     if _stable_stat_fields(before) != _stable_stat_fields(after):
         _fail(
-            "Pi installation changed while scanning "
-            f"{os.fsdecode(relative_path)}",
+            f"Pi installation changed while scanning {os.fsdecode(relative_path)}",
             code="pi_installation_changed",
         )
 
@@ -615,9 +635,7 @@ def _scan_regular_file(
             kind=b"regular",
             mode=opened.st_mode,
         )
-        hasher.update(
-            opened.st_size.to_bytes(8, byteorder="big", signed=False)
-        )
+        hasher.update(opened.st_size.to_bytes(8, byteorder="big", signed=False))
         bytes_read = 0
         while True:
             try:
@@ -849,8 +867,7 @@ def _assert_matches_snapshot(
 ) -> None:
     if _stable_stat_fields(metadata) != snapshot.stable_fields:
         _fail(
-            "Pi installation changed after scanning "
-            f"{os.fsdecode(relative_path)}",
+            f"Pi installation changed after scanning {os.fsdecode(relative_path)}",
             code="pi_installation_changed",
         )
 
@@ -865,8 +882,7 @@ def _verify_tree_snapshot(
     snapshot = snapshots.get(relative_path)
     if snapshot is None or snapshot.child_names is None:
         _fail(
-            "Pi installation snapshot is incomplete at "
-            f"{os.fsdecode(relative_path)}",
+            f"Pi installation snapshot is incomplete at {os.fsdecode(relative_path)}",
             code="pi_installation_changed",
         )
     _assert_matches_snapshot(

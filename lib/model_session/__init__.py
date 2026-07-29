@@ -2,11 +2,26 @@
 
 from .attachment import (
     ATTACHMENT_SCHEMA,
+    SERVICE_ENDPOINT_SCHEMA,
+    SERVICE_WORKLOAD_SCHEMA,
     InferenceAttachment,
+    ServiceEndpoint,
+    ServiceEndpointBinding,
+    ServiceWorkload,
     inference_attachment_receipt_path,
     inference_workload_identity,
     load_inference_attachment,
     publish_inference_attachment,
+)
+from .service_endpoint import (
+    load_service_endpoint,
+    parse_service_endpoint_binding,
+    parse_service_workload,
+    publish_service_endpoint,
+    revoke_service_endpoint,
+    service_endpoint_receipt_path,
+    service_endpoint_socket_path,
+    service_workload_identity,
 )
 from .errors import ModelSessionError
 from .pi_runtime import (
@@ -22,8 +37,10 @@ from .profile import (
     PI_TOOLS,
     PROFILE_FILE_NAME,
     PROFILE_SCHEMA,
+    PROFILE_SCHEMA_V3,
     WEIGHT_FORMATS,
     ModelContract,
+    EndpointRequirementContract,
     PiContract,
     Profile,
     ProfileContract,
@@ -41,13 +58,21 @@ from .runs import (
     load_run,
     load_run_from_state,
 )
-from .materialization import materialize_new_run
+from .materialization import (
+    materialize_legacy_run_for_migration,
+    materialize_new_run,
+)
 
 __all__ = [
     "AGENTS_FILE_NAME",
     "ATTACHMENT_SCHEMA",
+    "SERVICE_ENDPOINT_SCHEMA",
+    "SERVICE_WORKLOAD_SCHEMA",
     "INPUT_MODALITIES",
     "InferenceAttachment",
+    "ServiceEndpoint",
+    "ServiceEndpointBinding",
+    "ServiceWorkload",
     "KV_CACHE_DTYPES",
     "LOCK_SCHEMA",
     "LockedResource",
@@ -56,6 +81,8 @@ __all__ = [
     "PI_TOOLS",
     "PROFILE_FILE_NAME",
     "PROFILE_SCHEMA",
+    "PROFILE_SCHEMA_V3",
+    "EndpointRequirementContract",
     "PiInstallationIdentity",
     "PiContract",
     "PiRuntimeAsset",
@@ -72,10 +99,19 @@ __all__ = [
     "inference_attachment_receipt_path",
     "inference_workload_identity",
     "load_inference_attachment",
+    "load_service_endpoint",
     "load_profile",
     "load_run",
+    "materialize_legacy_run_for_migration",
     "load_run_from_state",
     "materialize_new_run",
     "pi_runtime_assets",
+    "parse_service_endpoint_binding",
+    "parse_service_workload",
     "publish_inference_attachment",
+    "publish_service_endpoint",
+    "revoke_service_endpoint",
+    "service_endpoint_receipt_path",
+    "service_endpoint_socket_path",
+    "service_workload_identity",
 ]

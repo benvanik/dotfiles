@@ -13,6 +13,9 @@ import stat
 from collections.abc import Iterator
 from typing import Any
 
+from .attachment import (
+    ServiceEndpointBinding,
+)
 from .errors import ModelSessionError
 from .pi_runtime import (
     PiInstallationIdentity,
@@ -20,9 +23,15 @@ from .pi_runtime import (
     fingerprint_pi_installation,
     pi_runtime_assets,
 )
-from .profile import AGENTS_FILE_NAME, PROFILE_FILE_NAME, Profile
+from .profile import (
+    AGENTS_FILE_NAME,
+    PROFILE_FILE_NAME,
+    PROFILE_SCHEMA_V3,
+    Profile,
+)
 from .runs import (
     LOCK_SCHEMA,
+    LOCK_SCHEMA_V1,
     RUN_SCHEMA,
     STAGING_NAME_PATTERN,
     SessionRun,
@@ -37,6 +46,7 @@ from .runs import (
     _validate_project_directory_descriptor,
     load_run,
 )
+from .service_endpoint import load_service_endpoint
 
 
 def _ensure_private_child_directory(
@@ -640,6 +650,7 @@ def _materialize_staging(
     profile: Profile,
     runtime_assets: tuple[PiRuntimeAsset, ...],
     pi_installation: PiInstallationIdentity,
+    service_binding: ServiceEndpointBinding | None,
     *,
     session_id: str,
     created_at: str,
@@ -714,7 +725,7 @@ def _materialize_staging(
         )
 
         manifest = {
-            "schema": LOCK_SCHEMA,
+            "schema": (LOCK_SCHEMA if service_binding is not None else LOCK_SCHEMA_V1),
             "session_id": session_id,
             "created_at": created_at,
             "source_profile_root": str(profile.contract.profile_root),
@@ -726,6 +737,8 @@ def _materialize_staging(
                 "memory_directory": str(memory_directory),
             },
         }
+        if service_binding is not None:
+            manifest["service"] = service_binding.as_dict()
         manifest_bytes = _json_bytes(manifest)
         _write_exclusive_at(
             snapshot_descriptor,
@@ -751,10 +764,49 @@ def _materialize_staging(
         _fsync_directory_tree(staging_descriptor, staging)
 
 
-def materialize_new_run(profile: Profile) -> SessionRun:
-    """Create one new run; no caller-controlled ID and no implicit resume."""
-
-    runtime_assets = pi_runtime_assets(profile.contract)
+def _materialize_run(
+    profile: Profile,
+    *,
+    endpoint_runtime_root: os.PathLike[str] | str | None = None,
+    expected_workload_sha256: str | None = None,
+) -> SessionRun:
+    service_binding: ServiceEndpointBinding | None = None
+    if profile.contract.schema == PROFILE_SCHEMA_V3:
+        endpoint = load_service_endpoint(
+            profile,
+            runtime_root=endpoint_runtime_root,
+        )
+        if endpoint.binding.service_id != profile.contract.service_id:
+            _fail(
+                "service endpoint does not match the active profile",
+                code="service_endpoint_mismatch",
+            )
+        if (
+            expected_workload_sha256 is not None
+            and endpoint.binding.workload_sha256 != expected_workload_sha256
+        ):
+            _fail(
+                "service endpoint workload does not match the model-lab use authority",
+                code="model_lab_use_authority_workload_mismatch",
+            )
+        if profile.contract.endpoint is None:
+            raise AssertionError("profile v3 endpoint requirement is absent")
+        service_binding = ServiceEndpointBinding(
+            service_id=endpoint.binding.service_id,
+            service_sha256=endpoint.binding.service_sha256,
+            workload=endpoint.binding.workload,
+            workload_sha256=endpoint.binding.workload_sha256,
+            input_modalities=(profile.contract.endpoint.required_input_modalities),
+        )
+    elif endpoint_runtime_root is not None:
+        _fail(
+            "legacy profile materialization cannot consume a service-scoped endpoint",
+            code="invalid_service_endpoint_binding",
+        )
+    runtime_assets = pi_runtime_assets(
+        profile.contract,
+        service_binding,
+    )
     pi_installation = fingerprint_pi_installation(profile.contract)
     state_root = profile.contract.state_root
     sessions_root = state_root / "sessions"
@@ -852,6 +904,7 @@ def materialize_new_run(profile: Profile) -> SessionRun:
                         profile,
                         runtime_assets,
                         pi_installation,
+                        service_binding,
                         session_id=session_id,
                         created_at=created_at,
                         report_directory=report_directory,
@@ -942,3 +995,35 @@ def materialize_new_run(profile: Profile) -> SessionRun:
                 "could not allocate a collision-free internal session ID",
                 code="session_id_exhausted",
             )
+
+
+def materialize_new_run(
+    profile: Profile,
+    *,
+    endpoint_runtime_root: os.PathLike[str] | str | None = None,
+    expected_workload_sha256: str | None = None,
+) -> SessionRun:
+    """Create one profile-v3 run; no caller-controlled ID or legacy fallback."""
+
+    if profile.contract.schema != PROFILE_SCHEMA_V3:
+        _fail(
+            "new sessions require an active profile v3; legacy profiles are "
+            "accepted only by the explicit migration fixture path",
+            code="legacy_profile_requires_migration",
+        )
+    return _materialize_run(
+        profile,
+        endpoint_runtime_root=endpoint_runtime_root,
+        expected_workload_sha256=expected_workload_sha256,
+    )
+
+
+def materialize_legacy_run_for_migration(profile: Profile) -> SessionRun:
+    """Create a v1/v2 run only as an input to an explicit migration test."""
+
+    if profile.contract.schema == PROFILE_SCHEMA_V3:
+        _fail(
+            "the legacy migration fixture path does not accept profile v3",
+            code="invalid_legacy_migration_input",
+        )
+    return _materialize_run(profile)

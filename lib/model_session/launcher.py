@@ -11,6 +11,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Iterator, Sequence
 from types import FrameType
@@ -24,6 +25,11 @@ from .history import (
     enumerate_history,
 )
 from .lease import RunLease, acquire_run_from_state
+from .launch_authority import (
+    SessionUseAuthority,
+    attest_workload,
+    read_session_use_authority,
+)
 from .materialization import materialize_new_run
 from .pi_runtime import INFERENCE_RELAY_PATH, SESSION_POLICY_PATH
 from .profile import ProfileRoute, load_profile, load_profile_route
@@ -33,6 +39,7 @@ from .sandbox import (
     SandboxPlan,
     build_sandbox_plan,
 )
+from .service_endpoint import load_service_endpoint
 
 
 SUPPORTED_PI_VERSION = "0.82.1"
@@ -50,8 +57,7 @@ def _parser(program: str) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=program,
         description=(
-            "Start or resume an isolated Pi session from an external model "
-            "profile."
+            "Start or resume an isolated Pi session from an external model profile."
         ),
     )
     parser.add_argument(
@@ -66,6 +72,11 @@ def _parser(program: str) -> argparse.ArgumentParser:
         "--agents-md",
         action="store_true",
         help="print the agent operating contract and exit",
+    )
+    parser.add_argument(
+        "--model-lab-use-fd",
+        type=int,
+        help=argparse.SUPPRESS,
     )
     subparsers = parser.add_subparsers(dest="command")
     subparsers.add_parser(
@@ -131,16 +142,13 @@ def resolve_profile_root(
                 code="invalid_launcher_invocation",
             )
         entry_point = (
-            pathlib.Path(__file__).resolve().parents[2]
-            / "bin"
-            / "model-session"
+            pathlib.Path(__file__).resolve().parents[2] / "bin" / "model-session"
         )
         try:
             matches_entry_point = os.path.samefile(invocation, entry_point)
         except OSError as error:
             raise ModelSessionError(
-                "cannot validate the external `pi` launcher symlink: "
-                f"{error}",
+                f"cannot validate the external `pi` launcher symlink: {error}",
                 code="invalid_launcher_invocation",
             ) from error
         if not matches_entry_point:
@@ -188,9 +196,7 @@ def _locked_profile_resource(
             f"locked run is missing its exact {role} resource",
             code="invalid_session_state",
         )
-    return pathlib.PurePosixPath("/profile").joinpath(
-        *configured_path.parts
-    ).as_posix()
+    return pathlib.PurePosixPath("/profile").joinpath(*configured_path.parts).as_posix()
 
 
 def build_pi_command(run: SessionRun) -> tuple[str, ...]:
@@ -228,6 +234,17 @@ def build_pi_command(run: SessionRun) -> tuple[str, ...]:
     pi_executable = pathlib.PurePosixPath("/opt/pi").joinpath(
         *run.profile.pi.executable.parts
     )
+    if run.service_binding is not None:
+        provider = run.service_binding.workload.provider
+        model_id = run.service_binding.workload.model_id
+    else:
+        if run.profile.runtime is None:
+            _fail(
+                "locked run has neither a frozen service binding nor a legacy runtime",
+                code="invalid_session_state",
+            )
+        provider = run.profile.runtime.provider
+        model_id = run.profile.runtime.model_id
     command = [
         "/usr/bin/python3",
         "/runtime/relay.py",
@@ -241,9 +258,9 @@ def build_pi_command(run: SessionRun) -> tuple[str, ...]:
         pi_executable.as_posix(),
         "--offline",
         "--provider",
-        run.profile.runtime.provider,
+        provider,
         "--model",
-        run.profile.runtime.model_id,
+        model_id,
         "--session-dir",
         "/sessions",
         "--session-id",
@@ -362,7 +379,78 @@ def _stop_and_reap(
             time.sleep(0.05)
 
 
-def launch_lease(lease: RunLease) -> int:
+class _ServiceUseMonitor:
+    """Reap the sandbox if its supervisor-owned use channel disappears."""
+
+    def __init__(
+        self,
+        authority: SessionUseAuthority,
+        plan: SandboxPlan,
+        process: subprocess.Popen[Any],
+    ) -> None:
+        self.authority = authority
+        self.plan = plan
+        self.process = process
+        self._closing = threading.Event()
+        self._process_done = threading.Event()
+        self._failure: BaseException | None = None
+        self._thread = threading.Thread(
+            target=self._run,
+            name="model-session-supervisor-channel",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _signal(self, signal_number: int) -> None:
+        try:
+            self.plan.signal_sandbox_child(signal_number)
+            return
+        except BaseException:
+            pass
+        try:
+            self.process.send_signal(signal_number)
+        except BaseException:
+            pass
+
+    def _run(self) -> None:
+        try:
+            payload = self.authority.receive_supervisor_event()
+            if self._closing.is_set():
+                return
+            if payload:
+                self._failure = ModelSessionError(
+                    "model-lab supervisor sent data after session admission",
+                    code="invalid_model_lab_supervisor_protocol",
+                )
+            else:
+                self._failure = ModelSessionError(
+                    "model-lab supervisor channel closed during the session",
+                    code="model_lab_supervisor_lost",
+                )
+        except BaseException as error:
+            if self._closing.is_set():
+                return
+            self._failure = error
+        self._signal(signal.SIGTERM)
+        if not self._process_done.wait(CHILD_SHUTDOWN_GRACE_SECONDS):
+            self._signal(signal.SIGKILL)
+
+    def finish(self) -> None:
+        self._process_done.set()
+        self._closing.set()
+        self.authority.close()
+        self._thread.join()
+        if self._failure is not None:
+            raise self._failure
+
+
+def launch_lease(
+    lease: RunLease,
+    *,
+    service_use: SessionUseAuthority | None = None,
+) -> int:
     """Transfer one exclusive lease into a plan for the whole child lifetime."""
 
     try:
@@ -384,13 +472,24 @@ def launch_lease(lease: RunLease) -> int:
                 code="sandbox_launch_failed",
             ) from error
         child_identity_ready = False
+        service_monitor: _ServiceUseMonitor | None = None
         try:
             plan.sandbox_child_pid(process)
             child_identity_ready = True
+            if service_use is not None:
+                service_monitor = _ServiceUseMonitor(
+                    service_use,
+                    plan,
+                    process,
+                )
+                service_monitor.start()
             with _forward_lifecycle_signals(plan):
                 while True:
                     try:
-                        return _shell_exit_code(process.wait())
+                        result = _shell_exit_code(process.wait())
+                        if service_monitor is not None:
+                            service_monitor.finish()
+                        return result
                     except InterruptedError:
                         continue
         except _ReceivedSignal as interruption:
@@ -400,12 +499,19 @@ def launch_lease(lease: RunLease) -> int:
                 initial_signal=interruption.signal_number,
                 signal_already_delivered=True,
             )
+            if service_monitor is not None:
+                service_monitor.finish()
             return 128 + interruption.signal_number
         except BaseException:
             _stop_and_reap(
                 process,
                 plan=plan if child_identity_ready else None,
             )
+            if service_monitor is not None:
+                try:
+                    service_monitor.finish()
+                except BaseException:
+                    pass
             raise
 
 
@@ -491,8 +597,7 @@ def _pick_session(
     for index, entry in enumerate(entries, start=1):
         state, error_suffix = _history_state(entry)
         print(
-            f"{index:>2}. {entry.session_id}  {state:7}  "
-            f"{entry.title}{error_suffix}",
+            f"{index:>2}. {entry.session_id}  {state:7}  {entry.title}{error_suffix}",
             file=output,
         )
     print(
@@ -519,20 +624,62 @@ def _pick_session(
     return entries[index - 1].session_id
 
 
-def _new_session(profile_root: pathlib.Path) -> int:
+def _attest_lease_service(
+    lease: RunLease,
+    authority: SessionUseAuthority,
+) -> None:
+    binding = lease.run.service_binding
+    if binding is None:
+        lease.close()
+        _fail(
+            "model-lab cannot launch a session without a frozen service binding",
+            code="invalid_session_state",
+        )
+    try:
+        endpoint = load_service_endpoint(
+            lease.run.profile,
+            expected_binding=binding,
+        )
+        attest_workload(
+            authority,
+            service_id=endpoint.binding.service_id,
+            workload_sha256=endpoint.binding.workload_sha256,
+        )
+    except BaseException:
+        lease.close()
+        raise
+
+
+def _new_session(
+    profile_root: pathlib.Path,
+    authority: SessionUseAuthority,
+) -> int:
     profile = load_profile(profile_root)
-    run = materialize_new_run(profile)
+    if (
+        profile.contract.profile_id != authority.profile_id
+        or profile.contract.service_id != authority.service_id
+    ):
+        _fail(
+            "active profile identity changed after model-lab admission",
+            code="model_lab_use_authority_mismatch",
+        )
+    run = materialize_new_run(
+        profile,
+        expected_workload_sha256=authority.workload_sha256,
+    )
     lease = acquire_run_from_state(
         profile.contract.state_root,
         profile.contract.profile_id,
         run.session_id,
     )
-    return launch_lease(lease)
+    _attest_lease_service(lease, authority)
+    return launch_lease(lease, service_use=authority)
 
 
 def _resume_session(
     profile_root: pathlib.Path,
     session_id: str | None,
+    authority: SessionUseAuthority,
     *,
     input_stream: IO[str],
     output: IO[str],
@@ -544,7 +691,8 @@ def _resume_session(
             route.profile_id,
             session_id,
         )
-        return launch_lease(lease)
+        _attest_lease_service(lease, authority)
+        return launch_lease(lease, service_use=authority)
     with enumerate_history(route.state_root, route.profile_id) as catalog:
         selected = _pick_session(
             catalog.entries,
@@ -552,7 +700,8 @@ def _resume_session(
             output=output,
         )
         lease = catalog.acquire(selected)
-    return launch_lease(lease)
+    _attest_lease_service(lease, authority)
+    return launch_lease(lease, service_use=authority)
 
 
 def _status(
@@ -582,23 +731,38 @@ def main(
     stdout = sys.stdout if output is None else output
     stderr = sys.stderr if error is None else error
     parser = _parser(pathlib.Path(invocation).name or "model-session")
-    parsed = parser.parse_args(
-        list(sys.argv[1:] if arguments is None else arguments)
-    )
+    parsed = parser.parse_args(list(sys.argv[1:] if arguments is None else arguments))
     if parsed.agents_md:
         print(AGENTS_MD, end="", file=stdout)
         return 0
     try:
         profile_root = resolve_profile_root(invocation, parsed.profile)
         if parsed.command in (None, "new"):
-            return _new_session(profile_root)
-        if parsed.command == "resume":
-            return _resume_session(
-                profile_root,
-                parsed.session_id,
-                input_stream=stdin,
-                output=stdout,
+            route = load_profile_route(profile_root)
+            authority = read_session_use_authority(
+                parsed.model_lab_use_fd,
+                route,
             )
+            try:
+                return _new_session(profile_root, authority)
+            finally:
+                authority.close()
+        if parsed.command == "resume":
+            route = load_profile_route(profile_root)
+            authority = read_session_use_authority(
+                parsed.model_lab_use_fd,
+                route,
+            )
+            try:
+                return _resume_session(
+                    profile_root,
+                    parsed.session_id,
+                    authority,
+                    input_stream=stdin,
+                    output=stdout,
+                )
+            finally:
+                authority.close()
         if parsed.command == "status":
             return _status(
                 profile_root,

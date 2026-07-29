@@ -35,6 +35,7 @@ from .pi_runtime import (
     SESSION_POLICY_ROLE,
     fingerprint_pi_installation_for_root_descriptor,
 )
+from .service_endpoint import load_service_endpoint
 
 if TYPE_CHECKING:
     from .runs import SessionRun
@@ -49,12 +50,8 @@ PRIVATE_SHM_BYTES = 256 * 1024 * 1024
 INFERENCE_SOCKET_DESTINATION = "/run/model-session/inference.sock"
 PROCESS_STAT_MAX_BYTES = 4096
 
-_VERSION_PATTERN = re.compile(
-    r"^bubblewrap ([0-9]+)\.([0-9]+)\.([0-9]+)(?:[^0-9].*)?$"
-)
-_SESSION_ID_PATTERN = re.compile(
-    r"^[0-9]{8}T[0-9]{12}Z-[0-9a-f]{16}$"
-)
+_VERSION_PATTERN = re.compile(r"^bubblewrap ([0-9]+)\.([0-9]+)\.([0-9]+)(?:[^0-9].*)?$")
+_SESSION_ID_PATTERN = re.compile(r"^[0-9]{8}T[0-9]{12}Z-[0-9a-f]{16}$")
 _REQUIRED_BWRAP_OPTIONS = frozenset(
     {
         "--assert-userns-disabled",
@@ -208,9 +205,7 @@ def _open_absolute_no_symlinks(
     try:
         if ancestor_identities is not None:
             root_metadata = os.fstat(current)
-            ancestor_identities.append(
-                (root_metadata.st_dev, root_metadata.st_ino)
-            )
+            ancestor_identities.append((root_metadata.st_dev, root_metadata.st_ino))
         for index, component in enumerate(parts[1:]):
             final = index == len(parts) - 2
             flags = common_flags
@@ -237,9 +232,7 @@ def _open_absolute_no_symlinks(
                     code="unsafe_sandbox_source",
                 )
             if not final and ancestor_identities is not None:
-                ancestor_identities.append(
-                    (metadata.st_dev, metadata.st_ino)
-                )
+                ancestor_identities.append((metadata.st_dev, metadata.st_ino))
         return current
     except BaseException:
         os.close(current)
@@ -281,8 +274,7 @@ def _validate_descriptor(
             code="unsafe_sandbox_permissions",
         )
     unsafe_write = bool(mode & stat.S_IWOTH) or bool(
-        mode & stat.S_IWGRP
-        and not owner_has_private_primary_group(metadata)
+        mode & stat.S_IWGRP and not owner_has_private_primary_group(metadata)
     )
     if reject_group_or_world_write and unsafe_write:
         _fail(
@@ -397,8 +389,7 @@ def validate_bwrap() -> tuple[int, int, int]:
     )
     if missing:
         _fail(
-            "bubblewrap lacks required sandbox capabilities: "
-            + ", ".join(missing),
+            "bubblewrap lacks required sandbox capabilities: " + ", ".join(missing),
             code="bwrap_capability_unsupported",
         )
     return version
@@ -460,10 +451,7 @@ def _process_parent_pid(process_pid: int) -> int:
         ) from error
     finally:
         os.close(descriptor)
-    if (
-        not raw_stat.endswith(b"\n")
-        or len(raw_stat) > PROCESS_STAT_MAX_BYTES
-    ):
+    if not raw_stat.endswith(b"\n") or len(raw_stat) > PROCESS_STAT_MAX_BYTES:
         _fail(
             "bubblewrap child ancestry exceeded its kernel protocol bound",
             code="sandbox_launch_failed",
@@ -599,14 +587,12 @@ class SandboxPlan:
         try:
             if _process_parent_pid(child_pid) != monitor_pid:
                 _fail(
-                    "bubblewrap reported a process outside its direct "
-                    "monitor ancestry",
+                    "bubblewrap reported a process outside its direct monitor ancestry",
                     code="sandbox_launch_failed",
                 )
             if _live_monitor_pid(monitor) != monitor_pid:
                 _fail(
-                    "bubblewrap monitor exited during child identity "
-                    "retention",
+                    "bubblewrap monitor exited during child identity retention",
                     code="sandbox_launch_failed",
                 )
             self._owned_descriptors.append(pid_descriptor)
@@ -675,8 +661,7 @@ def _validate_command(command: Sequence[str]) -> tuple[str, ...]:
         _fail("sandbox command must be a nonempty argument sequence")
     arguments = tuple(command)
     if any(
-        not isinstance(argument, str) or "\x00" in argument
-        for argument in arguments
+        not isinstance(argument, str) or "\x00" in argument for argument in arguments
     ):
         _fail("sandbox command arguments must be NUL-free strings")
     executable = pathlib.PurePosixPath(arguments[0])
@@ -685,14 +670,8 @@ def _validate_command(command: Sequence[str]) -> tuple[str, ...]:
         or executable.as_posix() != arguments[0]
         or any(part in {"", ".", ".."} for part in executable.parts)
     ):
-        _fail(
-            "sandbox command executable must be an absolute normalized "
-            "sandbox path"
-        )
-    allowed = (
-        arguments[0] == "/usr/bin/python3"
-        or arguments[0].startswith("/opt/pi/")
-    )
+        _fail("sandbox command executable must be an absolute normalized sandbox path")
+    allowed = arguments[0] == "/usr/bin/python3" or arguments[0].startswith("/opt/pi/")
     if not allowed:
         _fail(
             "sandbox entrypoint must be locked under /opt/pi or be the "
@@ -705,31 +684,22 @@ def _resource_destination(
     relative_path: pathlib.PurePosixPath,
 ) -> pathlib.PurePosixPath:
     if relative_path.parts[0] == "profile":
-        return pathlib.PurePosixPath("/profile").joinpath(
-            *relative_path.parts[1:]
-        )
+        return pathlib.PurePosixPath("/profile").joinpath(*relative_path.parts[1:])
     if relative_path.parts[0] == "runtime":
-        return pathlib.PurePosixPath("/runtime").joinpath(
-            *relative_path.parts[1:]
-        )
+        return pathlib.PurePosixPath("/runtime").joinpath(*relative_path.parts[1:])
     if relative_path == PI_MODELS_PATH:
         return pathlib.PurePosixPath("/config/models.json")
-    _fail(
-        "locked resource has no sandbox destination: "
-        f"{relative_path.as_posix()}"
-    )
+    _fail(f"locked resource has no sandbox destination: {relative_path.as_posix()}")
 
 
 def _validate_source_relationships(run: SessionRun) -> None:
-    if (
-        not isinstance(run.session_id, str)
-        or not _SESSION_ID_PATTERN.fullmatch(run.session_id)
+    if not isinstance(run.session_id, str) or not _SESSION_ID_PATTERN.fullmatch(
+        run.session_id
     ):
         _fail("sandbox run has an invalid internally generated session ID")
     profile_id = run.profile.profile_id
-    if (
-        not isinstance(profile_id, str)
-        or not re.fullmatch(r"^[a-z][a-z0-9-]{0,62}$", profile_id)
+    if not isinstance(profile_id, str) or not re.fullmatch(
+        r"^[a-z][a-z0-9-]{0,62}$", profile_id
     ):
         _fail("sandbox run has an invalid profile ID")
     state_root = _normal_absolute_path(
@@ -737,9 +707,7 @@ def _validate_source_relationships(run: SessionRun) -> None:
         label="state root",
     )
     session_root = _normal_absolute_path(run.root, label="session root")
-    if session_root != (
-        state_root / "sessions" / profile_id / run.session_id
-    ):
+    if session_root != (state_root / "sessions" / profile_id / run.session_id):
         _fail("session root is not at its canonical state path")
     expected_session_paths = {
         "snapshot root": session_root / "snapshot",
@@ -773,9 +741,7 @@ def _validate_source_relationships(run: SessionRun) -> None:
             )
             != expected_path
         ):
-            _fail(
-                f"locked {role} resource is not at its canonical snapshot path"
-            )
+            _fail(f"locked {role} resource is not at its canonical snapshot path")
 
     project_root = _normal_absolute_path(
         run.profile.project_root,
@@ -783,15 +749,21 @@ def _validate_source_relationships(run: SessionRun) -> None:
     )
     expected_report = project_root / "reports" / run.session_id
     expected_memory = project_root / "memory" / run.session_id
-    if _normal_absolute_path(
-        run.report_directory,
-        label="session report directory",
-    ) != expected_report:
+    if (
+        _normal_absolute_path(
+            run.report_directory,
+            label="session report directory",
+        )
+        != expected_report
+    ):
         _fail("session report directory is not at its canonical project path")
-    if _normal_absolute_path(
-        run.memory_directory,
-        label="session memory directory",
-    ) != expected_memory:
+    if (
+        _normal_absolute_path(
+            run.memory_directory,
+            label="session memory directory",
+        )
+        != expected_memory
+    ):
         _fail("session memory directory is not at its canonical project path")
 
     pi_root = _normal_absolute_path(
@@ -810,13 +782,13 @@ def _validate_source_relationships(run: SessionRun) -> None:
         pathlib.Path("/usr"),
         pathlib.Path("/var"),
     }
-    if any(source in broad_roots for source in (state_root, project_root, pi_root)):
+    if any(source in broad_roots for source in (session_root, project_root, pi_root)):
         _fail("sandbox source is a dangerously broad host root")
     if _overlaps(pi_root, infrastructure_root):
         _fail("Pi installation root is not a dedicated external tree")
 
     sources = (
-        state_root,
+        session_root,
         project_root,
         pi_root,
     )
@@ -844,10 +816,7 @@ def _validate_source_relationships(run: SessionRun) -> None:
         for second in sources[index + 1 :]:
             if _overlaps(first, second):
                 _fail(f"sandbox source roots overlap: {first} and {second}")
-    if any(
-        _overlaps(source, infrastructure_root)
-        for source in sources
-    ):
+    if any(_overlaps(source, infrastructure_root) for source in sources):
         _fail("sandbox source overlaps the dotfiles infrastructure repository")
 
 
@@ -992,20 +961,16 @@ def build_sandbox_plan(
             label="Pi installation root",
             allowed_owners=root_or_user,
         )
-        current_pi_installation = (
-            fingerprint_pi_installation_for_root_descriptor(
-                run.profile,
-                pi_installation_descriptor,
-            )
+        current_pi_installation = fingerprint_pi_installation_for_root_descriptor(
+            run.profile,
+            pi_installation_descriptor,
         )
         if current_pi_installation != run.pi_installation:
             _fail(
                 "Pi installation changed after the run was loaded",
                 code="pi_installation_changed",
             )
-        resource_bindings: list[
-            tuple[int, pathlib.PurePosixPath]
-        ] = []
+        resource_bindings: list[tuple[int, pathlib.PurePosixPath]] = []
         resource_directories: set[pathlib.PurePosixPath] = set()
         for resource in run.resources:
             descriptor = lease.duplicate_resource(resource.relative_path)
@@ -1042,21 +1007,30 @@ def build_sandbox_plan(
             label="session memory directory",
             exact_mode=0o700,
         )
-        attachment = load_inference_attachment(
-            run.profile,
-            runtime_root=attachment_runtime_root,
-        )
-        if (
-            attachment.profile_id != run.profile.profile_id
-            or attachment.project_id != run.profile.project_id
-            or attachment.workload_sha256
-            != inference_workload_identity(run.profile)
-        ):
-            _fail(
-                "loaded inference attachment does not match the locked "
-                "session workload",
-                code="inference_attachment_mismatch",
+        if run.service_binding is not None:
+            endpoint = load_service_endpoint(
+                run.profile,
+                expected_binding=run.service_binding,
+                runtime_root=attachment_runtime_root,
             )
+            attachment = endpoint
+        else:
+            legacy_attachment = load_inference_attachment(
+                run.profile,
+                runtime_root=attachment_runtime_root,
+            )
+            if (
+                legacy_attachment.profile_id != run.profile.profile_id
+                or legacy_attachment.project_id != run.profile.project_id
+                or legacy_attachment.workload_sha256
+                != inference_workload_identity(run.profile)
+            ):
+                _fail(
+                    "loaded inference attachment does not match the locked "
+                    "session workload",
+                    code="inference_attachment_mismatch",
+                )
+            attachment = legacy_attachment
         socket_path = _normal_absolute_path(
             attachment.socket_path,
             label="inference socket",
@@ -1101,12 +1075,9 @@ def build_sandbox_plan(
                 memory_descriptor,
             )
         }
-        if mounted_source_identities.intersection(
-            socket_ancestor_identities
-        ):
+        if mounted_source_identities.intersection(socket_ancestor_identities):
             _fail(
-                "inference socket is beneath a retained sandbox mount "
-                "source",
+                "inference socket is beneath a retained sandbox mount source",
                 code="unsafe_sandbox_source",
             )
         socket_metadata = os.fstat(socket_descriptor)
@@ -1145,9 +1116,7 @@ def build_sandbox_plan(
             status_read_descriptor, status_write_descriptor = os.pipe()
             os.set_inheritable(status_read_descriptor, False)
             os.set_inheritable(status_write_descriptor, False)
-        descriptors.extend(
-            (status_read_descriptor, status_write_descriptor)
-        )
+        descriptors.extend((status_read_descriptor, status_write_descriptor))
 
         argv = [
             os.fspath(BWRAP_BINARY),

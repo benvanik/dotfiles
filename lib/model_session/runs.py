@@ -15,6 +15,9 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
+from .attachment import (
+    ServiceEndpointBinding,
+)
 from .errors import ModelSessionError
 from .lease import RunSource
 from .ownership import owner_has_private_primary_group
@@ -29,7 +32,6 @@ from .pi_runtime import (
     fingerprint_pi_installation_for_root_descriptor,
     generated_pi_configuration_assets,
     parse_pi_installation_identity,
-    pi_runtime_assets,
 )
 from .profile import (
     AGENTS_FILE_NAME,
@@ -39,15 +41,16 @@ from .profile import (
     parse_locked_profile,
     validate_state_route,
 )
+from .service_endpoint import parse_service_endpoint_binding
 
 
-LOCK_SCHEMA = "model-session.lock.v1"
+LOCK_SCHEMA_V1 = "model-session.lock.v1"
+LOCK_SCHEMA_V2 = "model-session.lock.v2"
+LOCK_SCHEMA = LOCK_SCHEMA_V2
 RUN_SCHEMA = "model-session.run.v1"
 SESSION_ID_EXPRESSION = r"[0-9]{8}T[0-9]{12}Z-[0-9a-f]{16}"
 SESSION_ID_PATTERN = re.compile(rf"^{SESSION_ID_EXPRESSION}$")
-STAGING_NAME_PATTERN = re.compile(
-    rf"^\.creating-({SESSION_ID_EXPRESSION})$"
-)
+STAGING_NAME_PATTERN = re.compile(rf"^\.creating-({SESSION_ID_EXPRESSION})$")
 HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 _RUN_KEYS = {
@@ -58,7 +61,7 @@ _RUN_KEYS = {
     "created_at",
     "lock_sha256",
 }
-_LOCK_KEYS = {
+_LOCK_KEYS_V1 = {
     "schema",
     "session_id",
     "created_at",
@@ -68,6 +71,7 @@ _LOCK_KEYS = {
     "project",
     "pi_installation",
 }
+_LOCK_KEYS_V2 = {*_LOCK_KEYS_V1, "service"}
 _PROJECT_KEYS = {"report_directory", "memory_directory"}
 _RESOURCE_KEYS = {"path", "roles", "sha256", "size"}
 
@@ -95,6 +99,7 @@ class SessionRun:
     memory_directory: pathlib.Path
     resources: tuple[LockedResource, ...]
     pi_installation: PiInstallationIdentity
+    service_binding: ServiceEndpointBinding | None
 
     def resource_for_role(self, role: str) -> LockedResource | None:
         for resource in self.resources:
@@ -113,12 +118,7 @@ def _directory_flags() -> int:
             "model-session state requires O_NOFOLLOW and O_DIRECTORY",
             code="session_platform_unsupported",
         )
-    return (
-        os.O_RDONLY
-        | os.O_DIRECTORY
-        | os.O_NOFOLLOW
-        | getattr(os, "O_CLOEXEC", 0)
-    )
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 
 
 def _validate_private_directory_descriptor(
@@ -277,11 +277,7 @@ def _open_private_regular_file_at(
     label: str,
 ) -> int:
     name = _child_name(name, label=label)
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_NONBLOCK", 0)
-        | getattr(os, "O_CLOEXEC", 0)
-    )
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
@@ -657,10 +653,7 @@ def _parse_resource_entries(
         roles = entry["roles"]
         digest = entry["sha256"]
         size = entry["size"]
-        if (
-            not isinstance(relative, str)
-            or "\\" in relative
-        ):
+        if not isinstance(relative, str) or "\\" in relative:
             _fail("lock resource path is invalid")
         pure_path = pathlib.PurePosixPath(relative)
         if (
@@ -720,9 +713,7 @@ def _validate_snapshot_tree(
     snapshot_root: pathlib.Path,
     resources: tuple[LockedResource, ...],
 ) -> None:
-    expected_files = {
-        resource.relative_path.as_posix() for resource in resources
-    }
+    expected_files = {resource.relative_path.as_posix() for resource in resources}
     expected_files.add("lock.json")
     expected_directories = {""}
     for relative in expected_files:
@@ -807,8 +798,7 @@ def _validate_resource_roles(
         }
     )
     actual = {
-        resource.relative_path.as_posix(): set(resource.roles)
-        for resource in resources
+        resource.relative_path.as_posix(): set(resource.roles) for resource in resources
     }
     if actual != expected:
         _fail(
@@ -821,12 +811,14 @@ def _validate_generated_pi_configuration(
     profile: ProfileContract,
     resources: tuple[LockedResource, ...],
     *,
+    service_binding: ServiceEndpointBinding | None,
     resource_contents: dict[pathlib.PurePosixPath, bytes],
 ) -> None:
-    resources_by_path = {
-        resource.relative_path: resource for resource in resources
-    }
-    for expected in generated_pi_configuration_assets(profile):
+    resources_by_path = {resource.relative_path: resource for resource in resources}
+    for expected in generated_pi_configuration_assets(
+        profile,
+        service_binding,
+    ):
         resource = resources_by_path.get(expected.relative_path)
         if resource is None:
             _fail(
@@ -900,8 +892,7 @@ def _sealed_resource_file(
         fcntl.fcntl(descriptor, fcntl.F_ADD_SEALS, seals)
         if fcntl.fcntl(descriptor, fcntl.F_GET_SEALS) & seals != seals:
             _fail(
-                "kernel did not seal snapshot resource "
-                f"{relative_path.as_posix()}",
+                f"kernel did not seal snapshot resource {relative_path.as_posix()}",
                 code="session_platform_unsupported",
             )
         os.set_inheritable(descriptor, False)
@@ -1096,9 +1087,23 @@ def _load_run(
                 "session lock manifest does not match its receipt",
                 code="immutable_snapshot_changed",
             )
-        _require_keys(manifest, _LOCK_KEYS, label="session lock manifest")
-        if manifest["schema"] != LOCK_SCHEMA:
-            _fail(f"session lock schema must be {LOCK_SCHEMA!r}")
+        lock_schema = manifest.get("schema")
+        if lock_schema == LOCK_SCHEMA_V1:
+            _require_keys(
+                manifest,
+                _LOCK_KEYS_V1,
+                label="session lock manifest",
+            )
+        elif lock_schema == LOCK_SCHEMA_V2:
+            _require_keys(
+                manifest,
+                _LOCK_KEYS_V2,
+                label="session lock manifest",
+            )
+        else:
+            _fail(
+                f"session lock schema must be {LOCK_SCHEMA_V1!r} or {LOCK_SCHEMA_V2!r}"
+            )
         if manifest["session_id"] != session_id:
             _fail("session lock ID does not match selected session")
         if manifest["created_at"] != created_at:
@@ -1129,10 +1134,45 @@ def _load_run(
                 "locked profile contract does not match profile.toml",
                 code="immutable_snapshot_changed",
             )
+        service_binding: ServiceEndpointBinding | None = None
+        if lock_schema == LOCK_SCHEMA_V2:
+            try:
+                service_binding = parse_service_endpoint_binding(manifest["service"])
+            except ModelSessionError as error:
+                raise ModelSessionError(
+                    f"locked service binding is invalid: {error}",
+                    code="immutable_snapshot_changed",
+                ) from error
+            if (
+                locked_profile.service_id is None
+                or service_binding.service_id != locked_profile.service_id
+            ):
+                _fail(
+                    "locked service binding does not match profile.toml",
+                    code="immutable_snapshot_changed",
+                )
+            if locked_profile.endpoint is None:
+                raise AssertionError("profile v3 endpoint requirement is absent")
+            missing_modalities = set(
+                locked_profile.endpoint.required_input_modalities
+            ) - set(service_binding.input_modalities)
+            if missing_modalities:
+                _fail(
+                    "locked service binding lacks profile-required "
+                    "capabilities: "
+                    f"{', '.join(sorted(missing_modalities))}",
+                    code="immutable_snapshot_changed",
+                )
+        elif locked_profile.service_id is not None:
+            _fail(
+                "profile v3 session is missing its frozen service binding",
+                code="immutable_snapshot_changed",
+            )
         _validate_resource_roles(locked_profile, resources)
         _validate_generated_pi_configuration(
             locked_profile,
             resources,
+            service_binding=service_binding,
             resource_contents=resource_contents,
         )
         if locked_profile.profile_id != profile_id:
@@ -1141,9 +1181,7 @@ def _load_run(
             _fail("locked profile state_root does not match selected state")
         if receipt["project_id"] != locked_profile.project_id:
             _fail("session receipt project ID does not match locked profile")
-        pi_installation = parse_pi_installation_identity(
-            manifest["pi_installation"]
-        )
+        pi_installation = parse_pi_installation_identity(manifest["pi_installation"])
         installation_root = locked_profile.pi.installation_root
         pi_installation_descriptor: int | None = None
         if (
@@ -1156,11 +1194,9 @@ def _load_run(
                 label="Pi installation root",
             )
             descriptors.callback(os.close, pi_installation_descriptor)
-            actual_pi_installation = (
-                fingerprint_pi_installation_for_root_descriptor(
-                    locked_profile,
-                    pi_installation_descriptor,
-                )
+            actual_pi_installation = fingerprint_pi_installation_for_root_descriptor(
+                locked_profile,
+                pi_installation_descriptor,
             )
             if actual_pi_installation != pi_installation:
                 _fail(
@@ -1178,12 +1214,8 @@ def _load_run(
             _PROJECT_KEYS,
             label="session lock project binding",
         )
-        report_directory = (
-            locked_profile.project_root / "reports" / session_id
-        )
-        memory_directory = (
-            locked_profile.project_root / "memory" / session_id
-        )
+        report_directory = locked_profile.project_root / "reports" / session_id
+        memory_directory = locked_profile.project_root / "memory" / session_id
         if project_value != {
             "report_directory": str(report_directory),
             "memory_directory": str(memory_directory),
@@ -1286,6 +1318,7 @@ def _load_run(
             memory_directory=memory_directory,
             resources=resources,
             pi_installation=pi_installation,
+            service_binding=service_binding,
         )
 
 
@@ -1330,17 +1363,14 @@ def list_run_ids_from_state(
             descriptors.callback(os.close, sessions_descriptor)
             if not has_materialization_lock:
                 _fail(
-                    "session state exists without its stable "
-                    "materialization lock",
+                    "session state exists without its stable materialization lock",
                     code="unsafe_session_state",
                 )
-            profile_sessions_descriptor = (
-                _open_optional_private_child_directory(
-                    sessions_descriptor,
-                    validated_profile_id,
-                    path=profile_sessions,
-                    label="profile sessions directory",
-                )
+            profile_sessions_descriptor = _open_optional_private_child_directory(
+                sessions_descriptor,
+                validated_profile_id,
+                path=profile_sessions,
+                label="profile sessions directory",
             )
             if profile_sessions_descriptor is None:
                 return ()
@@ -1349,8 +1379,7 @@ def list_run_ids_from_state(
                 entries = tuple(os.listdir(profile_sessions_descriptor))
             except OSError as error:
                 raise ModelSessionError(
-                    "cannot enumerate profile sessions "
-                    f"{profile_sessions}: {error}",
+                    f"cannot enumerate profile sessions {profile_sessions}: {error}",
                     code="unsafe_session_state",
                 ) from error
             session_ids: list[str] = []
@@ -1364,8 +1393,7 @@ def list_run_ids_from_state(
                     )
                 if not SESSION_ID_PATTERN.fullmatch(name):
                     _fail(
-                        "unexpected entry in profile session state: "
-                        f"{path}",
+                        f"unexpected entry in profile session state: {path}",
                         code="unsafe_session_state",
                     )
                 descriptor = _open_private_child_directory(

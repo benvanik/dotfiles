@@ -15,8 +15,12 @@ from unittest import mock
 from model_session.attachment import publish_inference_attachment
 from model_session.errors import ModelSessionError
 from model_session.lease import RunLease, acquire_run_from_state
-from model_session.profile import load_profile
-from model_session.materialization import materialize_new_run
+from model_session.profile import (
+    load_legacy_profile_for_migration as load_profile,
+)
+from model_session.materialization import (
+    materialize_legacy_run_for_migration as materialize_new_run,
+)
 from model_session.sandbox import (
     BWRAP_BINARY,
     DENIED_COMMAND_DESTINATIONS,
@@ -50,9 +54,7 @@ class SandboxFixture:
         self.state_root = self.root / "state"
         self.project = _private_directory(self.root / "project")
         self.project.chmod(0o775)
-        self.pi_installation = _private_directory(
-            self.root / "pi-installation"
-        )
+        self.pi_installation = _private_directory(self.root / "pi-installation")
         pi_bin = _private_directory(self.pi_installation / "bin")
         pi_executable = pi_bin / "pi"
         pi_executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
@@ -229,12 +231,8 @@ class SandboxPlanTests(unittest.TestCase):
             self.assertLess(argv.index("/workspace"), argv.index("/workspace/.pi"))
             self.assertLess(argv.index("/usr"), argv.index("/usr/local"))
             project_bind = argv.index("/project")
-            report_bind = argv.index(
-                f"/project/reports/{self.fixture.run.session_id}"
-            )
-            memory_bind = argv.index(
-                f"/project/memory/{self.fixture.run.session_id}"
-            )
+            report_bind = argv.index(f"/project/reports/{self.fixture.run.session_id}")
+            memory_bind = argv.index(f"/project/memory/{self.fixture.run.session_id}")
             self.assertLess(project_bind, report_bind)
             self.assertLess(project_bind, memory_bind)
             socket_bind = argv.index(INFERENCE_SOCKET_DESTINATION)
@@ -425,13 +423,9 @@ class SandboxPlanTests(unittest.TestCase):
         with self.build() as plan:
             for relative_path, expected in originals.items():
                 if relative_path.parts[0] == "profile":
-                    destination = (
-                        "/profile/" + "/".join(relative_path.parts[1:])
-                    )
+                    destination = "/profile/" + "/".join(relative_path.parts[1:])
                 elif relative_path.parts[0] == "runtime":
-                    destination = (
-                        "/runtime/" + "/".join(relative_path.parts[1:])
-                    )
+                    destination = "/runtime/" + "/".join(relative_path.parts[1:])
                 else:
                     destination = "/config/models.json"
                 destination_index = plan.argv.index(destination)

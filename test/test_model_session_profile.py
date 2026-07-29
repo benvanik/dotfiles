@@ -14,14 +14,17 @@ import model_session.materialization as materialization_module
 import model_session.runs as runs_module
 from model_session import (
     ModelSessionError,
-    load_profile,
     load_run,
     load_run_from_state,
-    materialize_new_run,
+    materialize_legacy_run_for_migration as materialize_new_run,
+)
+from model_session.materialization import (
+    materialize_new_run as materialize_current_run,
 )
 from model_session.checkpoint import maximum_encoded_bytes
 from model_session.profile import (
     PROFILE_SCHEMA_V1,
+    load_legacy_profile_for_migration as load_profile,
     load_profile_route,
     parse_locked_profile,
 )
@@ -179,6 +182,19 @@ tools = {values["tools"]}
 
 
 class ModelSessionProfileTest(unittest.TestCase):
+    def test_current_materializer_rejects_a_legacy_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.fixture(directory)
+            profile = load_profile(fixture.profile_root)
+
+            with self.assertRaises(ModelSessionError) as caught:
+                materialize_current_run(profile)
+
+            self.assertEqual(
+                caught.exception.code,
+                "legacy_profile_requires_migration",
+            )
+
     def fixture(self, directory: str) -> ProfileFixture:
         return ProfileFixture(pathlib.Path(directory))
 
@@ -227,9 +243,7 @@ class ModelSessionProfileTest(unittest.TestCase):
                     "history_bytes": 2 * 1024**3,
                     "history_inodes": 16_384,
                     "checkpoint_bytes": 17 * 1024**3,
-                    "max_sparse_extents": (
-                        (10 * 1024**3) // STORAGE_PAGE_SIZE
-                    ),
+                    "max_sparse_extents": ((10 * 1024**3) // STORAGE_PAGE_SIZE),
                     "max_file_bytes": 4 * 1024**3,
                     "max_logical_bytes": 16 * 1024**3,
                 },
@@ -337,6 +351,14 @@ class ModelSessionProfileTest(unittest.TestCase):
             )
             self.assertEqual(locked["schema"], PROFILE_SCHEMA_V1)
 
+            fixture.write_profile(
+                schema=PROFILE_SCHEMA_V1,
+                storage_table="",
+                sandbox_table="",
+            )
+            migrated = load_profile(fixture.profile_root)
+            self.assertEqual(migrated.contract.schema, PROFILE_SCHEMA_V1)
+
             with self.assertRaises(ModelSessionError):
                 parse_locked_profile(
                     fixture.document(schema=PROFILE_SCHEMA_V1).encode("utf-8"),
@@ -352,9 +374,7 @@ class ModelSessionProfileTest(unittest.TestCase):
                 storage_table="",
                 sandbox_table="",
             ).encode("utf-8")
-            locked_profile_path = (
-                run.snapshot_root / "profile" / "profile.toml"
-            )
+            locked_profile_path = run.snapshot_root / "profile" / "profile.toml"
             locked_profile_path.write_bytes(v1_document)
 
             manifest_path = run.snapshot_root / "lock.json"
@@ -405,19 +425,20 @@ class ModelSessionProfileTest(unittest.TestCase):
             self.assertNotIn("storage", loaded.profile.as_dict())
             self.assertNotIn("sandbox", loaded.profile.as_dict())
 
-    def test_profile_route_accepts_known_historical_schema_only(self) -> None:
+    def test_active_profile_route_rejects_unmigrated_schemas(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = self.fixture(directory)
-            fixture.write_profile(
-                schema=PROFILE_SCHEMA_V1,
-                storage_table="",
-                sandbox_table="",
-            )
-            route = load_profile_route(fixture.profile_root)
-            self.assertEqual(route.profile_id, "fixture-model")
-            self.assertEqual(route.state_root, fixture.state_root)
-            with self.assertRaises(ModelSessionError):
-                load_profile(fixture.profile_root)
+            for schema, storage_table, sandbox_table in (
+                ("model-session.profile.v2", None, None),
+                (PROFILE_SCHEMA_V1, "", ""),
+            ):
+                fixture.write_profile(
+                    schema=schema,
+                    storage_table=storage_table,
+                    sandbox_table=sandbox_table,
+                )
+                with self.assertRaises(ModelSessionError):
+                    load_profile_route(fixture.profile_root)
 
             fixture.write_profile(schema="model-session.profile.v3")
             with self.assertRaises(ModelSessionError):
@@ -491,9 +512,7 @@ class ModelSessionProfileTest(unittest.TestCase):
                 "max_logical_bytes": 16 * 1024**3,
             },
             {
-                "memory_bytes": (
-                    10 * 1024**3 + 512 * 1024**2 - 1
-                ),
+                "memory_bytes": (10 * 1024**3 + 512 * 1024**2 - 1),
             },
             {"memory_bytes": 16 * 1024**3 + 1},
             {"max_tasks": 63},
@@ -586,15 +605,11 @@ class ModelSessionProfileTest(unittest.TestCase):
             )
             self.assertEqual(
                 limits.max_sparse_extents,
-                (
-                    storage.work_bytes + storage.history_bytes
-                )
-                // STORAGE_PAGE_SIZE,
+                (storage.work_bytes + storage.history_bytes) // STORAGE_PAGE_SIZE,
             )
             self.assertEqual(
                 limits.max_sparse_extents_per_file,
-                max(storage.work_bytes, storage.history_bytes)
-                // STORAGE_PAGE_SIZE,
+                max(storage.work_bytes, storage.history_bytes) // STORAGE_PAGE_SIZE,
             )
             minimum = maximum_encoded_bytes(limits)
 
@@ -697,13 +712,7 @@ class ModelSessionProfileTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             fixture = self.fixture(directory)
             executable = fixture.pi_root / "bin" / "pi"
-            target = (
-                fixture.pi_root
-                / "lib"
-                / "node_modules"
-                / "pi"
-                / "cli.js"
-            )
+            target = fixture.pi_root / "lib" / "node_modules" / "pi" / "cli.js"
             executable.unlink()
             executable.symlink_to(target)
             with self.assertRaises(ModelSessionError) as caught:
@@ -775,9 +784,7 @@ class ModelSessionProfileTest(unittest.TestCase):
                 b"fixture agents v1\n",
             )
             self.assertEqual(tuple((first.workspace / ".pi").iterdir()), ())
-            manifest = json.loads(
-                (first.snapshot_root / "lock.json").read_bytes()
-            )
+            manifest = json.loads((first.snapshot_root / "lock.json").read_bytes())
             self.assertEqual(
                 manifest["pi_installation"],
                 first.pi_installation.as_dict(),
@@ -852,11 +859,7 @@ class ModelSessionProfileTest(unittest.TestCase):
                 try:
                     self.assertTrue(profile_sessions_visible.wait(timeout=2))
                     self.assertTrue(
-                        (
-                            fixture.state_root
-                            / "locks"
-                            / "materialize.lock"
-                        ).is_file()
+                        (fixture.state_root / "locks" / "materialize.lock").is_file()
                     )
                     discovery = threading.Thread(target=discover_worker)
                     discovery.start()
@@ -891,9 +894,7 @@ class ModelSessionProfileTest(unittest.TestCase):
             failures: list[BaseException] = []
             discovered_ids: list[tuple[str, ...]] = []
             materialized_runs = []
-            real_open_optional = (
-                runs_module._open_optional_private_child_directory
-            )
+            real_open_optional = runs_module._open_optional_private_child_directory
             real_flock = runs_module.fcntl.flock
 
             def open_optional(*args: object, **kwargs: object) -> int | None:
@@ -973,9 +974,7 @@ class ModelSessionProfileTest(unittest.TestCase):
             state_descriptor = os.open(fixture.state_root, flags)
             competing_state_descriptor = os.open(fixture.state_root, flags)
             replacement_descriptor: int | None = None
-            marker = (
-                fixture.state_root / "locks" / "materialize.lock"
-            )
+            marker = fixture.state_root / "locks" / "materialize.lock"
             try:
                 with materialization_module._materialization_lock(
                     state_descriptor,
@@ -1015,9 +1014,7 @@ class ModelSessionProfileTest(unittest.TestCase):
             profile = load_profile(fixture.profile_root)
             materialize_new_run(profile)
             orphan_id = "20000101T000000000000Z-0000000000000000"
-            profile_sessions = (
-                fixture.state_root / "sessions" / "fixture-model"
-            )
+            profile_sessions = fixture.state_root / "sessions" / "fixture-model"
             staging = profile_sessions / f".creating-{orphan_id}"
             staging.mkdir(mode=0o700)
             staging.chmod(0o700)
@@ -1039,9 +1036,7 @@ class ModelSessionProfileTest(unittest.TestCase):
             profile = load_profile(fixture.profile_root)
             materialize_new_run(profile)
             orphan_id = "20000101T000000000000Z-0000000000000000"
-            profile_sessions = (
-                fixture.state_root / "sessions" / "fixture-model"
-            )
+            profile_sessions = fixture.state_root / "sessions" / "fixture-model"
             staging = profile_sessions / f".creating-{orphan_id}"
             staging.mkdir(mode=0o700)
             staging.chmod(0o700)
@@ -1066,9 +1061,7 @@ class ModelSessionProfileTest(unittest.TestCase):
             profile = load_profile(fixture.profile_root)
             materialize_new_run(profile)
             orphan_id = "20000101T000000000000Z-0000000000000000"
-            profile_sessions = (
-                fixture.state_root / "sessions" / "fixture-model"
-            )
+            profile_sessions = fixture.state_root / "sessions" / "fixture-model"
             staging = profile_sessions / f".creating-{orphan_id}"
             staging.mkdir(mode=0o700)
             staging.chmod(0o700)
@@ -1098,9 +1091,7 @@ class ModelSessionProfileTest(unittest.TestCase):
             staging_creation_started = False
             real_create = materialization_module._create_private_child_directory
             real_fsync = materialization_module.os.fsync
-            real_make_project = (
-                materialization_module._make_project_session_directories
-            )
+            real_make_project = materialization_module._make_project_session_directories
 
             def create(*args: object, **kwargs: object) -> int:
                 nonlocal staging_creation_started
@@ -1184,21 +1175,15 @@ class ModelSessionProfileTest(unittest.TestCase):
             with self.assertRaises(ModelSessionError) as caught:
                 materialize_new_run(profile)
             self.assertEqual(caught.exception.code, "unsafe_session_state")
-            self.assertFalse(
-                (redirected_route / "project" / "reports").exists()
-            )
-            self.assertFalse(
-                (redirected_route / "project" / "memory").exists()
-            )
+            self.assertFalse((redirected_route / "project" / "reports").exists())
+            self.assertFalse((redirected_route / "project" / "memory").exists())
 
     def test_resume_rejects_a_symlinked_profile_session_route(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = self.fixture(directory)
             profile = load_profile(fixture.profile_root)
             run = materialize_new_run(profile)
-            profile_sessions = (
-                fixture.state_root / "sessions" / "fixture-model"
-            )
+            profile_sessions = fixture.state_root / "sessions" / "fixture-model"
             moved = fixture.root / "moved-profile-sessions"
             profile_sessions.rename(moved)
             profile_sessions.symlink_to(moved, target_is_directory=True)
@@ -1231,9 +1216,7 @@ class ModelSessionProfileTest(unittest.TestCase):
                 caught.exception.code,
                 "published_session_requires_recovery",
             )
-            profile_sessions = (
-                fixture.state_root / "sessions" / "fixture-model"
-            )
+            profile_sessions = fixture.state_root / "sessions" / "fixture-model"
             published = tuple(
                 entry
                 for entry in profile_sessions.iterdir()
@@ -1280,9 +1263,7 @@ class ModelSessionProfileTest(unittest.TestCase):
                 caught.exception.code,
                 "published_session_durability_unknown",
             )
-            profile_sessions = (
-                fixture.state_root / "sessions" / "fixture-model"
-            )
+            profile_sessions = fixture.state_root / "sessions" / "fixture-model"
             published = tuple(
                 entry
                 for entry in profile_sessions.iterdir()
@@ -1365,13 +1346,7 @@ class ModelSessionProfileTest(unittest.TestCase):
             fixture = self.fixture(directory)
             profile = load_profile(fixture.profile_root)
             run = materialize_new_run(profile)
-            executable = (
-                fixture.pi_root
-                / "lib"
-                / "node_modules"
-                / "pi"
-                / "cli.js"
-            )
+            executable = fixture.pi_root / "lib" / "node_modules" / "pi" / "cli.js"
             executable.write_text(
                 "#!/usr/bin/env node\n// replaced after run creation\n",
                 encoding="utf-8",

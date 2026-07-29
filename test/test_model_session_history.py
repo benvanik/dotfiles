@@ -23,8 +23,12 @@ from model_session.lease import (
     acquire_run_from_state,
     open_pi_session_at,
 )
-from model_session.profile import load_profile
-from model_session.materialization import materialize_new_run
+from model_session.profile import (
+    load_legacy_profile_for_migration as load_profile,
+)
+from model_session.materialization import (
+    materialize_legacy_run_for_migration as materialize_new_run,
+)
 
 
 REVISION = "a" * 40
@@ -134,10 +138,7 @@ shutdown_grace_seconds = 30
 
     @staticmethod
     def pi_name(session_id: str, timestamp: str = PI_TIMESTAMP) -> str:
-        return (
-            timestamp.replace(":", "-").replace(".", "-")
-            + f"_{session_id}.jsonl"
-        )
+        return timestamp.replace(":", "-").replace(".", "-") + f"_{session_id}.jsonl"
 
     def write_pi_session(
         self,
@@ -242,12 +243,8 @@ class ModelSessionHistoryTest(unittest.TestCase):
                     [entry.session_id for entry in catalog.entries],
                     [older_run.session_id, newer_run.session_id],
                 )
-                self.assertTrue(
-                    catalog.entries[0].updated_at.endswith(".900000Z")
-                )
-                self.assertTrue(
-                    catalog.entries[1].updated_at.endswith(".100000Z")
-                )
+                self.assertTrue(catalog.entries[0].updated_at.endswith(".900000Z"))
+                self.assertTrue(catalog.entries[1].updated_at.endswith(".100000Z"))
 
     def test_title_uses_latest_name_and_explicit_clear_falls_back(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -261,9 +258,7 @@ class ModelSessionHistoryTest(unittest.TestCase):
                         "type": "message",
                         "message": {
                             "role": "user",
-                            "content": [
-                                {"type": "text", "text": "first\nrequest"}
-                            ],
+                            "content": [{"type": "text", "text": "first\nrequest"}],
                         },
                     },
                     {"type": "session_info", "name": " named experiment "},
@@ -274,9 +269,7 @@ class ModelSessionHistoryTest(unittest.TestCase):
 
             path = run.pi_sessions / fixture.pi_name(run.session_id)
             with path.open("a", encoding="utf-8") as output:
-                output.write(
-                    json.dumps({"type": "session_info", "name": None}) + "\n"
-                )
+                output.write(json.dumps({"type": "session_info", "name": None}) + "\n")
             with enumerate_history(fixture.state_root, "fixture") as catalog:
                 self.assertEqual(catalog.entries[0].title, "first request")
 
@@ -291,8 +284,7 @@ class ModelSessionHistoryTest(unittest.TestCase):
                     {
                         "type": "session_info",
                         "name": (
-                            "\x1b[2Jalpha\u202ebeta\u2066gamma"
-                            "\u200bdelta\ue000omega"
+                            "\x1b[2Jalpha\u202ebeta\u2066gamma\u200bdelta\ue000omega"
                         ),
                     },
                 ],
@@ -369,8 +361,7 @@ class ModelSessionHistoryTest(unittest.TestCase):
                 (
                     header + "\n" + header + "\n",
                     header + '\n{"type":"session_info","name":NaN}\n',
-                    header
-                    + '\n{"type":"session_info","name":"a","name":"b"}\n',
+                    header + '\n{"type":"session_info","name":"a","name":"b"}\n',
                     header + "\n[]\n",
                     "\n" + header + "\n",
                 )
@@ -721,10 +712,7 @@ class ModelSessionHistoryTest(unittest.TestCase):
                             original.unlink()
                             foreign = run.pi_sessions / "foreign.jsonl"
                             foreign.write_text(
-                                json.dumps(
-                                    fixture.header(run.session_id)
-                                )
-                                + "\n",
+                                json.dumps(fixture.header(run.session_id)) + "\n",
                                 encoding="utf-8",
                             )
                             foreign.chmod(0o600)
@@ -756,9 +744,7 @@ class ModelSessionHistoryTest(unittest.TestCase):
             fixture = HistoryFixture(pathlib.Path(directory))
             poisoned = materialize_new_run(fixture.profile())
             healthy = materialize_new_run(fixture.profile())
-            poisoned_path = (
-                poisoned.pi_sessions / fixture.pi_name(poisoned.session_id)
-            )
+            poisoned_path = poisoned.pi_sessions / fixture.pi_name(poisoned.session_id)
             poisoned_path.write_text("not json\n", encoding="utf-8")
             poisoned_path.chmod(0o600)
             fixture.write_pi_session(
@@ -770,9 +756,7 @@ class ModelSessionHistoryTest(unittest.TestCase):
                 fixture.state_root,
                 "fixture",
             ) as catalog:
-                by_id = {
-                    entry.session_id: entry for entry in catalog.entries
-                }
+                by_id = {entry.session_id: entry for entry in catalog.entries}
                 self.assertEqual(
                     by_id[poisoned.session_id].history_error,
                     "invalid_pi_session",
@@ -805,9 +789,7 @@ class ModelSessionHistoryTest(unittest.TestCase):
                 fixture.state_root,
                 "fixture",
             ) as catalog:
-                by_id = {
-                    entry.session_id: entry for entry in catalog.entries
-                }
+                by_id = {entry.session_id: entry for entry in catalog.entries}
                 damaged_entry = by_id[damaged.session_id]
                 self.assertEqual(
                     damaged_entry.title,
@@ -875,9 +857,7 @@ class ModelSessionHistoryTest(unittest.TestCase):
                 with mock.patch.object(
                     lease_module,
                     "RunLease",
-                    side_effect=MemoryError(
-                        "injected lease construction failure"
-                    ),
+                    side_effect=MemoryError("injected lease construction failure"),
                 ):
                     with self.assertRaises(MemoryError):
                         inspection.acquire()

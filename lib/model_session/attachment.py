@@ -33,6 +33,8 @@ from .profile import Profile, ProfileContract
 
 ATTACHMENT_SCHEMA = "model-session.inference-attachment.v1"
 WORKLOAD_SCHEMA = "model-session.workload.v1"
+SERVICE_ENDPOINT_SCHEMA = "model-lab.service-endpoint.v1"
+SERVICE_WORKLOAD_SCHEMA = "model-lab.inference-workload.v1"
 MAX_ATTACHMENT_BYTES = 64 * 1024
 MAX_ATTACHMENT_TTL_SECONDS = 24 * 60 * 60
 SOCKET_CONNECT_TIMEOUT_SECONDS = 1.0
@@ -61,6 +63,38 @@ _RECEIPT_KEYS = {
     "admission_expires_at",
     "payload_sha256",
 }
+_SERVICE_WORKLOAD_KEYS = {
+    "schema",
+    "repository",
+    "revision",
+    "provider",
+    "model_id",
+    "context_tokens",
+    "max_output_tokens",
+    "weight_format",
+    "kv_cache_dtype",
+    "runtime_compatibility",
+    "reasoning",
+}
+_SERVICE_BINDING_KEYS = {
+    "service_id",
+    "service_sha256",
+    "workload",
+    "workload_sha256",
+    "input_modalities",
+}
+_SERVICE_RECEIPT_KEYS = {
+    "schema",
+    "publication_id",
+    "boot_id",
+    *_SERVICE_BINDING_KEYS,
+    "socket_path",
+    "socket_device",
+    "socket_inode",
+    "published_at",
+    "admission_expires_at",
+    "payload_sha256",
+}
 
 Clock = Callable[[], datetime.datetime]
 
@@ -73,6 +107,71 @@ class InferenceAttachment:
     profile_id: str
     project_id: str
     workload_sha256: str
+    socket_path: pathlib.Path
+    socket_device: int
+    socket_inode: int
+    published_at: datetime.datetime
+    admission_expires_at: datetime.datetime
+    receipt_path: pathlib.Path
+
+
+@dataclass(frozen=True)
+class ServiceWorkload:
+    """Semantic workload identity independent of endpoint capabilities."""
+
+    repository: str
+    revision: str
+    provider: str
+    model_id: str
+    context_tokens: int
+    max_output_tokens: int
+    weight_format: str
+    kv_cache_dtype: str
+    runtime_compatibility: str
+    reasoning: bool
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "schema": SERVICE_WORKLOAD_SCHEMA,
+            "repository": self.repository,
+            "revision": self.revision,
+            "provider": self.provider,
+            "model_id": self.model_id,
+            "context_tokens": self.context_tokens,
+            "max_output_tokens": self.max_output_tokens,
+            "weight_format": self.weight_format,
+            "kv_cache_dtype": self.kv_cache_dtype,
+            "runtime_compatibility": self.runtime_compatibility,
+            "reasoning": self.reasoning,
+        }
+
+
+@dataclass(frozen=True)
+class ServiceEndpointBinding:
+    """Frozen session requirement derived from one attested service offer."""
+
+    service_id: str
+    service_sha256: str
+    workload: ServiceWorkload
+    workload_sha256: str
+    input_modalities: tuple[str, ...]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "service_id": self.service_id,
+            "service_sha256": self.service_sha256,
+            "workload": self.workload.as_dict(),
+            "workload_sha256": self.workload_sha256,
+            "input_modalities": list(self.input_modalities),
+        }
+
+
+@dataclass(frozen=True)
+class ServiceEndpoint:
+    """Validated boot-local service endpoint and its semantic binding."""
+
+    publication_id: str
+    binding: ServiceEndpointBinding
     socket_path: pathlib.Path
     socket_device: int
     socket_inode: int
@@ -203,9 +302,7 @@ def _runtime_root_path(
 
 def _paths_overlap(first: pathlib.Path, second: pathlib.Path) -> bool:
     return (
-        first == second
-        or first.is_relative_to(second)
-        or second.is_relative_to(first)
+        first == second or first.is_relative_to(second) or second.is_relative_to(first)
     )
 
 
@@ -268,11 +365,7 @@ def inference_attachment_receipt_path(
         contract,
         _runtime_root_path(runtime_root),
     )
-    return (
-        resolved_runtime_root
-        / "attachments"
-        / f"{profile_id}.json"
-    )
+    return resolved_runtime_root / "attachments" / f"{profile_id}.json"
 
 
 def _validate_private_directory_metadata(
@@ -406,10 +499,7 @@ def _open_runtime_root(
             label="inference attachment runtime parent",
         )
     except ModelSessionError as error:
-        if (
-            not create
-            and isinstance(error.__cause__, FileNotFoundError)
-        ):
+        if not create and isinstance(error.__cause__, FileNotFoundError):
             return None
         raise
     try:
@@ -656,6 +746,11 @@ def _validate_socket_metadata(
             f"inference endpoint is not an actual Unix socket: {path}",
             code="unsafe_inference_socket",
         )
+    if metadata.st_nlink != 1:
+        _fail(
+            f"inference socket must have exactly one filesystem link: {path}",
+            code="unsafe_inference_socket",
+        )
     if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
         _fail(
             f"inference socket is not owned by the current user: {path}",
@@ -798,9 +893,7 @@ def _parse_timestamp(value: Any, *, label: str) -> datetime.datetime:
             code="inference_attachment_tampered",
         )
     try:
-        parsed = datetime.datetime.fromisoformat(
-            value.removesuffix("Z") + "+00:00"
-        )
+        parsed = datetime.datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
     except ValueError as error:
         raise ModelSessionError(
             f"inference attachment {label} is not a valid timestamp",
@@ -918,11 +1011,14 @@ def _existing_receipt_is_safe(
     name: str,
     path: pathlib.Path,
 ) -> None:
-    if _entry_metadata(
-        directory_descriptor,
-        name,
-        path=path,
-    ) is None:
+    if (
+        _entry_metadata(
+            directory_descriptor,
+            name,
+            path=path,
+        )
+        is None
+    ):
         return
     _read_receipt(directory_descriptor, name, path)
 
@@ -949,9 +1045,7 @@ def _write_atomic_receipt(
     content: bytes,
 ) -> None:
     _existing_receipt_is_safe(directory_descriptor, name, path)
-    temporary_name = (
-        f".{path.stem}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
-    )
+    temporary_name = f".{path.stem}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
     flags = (
         os.O_WRONLY
         | os.O_CREAT
@@ -1059,8 +1153,7 @@ def publish_inference_attachment(
                 )
             except OverflowError as error:
                 raise ModelSessionError(
-                    "inference attachment clock cannot represent the admission "
-                    "expiry",
+                    "inference attachment clock cannot represent the admission expiry",
                     code="invalid_inference_attachment_clock",
                 ) from error
             payload: dict[str, Any] = {
@@ -1075,9 +1168,7 @@ def publish_inference_attachment(
                 "socket_device": socket.device,
                 "socket_inode": socket.inode,
                 "published_at": _format_timestamp(published_at),
-                "admission_expires_at": _format_timestamp(
-                    admission_expires_at
-                ),
+                "admission_expires_at": _format_timestamp(admission_expires_at),
             }
             document = {
                 **payload,
@@ -1117,8 +1208,7 @@ def _require_exact_receipt_keys(value: dict[str, Any]) -> None:
         if unexpected:
             details.append(f"unexpected {', '.join(sorted(unexpected))}")
         _fail(
-            "inference attachment receipt has invalid fields "
-            f"({'; '.join(details)})",
+            f"inference attachment receipt has invalid fields ({'; '.join(details)})",
             code="inference_attachment_tampered",
         )
 
@@ -1147,37 +1237,30 @@ def _validate_receipt(
             code="inference_attachment_tampered",
         )
     publication_id = value["publication_id"]
-    if (
-        not isinstance(publication_id, str)
-        or not _PUBLICATION_ID_PATTERN.fullmatch(publication_id)
+    if not isinstance(publication_id, str) or not _PUBLICATION_ID_PATTERN.fullmatch(
+        publication_id
     ):
         _fail(
             "inference attachment publication_id is invalid",
             code="inference_attachment_tampered",
         )
     payload_sha256 = value["payload_sha256"]
-    if (
-        not isinstance(payload_sha256, str)
-        or not _HASH_PATTERN.fullmatch(payload_sha256)
+    if not isinstance(payload_sha256, str) or not _HASH_PATTERN.fullmatch(
+        payload_sha256
     ):
         _fail(
             "inference attachment payload hash is invalid",
             code="inference_attachment_tampered",
         )
-    payload = {
-        key: child
-        for key, child in value.items()
-        if key != "payload_sha256"
-    }
+    payload = {key: child for key, child in value.items() if key != "payload_sha256"}
     if _sha256(_canonical_json_bytes(payload)) != payload_sha256:
         _fail(
             "inference attachment payload hash does not match its receipt",
             code="inference_attachment_tampered",
         )
     receipt_boot_id = value["boot_id"]
-    if (
-        not isinstance(receipt_boot_id, str)
-        or not _BOOT_ID_PATTERN.fullmatch(receipt_boot_id)
+    if not isinstance(receipt_boot_id, str) or not _BOOT_ID_PATTERN.fullmatch(
+        receipt_boot_id
     ):
         _fail(
             "inference attachment boot_id is invalid",
@@ -1198,15 +1281,12 @@ def _validate_receipt(
         label="project_id",
     )
     expected_workload = _workload_value(contract)
-    expected_workload_sha256 = _sha256(
-        _canonical_json_bytes(expected_workload)
-    )
+    expected_workload_sha256 = _sha256(_canonical_json_bytes(expected_workload))
     workload_sha256 = value["workload_sha256"]
     if (
         not isinstance(workload_sha256, str)
         or not _HASH_PATTERN.fullmatch(workload_sha256)
-        or _sha256(_canonical_json_bytes(value["workload"]))
-        != workload_sha256
+        or _sha256(_canonical_json_bytes(value["workload"])) != workload_sha256
     ):
         _fail(
             "inference attachment workload identity is invalid",
@@ -1280,10 +1360,7 @@ def _validate_receipt(
         value["socket_inode"],
         label="socket_inode",
     )
-    if (
-        socket.device != socket_device
-        or socket.inode != socket_inode
-    ):
+    if socket.device != socket_device or socket.inode != socket_inode:
         _fail(
             "attached inference socket inode was replaced after publication",
             code="inference_attachment_unavailable",

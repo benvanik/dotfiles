@@ -14,7 +14,14 @@ import threading
 import unittest
 from unittest import mock
 
-from model_session.attachment import publish_inference_attachment
+from model_session.attachment import ServiceWorkload
+from model_session.service_endpoint import (
+    publish_service_endpoint,
+    service_workload_identity,
+)
+from model_session.launch_authority import (
+    process_start_time,
+)
 from model_session.errors import ModelSessionError
 from model_session.launcher import (
     AGENTS_MD,
@@ -51,12 +58,15 @@ class LauncherFixture:
             dir="/tmp",
         )
         self.root = pathlib.Path(self.temporary.name)
-        self.profile_root = self.root / "profiles" / "fixture"
+        self.lab_root = _private_directory(self.root / "model-lab")
+        self.profile_root = self.lab_root / "profiles" / "fixture"
         self.profile_root.mkdir(parents=True)
         self.profile_root.chmod(0o755)
-        self.state_root = self.root / "state"
-        self.project_root = _private_directory(self.root / "project")
-        self.pi_root = _private_directory(self.root / "pi-0.82.1")
+        self.state_root = self.lab_root
+        self.project_root = _private_directory(
+            self.lab_root / "projects" / "fixture-project"
+        )
+        self.pi_root = _private_directory(self.lab_root / "runtimes" / "pi" / "0.82.1")
         pi_bin = _private_directory(self.pi_root / "bin")
         pi = pi_bin / "pi"
         pi.write_text(
@@ -89,30 +99,15 @@ printf '%s\n' "$@" > /workspace/pi-argv
             path.chmod(0o644)
         self.profile_file = self.profile_root / "profile.toml"
         self.profile_file.write_text(
-            f"""schema = "model-session.profile.v2"
+            """schema = "model-session.profile.v3"
 profile_id = "fixture"
 project_id = "fixture-project"
-state_root = "{self.state_root}"
-project_root = "{self.project_root}"
+service_id = "fixture-service"
 
-[model]
-repository = "fixture/model"
-revision = "{REVISION}"
-context_tokens = 65536
-max_output_tokens = 8192
-kv_cache_dtype = "bf16"
-max_sequences = 1
-weight_format = "bf16"
-
-[runtime]
-provider = "fixture-provider"
-model_id = "fixture-model"
-reasoning = false
-input_modalities = ["text"]
+[endpoint]
+required_input_modalities = ["text"]
 
 [pi]
-installation_root = "{self.pi_root}"
-executable = "bin/pi"
 version = "0.82.1"
 tools = ["read", "write", "edit", "bash"]
 system_prompt_file = "SYSTEM.md"
@@ -140,8 +135,43 @@ shutdown_grace_seconds = 30
         self.profile_file.chmod(0o644)
         self.launcher = self.profile_root / "pi"
         self.launcher.symlink_to(ENTRY_POINT)
+        self.previous_xdg_runtime = os.environ.get("XDG_RUNTIME_DIR")
+        self.xdg_runtime = _private_directory(self.root / "runtime")
+        os.environ["XDG_RUNTIME_DIR"] = os.fspath(self.xdg_runtime)
+        runtime_model_lab = _private_directory(self.xdg_runtime / "model-lab")
+        service_directory = _private_directory(runtime_model_lab / "services")
+        self.inference_socket = service_directory / "fixture-service.sock"
+        self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.listener.bind(os.fspath(self.inference_socket))
+        self.listener.listen(16)
+        self.inference_socket.chmod(0o600)
+        self.workload = ServiceWorkload(
+            repository="fixture/model",
+            revision=REVISION,
+            provider="fixture-provider",
+            model_id="fixture-model",
+            context_tokens=65536,
+            max_output_tokens=8192,
+            weight_format="bf16",
+            kv_cache_dtype="bf16",
+            runtime_compatibility="fixture-runtime-v1",
+            reasoning=False,
+        )
+        publish_service_endpoint(
+            "fixture-service",
+            service_sha256="b" * 64,
+            workload=self.workload,
+            input_modalities=("text",),
+            ttl_seconds=3600,
+            socket_path=self.inference_socket,
+        )
 
     def close(self) -> None:
+        self.listener.close()
+        if self.previous_xdg_runtime is None:
+            os.environ.pop("XDG_RUNTIME_DIR", None)
+        else:
+            os.environ["XDG_RUNTIME_DIR"] = self.previous_xdg_runtime
         self.temporary.cleanup()
 
     def profile(self):
@@ -172,11 +202,7 @@ class _FakeProcess:
 
     def wait(self, timeout: float | None = None) -> int:
         self.wait_timeouts.append(timeout)
-        if (
-            timeout is not None
-            and self.timeout_on_grace
-            and not self.killed
-        ):
+        if timeout is not None and self.timeout_on_grace and not self.killed:
             raise subprocess.TimeoutExpired("/fake/bwrap", timeout)
         if self.killed:
             return self.returncode
@@ -231,6 +257,102 @@ class ModelSessionLauncherTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.fixture.close()
+
+    @contextlib.contextmanager
+    def authorized_arguments(
+        self,
+        arguments,
+        *,
+        workload_sha256: str | None = None,
+        post_admission: bytes | None = None,
+    ):
+        supervisor_path = (
+            pathlib.Path(os.environ["XDG_RUNTIME_DIR"])
+            / "model-lab"
+            / "supervisor.sock"
+        )
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(os.fspath(supervisor_path))
+        supervisor_path.chmod(0o600)
+        listener.listen(1)
+        server_failures: list[BaseException] = []
+
+        def server() -> None:
+            try:
+                connection, _address = listener.accept()
+                with connection:
+                    request = bytearray()
+                    while not request.endswith(b"\n"):
+                        chunk = connection.recv(4096)
+                        if not chunk:
+                            raise AssertionError("launcher closed before admission")
+                        request.extend(chunk)
+                    admission = json.loads(request)
+                    if admission != {
+                        "schema": "model-lab.session-use-admit.v1",
+                        "profile_id": "fixture",
+                        "service_id": "fixture-service",
+                        "pid": os.getpid(),
+                        "start_time": process_start_time(os.getpid()),
+                    }:
+                        raise AssertionError(f"unexpected admission: {admission!r}")
+                    response = {
+                        "schema": "model-lab.session-use-accepted.v1",
+                        "profile_id": "fixture",
+                        "service_id": "fixture-service",
+                        "workload_sha256": (
+                            service_workload_identity(self.fixture.workload)
+                            if workload_sha256 is None
+                            else workload_sha256
+                        ),
+                        "deployment_id": "deployment-fixture",
+                        "use_lease_id": "use-fixture",
+                        "supervisor_pid": os.getpid(),
+                        "supervisor_start_time": process_start_time(os.getpid()),
+                        "session_pid": os.getpid(),
+                        "session_start_time": process_start_time(os.getpid()),
+                    }
+                    connection.sendall(
+                        (
+                            json.dumps(
+                                response,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                                ensure_ascii=True,
+                            )
+                            + "\n"
+                        ).encode("ascii")
+                    )
+                    if post_admission is not None:
+                        connection.sendall(post_admission)
+                        return
+                    while connection.recv(1):
+                        raise AssertionError(
+                            "post-admission client bytes are unsupported"
+                        )
+            except BaseException as error:
+                server_failures.append(error)
+
+        server_thread = threading.Thread(target=server)
+        server_thread.start()
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.connect(os.fspath(supervisor_path))
+        descriptor = client.detach()
+        try:
+            yield [
+                "--model-lab-use-fd",
+                str(descriptor),
+                *arguments,
+            ]
+        finally:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            listener.close()
+            server_thread.join()
+            if server_failures:
+                raise server_failures[0]
 
     @contextlib.contextmanager
     def fake_launch(self, *, return_code: int = 0):
@@ -363,9 +485,12 @@ class ModelSessionLauncherTest(unittest.TestCase):
     def test_bare_pi_creates_and_launches_one_external_session(self) -> None:
         output = io.StringIO()
         error = io.StringIO()
-        with self.fake_launch() as (captured, process):
+        with (
+            self.authorized_arguments([]) as arguments,
+            self.fake_launch() as (captured, process),
+        ):
             result = main(
-                [],
+                arguments,
                 argument_zero=os.fspath(self.fixture.launcher),
                 output=output,
                 error=error,
@@ -377,9 +502,7 @@ class ModelSessionLauncherTest(unittest.TestCase):
         command = captured["command"]
         self.assertIsInstance(command, tuple)
         session_id = command[command.index("--session-id") + 1]
-        session_root = (
-            self.fixture.state_root / "sessions" / "fixture" / session_id
-        )
+        session_root = self.fixture.state_root / "sessions" / "fixture" / session_id
         self.assertTrue(session_root.is_dir())
         self.assertTrue((session_root / "workspace" / "AGENTS.md").is_file())
         self.assertFalse(str(session_root).startswith(str(DOTFILES_ROOT)))
@@ -387,6 +510,110 @@ class ModelSessionLauncherTest(unittest.TestCase):
             captured["popen_options"],
             {"pass_fds": (), "close_fds": True},
         )
+
+    def test_direct_launch_without_model_lab_use_lease_fails_closed(
+        self,
+    ) -> None:
+        error = io.StringIO()
+
+        result = main(
+            [],
+            argument_zero=os.fspath(self.fixture.launcher),
+            output=io.StringIO(),
+            error=error,
+        )
+
+        self.assertEqual(result, 2)
+        self.assertIn(
+            "model_lab_use_authority_required",
+            error.getvalue(),
+        )
+        self.assertFalse((self.fixture.state_root / "sessions").exists())
+
+    def test_authority_workload_mismatch_does_not_publish_a_session(
+        self,
+    ) -> None:
+        error = io.StringIO()
+        with self.authorized_arguments(
+            [],
+            workload_sha256="f" * 64,
+        ) as arguments:
+            result = main(
+                arguments,
+                argument_zero=os.fspath(self.fixture.launcher),
+                output=io.StringIO(),
+                error=error,
+            )
+
+        self.assertEqual(result, 2)
+        self.assertIn(
+            "model_lab_use_authority_workload_mismatch",
+            error.getvalue(),
+        )
+        self.assertFalse((self.fixture.state_root / "sessions").exists())
+
+    def test_supervisor_loss_reaps_pi_and_reports_lifetime_failure(
+        self,
+    ) -> None:
+        class ChannelBoundProcess(_FakeProcess):
+            def __init__(self) -> None:
+                super().__init__()
+                self.terminated = threading.Event()
+
+            def wait(self, timeout: float | None = None) -> int:
+                self.wait_timeouts.append(timeout)
+                if timeout is not None:
+                    if not self.terminated.wait(timeout):
+                        raise subprocess.TimeoutExpired(
+                            "/fake/bwrap",
+                            timeout,
+                        )
+                else:
+                    self.terminated.wait()
+                if self.returncode is None:
+                    self.returncode = -signal.SIGTERM
+                return self.returncode
+
+        process = ChannelBoundProcess()
+        plans: list[_FakePlan] = []
+
+        class ChannelBoundPlan(_FakePlan):
+            def signal_sandbox_child(self, signal_number: int) -> None:
+                super().signal_sandbox_child(signal_number)
+                process.returncode = -signal_number
+                process.terminated.set()
+
+        def build(lease, *, command):
+            plan = ChannelBoundPlan(lease, process=process)
+            plans.append(plan)
+            return plan
+
+        error = io.StringIO()
+        with (
+            self.authorized_arguments(
+                [],
+                post_admission=b"",
+            ) as arguments,
+            mock.patch(
+                "model_session.launcher.build_sandbox_plan",
+                side_effect=build,
+            ),
+            mock.patch(
+                "model_session.launcher.subprocess.Popen",
+                return_value=process,
+            ),
+        ):
+            result = main(
+                arguments,
+                argument_zero=os.fspath(self.fixture.launcher),
+                output=io.StringIO(),
+                error=error,
+            )
+
+        self.assertEqual(result, 2)
+        self.assertIn("model_lab_supervisor_lost", error.getvalue())
+        self.assertEqual(len(plans), 1)
+        self.assertIn(signal.SIGTERM, plans[0].sent_signals)
 
     def test_resume_uses_locked_prompt_after_current_prompt_changes(self) -> None:
         run = materialize_new_run(self.fixture.profile())
@@ -409,6 +636,7 @@ class ModelSessionLauncherTest(unittest.TestCase):
             return _FakePlan(lease, process=process)
 
         with (
+            self.authorized_arguments(["resume", run.session_id]) as arguments,
             mock.patch(
                 "model_session.launcher.build_sandbox_plan",
                 side_effect=build,
@@ -419,7 +647,7 @@ class ModelSessionLauncherTest(unittest.TestCase):
             ),
         ):
             result = main(
-                ["resume", run.session_id],
+                arguments,
                 argument_zero=os.fspath(self.fixture.launcher),
                 output=io.StringIO(),
                 error=io.StringIO(),
@@ -434,9 +662,12 @@ class ModelSessionLauncherTest(unittest.TestCase):
         picker_input = _TTYBuffer("2\n")
         picker_output = _TTYBuffer()
 
-        with self.fake_launch() as (captured, _process):
+        with (
+            self.authorized_arguments(["resume"]) as arguments,
+            self.fake_launch() as (captured, _process),
+        ):
             result = main(
-                ["resume"],
+                arguments,
                 argument_zero=os.fspath(self.fixture.launcher),
                 input_stream=picker_input,
                 output=picker_output,
@@ -455,13 +686,14 @@ class ModelSessionLauncherTest(unittest.TestCase):
     def test_noninteractive_resume_requires_an_explicit_id(self) -> None:
         materialize_new_run(self.fixture.profile())
         error = io.StringIO()
-        result = main(
-            ["resume"],
-            argument_zero=os.fspath(self.fixture.launcher),
-            input_stream=io.StringIO(),
-            output=io.StringIO(),
-            error=error,
-        )
+        with self.authorized_arguments(["resume"]) as arguments:
+            result = main(
+                arguments,
+                argument_zero=os.fspath(self.fixture.launcher),
+                input_stream=io.StringIO(),
+                output=io.StringIO(),
+                error=error,
+            )
         self.assertEqual(result, 2)
         self.assertIn("session_id_required", error.getvalue())
 
@@ -515,13 +747,14 @@ class ModelSessionLauncherTest(unittest.TestCase):
             by_id[structurally_damaged.session_id]["history_error"],
             "unsafe_session_permissions",
         )
-        self.assertIsNone(
-            by_id[structurally_damaged.session_id]["prompt_fingerprint"]
-        )
+        self.assertIsNone(by_id[structurally_damaged.session_id]["prompt_fingerprint"])
 
-        with self.fake_launch() as (captured, _process):
+        with (
+            self.authorized_arguments(["resume", healthy.session_id]) as arguments,
+            self.fake_launch() as (captured, _process),
+        ):
             result = main(
-                ["resume", healthy.session_id],
+                arguments,
                 argument_zero=os.fspath(self.fixture.launcher),
                 output=io.StringIO(),
                 error=io.StringIO(),
@@ -743,7 +976,10 @@ class ModelSessionLauncherTest(unittest.TestCase):
         )
         self.assertEqual(result, 0)
         self.assertEqual(output.getvalue(), AGENTS_MD)
-        self.assertIn("./pi resume SESSION_ID", output.getvalue())
+        self.assertIn(
+            "model-lab pi PROFILE resume SESSION_ID",
+            output.getvalue(),
+        )
 
     def test_entry_point_executes_without_installing_profile_state(self) -> None:
         result = subprocess.run(
@@ -771,11 +1007,13 @@ class ModelSessionLauncherTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("{new,resume,status}", result.stdout)
         self.assertIn("--agents-md", result.stdout)
-        self.assertFalse(self.fixture.state_root.exists())
+        self.assertFalse((self.fixture.state_root / "sessions").exists())
 
     def test_real_bwrap_relay_and_fixed_pi_command_vertical_slice(self) -> None:
-        runtime_directory = _private_directory(self.fixture.root / "runtime")
-        inference_socket = runtime_directory / "inference.sock"
+        runtime_directory = _private_directory(self.fixture.root / "vertical-runtime")
+        runtime_model_lab = _private_directory(runtime_directory / "model-lab")
+        service_directory = _private_directory(runtime_model_lab / "services")
+        inference_socket = service_directory / "fixture-service.sock"
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             listener.bind(os.fspath(inference_socket))
@@ -785,28 +1023,35 @@ class ModelSessionLauncherTest(unittest.TestCase):
                 os.environ,
                 {"XDG_RUNTIME_DIR": os.fspath(runtime_directory)},
             ):
-                publish_inference_attachment(
-                    self.fixture.profile(),
-                    inference_socket,
+                publish_service_endpoint(
+                    "fixture-service",
+                    service_sha256="b" * 64,
+                    workload=self.fixture.workload,
+                    input_modalities=("text",),
                     ttl_seconds=60,
+                    socket_path=inference_socket,
                 )
-                result = main(
-                    [],
-                    argument_zero=os.fspath(self.fixture.launcher),
-                    output=io.StringIO(),
-                    error=io.StringIO(),
-                )
+                error = io.StringIO()
+                with self.authorized_arguments([]) as arguments:
+                    result = main(
+                        arguments,
+                        argument_zero=os.fspath(self.fixture.launcher),
+                        output=io.StringIO(),
+                        error=error,
+                    )
         finally:
             listener.close()
 
-        self.assertEqual(result, 0)
+        self.assertEqual(result, 0, error.getvalue())
         session_roots = tuple(
             (self.fixture.state_root / "sessions" / "fixture").iterdir()
         )
         self.assertEqual(len(session_roots), 1)
         arguments = (
-            session_roots[0] / "workspace" / "pi-argv"
-        ).read_text(encoding="utf-8").splitlines()
+            (session_roots[0] / "workspace" / "pi-argv")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        )
         self.assertEqual(
             arguments[arguments.index("--session-id") + 1],
             session_roots[0].name,

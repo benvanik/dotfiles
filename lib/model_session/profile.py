@@ -22,8 +22,11 @@ from .storage_limits import STORAGE_PAGE_SIZE, StoragePoolLimits
 
 PROFILE_SCHEMA_V1 = "model-session.profile.v1"
 PROFILE_SCHEMA_V2 = "model-session.profile.v2"
-PROFILE_SCHEMA = PROFILE_SCHEMA_V2
-KNOWN_PROFILE_SCHEMAS = frozenset({PROFILE_SCHEMA_V1, PROFILE_SCHEMA_V2})
+PROFILE_SCHEMA_V3 = "model-session.profile.v3"
+PROFILE_SCHEMA = PROFILE_SCHEMA_V3
+KNOWN_PROFILE_SCHEMAS = frozenset(
+    {PROFILE_SCHEMA_V1, PROFILE_SCHEMA_V2, PROFILE_SCHEMA_V3}
+)
 PROFILE_FILE_NAME = "profile.toml"
 AGENTS_FILE_NAME = "AGENTS.md"
 MAX_PROFILE_BYTES = 256 * 1024
@@ -77,6 +80,16 @@ _PROFILE_V2_KEYS = {
     "storage",
     "sandbox",
 }
+_PROFILE_V3_KEYS = {
+    "schema",
+    "profile_id",
+    "project_id",
+    "service_id",
+    "endpoint",
+    "pi",
+    "storage",
+    "sandbox",
+}
 _MODEL_KEYS = {
     "repository",
     "revision",
@@ -99,6 +112,11 @@ _PI_REQUIRED_KEYS = {
     "tools",
 }
 _PI_OPTIONAL_KEYS = {"system_prompt_file", "append_system_prompt_file"}
+_PI_V3_REQUIRED_KEYS = {
+    "version",
+    "tools",
+}
+_ENDPOINT_KEYS = {"required_input_modalities"}
 _STORAGE_KEYS = {
     "max_sessions",
     "work_bytes",
@@ -182,6 +200,18 @@ class RuntimeContract:
 
 
 @dataclass(frozen=True)
+class EndpointRequirementContract:
+    """Consumer capabilities required from a service-scoped endpoint."""
+
+    required_input_modalities: tuple[str, ...]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "required_input_modalities": list(self.required_input_modalities),
+        }
+
+
+@dataclass(frozen=True)
 class PiContract:
     installation_root: pathlib.Path
     executable: pathlib.PurePosixPath
@@ -252,8 +282,7 @@ class StorageContract:
             max_payload_bytes=self.max_logical_bytes,
             max_pack_bytes=self.checkpoint_bytes,
             max_sparse_extents_per_file=(
-                max(self.work_bytes, self.history_bytes)
-                // STORAGE_PAGE_SIZE
+                max(self.work_bytes, self.history_bytes) // STORAGE_PAGE_SIZE
             ),
             max_sparse_extents=self.max_sparse_extents,
         )
@@ -303,24 +332,47 @@ class ProfileContract:
     profile_root: pathlib.Path
     state_root: pathlib.Path
     project_root: pathlib.Path
-    model: ModelContract
-    runtime: RuntimeContract
+    model: ModelContract | None
+    runtime: RuntimeContract | None
     pi: PiContract
     storage: StorageContract | None = None
     sandbox: SandboxContract | None = None
+    service_id: str | None = None
+    endpoint: EndpointRequirementContract | None = None
 
     def __post_init__(self) -> None:
         if self.schema == PROFILE_SCHEMA_V1:
-            if self.storage is not None or self.sandbox is not None:
-                raise ValueError(
-                    "profile v1 contracts cannot contain storage or sandbox policy"
-                )
+            if (
+                self.model is None
+                or self.runtime is None
+                or self.storage is not None
+                or self.sandbox is not None
+                or self.service_id is not None
+                or self.endpoint is not None
+            ):
+                raise ValueError("profile v1 contract fields are inconsistent")
             return
         if self.schema == PROFILE_SCHEMA_V2:
-            if self.storage is None or self.sandbox is None:
-                raise ValueError(
-                    "profile v2 contracts require storage and sandbox policy"
-                )
+            if (
+                self.model is None
+                or self.runtime is None
+                or self.storage is None
+                or self.sandbox is None
+                or self.service_id is not None
+                or self.endpoint is not None
+            ):
+                raise ValueError("profile v2 contract fields are inconsistent")
+            return
+        if self.schema == PROFILE_SCHEMA_V3:
+            if (
+                self.model is not None
+                or self.runtime is not None
+                or self.storage is None
+                or self.sandbox is None
+                or self.service_id is None
+                or self.endpoint is None
+            ):
+                raise ValueError("profile v3 contract fields are inconsistent")
             return
         raise ValueError(f"unsupported profile schema {self.schema!r}")
 
@@ -332,13 +384,21 @@ class ProfileContract:
             "profile_root": str(self.profile_root),
             "state_root": str(self.state_root),
             "project_root": str(self.project_root),
-            "model": self.model.as_dict(),
-            "runtime": self.runtime.as_dict(),
             "pi": self.pi.as_dict(),
         }
-        if self.schema == PROFILE_SCHEMA_V2:
+        if self.schema in {PROFILE_SCHEMA_V1, PROFILE_SCHEMA_V2}:
+            if self.model is None or self.runtime is None:
+                raise AssertionError("legacy profile workload is absent")
+            value["model"] = self.model.as_dict()
+            value["runtime"] = self.runtime.as_dict()
+        else:
+            if self.service_id is None or self.endpoint is None:
+                raise AssertionError("profile v3 service requirement is absent")
+            value["service_id"] = self.service_id
+            value["endpoint"] = self.endpoint.as_dict()
+        if self.schema in {PROFILE_SCHEMA_V2, PROFILE_SCHEMA_V3}:
             if self.storage is None or self.sandbox is None:
-                raise AssertionError("profile v2 policy is absent")
+                raise AssertionError("profile policy is absent")
             value["storage"] = self.storage.as_dict()
             value["sandbox"] = self.sandbox.as_dict()
         return value
@@ -370,6 +430,9 @@ class ProfileRoute:
 
     profile_root: pathlib.Path
     profile_id: str
+    project_id: str
+    service_id: str
+    required_input_modalities: tuple[str, ...]
     state_root: pathlib.Path
 
 
@@ -533,9 +596,7 @@ def _parse_storage_contract(value: dict[str, Any]) -> StorageContract:
         max_file_bytes=max_file_bytes,
         max_logical_bytes=max_logical_bytes,
     )
-    minimum_checkpoint_bytes = maximum_encoded_bytes(
-        storage.checkpoint_limits()
-    )
+    minimum_checkpoint_bytes = maximum_encoded_bytes(storage.checkpoint_limits())
     if checkpoint_bytes < minimum_checkpoint_bytes:
         _fail(
             "profile.storage.checkpoint_bytes must cover the complete "
@@ -577,14 +638,9 @@ def _parse_sandbox_contract(
     )
 
     if memory_bytes % STORAGE_PAGE_SIZE != 0:
-        _fail(
-            "profile.sandbox.memory_bytes must be a multiple of "
-            f"{STORAGE_PAGE_SIZE}"
-        )
+        _fail(f"profile.sandbox.memory_bytes must be a multiple of {STORAGE_PAGE_SIZE}")
     minimum_memory_bytes = (
-        storage.work_bytes
-        + storage.history_bytes
-        + SANDBOX_STORAGE_HEADROOM_BYTES
+        storage.work_bytes + storage.history_bytes + SANDBOX_STORAGE_HEADROOM_BYTES
     )
     if memory_bytes < minimum_memory_bytes:
         _fail(
@@ -600,8 +656,7 @@ def _parse_sandbox_contract(
         )
     if idle_timeout_seconds > max_runtime_seconds:
         _fail(
-            "profile.sandbox.idle_timeout_seconds must not exceed "
-            "max_runtime_seconds"
+            "profile.sandbox.idle_timeout_seconds must not exceed max_runtime_seconds"
         )
     if shutdown_grace_seconds > idle_timeout_seconds:
         _fail(
@@ -716,8 +771,7 @@ def _validate_directory(
             code=error_code,
         )
     if metadata.st_mode & stat.S_IWGRP and (
-        reject_group_write
-        or not owner_has_private_primary_group(metadata)
+        reject_group_write or not owner_has_private_primary_group(metadata)
     ):
         _fail(
             f"{label} is writable by another principal: {path}",
@@ -896,7 +950,6 @@ def _validate_pi_executable(
     *,
     label: str,
 ) -> None:
-    candidate = contract.installation_root.joinpath(*executable.parts)
     resolved = _resolve_pi_executable_path(
         contract,
         executable,
@@ -974,6 +1027,170 @@ def _validate_pi_installation_tree(contract: PiContract) -> None:
             )
 
 
+def _parse_input_modalities(
+    value: Any,
+    *,
+    label: str,
+) -> tuple[str, ...]:
+    if not isinstance(value, list) or not value:
+        _fail(f"{label} must be a nonempty array")
+    modalities: list[str] = []
+    for modality in value:
+        if not isinstance(modality, str) or modality not in INPUT_MODALITIES:
+            _fail(f"{label} entries must be text or image")
+        if modality in modalities:
+            _fail(f"{label} contains duplicate entry {modality!r}")
+        modalities.append(modality)
+    if "text" not in modalities:
+        _fail(f"{label} must include text")
+    return tuple(modalities)
+
+
+def _parse_pi_tools(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, list) or not value:
+        _fail("profile.pi.tools must be a nonempty array")
+    tools: list[str] = []
+    for tool in value:
+        if not isinstance(tool, str) or tool not in PI_TOOLS:
+            _fail(
+                "profile.pi.tools entries must be selected from "
+                "read, write, edit, and bash"
+            )
+        if tool in tools:
+            _fail(f"profile.pi.tools contains duplicate entry {tool!r}")
+        tools.append(tool)
+    return tuple(tools)
+
+
+def _parse_prompt_paths(
+    pi_value: dict[str, Any],
+) -> tuple[pathlib.PurePosixPath | None, pathlib.PurePosixPath | None]:
+    system_prompt_file = (
+        _relative_path(
+            pi_value["system_prompt_file"],
+            label="profile.pi.system_prompt_file",
+        )
+        if "system_prompt_file" in pi_value
+        else None
+    )
+    append_system_prompt_file = (
+        _relative_path(
+            pi_value["append_system_prompt_file"],
+            label="profile.pi.append_system_prompt_file",
+        )
+        if "append_system_prompt_file" in pi_value
+        else None
+    )
+    prompt_paths = [
+        path
+        for path in (system_prompt_file, append_system_prompt_file)
+        if path is not None
+    ]
+    if any(path.as_posix() == PROFILE_FILE_NAME for path in prompt_paths):
+        _fail("profile.toml cannot be used as a Pi prompt resource")
+    if len(set(prompt_paths)) != len(prompt_paths):
+        _fail("Pi system and append-system prompt files must be distinct")
+    return system_prompt_file, append_system_prompt_file
+
+
+def _parse_v3_document(
+    value: dict[str, Any],
+    profile_root: pathlib.Path,
+    *,
+    require_live_profile_root: bool,
+) -> ProfileContract:
+    top = _require_exact_keys(
+        value,
+        required=_PROFILE_V3_KEYS,
+        label="profile",
+    )
+    endpoint_value = _require_exact_keys(
+        top["endpoint"],
+        required=_ENDPOINT_KEYS,
+        label="profile.endpoint",
+    )
+    pi_value = _require_exact_keys(
+        top["pi"],
+        required=_PI_V3_REQUIRED_KEYS,
+        optional=_PI_OPTIONAL_KEYS,
+        label="profile.pi",
+    )
+    storage_value = _require_exact_keys(
+        top["storage"],
+        required=_STORAGE_KEYS,
+        label="profile.storage",
+    )
+    sandbox_value = _require_exact_keys(
+        top["sandbox"],
+        required=_SANDBOX_KEYS,
+        label="profile.sandbox",
+    )
+
+    profile_id = _identifier(top["profile_id"], label="profile.profile_id")
+    project_id = _identifier(top["project_id"], label="profile.project_id")
+    service_id = _identifier(top["service_id"], label="profile.service_id")
+    if profile_root.name != profile_id or profile_root.parent.name != "profiles":
+        _fail(
+            "profile v3 directory must be <model-lab-root>/profiles/<profile_id>",
+            code="invalid_profile_layout",
+        )
+    lab_root = profile_root.parent.parent
+    if (
+        lab_root.name != "model-lab"
+        or lab_root in _BROAD_ROOTS
+        or lab_root == infrastructure_root()
+    ):
+        _fail(
+            "profile v3 model-lab root must be a dedicated directory named 'model-lab'",
+            code="invalid_profile_layout",
+        )
+    project_root = lab_root / "projects" / project_id
+
+    version = _string(
+        pi_value["version"],
+        label="profile.pi.version",
+        maximum_bytes=96,
+    )
+    if not PI_VERSION_PATTERN.fullmatch(version):
+        _fail("profile.pi.version must be an exact semantic version")
+    installation_root = lab_root / "runtimes" / "pi" / version
+    system_prompt_file, append_system_prompt_file = _parse_prompt_paths(pi_value)
+    storage = _parse_storage_contract(storage_value)
+    sandbox = _parse_sandbox_contract(sandbox_value, storage=storage)
+    contract = ProfileContract(
+        schema=PROFILE_SCHEMA_V3,
+        profile_id=profile_id,
+        project_id=project_id,
+        profile_root=profile_root,
+        state_root=lab_root,
+        project_root=project_root,
+        model=None,
+        runtime=None,
+        pi=PiContract(
+            installation_root=installation_root,
+            executable=pathlib.PurePosixPath("bin/pi"),
+            version=version,
+            tools=_parse_pi_tools(pi_value["tools"]),
+            system_prompt_file=system_prompt_file,
+            append_system_prompt_file=append_system_prompt_file,
+        ),
+        storage=storage,
+        sandbox=sandbox,
+        service_id=service_id,
+        endpoint=EndpointRequirementContract(
+            required_input_modalities=_parse_input_modalities(
+                endpoint_value["required_input_modalities"],
+                label="profile.endpoint.required_input_modalities",
+            ),
+        ),
+    )
+    _validate_contract_paths(
+        contract,
+        require_live_profile_root=require_live_profile_root,
+    )
+    return contract
+
+
 def _parse_document(
     document: bytes,
     profile_root: pathlib.Path,
@@ -996,16 +1213,22 @@ def _parse_document(
     if not isinstance(schema, str) or schema not in KNOWN_PROFILE_SCHEMAS:
         _fail(
             "profile.schema must be one of "
-            f"{PROFILE_SCHEMA_V1!r} or {PROFILE_SCHEMA_V2!r}"
+            f"{PROFILE_SCHEMA_V1!r}, {PROFILE_SCHEMA_V2!r}, or "
+            f"{PROFILE_SCHEMA_V3!r}"
         )
     if schema not in accepted_schemas:
-        if accepted_schemas == frozenset({PROFILE_SCHEMA_V2}):
-            _fail(f"profile.schema must be exactly {PROFILE_SCHEMA_V2!r}")
+        if len(accepted_schemas) == 1:
+            accepted = next(iter(accepted_schemas))
+            _fail(f"profile.schema must be exactly {accepted!r}")
         _fail(f"profile.schema {schema!r} is not accepted here")
+    if schema == PROFILE_SCHEMA_V3:
+        return _parse_v3_document(
+            value,
+            profile_root,
+            require_live_profile_root=require_live_profile_root,
+        )
     top_level_keys = (
-        _PROFILE_V1_KEYS
-        if schema == PROFILE_SCHEMA_V1
-        else _PROFILE_V2_KEYS
+        _PROFILE_V1_KEYS if schema == PROFILE_SCHEMA_V1 else _PROFILE_V2_KEYS
     )
     top = _require_exact_keys(
         value,
@@ -1102,8 +1325,7 @@ def _parse_document(
     )
     if weight_format not in WEIGHT_FORMATS:
         _fail(
-            "profile.model.weight_format must be one of "
-            "native, bf16, fp8, int8, or q8"
+            "profile.model.weight_format must be one of native, bf16, fp8, int8, or q8"
         )
 
     provider = _string(
@@ -1127,9 +1349,7 @@ def _parse_document(
     input_modalities: list[str] = []
     for modality in modalities_value:
         if not isinstance(modality, str) or modality not in INPUT_MODALITIES:
-            _fail(
-                "profile.runtime.input_modalities entries must be text or image"
-            )
+            _fail("profile.runtime.input_modalities entries must be text or image")
         if modality in input_modalities:
             _fail(
                 "profile.runtime.input_modalities contains duplicate entry "
@@ -1259,14 +1479,28 @@ def _validate_contract_paths(
                 f"{label} overlaps the dotfiles infrastructure repository",
                 code="profile_inside_infrastructure",
             )
-    entries = list(roots.items())
-    for index, (first_label, first_path) in enumerate(entries):
-        for second_label, second_path in entries[index + 1 :]:
-            if _paths_overlap(first_path, second_path):
-                _fail(
-                    f"{first_label} overlaps {second_label}",
-                    code="overlapping_profile_paths",
-                )
+    if contract.schema == PROFILE_SCHEMA_V3:
+        expected_profile = contract.state_root / "profiles" / contract.profile_id
+        expected_project = contract.state_root / "projects" / contract.project_id
+        expected_pi = contract.state_root / "runtimes" / "pi" / contract.pi.version
+        if (
+            contract.profile_root != expected_profile
+            or contract.project_root != expected_project
+            or contract.pi.installation_root != expected_pi
+        ):
+            _fail(
+                "profile v3 paths do not match the canonical model-lab layout",
+                code="invalid_profile_layout",
+            )
+    else:
+        entries = list(roots.items())
+        for index, (first_label, first_path) in enumerate(entries):
+            for second_label, second_path in entries[index + 1 :]:
+                if _paths_overlap(first_path, second_path):
+                    _fail(
+                        f"{first_label} overlaps {second_label}",
+                        code="overlapping_profile_paths",
+                    )
 
     if require_live_profile_root:
         _validate_directory(
@@ -1307,9 +1541,11 @@ def _validate_contract_paths(
     _validate_pi_installation_tree(contract.pi)
 
 
-def load_profile(profile_root: str | pathlib.Path) -> Profile:
-    """Load and validate one concrete profile without mutating external state."""
-
+def _load_profile_with_schemas(
+    profile_root: str | pathlib.Path,
+    *,
+    accepted_schemas: frozenset[str],
+) -> Profile:
     raw_root = str(profile_root)
     root = _absolute_normalized_path(
         raw_root,
@@ -1336,7 +1572,7 @@ def load_profile(profile_root: str | pathlib.Path) -> Profile:
         document,
         root,
         require_live_profile_root=True,
-        accepted_schemas=frozenset({PROFILE_SCHEMA_V2}),
+        accepted_schemas=accepted_schemas,
     )
 
     roles_by_path: dict[pathlib.PurePosixPath, list[str]] = {
@@ -1377,6 +1613,26 @@ def load_profile(profile_root: str | pathlib.Path) -> Profile:
     )
 
 
+def load_profile(profile_root: str | pathlib.Path) -> Profile:
+    """Load one active profile-v3 definition from the model-lab layout."""
+
+    return _load_profile_with_schemas(
+        profile_root,
+        accepted_schemas=frozenset({PROFILE_SCHEMA_V3}),
+    )
+
+
+def load_legacy_profile_for_migration(
+    profile_root: str | pathlib.Path,
+) -> Profile:
+    """Load a v1/v2 profile only for an explicit migration transaction."""
+
+    return _load_profile_with_schemas(
+        profile_root,
+        accepted_schemas=frozenset({PROFILE_SCHEMA_V1, PROFILE_SCHEMA_V2}),
+    )
+
+
 def load_profile_route(profile_root: str | pathlib.Path) -> ProfileRoute:
     """Read only the stable route fields needed by status and resume."""
 
@@ -1412,30 +1668,53 @@ def load_profile_route(profile_root: str | pathlib.Path) -> ProfileRoute:
     if not isinstance(value, dict):
         _fail("profile must be a TOML table")
     schema = value.get("schema")
-    if not isinstance(schema, str) or schema not in KNOWN_PROFILE_SCHEMAS:
+    if schema != PROFILE_SCHEMA_V3:
         _fail(
-            "profile.schema must be one of "
-            f"{PROFILE_SCHEMA_V1!r} or {PROFILE_SCHEMA_V2!r}"
+            f"active profile route schema must be {PROFILE_SCHEMA_V3!r}; "
+            "legacy profiles require explicit migration"
         )
     profile_id = _identifier(
         value.get("profile_id"),
         label="profile.profile_id",
     )
-    state_root = _absolute_normalized_path(
-        value.get("state_root"),
-        label="profile.state_root",
-        must_exist=False,
+    top = _require_exact_keys(
+        value,
+        required=_PROFILE_V3_KEYS,
+        label="profile",
     )
+    project_id = _identifier(
+        top["project_id"],
+        label="profile.project_id",
+    )
+    service_id = _identifier(
+        top["service_id"],
+        label="profile.service_id",
+    )
+    endpoint = _require_exact_keys(
+        top["endpoint"],
+        required=_ENDPOINT_KEYS,
+        label="profile.endpoint",
+    )
+    required_input_modalities = _parse_input_modalities(
+        endpoint["required_input_modalities"],
+        label="profile.endpoint.required_input_modalities",
+    )
+    if root.parent.name != "profiles" or root.name != profile_id:
+        _fail(
+            "profile v3 directory must be <model-lab-root>/profiles/<profile_id>",
+            code="invalid_profile_layout",
+        )
+    state_root = root.parent.parent
+    if state_root.name != "model-lab":
+        _fail(
+            "profile v3 model-lab root must be a dedicated directory named 'model-lab'",
+            code="invalid_profile_layout",
+        )
     dotfiles = infrastructure_root()
     if _paths_overlap(root, dotfiles) or _paths_overlap(state_root, dotfiles):
         _fail(
             "profile route overlaps the dotfiles infrastructure repository",
             code="profile_inside_infrastructure",
-        )
-    if _paths_overlap(root, state_root):
-        _fail(
-            "profile directory overlaps state_root",
-            code="overlapping_profile_paths",
         )
     if state_root.exists():
         _validate_directory(
@@ -1447,6 +1726,9 @@ def load_profile_route(profile_root: str | pathlib.Path) -> ProfileRoute:
     return ProfileRoute(
         profile_root=root,
         profile_id=profile_id,
+        project_id=project_id,
+        service_id=service_id,
+        required_input_modalities=required_input_modalities,
         state_root=state_root,
     )
 
@@ -1486,8 +1768,7 @@ def validate_state_route(
     identifier = _identifier(profile_id, label="profile_id")
     if _paths_overlap(root, infrastructure_root()):
         _fail(
-            "model-session state_root overlaps the dotfiles infrastructure "
-            "repository",
+            "model-session state_root overlaps the dotfiles infrastructure repository",
             code="profile_inside_infrastructure",
         )
     if require_existing:

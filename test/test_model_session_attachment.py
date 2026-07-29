@@ -17,14 +17,25 @@ from model_session.attachment import (
     ATTACHMENT_SCHEMA,
     MAX_ATTACHMENT_TTL_SECONDS,
     InferenceAttachment,
+    ServiceEndpoint,
+    ServiceWorkload,
     inference_attachment_receipt_path as _inference_attachment_receipt_path,
     inference_workload_identity,
     load_inference_attachment as _load_inference_attachment,
     publish_inference_attachment as _publish_inference_attachment,
 )
+from model_session.service_endpoint import (
+    load_service_endpoint,
+    parse_service_workload,
+    publish_service_endpoint,
+    revoke_service_endpoint,
+    service_endpoint_receipt_path,
+)
 from model_session.errors import ModelSessionError
 from model_session.profile import (
-    PROFILE_SCHEMA,
+    PROFILE_SCHEMA_V2,
+    PROFILE_SCHEMA_V3,
+    EndpointRequirementContract,
     ModelContract,
     PiContract,
     ProfileContract,
@@ -109,9 +120,7 @@ def _rewrite_receipt(
     mutate(value)
     if recompute_payload_hash:
         payload = {
-            key: child
-            for key, child in value.items()
-            if key != "payload_sha256"
+            key: child for key, child in value.items() if key != "payload_sha256"
         }
         value["payload_sha256"] = hashlib.sha256(
             _canonical_json_bytes(payload)
@@ -130,7 +139,7 @@ class AttachmentFixture:
         self.root = root
         self.state_root = state_root or root / "state"
         self.contract = ProfileContract(
-            schema=PROFILE_SCHEMA,
+            schema=PROFILE_SCHEMA_V2,
             profile_id="fixture-profile",
             project_id="fixture-project",
             profile_root=root / "profile",
@@ -166,9 +175,7 @@ class AttachmentFixture:
                 history_bytes=2 * 1024**3,
                 history_inodes=16_384,
                 checkpoint_bytes=17 * 1024**3,
-                max_sparse_extents=(
-                    (10 * 1024**3) // STORAGE_PAGE_SIZE
-                ),
+                max_sparse_extents=((10 * 1024**3) // STORAGE_PAGE_SIZE),
                 max_file_bytes=4 * 1024**3,
                 max_logical_bytes=16 * 1024**3,
             ),
@@ -288,13 +295,7 @@ class ModelSessionAttachmentTest(unittest.TestCase):
     def test_explicit_home_shaped_runtime_root_is_supported(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
-            runtime_root = (
-                root
-                / "home"
-                / "operator"
-                / ".local"
-                / "model-sessions"
-            )
+            runtime_root = root / "home" / "operator" / ".local" / "model-sessions"
             runtime_root.parent.mkdir(parents=True, mode=0o700)
             runtime_root.parent.chmod(0o700)
             fixture = AttachmentFixture(root)
@@ -552,9 +553,7 @@ class ModelSessionAttachmentTest(unittest.TestCase):
                 )
 
                 def extend_expiry(value: dict[str, object]) -> None:
-                    value["admission_expires_at"] = (
-                        "2026-07-27T18:30:15.123456Z"
-                    )
+                    value["admission_expires_at"] = "2026-07-27T18:30:15.123456Z"
 
                 _rewrite_receipt(
                     attachment.receipt_path,
@@ -622,9 +621,7 @@ class ModelSessionAttachmentTest(unittest.TestCase):
                 self.assertEqual(after_failure.socket_path, first_socket)
                 self.assertEqual(
                     list(
-                        (
-                            _runtime_root(fixture.contract) / "attachments"
-                        ).glob("*.tmp")
+                        (_runtime_root(fixture.contract) / "attachments").glob("*.tmp")
                     ),
                     [],
                 )
@@ -943,9 +940,7 @@ class ModelSessionAttachmentTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             fixture = AttachmentFixture(pathlib.Path(directory))
             with fixture.unix_socket() as socket_path:
-                traversing_path = (
-                    f"{fixture.root}/unused/../{socket_path.name}"
-                )
+                traversing_path = f"{fixture.root}/unused/../{socket_path.name}"
                 self.assert_error_code(
                     "unsafe_inference_socket",
                     lambda: publish_inference_attachment(
@@ -1068,13 +1063,452 @@ class ModelSessionAttachmentTest(unittest.TestCase):
                     clock=lambda: NOW,
                 )
                 socket_path.unlink()
-                self.assert_error_code(
-                    "inference_attachment_unavailable",
-                    lambda: load_inference_attachment(
-                        fixture.contract,
-                        clock=lambda: NOW,
-                    ),
+            self.assert_error_code(
+                "inference_attachment_unavailable",
+                lambda: load_inference_attachment(
+                    fixture.contract,
+                    clock=lambda: NOW,
+                ),
+            )
+
+
+class ModelSessionServiceEndpointTest(unittest.TestCase):
+    def contract(
+        self,
+        root: pathlib.Path,
+        *,
+        profile_id: str,
+        project_id: str,
+        required_modalities: tuple[str, ...] = ("text",),
+    ) -> ProfileContract:
+        return ProfileContract(
+            schema=PROFILE_SCHEMA_V3,
+            profile_id=profile_id,
+            project_id=project_id,
+            profile_root=root / "lab" / "profiles" / profile_id,
+            state_root=root / "lab",
+            project_root=root / "lab" / "projects" / project_id,
+            model=None,
+            runtime=None,
+            pi=PiContract(
+                installation_root=(root / "lab" / "runtimes" / "pi" / "0.82.1"),
+                executable=pathlib.PurePosixPath("bin/pi"),
+                version="0.82.1",
+                tools=("read", "write", "edit", "bash"),
+                system_prompt_file=None,
+                append_system_prompt_file=None,
+            ),
+            storage=StorageContract(
+                max_sessions=7,
+                work_bytes=8 * 1024**3,
+                work_inodes=65_536,
+                history_bytes=2 * 1024**3,
+                history_inodes=16_384,
+                checkpoint_bytes=17 * 1024**3,
+                max_sparse_extents=((10 * 1024**3) // STORAGE_PAGE_SIZE),
+                max_file_bytes=4 * 1024**3,
+                max_logical_bytes=16 * 1024**3,
+            ),
+            sandbox=SandboxContract(
+                memory_bytes=16 * 1024**3,
+                max_tasks=256,
+                max_runtime_seconds=86_400,
+                idle_timeout_seconds=3_600,
+                shutdown_grace_seconds=30,
+            ),
+            service_id="shared-service",
+            endpoint=EndpointRequirementContract(
+                required_input_modalities=required_modalities,
+            ),
+        )
+
+    @contextlib.contextmanager
+    def service_socket(
+        self,
+        runtime_root: pathlib.Path,
+    ) -> Iterator[pathlib.Path]:
+        runtime_root.mkdir(mode=0o700)
+        services = runtime_root / "services"
+        services.mkdir(mode=0o700)
+        path = services / "shared-service.sock"
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(os.fspath(path))
+        listener.listen(16)
+        path.chmod(0o600)
+        try:
+            yield path
+        finally:
+            listener.close()
+
+    @staticmethod
+    def workload(*, revision: str = REVISION) -> ServiceWorkload:
+        return ServiceWorkload(
+            repository="example-org/example-model",
+            revision=revision,
+            provider="fixture-provider",
+            model_id="served-model",
+            context_tokens=65_536,
+            max_output_tokens=8_192,
+            weight_format="bf16",
+            kv_cache_dtype="bf16",
+            runtime_compatibility="vllm-openai-v1",
+            reasoning=False,
+        )
+
+    def test_service_workload_parser_rejects_noncanonical_client_values(
+        self,
+    ) -> None:
+        base = self.workload().as_dict()
+        cases = (
+            ("provider", "Fixture-Provider"),
+            ("provider", "fixture-provider "),
+            ("model_id", "served\nmodel"),
+            ("model_id", "served model"),
+            ("runtime_compatibility", " vllm-openai-v1"),
+            ("context_tokens", 2**24 + 1),
+            ("max_output_tokens", 2**24 + 1),
+        )
+        for field, value in cases:
+            with self.subTest(field=field, value=value):
+                document = {**base, field: value}
+                with self.assertRaises(ModelSessionError) as caught:
+                    parse_service_workload(document)
+                self.assertEqual(
+                    caught.exception.code,
+                    "invalid_service_endpoint",
                 )
+
+    def test_service_publication_reports_unrepresentable_expiry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime_root = pathlib.Path(directory) / "runtime"
+            with self.service_socket(runtime_root) as socket_path:
+                with self.assertRaises(ModelSessionError) as caught:
+                    publish_service_endpoint(
+                        "shared-service",
+                        service_sha256="b" * 64,
+                        workload=self.workload(),
+                        input_modalities=("text",),
+                        ttl_seconds=1,
+                        socket_path=socket_path,
+                        runtime_root=runtime_root,
+                        clock=lambda: datetime.datetime.max.replace(
+                            tzinfo=datetime.timezone.utc
+                        ),
+                    )
+
+            self.assertEqual(
+                caught.exception.code,
+                "invalid_inference_attachment_clock",
+            )
+
+    def test_one_service_receipt_is_shared_across_profiles(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            runtime_root = root / "runtime"
+            first = self.contract(
+                root,
+                profile_id="first",
+                project_id="first-project",
+            )
+            second = self.contract(
+                root,
+                profile_id="second",
+                project_id="second-project",
+            )
+            with self.service_socket(runtime_root) as socket_path:
+                published = publish_service_endpoint(
+                    "shared-service",
+                    service_sha256="b" * 64,
+                    workload=self.workload(),
+                    input_modalities=("text",),
+                    ttl_seconds=3600,
+                    socket_path=socket_path,
+                    runtime_root=runtime_root,
+                    clock=lambda: NOW,
+                )
+                first_loaded = load_service_endpoint(
+                    first,
+                    runtime_root=runtime_root,
+                    clock=lambda: NOW,
+                )
+                second_loaded = load_service_endpoint(
+                    second,
+                    runtime_root=runtime_root,
+                    clock=lambda: NOW,
+                )
+
+            self.assertIsInstance(published, ServiceEndpoint)
+            self.assertEqual(
+                first_loaded.publication_id,
+                second_loaded.publication_id,
+            )
+            self.assertEqual(
+                published.receipt_path,
+                service_endpoint_receipt_path(
+                    "shared-service",
+                    runtime_root=runtime_root,
+                ),
+            )
+            self.assertEqual(
+                published.receipt_path,
+                runtime_root / "services" / "shared-service.json",
+            )
+
+    def test_service_socket_cannot_be_a_hard_link_to_another_socket(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime_root = pathlib.Path(directory) / "runtime"
+            runtime_root.mkdir(mode=0o700)
+            services = runtime_root / "services"
+            services.mkdir(mode=0o700)
+            original_path = services / "credential.sock"
+            canonical_path = services / "shared-service.sock"
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+                listener.bind(os.fspath(original_path))
+                listener.listen(1)
+                original_path.chmod(0o600)
+                os.link(original_path, canonical_path)
+
+                with self.assertRaises(ModelSessionError) as caught:
+                    publish_service_endpoint(
+                        "shared-service",
+                        service_sha256="b" * 64,
+                        workload=self.workload(),
+                        input_modalities=("text",),
+                        ttl_seconds=3600,
+                        socket_path=canonical_path,
+                        runtime_root=runtime_root,
+                        clock=lambda: NOW,
+                    )
+
+            self.assertEqual(
+                caught.exception.code,
+                "unsafe_inference_socket",
+            )
+
+    def test_resume_requires_workload_identity_not_service_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            runtime_root = root / "runtime"
+            text_profile = self.contract(
+                root,
+                profile_id="text",
+                project_id="text-project",
+            )
+            vision_profile = self.contract(
+                root,
+                profile_id="vision",
+                project_id="vision-project",
+                required_modalities=("text", "image"),
+            )
+            with self.service_socket(runtime_root) as socket_path:
+                original = publish_service_endpoint(
+                    "shared-service",
+                    service_sha256="b" * 64,
+                    workload=self.workload(),
+                    input_modalities=("text",),
+                    ttl_seconds=3600,
+                    socket_path=socket_path,
+                    runtime_root=runtime_root,
+                    clock=lambda: NOW,
+                )
+                with self.assertRaises(ModelSessionError) as caught:
+                    load_service_endpoint(
+                        vision_profile,
+                        runtime_root=runtime_root,
+                        clock=lambda: NOW,
+                    )
+                self.assertEqual(
+                    caught.exception.code,
+                    "service_endpoint_capability_mismatch",
+                )
+
+                publish_service_endpoint(
+                    "shared-service",
+                    service_sha256="c" * 64,
+                    workload=self.workload(),
+                    input_modalities=("text", "image"),
+                    ttl_seconds=3600,
+                    socket_path=socket_path,
+                    runtime_root=runtime_root,
+                    clock=lambda: NOW,
+                )
+                compatible = load_service_endpoint(
+                    text_profile,
+                    expected_binding=original.binding,
+                    runtime_root=runtime_root,
+                    clock=lambda: NOW,
+                )
+                self.assertEqual(
+                    compatible.binding.workload_sha256,
+                    original.binding.workload_sha256,
+                )
+                load_service_endpoint(
+                    vision_profile,
+                    runtime_root=runtime_root,
+                    clock=lambda: NOW,
+                )
+
+                publish_service_endpoint(
+                    "shared-service",
+                    service_sha256="d" * 64,
+                    workload=self.workload(revision="e" * 40),
+                    input_modalities=("text", "image"),
+                    ttl_seconds=3600,
+                    socket_path=socket_path,
+                    runtime_root=runtime_root,
+                    clock=lambda: NOW,
+                )
+                with self.assertRaises(ModelSessionError) as caught:
+                    load_service_endpoint(
+                        text_profile,
+                        expected_binding=original.binding,
+                        runtime_root=runtime_root,
+                        clock=lambda: NOW,
+                    )
+                self.assertEqual(
+                    caught.exception.code,
+                    "service_endpoint_workload_mismatch",
+                )
+
+    def test_receipt_cannot_redirect_to_another_owned_unix_socket(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            runtime_root = root / "runtime"
+            profile = self.contract(
+                root,
+                profile_id="chat",
+                project_id="playground",
+            )
+            with (
+                self.service_socket(runtime_root) as socket_path,
+                socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as other,
+            ):
+                other_path = runtime_root / "services" / "credential.sock"
+                other.bind(os.fspath(other_path))
+                other.listen(1)
+                other_path.chmod(0o600)
+                endpoint = publish_service_endpoint(
+                    "shared-service",
+                    service_sha256="b" * 64,
+                    workload=self.workload(),
+                    input_modalities=("text",),
+                    ttl_seconds=3600,
+                    socket_path=socket_path,
+                    runtime_root=runtime_root,
+                    clock=lambda: NOW,
+                )
+                _rewrite_receipt(
+                    endpoint.receipt_path,
+                    lambda value: value.update(
+                        {
+                            "socket_path": str(other_path),
+                            "socket_device": other_path.stat().st_dev,
+                            "socket_inode": other_path.stat().st_ino,
+                        }
+                    ),
+                    recompute_payload_hash=True,
+                )
+                with self.assertRaises(ModelSessionError) as caught:
+                    load_service_endpoint(
+                        profile,
+                        runtime_root=runtime_root,
+                        clock=lambda: NOW,
+                    )
+            self.assertEqual(
+                caught.exception.code,
+                "service_endpoint_tampered",
+            )
+
+    def test_revoke_removes_only_the_exact_receipt_not_its_socket(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            runtime_root = root / "runtime"
+            profile = self.contract(
+                root,
+                profile_id="chat",
+                project_id="playground",
+            )
+            with self.service_socket(runtime_root) as socket_path:
+                endpoint = publish_service_endpoint(
+                    "shared-service",
+                    service_sha256="b" * 64,
+                    workload=self.workload(),
+                    input_modalities=("text",),
+                    ttl_seconds=3600,
+                    socket_path=socket_path,
+                    runtime_root=runtime_root,
+                    clock=lambda: NOW,
+                )
+
+                revoke_service_endpoint(
+                    "shared-service",
+                    endpoint.publication_id,
+                    runtime_root=runtime_root,
+                )
+
+                self.assertFalse(endpoint.receipt_path.exists())
+                self.assertTrue(socket_path.exists())
+                with self.assertRaises(ModelSessionError) as caught:
+                    load_service_endpoint(
+                        profile,
+                        runtime_root=runtime_root,
+                        clock=lambda: NOW,
+                    )
+                self.assertEqual(
+                    caught.exception.code,
+                    "service_endpoint_missing",
+                )
+
+    def test_stale_revoke_cannot_remove_a_newer_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            runtime_root = root / "runtime"
+            profile = self.contract(
+                root,
+                profile_id="chat",
+                project_id="playground",
+            )
+            with self.service_socket(runtime_root) as socket_path:
+                first = publish_service_endpoint(
+                    "shared-service",
+                    service_sha256="b" * 64,
+                    workload=self.workload(),
+                    input_modalities=("text",),
+                    ttl_seconds=3600,
+                    socket_path=socket_path,
+                    runtime_root=runtime_root,
+                    clock=lambda: NOW,
+                )
+                second = publish_service_endpoint(
+                    "shared-service",
+                    service_sha256="c" * 64,
+                    workload=self.workload(),
+                    input_modalities=("text", "image"),
+                    ttl_seconds=3600,
+                    socket_path=socket_path,
+                    runtime_root=runtime_root,
+                    clock=lambda: NOW,
+                )
+
+                with self.assertRaises(ModelSessionError) as caught:
+                    revoke_service_endpoint(
+                        "shared-service",
+                        first.publication_id,
+                        runtime_root=runtime_root,
+                    )
+
+                self.assertEqual(
+                    caught.exception.code,
+                    "service_endpoint_publication_mismatch",
+                )
+                active = load_service_endpoint(
+                    profile,
+                    runtime_root=runtime_root,
+                    clock=lambda: NOW,
+                )
+                self.assertEqual(active.publication_id, second.publication_id)
 
 
 def stat_mode(path: pathlib.Path) -> int:

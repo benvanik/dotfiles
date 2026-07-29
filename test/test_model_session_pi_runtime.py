@@ -25,7 +25,7 @@ from model_session.pi_runtime import (
     render_pi_models_json,
 )
 from model_session.profile import (
-    PROFILE_SCHEMA,
+    PROFILE_SCHEMA_V2,
     ModelContract,
     PiContract,
     ProfileContract,
@@ -47,7 +47,7 @@ def make_contract(
 ) -> ProfileContract:
     installation_root = root / "pi"
     return ProfileContract(
-        schema=PROFILE_SCHEMA,
+        schema=PROFILE_SCHEMA_V2,
         profile_id="fixture-model",
         project_id="fixture-project",
         profile_root=root / "profile",
@@ -83,9 +83,7 @@ def make_contract(
             history_bytes=2 * 1024**3,
             history_inodes=16_384,
             checkpoint_bytes=17 * 1024**3,
-            max_sparse_extents=(
-                (10 * 1024**3) // STORAGE_PAGE_SIZE
-            ),
+            max_sparse_extents=((10 * 1024**3) // STORAGE_PAGE_SIZE),
             max_file_bytes=4 * 1024**3,
             max_logical_bytes=16 * 1024**3,
         ),
@@ -106,9 +104,7 @@ def create_installation(root: pathlib.Path) -> ProfileContract:
     (installation / "lib").mkdir()
     (installation / "lib" / "pi.js").write_bytes(b"console.log('pi');\n")
     (installation / "lib" / "pi.js").chmod(0o755)
-    (installation / "bin" / "node").write_bytes(
-        b"#!/bin/sh\necho v24.11.1\n"
-    )
+    (installation / "bin" / "node").write_bytes(b"#!/bin/sh\necho v24.11.1\n")
     (installation / "bin" / "node").chmod(0o755)
     (installation / "README.md").write_bytes(b"fixture installation\n")
     (installation / "README.md").chmod(0o644)
@@ -167,6 +163,7 @@ class PiRuntimeConfigurationTest(unittest.TestCase):
             ).encode("utf-8")
             + b"\n",
         )
+
     def test_generated_configuration_contains_no_secret_resolution_marker(
         self,
     ) -> None:
@@ -193,27 +190,15 @@ class PiRuntimeConfigurationTest(unittest.TestCase):
             {asset.roles[0] for asset in committed},
             {INFERENCE_RELAY_ROLE, SESSION_POLICY_ROLE},
         )
-        committed_by_role = {
-            asset.roles[0]: asset
-            for asset in committed
-        }
+        committed_by_role = {asset.roles[0]: asset for asset in committed}
         infrastructure_root = pathlib.Path(__file__).resolve().parents[1]
         self.assertEqual(
             committed_by_role[INFERENCE_RELAY_ROLE].content,
-            (
-                infrastructure_root
-                / "lib"
-                / "model_session"
-                / "relay.py"
-            ).read_bytes(),
+            (infrastructure_root / "lib" / "model_session" / "relay.py").read_bytes(),
         )
         self.assertEqual(
             committed_by_role[SESSION_POLICY_ROLE].content,
-            (
-                infrastructure_root
-                / "model-session"
-                / "session-policy.js"
-            ).read_bytes(),
+            (infrastructure_root / "model-session" / "session-policy.js").read_bytes(),
         )
         self.assertEqual(len(assets), 3)
         self.assertEqual(
@@ -300,9 +285,7 @@ class PiInstallationIdentityTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             contract = create_installation(root)
-            (contract.pi.installation_root / "absolute").symlink_to(
-                "/etc/passwd"
-            )
+            (contract.pi.installation_root / "absolute").symlink_to("/etc/passwd")
             with self.assertRaises(ModelSessionError) as caught:
                 fingerprint_pi_installation(contract)
 

@@ -10,14 +10,16 @@ the service and the sandbox must be reaped.
 from __future__ import annotations
 
 import json
+import math
 import os
 import pathlib
 import re
 import socket
 import stat
 import struct
+import time
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from .errors import ModelSessionError
 
@@ -174,14 +176,38 @@ def _supervisor_socket_path() -> pathlib.Path:
     return path / "model-lab" / "supervisor.sock"
 
 
-def _read_frame(channel: socket.socket) -> bytes:
+def _remaining_startup_budget(
+    deadline: float,
+    monotonic: Callable[[], float],
+) -> float:
+    remaining_seconds = deadline - monotonic()
+    if remaining_seconds <= 0:
+        _fail(
+            "Pi session admission did not complete within the configured "
+            "startup budget",
+            code="service_startup_timeout",
+        )
+    return remaining_seconds
+
+
+def _read_frame(
+    channel: socket.socket,
+    *,
+    deadline: float,
+    monotonic: Callable[[], float],
+) -> bytes:
     payload = bytearray()
     while True:
         remaining = MAX_SUPERVISOR_FRAME_BYTES + 1 - len(payload)
         if remaining <= 0:
             _fail("model-lab supervisor response exceeds its frame bound")
+        channel.settimeout(
+            _remaining_startup_budget(deadline, monotonic)
+        )
         try:
             chunk = channel.recv(remaining)
+        except TimeoutError:
+            raise
         except OSError as error:
             raise ModelSessionError(
                 f"cannot read model-lab supervisor response: {error}",
@@ -455,9 +481,29 @@ def _raise_supervisor_error(value: dict[str, Any]) -> None:
 def read_session_use_authority(
     descriptor: int | None,
     route: ProfileRoute,
+    *,
+    startup_deadline: float | None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> SessionUseAuthority:
     """Admit this launcher over one supervisor-owned use connection."""
 
+    if descriptor is None:
+        _fail(
+            "new and resumed sessions must be launched by `model-lab pi`",
+            code="model_lab_use_authority_required",
+        )
+    if (
+        startup_deadline is None
+        or isinstance(startup_deadline, bool)
+        or not isinstance(startup_deadline, (int, float))
+        or not math.isfinite(float(startup_deadline))
+    ):
+        _fail(
+            "model-lab startup deadline is required for session admission",
+            code="invalid_model_lab_use_authority",
+        )
+    deadline = float(startup_deadline)
+    _remaining_startup_budget(deadline, monotonic)
     channel, peer_pid = _open_channel(descriptor)
     session_pid = os.getpid()
     session_start_time = process_start_time(session_pid)
@@ -469,11 +515,26 @@ def read_session_use_authority(
         "start_time": session_start_time,
     }
     try:
+        channel.settimeout(
+            _remaining_startup_budget(deadline, monotonic)
+        )
         channel.sendall(_canonical_json_bytes(request))
-        response = _strict_json_object(_read_frame(channel))
+        response = _strict_json_object(
+            _read_frame(
+                channel,
+                deadline=deadline,
+                monotonic=monotonic,
+            )
+        )
+        if monotonic() >= deadline:
+            _fail(
+                "Pi session admission did not complete within the configured "
+                "startup budget",
+                code="service_startup_timeout",
+            )
         if response.get("schema") == SESSION_USE_ERROR_SCHEMA:
             _raise_supervisor_error(response)
-        return _parse_accepted(
+        authority = _parse_accepted(
             response,
             route=route,
             channel=channel,
@@ -481,6 +542,22 @@ def read_session_use_authority(
             session_pid=session_pid,
             session_start_time=session_start_time,
         )
+        if monotonic() >= deadline:
+            authority.close()
+            _fail(
+                "Pi session admission did not complete within the configured "
+                "startup budget",
+                code="service_startup_timeout",
+            )
+        channel.settimeout(None)
+        return authority
+    except TimeoutError as error:
+        channel.close()
+        raise ModelSessionError(
+            "Pi session admission did not complete within the configured "
+            "startup budget",
+            code="service_startup_timeout",
+        ) from error
     except BaseException:
         channel.close()
         raise

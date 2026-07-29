@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
 import json
 import os
 import pathlib
 import signal
+import subprocess
 import sys
+import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Sequence
 
@@ -176,11 +180,103 @@ class ServiceRuntimeController:
         platform: Any | None = None,
         collaborators: RuntimeCollaborators | None = None,
         invoked_entrypoint: pathlib.Path | None = None,
+        startup_expires_at: datetime.datetime | None = None,
     ) -> None:
         self.layout = layout or RuntimeLayout()
         self.platform = platform or SystemPlatform()
         self.collaborators = collaborators or RuntimeCollaborators()
         self.invoked_entrypoint = invoked_entrypoint
+        self.startup_expires_at = startup_expires_at
+
+    def _remaining_startup_seconds(self) -> float | None:
+        if self.startup_expires_at is None:
+            return None
+        remaining = self.startup_expires_at.timestamp() - time.time()
+        if remaining <= 0:
+            _fail(
+                "remote service action exceeded its startup deadline",
+                code="service_startup_timeout",
+            )
+        return remaining
+
+    def _cleanup_grace_seconds(self) -> float:
+        if self.startup_expires_at is None:
+            return float(KILL_GRACE_SECONDS)
+        return min(
+            float(KILL_GRACE_SECONDS),
+            max(
+                0.0,
+                self.startup_expires_at.timestamp() - time.time(),
+            ),
+        )
+
+    @staticmethod
+    def _background_reap(process: Any) -> None:
+        def reap() -> None:
+            try:
+                process.wait()
+            except BaseException:
+                return
+
+        threading.Thread(target=reap, daemon=True).start()
+
+    def _reap_command_group(self, process: Any) -> None:
+        grace_seconds = self._cleanup_grace_seconds()
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        try:
+            process.wait(timeout=grace_seconds)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        try:
+            process.wait(timeout=0)
+        except subprocess.TimeoutExpired:
+            self._background_reap(process)
+
+    def _run_startup_bounded_command(
+        self,
+        command: Sequence[str],
+        **keywords: Any,
+    ) -> subprocess.CompletedProcess[bytes]:
+        """Run one child group whose lifetime cannot outlive startup."""
+
+        check = keywords.pop("check", False)
+        if keywords:
+            allowed = {"cwd", "env", "stdin", "stdout", "stderr", "umask"}
+            unexpected = set(keywords).difference(allowed)
+            if unexpected:
+                _fail(
+                    "bounded runtime command received unsupported options",
+                    code="invalid_service_runtime_command",
+                )
+        remaining = self._remaining_startup_seconds()
+        process = subprocess.Popen(
+            command,
+            start_new_session=True,
+            **keywords,
+        )
+        try:
+            return_code = process.wait(timeout=remaining)
+        except BaseException:
+            self._reap_command_group(process)
+            raise
+        result = subprocess.CompletedProcess(
+            command,
+            return_code,
+        )
+        if check and return_code != 0:
+            raise subprocess.CalledProcessError(
+                return_code,
+                command,
+            )
+        return result
 
     def _load(
         self,
@@ -462,6 +558,11 @@ class ServiceRuntimeController:
     def stage_snapshot(self, manifest_path: pathlib.Path) -> dict[str, Any]:
         manifest, canonical_paths, local_paths = self._load(manifest_path)
         self._require_roots(local_paths=local_paths)
+        stage_arguments: dict[str, Any] = {}
+        if self.startup_expires_at is not None:
+            stage_arguments["command_runner"] = (
+                self._run_startup_bounded_command
+            )
         publication = self.collaborators.snapshot_stager(
             closure=manifest.closure,
             canonical_snapshot_root=canonical_paths.snapshot_root,
@@ -469,6 +570,7 @@ class ServiceRuntimeController:
             receipt_path=local_paths["snapshot_receipt"],
             layout=self.layout,
             boot_id=self.platform.boot_id(layout=self.layout),
+            **stage_arguments,
         )
         return {
             "schema_version": "model-lab.service-operation.v1",
@@ -592,6 +694,7 @@ class ServiceRuntimeController:
     ) -> bool:
         """Stop the launch group plus every escaped process with its exact tags."""
 
+        grace_seconds = self._cleanup_grace_seconds()
         initial_exited = True
         if spawned is not None:
             self.platform.signal_processes(
@@ -600,7 +703,7 @@ class ServiceRuntimeController:
             )
             initial_exited = self.platform.wait_for_exit(
                 processes=[spawned],
-                timeout_seconds=KILL_GRACE_SECONDS,
+                timeout_seconds=grace_seconds,
             )
 
         tagged = self.platform.list_service_processes(
@@ -625,7 +728,7 @@ class ServiceRuntimeController:
             )
             self.platform.wait_for_exit(
                 processes=escaped,
-                timeout_seconds=KILL_GRACE_SECONDS,
+                timeout_seconds=grace_seconds,
             )
 
         remaining = self.platform.list_service_processes(
@@ -644,7 +747,7 @@ class ServiceRuntimeController:
             )
             initial_exited = self.platform.wait_for_exit(
                 processes=[spawned],
-                timeout_seconds=KILL_GRACE_SECONDS,
+                timeout_seconds=grace_seconds,
             )
         escaped_remaining = [
             process
@@ -658,7 +761,7 @@ class ServiceRuntimeController:
             )
             self.platform.wait_for_exit(
                 processes=escaped_remaining,
-                timeout_seconds=KILL_GRACE_SECONDS,
+                timeout_seconds=grace_seconds,
             )
 
         survivors = self.platform.list_service_processes(
@@ -1635,6 +1738,72 @@ def _absolute_normalized_path(value: str) -> pathlib.Path:
     return path
 
 
+def _canonical_startup_expiration(value: str) -> datetime.datetime:
+    try:
+        parsed = datetime.datetime.fromisoformat(
+            value.replace("Z", "+00:00")
+        )
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "startup expiration must be an RFC3339 timestamp"
+        ) from error
+    if parsed.tzinfo is None:
+        raise argparse.ArgumentTypeError(
+            "startup expiration must include a timezone"
+        )
+    normalized = (
+        parsed.astimezone(datetime.timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    if normalized != value:
+        raise argparse.ArgumentTypeError(
+            "startup expiration must be canonical UTC"
+        )
+    return parsed.astimezone(datetime.timezone.utc)
+
+
+def _execute_with_startup_alarm(
+    controller: ServiceRuntimeController,
+    *,
+    action: str,
+    manifest_path: pathlib.Path,
+    cache_mode: str | None,
+    startup_expires_at: datetime.datetime | None,
+) -> dict[str, Any]:
+    if startup_expires_at is None:
+        return controller.execute(
+            action=action,
+            manifest_path=manifest_path,
+            cache_mode=cache_mode,
+        )
+    remaining = startup_expires_at.timestamp() - time.time()
+    if remaining <= 0:
+        _fail(
+            "remote service action cannot start after its startup deadline",
+            code="service_startup_timeout",
+        )
+    previous_handler = signal.getsignal(signal.SIGALRM)
+
+    def expire_action(_signal_number: int, _frame: Any) -> None:
+        _fail(
+            "remote service action exceeded its startup deadline",
+            code="service_startup_timeout",
+        )
+
+    signal.signal(signal.SIGALRM, expire_action)
+    signal.setitimer(signal.ITIMER_REAL, remaining)
+    try:
+        return controller.execute(
+            action=action,
+            manifest_path=manifest_path,
+            cache_mode=cache_mode,
+        )
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="model-lab-service-runtime",
@@ -1666,6 +1835,14 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("ephemeral", "author", "candidate-proof", "accepted"),
         help="explicit compiled-cache lifecycle mode",
     )
+    parser.add_argument(
+        "--startup-expires-at",
+        type=_canonical_startup_expiration,
+        help=(
+            "absolute UTC deadline inherited from the endpoint startup "
+            "operation"
+        ),
+    )
     return parser
 
 
@@ -1677,12 +1854,15 @@ def main(
     arguments = build_parser().parse_args(argv)
     controller = ServiceRuntimeController(
         invoked_entrypoint=invoked_entrypoint,
+        startup_expires_at=arguments.startup_expires_at,
     )
     try:
-        result = controller.execute(
+        result = _execute_with_startup_alarm(
+            controller,
             action=arguments.action,
             manifest_path=arguments.manifest,
             cache_mode=arguments.cache_mode,
+            startup_expires_at=arguments.startup_expires_at,
         )
     except ModelLabError as error:
         print(

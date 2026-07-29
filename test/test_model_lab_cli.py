@@ -11,6 +11,8 @@ from unittest import mock
 from model_lab.cli import main
 from model_lab.dependencies import Dependencies
 from model_session.attachment import ServiceWorkload
+from model_session.errors import ModelSessionError
+from model_session.launcher import ResumeSelection
 from model_session.service_endpoint import service_workload_identity
 
 
@@ -18,27 +20,56 @@ class FakeSupervisor:
     def __init__(self) -> None:
         self.acquisitions = []
         self.down_requests = []
+        self.pending_overrides = {}
+        self.closed_channels = 0
 
     def acquire_pi(
         self,
         *,
         profile_id,
-        host_name=None,
-        stop_on_release=False,
+        project_id,
+        service_id,
+        service_sha256,
+        workload_sha256,
+        required_input_modalities,
+        session_id,
+        host_name,
+        stop_on_release,
+        startup_timeout_seconds,
     ):
         self.acquisitions.append(
-            (profile_id, host_name, stop_on_release)
+            {
+                "profile_id": profile_id,
+                "project_id": project_id,
+                "service_id": service_id,
+                "service_sha256": service_sha256,
+                "workload_sha256": workload_sha256,
+                "required_input_modalities": required_input_modalities,
+                "session_id": session_id,
+                "host_name": host_name,
+                "stop_on_release": stop_on_release,
+                "startup_timeout_seconds": startup_timeout_seconds,
+            }
         )
+        pending = {
+            "profile_id": profile_id,
+            "project_id": project_id,
+            "service_id": service_id,
+            "service_sha256": service_sha256,
+            "workload_sha256": workload_sha256,
+            "required_input_modalities": required_input_modalities,
+            "session_id": session_id,
+            "deployment_id": "deployment-one",
+            "use_lease_id": "use-one",
+        }
+        pending.update(self.pending_overrides)
         return SimpleNamespace(
-            pending=SimpleNamespace(
-                profile_id=profile_id,
-                service_id="fixture-chat",
-                workload_sha256="a" * 64,
-                deployment_id="deployment-one",
-                use_lease_id="use-one",
-            ),
-            close=lambda: None,
+            pending=SimpleNamespace(**pending),
+            close=self._close_channel,
         )
+
+    def _close_channel(self):
+        self.closed_channels += 1
 
     def request(self, operation, fields):
         if operation == "down":
@@ -103,39 +134,80 @@ class ModelLabCliTest(unittest.TestCase):
         self.supervisor = FakeSupervisor()
         self.output = io.StringIO()
         self.error = io.StringIO()
+        self.resume_selection = ResumeSelection(
+            session_id="session-one",
+            service_id=self.service.service_id,
+            workload_sha256=self.service.workload_sha256,
+            input_modalities=("text", "image"),
+        )
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def _run(self, arguments, runner):
+    def _run(
+        self,
+        arguments,
+        runner,
+        *,
+        profile_error=None,
+        resume_selection=None,
+        resume_error=None,
+        input_stream=None,
+    ):
         dependencies = Dependencies(
             supervisor=self.supervisor,
             run_model_session=runner,
         )
+        profile_loader = mock.Mock()
+        if profile_error is not None:
+            profile_loader.side_effect = profile_error
+        selection_resolver = mock.Mock(
+            return_value=(
+                self.resume_selection
+                if resume_selection is None
+                else resume_selection
+            )
+        )
+        if resume_error is not None:
+            selection_resolver.side_effect = resume_error
         with (
             mock.patch(
                 "model_lab.cli.load_lab_configuration",
-                return_value=object(),
+                return_value=SimpleNamespace(
+                    lease=SimpleNamespace(startup_timeout_seconds=300),
+                ),
             ),
             mock.patch(
                 "model_lab.cli.load_profile_route",
                 return_value=self.route,
             ),
             mock.patch(
+                "model_lab.cli.load_profile",
+                new=profile_loader,
+            ),
+            mock.patch(
                 "model_lab.cli.load_service_id",
                 return_value=self.service,
+            ),
+            mock.patch(
+                "model_lab.cli.resolve_resume_selection",
+                new=selection_resolver,
             ),
             mock.patch(
                 "model_lab.cli.runtime_root",
                 return_value=pathlib.Path(self.temporary.name) / "runtime",
             ),
         ):
-            return main(
+            result = main(
                 ["--root", str(self.root), *arguments],
                 dependencies=dependencies,
+                input_stream=input_stream,
                 output=self.output,
                 error=self.error,
             )
+        self.profile_loader = profile_loader
+        self.selection_resolver = selection_resolver
+        return result
 
     def test_pi_is_one_command_and_supervisor_owns_final_release(self) -> None:
         invocations = []
@@ -152,7 +224,23 @@ class ModelLabCliTest(unittest.TestCase):
         self.assertEqual(invocations[0][2].pending.use_lease_id, "use-one")
         self.assertEqual(
             self.supervisor.acquisitions,
-            [("chat", "dev96", False)],
+            [
+                {
+                    "profile_id": "chat",
+                    "project_id": "model-playground",
+                    "service_id": "fixture-chat",
+                    "service_sha256": "b" * 64,
+                    "workload_sha256": "a" * 64,
+                    "required_input_modalities": ("image", "text"),
+                    "session_id": None,
+                    "host_name": "dev96",
+                    "stop_on_release": False,
+                    "startup_timeout_seconds": 300,
+                }
+            ],
+        )
+        self.profile_loader.assert_called_once_with(
+            self.root / "profiles" / "chat"
         )
         progress = self.error.getvalue()
         self.assertIn(
@@ -175,8 +263,125 @@ class ModelLabCliTest(unittest.TestCase):
         self.assertEqual(result, 19)
         self.assertEqual(
             self.supervisor.acquisitions,
-            [("chat", None, True)],
+            [
+                {
+                    "profile_id": "chat",
+                    "project_id": "model-playground",
+                    "service_id": "fixture-chat",
+                    "service_sha256": "b" * 64,
+                    "workload_sha256": "a" * 64,
+                    "required_input_modalities": ("image", "text"),
+                    "session_id": "session-one",
+                    "host_name": None,
+                    "stop_on_release": True,
+                    "startup_timeout_seconds": 300,
+                }
+            ],
         )
+        self.profile_loader.assert_not_called()
+        self.selection_resolver.assert_called_once_with(
+            self.root / "profiles" / "chat",
+            "session-one",
+            input_stream=mock.ANY,
+            output=self.output,
+        )
+
+    def test_resume_selection_failure_never_acquires_paid_capacity(self) -> None:
+        result = self._run(
+            ["pi", "chat", "resume"],
+            lambda *_: self.fail("model-session must not launch"),
+            resume_error=ModelSessionError(
+                "resume picker reached end of input",
+                code="resume_cancelled",
+            ),
+            input_stream=io.StringIO(""),
+        )
+
+        self.assertEqual(result, 2)
+        self.assertEqual(self.supervisor.acquisitions, [])
+        self.assertIn("resume_cancelled", self.error.getvalue())
+
+    def test_resume_frozen_workload_mismatch_never_acquires_capacity(self) -> None:
+        mismatched = ResumeSelection(
+            session_id="session-one",
+            service_id=self.service.service_id,
+            workload_sha256="d" * 64,
+            input_modalities=("text",),
+        )
+
+        result = self._run(
+            ["pi", "chat", "resume", "session-one"],
+            lambda *_: self.fail("model-session must not launch"),
+            resume_selection=mismatched,
+        )
+
+        self.assertEqual(result, 2)
+        self.assertEqual(self.supervisor.acquisitions, [])
+        self.assertIn("service_workload_mismatch", self.error.getvalue())
+
+    def test_resume_dropped_modality_never_acquires_capacity(self) -> None:
+        unsupported = ResumeSelection(
+            session_id="session-one",
+            service_id=self.service.service_id,
+            workload_sha256=self.service.workload_sha256,
+            input_modalities=("text", "audio"),
+        )
+
+        result = self._run(
+            ["pi", "chat", "resume", "session-one"],
+            lambda *_: self.fail("model-session must not launch"),
+            resume_selection=unsupported,
+        )
+
+        self.assertEqual(result, 2)
+        self.assertEqual(self.supervisor.acquisitions, [])
+        self.assertIn("service_workload_mismatch", self.error.getvalue())
+
+    def test_invalid_new_profile_fails_before_supervisor_acquisition(self):
+        result = self._run(
+            ["pi", "chat"],
+            lambda *_: self.fail("model-session must not launch"),
+            profile_error=ModelSessionError(
+                "controlled invalid prompt",
+                code="invalid_profile",
+            ),
+        )
+
+        self.assertEqual(result, 2)
+        self.assertEqual(self.supervisor.acquisitions, [])
+        self.assertIn(
+            "invalid_profile: cannot start a new session from profile chat",
+            self.error.getvalue(),
+        )
+
+    def test_pi_rejects_every_mismatched_grant_identity_field(self) -> None:
+        mismatches = {
+            "profile_id": "other-profile",
+            "project_id": "other-project",
+            "service_id": "other-service",
+            "service_sha256": "d" * 64,
+            "workload_sha256": "e" * 64,
+            "required_input_modalities": ("text",),
+            "session_id": "unexpected-session",
+        }
+        for field, value in mismatches.items():
+            with self.subTest(field=field):
+                self.supervisor = FakeSupervisor()
+                self.supervisor.pending_overrides[field] = value
+                self.output = io.StringIO()
+                self.error = io.StringIO()
+
+                result = self._run(
+                    ["pi", "chat"],
+                    lambda *_: self.fail("model-session must not launch"),
+                )
+
+                self.assertEqual(result, 2)
+                self.assertEqual(self.supervisor.closed_channels, 1)
+                self.assertIn(
+                    "supervisor_grant_mismatch",
+                    self.error.getvalue(),
+                )
 
     def test_down_defaults_to_model_idle_and_now_is_explicit(self) -> None:
         result = self._run(["down", "fixture-chat"], lambda *_: 0)

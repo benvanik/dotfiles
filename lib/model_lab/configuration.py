@@ -53,6 +53,7 @@ class LeasePolicy:
     service_idle_ttl_seconds: int
     renewal_ttl_seconds: int
     minimum_useful_seconds: int
+    startup_timeout_seconds: int
 
     def normalized(self) -> dict[str, int]:
         return dataclasses.asdict(self)
@@ -114,6 +115,7 @@ def parse_lab_toml(
             "service_idle_ttl_seconds",
             "renewal_ttl_seconds",
             "minimum_useful_seconds",
+            "startup_timeout_seconds",
         },
     )
     parsed_lease = LeasePolicy(
@@ -141,9 +143,24 @@ def parse_lab_toml(
             minimum=60,
             maximum=86400,
         ),
+        startup_timeout_seconds=_seconds(
+            lease["startup_timeout_seconds"],
+            label="lease.startup_timeout_seconds",
+            minimum=60,
+            maximum=300,
+        ),
     )
     if parsed_lease.renewal_ttl_seconds >= parsed_lease.hard_ttl_seconds:
         _fail("lease.renewal_ttl_seconds must be shorter than the hard TTL")
+    if (
+        parsed_lease.startup_timeout_seconds
+        + parsed_lease.minimum_useful_seconds
+        > parsed_lease.hard_ttl_seconds
+    ):
+        _fail(
+            "lease startup timeout plus minimum useful lifetime must not "
+            "exceed the hard TTL"
+        )
     return LabConfiguration(
         allowed_runpod_profiles=tuple(profiles),
         lease=parsed_lease,

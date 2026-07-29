@@ -10,6 +10,7 @@ import re
 import secrets
 import stat
 import subprocess
+import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any, BinaryIO
@@ -274,6 +275,8 @@ def push_service_materialization(
     resolved_endpoint: SshEndpoint,
     instances: InstanceStore,
     popen_factory: Callable[..., Any] = subprocess.Popen,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
     """Execute the exact plan against a separately resolved active endpoint."""
 
@@ -318,6 +321,8 @@ def push_service_materialization(
                     source=source,
                     stdin=installer,
                     popen_factory=popen_factory,
+                    deadline=deadline,
+                    monotonic=monotonic,
                 )
         else:
             return_code = run_with_activity(
@@ -328,6 +333,8 @@ def push_service_materialization(
                 expected_pod_id=resolved_endpoint.pod_id,
                 source=source,
                 popen_factory=popen_factory,
+                deadline=deadline,
+                monotonic=monotonic,
             )
         if return_code != 0:
             raise ModelLabError(

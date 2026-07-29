@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import copy
+import datetime
 import hashlib
 import json
 import os
 import pathlib
 import signal
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "model-lab"))
@@ -20,7 +23,10 @@ from model_lab.errors import ModelLabError  # noqa: E402
 from model_lab.service_definition import (  # noqa: E402
     parse_service_toml,
 )
-from service_runtime.controller import ServiceRuntimeController  # noqa: E402
+from service_runtime.controller import (  # noqa: E402
+    ServiceRuntimeController,
+    _execute_with_startup_alarm,
+)
 from service_runtime.document import parse_deployment_manifest  # noqa: E402
 from service_runtime.execution_environment import (  # noqa: E402
     runtime_execution_environment,
@@ -662,6 +668,99 @@ class SnapshotStageTest(unittest.TestCase):
                 receipt_path=fixture.local["snapshot_receipt"],
                 boot_id=BOOT_ID,
             )
+
+
+class StartupDeadlineTest(unittest.TestCase):
+    def test_alarm_restores_prior_handler_and_disarms_timer(self):
+        controller = mock.Mock()
+        controller.execute.return_value = {"status": "completed"}
+        expiration = datetime.datetime.fromtimestamp(
+            125.0,
+            tz=datetime.timezone.utc,
+        )
+        prior_handler = object()
+
+        with (
+            mock.patch(
+                "service_runtime.controller.time.time",
+                return_value=100.0,
+            ),
+            mock.patch(
+                "service_runtime.controller.signal.getsignal",
+                return_value=prior_handler,
+            ),
+            mock.patch(
+                "service_runtime.controller.signal.signal"
+            ) as install_handler,
+            mock.patch(
+                "service_runtime.controller.signal.setitimer"
+            ) as set_timer,
+        ):
+            result = _execute_with_startup_alarm(
+                controller,
+                action="setup",
+                manifest_path=pathlib.Path("/fixture/manifest.json"),
+                cache_mode="accepted",
+                startup_expires_at=expiration,
+            )
+
+        self.assertEqual(result, {"status": "completed"})
+        self.assertEqual(
+            set_timer.call_args_list,
+            [
+                mock.call(signal.ITIMER_REAL, 25.0),
+                mock.call(signal.ITIMER_REAL, 0),
+            ],
+        )
+        self.assertEqual(install_handler.call_count, 2)
+        self.assertEqual(
+            install_handler.call_args_list[-1],
+            mock.call(signal.SIGALRM, prior_handler),
+        )
+
+    def test_expired_child_group_cleanup_never_waits_past_deadline(self):
+        class StubbornProcess:
+            pid = 4242
+
+            def __init__(self) -> None:
+                self.wait_timeouts = []
+
+            def wait(self, timeout=None):
+                self.wait_timeouts.append(timeout)
+                raise subprocess.TimeoutExpired(["fixture"], timeout)
+
+        process = StubbornProcess()
+        controller = ServiceRuntimeController(
+            startup_expires_at=datetime.datetime.fromtimestamp(
+                100.0,
+                tz=datetime.timezone.utc,
+            )
+        )
+
+        with (
+            mock.patch(
+                "service_runtime.controller.time.time",
+                return_value=100.0,
+            ),
+            mock.patch(
+                "service_runtime.controller.os.killpg"
+            ) as kill_group,
+            mock.patch.object(
+                controller,
+                "_background_reap",
+            ) as background_reap,
+        ):
+            controller._reap_command_group(process)
+
+        self.assertEqual(process.wait_timeouts, [0.0, 0])
+        self.assertEqual(
+            kill_group.call_args_list,
+            [
+                mock.call(4242, signal.SIGTERM),
+                mock.call(4242, signal.SIGKILL),
+            ],
+        )
+        background_reap.assert_called_once_with(process)
 
 
 class ServiceRuntimeLifecycleTest(unittest.TestCase):

@@ -44,8 +44,14 @@ from .huggingface_credentials import (
     open_huggingface_token_file,
 )
 from .huggingface_model import HuggingFaceClient
+from .http import JsonHttpTransport
+from .lifecycle import format_timestamp, utc_now
 from .proxy import MeteredUnixProxy
-from .runpod_backend import HostClaim, HostClaimRequest
+from .runpod_backend import (
+    ClaimReleaseResult,
+    HostClaim,
+    HostClaimRequest,
+)
 from .runtime_catalog import load_runtime
 from .service_definition import ServiceDefinition
 from .service_deployment import (
@@ -103,6 +109,7 @@ class RunpodHostControlAdapter:
         api: RunpodApi,
         instances: InstanceStore,
         popen_factory: Callable[..., Any] = subprocess.Popen,
+        clock: Callable[[], datetime.datetime] = utc_now,
         monotonic: Callable[[], float] = time.monotonic,
         poll_waiter: Callable[[float], None] = time.sleep,
         ssh_readiness_seconds: float = HOST_SSH_READINESS_SECONDS,
@@ -118,10 +125,11 @@ class RunpodHostControlAdapter:
         self.api = api
         self.instances = instances
         self.popen_factory = popen_factory
+        self.clock = clock
         self.monotonic = monotonic
         self.poll_waiter = poll_waiter
         self.ssh_readiness_seconds = ssh_readiness_seconds
-        self.ssh_probe = ssh_probe or self._probe_ssh
+        self.ssh_probe = ssh_probe
 
     def _call(self, method: str, *arguments: Any, **keywords: Any) -> Any:
         try:
@@ -129,8 +137,31 @@ class RunpodHostControlAdapter:
         except RunpodLocalError as error:
             raise _translate(error) from error
 
-    def acquire(self, request: HostClaimRequest) -> HostClaim:
-        return self._call("acquire", request)
+    def acquire(
+        self,
+        request: HostClaimRequest,
+        *,
+        startup_deadline: float,
+        cleanup_deadline_factory: Callable[[], float] | None = None,
+    ) -> HostClaim:
+        return self._call(
+            "acquire",
+            request,
+            startup_deadline=startup_deadline,
+            cleanup_deadline_factory=cleanup_deadline_factory,
+        )
+
+    def cancel(
+        self,
+        request: HostClaimRequest,
+        *,
+        cleanup_deadline: float | None = None,
+    ) -> None:
+        self._call(
+            "cancel",
+            request,
+            cleanup_deadline=cleanup_deadline,
+        )
 
     @staticmethod
     def _attest_wait_identity(
@@ -149,7 +180,12 @@ class RunpodHostControlAdapter:
                 code="service_host_claim_mismatch",
             )
 
-    def _probe_ssh(self, endpoint: SshEndpoint) -> bool:
+    def _probe_ssh(
+        self,
+        endpoint: SshEndpoint,
+        *,
+        startup_deadline: float,
+    ) -> bool:
         try:
             ensure_known_hosts_file(endpoint.known_hosts_file)
             return (
@@ -161,10 +197,18 @@ class RunpodHostControlAdapter:
                     expected_pod_id=endpoint.pod_id,
                     source="host-ssh-readiness",
                     popen_factory=self.popen_factory,
+                    deadline=startup_deadline,
+                    monotonic=self.monotonic,
                 )
                 == 0
             )
         except RunpodLocalError as error:
+            if error.code == "remote_client_timeout":
+                raise ModelLabError(
+                    "SSH readiness probe exceeded the endpoint startup "
+                    "deadline",
+                    code="service_startup_timeout",
+                ) from error
             raise _translate(error) from error
 
     def wait_ready(
@@ -172,6 +216,7 @@ class RunpodHostControlAdapter:
         claim: HostClaim,
         *,
         renewal_ttl_seconds: int,
+        startup_deadline: float | None = None,
     ) -> HostClaim:
         if (
             not isinstance(renewal_ttl_seconds, int)
@@ -183,14 +228,18 @@ class RunpodHostControlAdapter:
                 code="invalid_host_claim",
             )
         started = self.monotonic()
+        if startup_deadline is None:
+            startup_deadline = started + self.ssh_readiness_seconds
         # One exact provider reconciliation is a 30-second REST request plus a
         # 30-second GraphQL policy attestation. OpenSSH then has a 15-second
         # ConnectTimeout. Stop starting attempts one full allowance early so
         # the final provider observation and handshake stay in the five-minute
         # controller budget.
         probe_deadline = (
-            started
-            + self.ssh_readiness_seconds
+            min(
+                started + self.ssh_readiness_seconds,
+                startup_deadline,
+            )
             - HOST_FINAL_READINESS_ATTEMPT_SECONDS
         )
         renewal_interval = max(1.0, renewal_ttl_seconds / 3)
@@ -198,7 +247,19 @@ class RunpodHostControlAdapter:
         current = claim
         last_observation = "provider SSH routing is not populated"
         while True:
-            observed = self.get(current.host_name, current.claim_id)
+            remaining = probe_deadline - self.monotonic()
+            if remaining <= 0:
+                raise ModelLabError(
+                    "RunPod host did not become SSH-ready within the shared "
+                    "service startup budget: "
+                    f"{last_observation}",
+                    code="service_host_ssh_not_ready",
+                )
+            observed = self.get(
+                current.host_name,
+                current.claim_id,
+                startup_deadline=startup_deadline,
+            )
             self._attest_wait_identity(claim, observed)
             current = observed
             now = self.monotonic()
@@ -208,6 +269,7 @@ class RunpodHostControlAdapter:
                     current.claim_id,
                     current.generation,
                     renewal_ttl_seconds,
+                    startup_deadline=startup_deadline,
                 )
                 self._attest_wait_identity(claim, current)
                 next_renewal = now + renewal_interval
@@ -217,6 +279,8 @@ class RunpodHostControlAdapter:
                     instances=self.instances,
                     api=self.api,
                     state=self.runpod_state,
+                    deadline=startup_deadline,
+                    monotonic=self.monotonic,
                 )
             except RunpodLocalError as error:
                 if error.code != "pod_not_ready":
@@ -231,20 +295,38 @@ class RunpodHostControlAdapter:
                         "resolved SSH endpoint differs from the exact host claim",
                         code="service_host_claim_mismatch",
                     )
-                if self.ssh_probe(endpoint):
+                ssh_ready = (
+                    self._probe_ssh(
+                        endpoint,
+                        startup_deadline=startup_deadline,
+                    )
+                    if self.ssh_probe is None
+                    else self.ssh_probe(endpoint)
+                )
+                if ssh_ready:
                     observed = self.get(
                         current.host_name,
                         current.claim_id,
+                        startup_deadline=startup_deadline,
                     )
                     self._attest_wait_identity(current, observed)
-                    return observed
+                    current = observed
+                    if self.monotonic() >= next_renewal:
+                        current = self.renew(
+                            current.host_name,
+                            current.claim_id,
+                            current.generation,
+                            renewal_ttl_seconds,
+                            startup_deadline=startup_deadline,
+                        )
+                        self._attest_wait_identity(claim, current)
+                    return current
                 last_observation = "SSH endpoint did not accept /usr/bin/true"
             remaining = probe_deadline - self.monotonic()
             if remaining <= 0:
                 raise ModelLabError(
-                    "RunPod host did not become SSH-ready for the exact "
-                    f"claimed operation within "
-                    f"{self.ssh_readiness_seconds:g} seconds: "
+                    "RunPod host did not become SSH-ready within the shared "
+                    "service startup budget: "
                     f"{last_observation}",
                     code="service_host_ssh_not_ready",
                 )
@@ -259,6 +341,9 @@ class RunpodHostControlAdapter:
         claim_id: str,
         expected_generation: int,
         renewal_ttl_seconds: int,
+        *,
+        startup_deadline: float | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> HostClaim:
         return self._call(
             "renew",
@@ -266,6 +351,8 @@ class RunpodHostControlAdapter:
             claim_id,
             expected_generation,
             renewal_ttl_seconds,
+            startup_deadline=startup_deadline,
+            cancel_event=cancel_event,
         )
 
     def release(
@@ -275,17 +362,62 @@ class RunpodHostControlAdapter:
         expected_generation: int,
         *,
         now: bool = False,
-    ) -> Any:
-        return self._call(
+        cleanup_deadline: float | None = None,
+    ) -> ClaimReleaseResult:
+        released = self._call(
             "release",
             host_name,
             claim_id,
             expected_generation,
             now=now,
+            cleanup_deadline=cleanup_deadline,
+        )
+        if (
+            getattr(released, "host_name", None) != host_name
+            or getattr(released, "claim_id", None) != claim_id
+            or getattr(released, "released_generation", None)
+            != expected_generation
+            or isinstance(
+                getattr(released, "remaining_claim_count", None),
+                bool,
+            )
+            or not isinstance(
+                getattr(released, "remaining_claim_count", None),
+                int,
+            )
+            or released.remaining_claim_count < 0
+            or not isinstance(getattr(released, "retention", None), str)
+            or (
+                getattr(released, "retire_at", None) is not None
+                and not isinstance(released.retire_at, str)
+            )
+        ):
+            raise ModelLabError(
+                "generic RunPod claim release returned a mismatched result",
+                code="host_claim_release_mismatch",
+            )
+        return ClaimReleaseResult(
+            host_name=host_name,
+            claim_id=claim_id,
+            released=True,
+            final_claim=released.remaining_claim_count == 0,
+            retirement=released.retention,
+            empty_deadline=released.retire_at,
         )
 
-    def get(self, host_name: str, claim_id: str) -> HostClaim:
-        return self._call("get", host_name, claim_id)
+    def get(
+        self,
+        host_name: str,
+        claim_id: str,
+        *,
+        startup_deadline: float | None = None,
+    ) -> HostClaim:
+        return self._call(
+            "get",
+            host_name,
+            claim_id,
+            startup_deadline=startup_deadline,
+        )
 
     def list(self, host_name: str | None = None) -> Any:
         return self._call("list", host_name)
@@ -329,6 +461,7 @@ class ProductionModelServiceBackend:
         installations: ServiceInstallationStore,
         popen_factory: Callable[..., Any] = subprocess.Popen,
         monotonic: Callable[[], float] = time.monotonic,
+        clock: Callable[[], datetime.datetime] | None = None,
         poll_waiter: Callable[[float], None] = time.sleep,
     ) -> None:
         self.source_root = source_root
@@ -341,29 +474,66 @@ class ProductionModelServiceBackend:
         self.installations = installations
         self.popen_factory = popen_factory
         self.monotonic = monotonic
+        self.clock = clock or (
+            lambda: datetime.datetime.now(datetime.timezone.utc)
+        )
         self.poll_waiter = poll_waiter
         self._transport_lock = threading.Lock()
         self._transports: dict[str, _LiveTransport] = {}
 
-    def _endpoint_for_claim(self, claim: HostClaim) -> SshEndpoint:
+    def _require_startup_budget(self, deadline: float | None) -> None:
+        if deadline is not None and self.monotonic() >= deadline:
+            raise ModelLabError(
+                "service exceeded its absolute endpoint startup deadline",
+                code="service_startup_timeout",
+            )
+
+    def _remote_startup_expiration(
+        self,
+        deadline: float | None,
+    ) -> str | None:
+        if deadline is None:
+            return None
+        remaining = deadline - self.monotonic()
+        if remaining <= 0:
+            self._require_startup_budget(deadline)
+            raise AssertionError("expired startup deadline was accepted")
+        return format_timestamp(
+            self.clock() + datetime.timedelta(seconds=remaining)
+        )
+
+    def _endpoint_for_claim(
+        self,
+        claim: HostClaim,
+        *,
+        startup_deadline: float | None = None,
+    ) -> SshEndpoint:
+        self._require_startup_budget(startup_deadline)
         try:
             self.instances.check_active_lease(
                 claim.host_name,
-                now=datetime.datetime.now(datetime.timezone.utc),
+                now=self.clock(),
                 expected_operation_id=claim.operation_id,
                 expected_pod_id=claim.provider_resource_id,
+                deadline=startup_deadline,
+                monotonic=self.monotonic,
             )
             endpoint = resolve_endpoint(
                 claim.host_name,
                 instances=self.instances,
                 api=self.api,
                 state=self.runpod_state,
+                deadline=startup_deadline,
+                monotonic=self.monotonic,
             )
+            self._require_startup_budget(startup_deadline)
             record = self.instances.check_active_lease(
                 claim.host_name,
-                now=datetime.datetime.now(datetime.timezone.utc),
+                now=self.clock(),
                 expected_operation_id=claim.operation_id,
                 expected_pod_id=claim.provider_resource_id,
+                deadline=startup_deadline,
+                monotonic=self.monotonic,
             )
         except RunpodLocalError as error:
             raise _translate(error) from error
@@ -387,13 +557,17 @@ class ProductionModelServiceBackend:
         self,
         endpoint: SshEndpoint,
         runtime_image: str,
+        *,
+        startup_deadline: float | None,
     ) -> None:
         try:
             record = self.instances.check_active_lease(
                 endpoint.instance_name,
-                now=datetime.datetime.now(datetime.timezone.utc),
+                now=self.clock(),
                 expected_operation_id=endpoint.operation_id,
                 expected_pod_id=endpoint.pod_id,
+                deadline=startup_deadline,
+                monotonic=self.monotonic,
             )
         except RunpodLocalError as error:
             raise _translate(error) from error
@@ -406,13 +580,36 @@ class ProductionModelServiceBackend:
                 code="service_runtime_host_image_mismatch",
             )
 
-    def _resolve_closure(self, service: ServiceDefinition) -> Any:
+    def _resolve_closure(
+        self,
+        service: ServiceDefinition,
+        *,
+        startup_deadline: float | None,
+    ) -> Any:
+        self._require_startup_budget(startup_deadline)
         token = configured_huggingface_token()
         client = HuggingFaceClient(
             cache=JsonCache(self.state_root / "cache" / "huggingface-metadata"),
             token=token,
+            transport=JsonHttpTransport(
+                deadline=startup_deadline,
+                monotonic=self.monotonic,
+            ),
         )
-        closure = resolve_huggingface_closure(service, client=client)
+        try:
+            closure = resolve_huggingface_closure(service, client=client)
+        except BaseException as error:
+            if (
+                startup_deadline is not None
+                and self.monotonic() >= startup_deadline
+            ):
+                raise ModelLabError(
+                    "Hugging Face metadata resolution exceeded the absolute "
+                    "service startup deadline",
+                    code="service_startup_timeout",
+                ) from error
+            raise
+        self._require_startup_budget(startup_deadline)
         write_huggingface_closure(
             default_huggingface_closure_path(self.state_root, closure),
             closure,
@@ -423,6 +620,8 @@ class ProductionModelServiceBackend:
         self,
         service: ServiceDefinition,
         claim: HostClaim,
+        *,
+        startup_deadline: float | None,
     ) -> tuple[MaterializedService, pathlib.Path]:
         try:
             remote_port = claim.endpoints["openai"]
@@ -432,7 +631,10 @@ class ProductionModelServiceBackend:
                 code="service_host_claim_mismatch",
             ) from error
         runtime = load_runtime(service.runtime_id)
-        closure = self._resolve_closure(service)
+        closure = self._resolve_closure(
+            service,
+            startup_deadline=startup_deadline,
+        )
         plan = build_service_materialization_plan(
             service,
             source_root=self.source_root,
@@ -441,7 +643,9 @@ class ProductionModelServiceBackend:
             closure=closure,
             remote_port=remote_port,
         )
-        return materialize_service(plan), plan.installer_path
+        materialized = materialize_service(plan)
+        self._require_startup_budget(startup_deadline)
+        return materialized, plan.installer_path
 
     @staticmethod
     def _installation_matches(
@@ -470,13 +674,23 @@ class ProductionModelServiceBackend:
         claim: HostClaim,
         *,
         deployment_id: str,
+        startup_deadline: float | None = None,
     ) -> PreparedService:
-        endpoint = self._endpoint_for_claim(claim)
+        self._require_startup_budget(startup_deadline)
+        endpoint = self._endpoint_for_claim(
+            claim,
+            startup_deadline=startup_deadline,
+        )
         runtime = load_runtime(service.runtime_id)
-        self._attest_runtime_image(endpoint, runtime.image)
+        self._attest_runtime_image(
+            endpoint,
+            runtime.image,
+            startup_deadline=startup_deadline,
+        )
         materialization, installer_path = self._desired_materialization(
             service,
             claim,
+            startup_deadline=startup_deadline,
         )
         installed: InstalledService | None
         try:
@@ -505,14 +719,25 @@ class ProductionModelServiceBackend:
                     resolved_endpoint=endpoint,
                     instances=self.instances,
                     popen_factory=self.popen_factory,
+                    deadline=startup_deadline,
+                    monotonic=self.monotonic,
                 )
                 installed, _ = self.installations.publish(
                     materialization=materialization,
                     endpoint=endpoint,
                     instances=self.instances,
+                    deadline=startup_deadline,
+                    monotonic=self.monotonic,
                 )
-            except RunpodLocalError as error:
+            except (ModelLabError, RunpodLocalError) as error:
+                if error.code == "remote_client_timeout":
+                    raise ModelLabError(
+                        "service installation exceeded the endpoint startup "
+                        "deadline",
+                        code="service_startup_timeout",
+                    ) from error
                 raise _translate(error) from error
+        self._require_startup_budget(startup_deadline)
         if installed is None:
             raise AssertionError("successful service installation is absent")
         return PreparedService(
@@ -526,9 +751,19 @@ class ProductionModelServiceBackend:
     def _context(
         self,
         prepared: PreparedService,
+        *,
+        startup_deadline: float | None = None,
     ) -> tuple[HostClaim, SshEndpoint, InstalledService]:
-        claim = self.hosts.get(prepared.host_name, prepared.claim_id)
-        endpoint = self._endpoint_for_claim(claim)
+        self._require_startup_budget(startup_deadline)
+        claim = self.hosts.get(
+            prepared.host_name,
+            prepared.claim_id,
+            startup_deadline=startup_deadline,
+        )
+        endpoint = self._endpoint_for_claim(
+            claim,
+            startup_deadline=startup_deadline,
+        )
         try:
             installed = self.installations.load(
                 instance_name=endpoint.instance_name,
@@ -554,7 +789,10 @@ class ProductionModelServiceBackend:
         service: ServiceDefinition,
         claim: HostClaim,
         deployment: Any,
+        *,
+        startup_deadline: float | None = None,
     ) -> PreparedService:
+        self._require_startup_budget(startup_deadline)
         if (
             claim.host_name != deployment.host_name
             or claim.claim_id != deployment.claim_id
@@ -570,7 +808,11 @@ class ProductionModelServiceBackend:
             claim_id=claim.claim_id,
             handle="",
         )
-        endpoint = self._endpoint_for_claim(claim)
+        endpoint = self._endpoint_for_claim(
+            claim,
+            startup_deadline=startup_deadline,
+        )
+        self._require_startup_budget(startup_deadline)
         try:
             installed = self.installations.load(
                 instance_name=endpoint.instance_name,
@@ -590,7 +832,12 @@ class ProductionModelServiceBackend:
                 code="service_installation_changed",
             )
         runtime = load_runtime(service.runtime_id)
-        self._attest_runtime_image(endpoint, runtime.image)
+        self._attest_runtime_image(
+            endpoint,
+            runtime.image,
+            startup_deadline=startup_deadline,
+        )
+        self._require_startup_budget(startup_deadline)
         return dataclasses.replace(
             prepared,
             handle=installed.materialization.materialization_sha256,
@@ -604,8 +851,14 @@ class ProductionModelServiceBackend:
         source: str,
         stdin: Any = None,
         accepted_return_codes: tuple[int, ...] = (0,),
+        startup_deadline: float | None = None,
     ) -> int:
-        _, endpoint, _ = self._context(prepared)
+        self._require_startup_budget(startup_deadline)
+        _, endpoint, _ = self._context(
+            prepared,
+            startup_deadline=startup_deadline,
+        )
+        self._require_startup_budget(startup_deadline)
         try:
             ensure_known_hosts_file(endpoint.known_hosts_file)
             return_code = run_with_activity(
@@ -617,8 +870,16 @@ class ProductionModelServiceBackend:
                 source=source,
                 stdin=stdin,
                 popen_factory=self.popen_factory,
+                deadline=startup_deadline,
+                monotonic=self.monotonic,
             )
         except RunpodLocalError as error:
+            if error.code == "remote_client_timeout":
+                raise ModelLabError(
+                    "remote Hugging Face action exceeded the endpoint startup "
+                    "deadline",
+                    code="service_startup_timeout",
+                ) from error
             raise _translate(error) from error
         if return_code not in accepted_return_codes:
             raise ModelLabError(
@@ -627,14 +888,23 @@ class ProductionModelServiceBackend:
             )
         return return_code
 
-    def push_huggingface_credential(self, prepared: PreparedService) -> None:
+    def push_huggingface_credential(
+        self,
+        prepared: PreparedService,
+        *,
+        startup_deadline: float | None = None,
+    ) -> None:
         if configured_huggingface_token() is None:
-            self.clear_huggingface_credential(prepared)
+            self.clear_huggingface_credential(
+                prepared,
+                startup_deadline=startup_deadline,
+            )
             return
         self._run_remote_hf(
             prepared,
             build_remote_hf_probe_argv(),
             source="service-hf-probe",
+            startup_deadline=startup_deadline,
         )
         with open_huggingface_token_file() as token:
             self._run_remote_hf(
@@ -642,14 +912,21 @@ class ProductionModelServiceBackend:
                 build_remote_hf_credential_argv("push"),
                 source="service-hf-push",
                 stdin=token,
+                startup_deadline=startup_deadline,
             )
 
-    def clear_huggingface_credential(self, prepared: PreparedService) -> None:
+    def clear_huggingface_credential(
+        self,
+        prepared: PreparedService,
+        *,
+        startup_deadline: float | None = None,
+    ) -> None:
         self._run_remote_hf(
             prepared,
             build_remote_hf_credential_argv("clear"),
             source="service-hf-clear",
             accepted_return_codes=(0, 3),
+            startup_deadline=startup_deadline,
         )
 
     def execute(
@@ -658,8 +935,14 @@ class ProductionModelServiceBackend:
         action: str,
         *,
         cache_mode: str | None = None,
+        startup_deadline: float | None = None,
     ) -> dict[str, Any]:
-        _, endpoint, installed = self._context(prepared)
+        self._require_startup_budget(startup_deadline)
+        _, endpoint, installed = self._context(
+            prepared,
+            startup_deadline=startup_deadline,
+        )
+        self._require_startup_budget(startup_deadline)
         try:
             result = execute_service_runtime_capture(
                 build_service_runtime_plan(
@@ -667,10 +950,15 @@ class ProductionModelServiceBackend:
                     endpoint=endpoint,
                     action=action,
                     cache_mode=cache_mode,
+                    startup_expires_at=self._remote_startup_expiration(
+                        startup_deadline
+                    ),
                 ),
                 resolved_endpoint=endpoint,
                 instances=self.instances,
                 popen_factory=self.popen_factory,
+                deadline=startup_deadline,
+                monotonic=self.monotonic,
             )
         except RunpodLocalError as error:
             raise _translate(error) from error
@@ -681,8 +969,17 @@ class ProductionModelServiceBackend:
             )
         return result
 
-    def inspect_cache(self, prepared: PreparedService) -> str:
-        result = self.execute(prepared, "cache-status")
+    def inspect_cache(
+        self,
+        prepared: PreparedService,
+        *,
+        startup_deadline: float | None = None,
+    ) -> str:
+        result = self.execute(
+            prepared,
+            "cache-status",
+            startup_deadline=startup_deadline,
+        )
         state = result.get("state")
         if (
             result.get("schema_version")
@@ -708,9 +1005,13 @@ class ProductionModelServiceBackend:
         )
 
     @staticmethod
-    def _socket_accepting(path: pathlib.Path) -> bool:
+    def _socket_accepting(
+        path: pathlib.Path,
+        *,
+        timeout_seconds: float = 0.25,
+    ) -> bool:
         probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        probe.settimeout(0.25)
+        probe.settimeout(timeout_seconds)
         try:
             probe.connect(os.fspath(path))
             return True
@@ -740,8 +1041,14 @@ class ProductionModelServiceBackend:
         prepared: PreparedService,
         *,
         completed: Any,
+        startup_deadline: float | None,
     ) -> TransportBinding:
-        claim, endpoint, installed = self._context(prepared)
+        self._require_startup_budget(startup_deadline)
+        claim, endpoint, installed = self._context(
+            prepared,
+            startup_deadline=startup_deadline,
+        )
+        self._require_startup_budget(startup_deadline)
         upstream_path, public_path = self._transport_paths(prepared)
         tunnel: Any | None = None
         proxy: MeteredUnixProxy | None = None
@@ -762,43 +1069,70 @@ class ProductionModelServiceBackend:
                 stderr=subprocess.DEVNULL,
             )
             deadline = self.monotonic() + TUNNEL_START_SECONDS
-            while not self._socket_accepting(upstream_path):
+            if startup_deadline is not None:
+                deadline = min(deadline, startup_deadline)
+            while True:
+                remaining = deadline - self.monotonic()
+                if remaining <= 0:
+                    self._raise_transport_start_timeout(
+                        deadline=deadline,
+                        startup_deadline=startup_deadline,
+                    )
+                accepting = self._socket_accepting(
+                    upstream_path,
+                    timeout_seconds=min(0.25, remaining),
+                )
+                if self.monotonic() >= deadline:
+                    self._raise_transport_start_timeout(
+                        deadline=deadline,
+                        startup_deadline=startup_deadline,
+                    )
+                if accepting:
+                    break
                 if tunnel.poll() is not None:
                     raise ModelLabError(
                         "SSH inference tunnel exited before becoming ready",
                         code="service_transport_start_failed",
                     )
-                if self.monotonic() >= deadline:
-                    raise ModelLabError(
-                        "SSH inference tunnel did not become ready",
-                        code="service_transport_start_failed",
+                remaining = deadline - self.monotonic()
+                if remaining <= 0:
+                    self._raise_transport_start_timeout(
+                        deadline=deadline,
+                        startup_deadline=startup_deadline,
                     )
-                self.poll_waiter(TUNNEL_POLL_SECONDS)
+                self.poll_waiter(min(TUNNEL_POLL_SECONDS, remaining))
+            self._require_startup_budget(startup_deadline)
             self.instances.touch(
                 endpoint.instance_name,
-                now=datetime.datetime.now(datetime.timezone.utc),
+                now=self.clock(),
                 source="service-transport-open",
                 expected_operation_id=endpoint.operation_id,
                 expected_pod_id=endpoint.pod_id,
+                deadline=startup_deadline,
+                monotonic=self.monotonic,
             )
+            self._require_startup_budget(startup_deadline)
             proxy = MeteredUnixProxy(
                 listen_path=public_path,
                 upstream_path=upstream_path,
                 completed=completed,
             )
             proxy.bind()
+            self._require_startup_budget(startup_deadline)
             proxy_thread = threading.Thread(
                 target=proxy.serve,
                 name=f"model-lab-proxy-{prepared.service_id}",
                 daemon=True,
             )
             proxy_thread.start()
+            self._require_startup_budget(startup_deadline)
             upstream_device, upstream_inode = self._bound_socket_identity(
                 upstream_path
             )
             public_device, public_inode = self._bound_socket_identity(
                 public_path
             )
+            self._require_startup_budget(startup_deadline)
             binding = TransportBinding(
                 socket_path=str(public_path),
                 handle=(
@@ -832,14 +1166,25 @@ class ProductionModelServiceBackend:
             cleanup_errors: list[str] = []
             if proxy is not None:
                 try:
-                    proxy.close()
+                    remaining = self._remaining_startup_cleanup(startup_deadline)
+                    if remaining is None:
+                        proxy.close()
+                    else:
+                        proxy.close(timeout_seconds=remaining)
                     if proxy_thread is not None:
-                        proxy_thread.join()
+                        remaining = self._remaining_startup_cleanup(startup_deadline)
+                        proxy_thread.join(remaining)
                 except Exception as error:
                     cleanup_errors.append(f"proxy={error}")
             if tunnel is not None:
                 try:
-                    self._reap_tunnel(tunnel)
+                    remaining = self._remaining_startup_cleanup(startup_deadline)
+                    self._reap_tunnel(
+                        tunnel,
+                        wait_timeout_seconds=(
+                            5.0 if remaining is None else min(5.0, remaining)
+                        ),
+                    )
                 except Exception as error:
                     cleanup_errors.append(f"tunnel={error}")
             for label, path in (
@@ -866,16 +1211,26 @@ class ProductionModelServiceBackend:
         prepared: PreparedService,
         *,
         completed: Any,
+        startup_deadline: float | None = None,
     ) -> TransportBinding:
-        return self._start_transport(prepared, completed=completed)
+        return self._start_transport(
+            prepared,
+            completed=completed,
+            startup_deadline=startup_deadline,
+        )
 
     def restore_transport(
         self,
         prepared: PreparedService,
         *,
         completed: Any,
+        startup_deadline: float | None = None,
     ) -> TransportBinding:
-        return self._start_transport(prepared, completed=completed)
+        return self._start_transport(
+            prepared,
+            completed=completed,
+            startup_deadline=startup_deadline,
+        )
 
     def transport_is_live(
         self,
@@ -917,17 +1272,62 @@ class ProductionModelServiceBackend:
                 return False
         return True
 
+    def _raise_transport_start_timeout(
+        self,
+        *,
+        deadline: float,
+        startup_deadline: float | None,
+    ) -> None:
+        if startup_deadline is not None and deadline == startup_deadline:
+            raise ModelLabError(
+                "SSH inference tunnel exceeded the endpoint startup deadline",
+                code="service_startup_timeout",
+            )
+        raise ModelLabError(
+            "SSH inference tunnel did not become ready",
+            code="service_transport_start_failed",
+        )
+
+    def _remaining_startup_cleanup(
+        self,
+        startup_deadline: float | None,
+    ) -> float | None:
+        if startup_deadline is None:
+            return None
+        return max(0.0, startup_deadline - self.monotonic())
+
     @staticmethod
-    def _reap_tunnel(tunnel: Any) -> None:
+    def _background_reap_tunnel(tunnel: Any) -> None:
+        def reap() -> None:
+            try:
+                tunnel.wait()
+            except BaseException:
+                return
+
+        threading.Thread(target=reap, daemon=True).start()
+
+    @classmethod
+    def _reap_tunnel(
+        cls,
+        tunnel: Any,
+        *,
+        wait_timeout_seconds: float = 5.0,
+    ) -> None:
         if tunnel.poll() is not None:
-            tunnel.wait()
+            try:
+                tunnel.wait(timeout=0)
+            except subprocess.TimeoutExpired:
+                cls._background_reap_tunnel(tunnel)
             return
         tunnel.terminate()
         try:
-            tunnel.wait(timeout=5)
+            tunnel.wait(timeout=max(0.0, wait_timeout_seconds))
         except subprocess.TimeoutExpired:
             tunnel.kill()
-            tunnel.wait()
+            try:
+                tunnel.wait(timeout=0)
+            except subprocess.TimeoutExpired:
+                cls._background_reap_tunnel(tunnel)
 
     def _remove_stale_socket(self, path: pathlib.Path) -> None:
         try:
@@ -939,6 +1339,8 @@ class ProductionModelServiceBackend:
         self,
         prepared: PreparedService,
         transport: TransportBinding | None,
+        *,
+        startup_deadline: float | None = None,
     ) -> None:
         with self._transport_lock:
             live = self._transports.get(prepared.deployment_id)
@@ -947,12 +1349,30 @@ class ProductionModelServiceBackend:
             if transport is not None and live.binding != transport:
                 cleanup_errors.append("binding identity changed")
             try:
-                live.proxy.close()
-                live.proxy_thread.join()
+                remaining = self._remaining_startup_cleanup(startup_deadline)
+                workers_closed = live.proxy.close(
+                    timeout_seconds=remaining,
+                )
+                if not workers_closed:
+                    cleanup_errors.append(
+                        "proxy workers did not close before the cleanup deadline"
+                    )
+                remaining = self._remaining_startup_cleanup(startup_deadline)
+                live.proxy_thread.join(remaining)
+                if live.proxy_thread.is_alive():
+                    cleanup_errors.append(
+                        "proxy listener did not close before the cleanup deadline"
+                    )
             except Exception as error:
                 cleanup_errors.append(f"proxy={error}")
             try:
-                self._reap_tunnel(live.tunnel)
+                remaining = self._remaining_startup_cleanup(startup_deadline)
+                self._reap_tunnel(
+                    live.tunnel,
+                    wait_timeout_seconds=(
+                        5.0 if remaining is None else min(5.0, remaining)
+                    ),
+                )
             except Exception as error:
                 cleanup_errors.append(f"tunnel={error}")
         upstream_path, public_path = self._transport_paths(prepared)
@@ -983,8 +1403,16 @@ class ProductionModelServiceBackend:
 class ServiceEndpointPublisher:
     """Publish live admission offers and separately inspect cleanup state."""
 
-    def __init__(self, runtime_root: pathlib.Path) -> None:
+    def __init__(
+        self,
+        runtime_root: pathlib.Path,
+        *,
+        clock: Callable[[], datetime.datetime] = utc_now,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.runtime_root = runtime_root
+        self.clock = clock
+        self.monotonic = monotonic
 
     @staticmethod
     def _translate_model_session(error: ModelSessionError) -> ModelLabError:
@@ -996,6 +1424,8 @@ class ServiceEndpointPublisher:
         transport: TransportBinding,
         *,
         ttl_seconds: int,
+        startup_deadline: float | None = None,
+        deadline_error_code: str = "service_startup_timeout",
     ) -> Any:
         try:
             return publish_service_endpoint(
@@ -1006,26 +1436,46 @@ class ServiceEndpointPublisher:
                 ttl_seconds=ttl_seconds,
                 socket_path=transport.socket_path,
                 runtime_root=self.runtime_root,
+                deadline=startup_deadline,
+                monotonic=self.monotonic,
+                deadline_error_code=deadline_error_code,
             )
         except ModelSessionError as error:
             raise self._translate_model_session(error) from error
 
-    def inspect(self, service: ServiceDefinition) -> Any | None:
+    def inspect(
+        self,
+        service: ServiceDefinition,
+        *,
+        startup_deadline: float | None = None,
+        deadline_error_code: str = "service_startup_timeout",
+    ) -> Any | None:
         try:
             return inspect_service_publication(
                 service.service_id,
                 runtime_root=self.runtime_root,
+                deadline=startup_deadline,
+                monotonic=self.monotonic,
+                deadline_error_code=deadline_error_code,
             )
         except ModelSessionError as error:
             raise self._translate_model_session(error) from error
 
-    def load(self, service: ServiceDefinition) -> Any | None:
-        endpoint = self.inspect(service)
+    def load(
+        self,
+        service: ServiceDefinition,
+        *,
+        startup_deadline: float | None = None,
+        deadline_error_code: str = "service_startup_timeout",
+    ) -> Any | None:
+        endpoint = self.inspect(
+            service,
+            startup_deadline=startup_deadline,
+            deadline_error_code=deadline_error_code,
+        )
         if endpoint is None:
             return None
-        if endpoint.admission_expires_at <= datetime.datetime.now(
-            datetime.timezone.utc
-        ):
+        if endpoint.admission_expires_at <= self.clock():
             return None
         try:
             metadata = endpoint.socket_path.stat()
@@ -1039,12 +1489,21 @@ class ServiceEndpointPublisher:
             return None
         return endpoint
 
-    def revoke(self, endpoint: Any) -> None:
+    def revoke(
+        self,
+        endpoint: Any,
+        *,
+        startup_deadline: float | None = None,
+        deadline_error_code: str = "service_startup_timeout",
+    ) -> None:
         try:
             revoke_service_endpoint(
                 endpoint.binding.service_id,
                 endpoint.publication_id,
                 runtime_root=self.runtime_root,
+                deadline=startup_deadline,
+                monotonic=self.monotonic,
+                deadline_error_code=deadline_error_code,
             )
         except ModelSessionError as error:
             if error.code == "service_endpoint_missing":

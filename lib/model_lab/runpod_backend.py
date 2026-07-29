@@ -8,6 +8,8 @@ models, Hugging Face, vLLM, caches, and inference endpoints.
 from __future__ import annotations
 
 import dataclasses
+import threading
+from collections.abc import Callable
 from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
 from .errors import ModelLabError
@@ -29,6 +31,8 @@ class HostClaimRequest:
     ephemeral_disk_bytes: int
     endpoint_names: tuple[str, ...]
     minimum_remaining_seconds: int
+    acquisition_timeout_seconds: int
+    acquisition_expires_at: str | None
     renewal_ttl_seconds: int
     new_host_hard_ttl_seconds: int
     new_host_retention: str
@@ -95,18 +99,32 @@ class ClaimReleaseResult:
 class HostControl(Protocol):
     """Duck-typed generic host facade supplied by ``runpod_local``."""
 
-    def acquire(self, request: HostClaimRequest) -> HostClaim: ...
+    def acquire(
+        self,
+        request: HostClaimRequest,
+        *,
+        startup_deadline: float,
+        cleanup_deadline_factory: Callable[[], float] | None = None,
+    ) -> HostClaim: ...
 
     def wait_ready(
         self,
         claim: HostClaim,
         *,
         renewal_ttl_seconds: int,
+        startup_deadline: float,
     ) -> HostClaim:
         """Attest provider routing and SSH for the exact claimed operation."""
         ...
 
     def find(self, request: HostClaimRequest) -> HostClaim | None: ...
+
+    def cancel(
+        self,
+        request: HostClaimRequest,
+        *,
+        cleanup_deadline: float | None = None,
+    ) -> None: ...
 
     def renew(
         self,
@@ -114,6 +132,9 @@ class HostControl(Protocol):
         claim_id: str,
         expected_generation: int,
         renewal_ttl_seconds: int,
+        *,
+        startup_deadline: float | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> HostClaim: ...
 
     def release(
@@ -123,9 +144,16 @@ class HostControl(Protocol):
         expected_generation: int,
         *,
         now: bool = False,
+        cleanup_deadline: float | None = None,
     ) -> ClaimReleaseResult: ...
 
-    def get(self, host_name: str, claim_id: str) -> HostClaim: ...
+    def get(
+        self,
+        host_name: str,
+        claim_id: str,
+        *,
+        startup_deadline: float | None = None,
+    ) -> HostClaim: ...
 
     def list(self, host_name: str | None = None) -> Sequence[HostClaim]: ...
 

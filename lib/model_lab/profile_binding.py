@@ -5,11 +5,14 @@ from __future__ import annotations
 import dataclasses
 import fcntl
 import json
+import math
 import os
 import pathlib
 import re
 import secrets
 import stat
+import time
+from collections.abc import Callable
 from typing import Any, Protocol
 
 from .documents import canonical_json_bytes, read_owned_regular_file
@@ -21,6 +24,7 @@ PROFILE_BINDING_SCHEMA = "model-lab.profile-binding.v1"
 PROFILE_BINDING_FILE_NAME = "service-binding.json"
 _IDENTIFIER = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+LOCK_POLL_SECONDS = 0.05
 
 
 class ProfileRoute(Protocol):
@@ -116,6 +120,9 @@ class ProfileBindingStore:
         self,
         profile: ProfileRoute,
         service: ServiceDefinition,
+        *,
+        startup_deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> ProfileBinding:
         if profile.service_id != service.service_id:
             raise ModelLabError(
@@ -130,9 +137,63 @@ class ProfileBindingStore:
         directory = self.path(profile.profile_id).parent
         descriptor = self._open_profile_directory(directory)
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            if (
+                startup_deadline is not None
+                and (
+                    isinstance(startup_deadline, bool)
+                    or not isinstance(startup_deadline, (int, float))
+                    or not math.isfinite(float(startup_deadline))
+                )
+            ):
+                raise ModelLabError(
+                    "profile-binding startup deadline must be finite",
+                    code="invalid_profile_binding",
+                )
+            if startup_deadline is not None:
+                startup_deadline = float(startup_deadline)
+            while True:
+                remaining_seconds: float | None = None
+                if startup_deadline is not None:
+                    remaining_seconds = startup_deadline - monotonic()
+                    if remaining_seconds <= 0:
+                        raise ModelLabError(
+                            "profile binding exceeded the service startup "
+                            "deadline",
+                            code="service_startup_timeout",
+                        )
+                try:
+                    fcntl.flock(
+                        descriptor,
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
+                    break
+                except BlockingIOError:
+                    wait_seconds = LOCK_POLL_SECONDS
+                    if remaining_seconds is not None:
+                        wait_seconds = min(
+                            wait_seconds,
+                            remaining_seconds,
+                        )
+                    time.sleep(wait_seconds)
+            if (
+                startup_deadline is not None
+                and monotonic() >= startup_deadline
+            ):
+                raise ModelLabError(
+                    "profile binding exceeded the service startup deadline",
+                    code="service_startup_timeout",
+                )
             current = self.load(profile.profile_id)
             if current is None:
+                if (
+                    startup_deadline is not None
+                    and monotonic() >= startup_deadline
+                ):
+                    raise ModelLabError(
+                        "profile binding exceeded the service startup "
+                        "deadline",
+                        code="service_startup_timeout",
+                    )
                 self._publish(descriptor, directory, expected)
                 current = self.load(profile.profile_id)
             if current != expected:

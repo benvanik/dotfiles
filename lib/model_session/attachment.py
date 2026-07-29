@@ -17,12 +17,14 @@ import datetime
 import fcntl
 import hashlib
 import json
+import math
 import os
 import pathlib
 import re
 import secrets
 import socket
 import stat
+import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any
@@ -38,6 +40,7 @@ SERVICE_WORKLOAD_SCHEMA = "model-lab.inference-workload.v1"
 MAX_ATTACHMENT_BYTES = 64 * 1024
 MAX_ATTACHMENT_TTL_SECONDS = 24 * 60 * 60
 SOCKET_CONNECT_TIMEOUT_SECONDS = 1.0
+ATTACHMENT_LOCK_POLL_SECONDS = 0.05
 DEFAULT_RUNTIME_DIRECTORY_NAME = "model-session"
 BOOT_ID_PATH = pathlib.Path("/proc/sys/kernel/random/boot_id")
 
@@ -673,7 +676,21 @@ def _attachment_lock(
     *,
     exclusive: bool,
     create: bool,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+    deadline_error_code: str = "inference_attachment_lock_timeout",
 ) -> Iterator[None]:
+    if deadline is not None and (
+        isinstance(deadline, bool)
+        or not isinstance(deadline, (int, float))
+        or not math.isfinite(float(deadline))
+    ):
+        _fail(
+            "inference attachment lock deadline must be finite",
+            code="invalid_inference_attachment_state",
+        )
+    if deadline is not None:
+        deadline = float(deadline)
     if directories.locks_descriptor is None:
         _fail(
             "inference attachment lock directory is missing",
@@ -693,8 +710,34 @@ def _attachment_lock(
             os.fsync(descriptor)
             os.fsync(directories.locks_descriptor)
         operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
-        fcntl.flock(descriptor, operation)
-        locked = True
+        if deadline is None:
+            fcntl.flock(descriptor, operation)
+            locked = True
+        else:
+            while True:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    _fail(
+                        "inference attachment lock exceeded its absolute "
+                        "deadline",
+                        code=deadline_error_code,
+                    )
+                try:
+                    fcntl.flock(
+                        descriptor,
+                        operation | fcntl.LOCK_NB,
+                    )
+                    locked = True
+                    break
+                except BlockingIOError:
+                    time.sleep(
+                        min(ATTACHMENT_LOCK_POLL_SECONDS, remaining)
+                    )
+            if monotonic() >= deadline:
+                _fail(
+                    "inference attachment lock exceeded its absolute deadline",
+                    code=deadline_error_code,
+                )
         yield
     finally:
         if locked:

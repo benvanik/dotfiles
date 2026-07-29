@@ -7,6 +7,7 @@ import pathlib
 import socket
 import tempfile
 import threading
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -71,7 +72,13 @@ class SessionUseAuthorityTest(unittest.TestCase):
         return value
 
     @contextlib.contextmanager
-    def _channel(self, response: bytes):
+    def _channel(
+        self,
+        response: bytes,
+        *,
+        response_delay_seconds: float = 0.0,
+        response_byte_delay_seconds: float = 0.0,
+    ):
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         listener.bind(os.fspath(self.supervisor_path))
         self.supervisor_path.chmod(0o600)
@@ -90,7 +97,14 @@ class SessionUseAuthorityTest(unittest.TestCase):
                             return
                         payload.extend(chunk)
                     requests.append(json.loads(payload))
-                    connection.sendall(response)
+                    if response_delay_seconds:
+                        time.sleep(response_delay_seconds)
+                    if response_byte_delay_seconds:
+                        for byte in response:
+                            connection.sendall(bytes((byte,)))
+                            time.sleep(response_byte_delay_seconds)
+                    else:
+                        connection.sendall(response)
                     if not response.endswith(b"\n"):
                         connection.shutdown(socket.SHUT_WR)
                     while connection.recv(1):
@@ -125,6 +139,7 @@ class SessionUseAuthorityTest(unittest.TestCase):
             authority = read_session_use_authority(
                 descriptor,
                 self.route,
+                startup_deadline=time.monotonic() + 5,
             )
             self.assertEqual(authority.profile_id, "chat")
             self.assertEqual(authority.service_id, "qwen-chat")
@@ -151,7 +166,11 @@ class SessionUseAuthorityTest(unittest.TestCase):
 
     def test_missing_descriptor_fails_with_operator_surface(self) -> None:
         with self.assertRaises(ModelSessionError) as caught:
-            read_session_use_authority(None, self.route)
+            read_session_use_authority(
+                None,
+                self.route,
+                startup_deadline=time.monotonic() + 5,
+            )
 
         self.assertEqual(
             caught.exception.code,
@@ -180,6 +199,7 @@ class SessionUseAuthorityTest(unittest.TestCase):
                             read_session_use_authority(
                                 descriptor,
                                 self.route,
+                                startup_deadline=time.monotonic() + 5,
                             )
                         self.assertEqual(
                             caught.exception.code,
@@ -215,6 +235,7 @@ class SessionUseAuthorityTest(unittest.TestCase):
                         read_session_use_authority(
                             descriptor,
                             self.route,
+                            startup_deadline=time.monotonic() + 5,
                         )
                 self.assertEqual(
                     caught.exception.code,
@@ -232,6 +253,7 @@ class SessionUseAuthorityTest(unittest.TestCase):
                 read_session_use_authority(
                     descriptor,
                     self.route,
+                    startup_deadline=time.monotonic() + 5,
                 )
 
         self.assertEqual(caught.exception.code, "service_start_failed")
@@ -239,6 +261,59 @@ class SessionUseAuthorityTest(unittest.TestCase):
             str(caught.exception),
             "remote vLLM did not become ready",
         )
+
+    def test_pending_admission_is_bounded_by_the_original_startup_deadline(
+        self,
+    ) -> None:
+        with self._channel(
+            _canonical(self._accepted()),
+            response_delay_seconds=0.1,
+        ) as (descriptor, _requests):
+            with self.assertRaises(ModelSessionError) as caught:
+                read_session_use_authority(
+                    descriptor,
+                    self.route,
+                    startup_deadline=time.monotonic() + 0.02,
+                )
+
+        self.assertEqual(caught.exception.code, "service_startup_timeout")
+
+    def test_slow_bytes_cannot_reset_the_absolute_admission_deadline(
+        self,
+    ) -> None:
+        started = time.monotonic()
+        with self._channel(
+            _canonical(self._accepted()),
+            response_byte_delay_seconds=0.01,
+        ) as (descriptor, _requests):
+            with self.assertRaises(ModelSessionError) as caught:
+                read_session_use_authority(
+                    descriptor,
+                    self.route,
+                    startup_deadline=started + 0.05,
+                )
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(caught.exception.code, "service_startup_timeout")
+        self.assertLess(elapsed, 0.25)
+
+    def test_accepted_frame_processed_after_deadline_cannot_launch_pi(
+        self,
+    ) -> None:
+        observed_times = iter((0.0, 0.0, 0.0, 2.0))
+        with self._channel(_canonical(self._accepted())) as (
+            descriptor,
+            _requests,
+        ):
+            with self.assertRaises(ModelSessionError) as caught:
+                read_session_use_authority(
+                    descriptor,
+                    self.route,
+                    startup_deadline=1.0,
+                    monotonic=lambda: next(observed_times),
+                )
+
+        self.assertEqual(caught.exception.code, "service_startup_timeout")
 
     def test_malformed_supervisor_error_is_not_trusted(self) -> None:
         responses = (
@@ -269,6 +344,7 @@ class SessionUseAuthorityTest(unittest.TestCase):
                         read_session_use_authority(
                             descriptor,
                             self.route,
+                            startup_deadline=time.monotonic() + 5,
                         )
                 self.assertEqual(
                     caught.exception.code,
@@ -298,6 +374,7 @@ class SessionUseAuthorityTest(unittest.TestCase):
                         read_session_use_authority(
                             descriptor,
                             self.route,
+                            startup_deadline=time.monotonic() + 5,
                         )
                 self.assertEqual(caught.exception.code, expected_code)
 
@@ -306,6 +383,7 @@ class SessionUseAuthorityTest(unittest.TestCase):
             authority = read_session_use_authority(
                 descriptor,
                 self.route,
+                startup_deadline=time.monotonic() + 5,
             )
             try:
                 for service_id, workload_sha256 in (

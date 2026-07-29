@@ -31,8 +31,10 @@ from .lifecycle import DeploymentStore
 from .migration import MigrationPolicy, migrate_legacy_profile
 from .paths import authored_root, profile_path, runtime_root, state_root
 from .placement import load_hardware_catalog, place_model
+from .supervisor_protocol import require_canonical_input_modalities
 from model_session.attachment import ServiceEndpointBinding
 from model_session.errors import ModelSessionError
+from model_session.launcher import resolve_resume_selection
 from model_session.profile import load_profile
 from model_session.service_endpoint import service_workload_identity
 
@@ -128,7 +130,7 @@ def _parser() -> argparse.ArgumentParser:
 
     migrate = subparsers.add_parser(
         "migrate",
-        help="provider-free migration of one quiesced legacy profile",
+        help="provider-free cutover of one quiesced pre-separation profile",
         allow_abbrev=False,
     )
     migrate.add_argument("source_profile_root")
@@ -186,16 +188,31 @@ def _parser() -> argparse.ArgumentParser:
         help="ensure a service and run an isolated Pi session",
         allow_abbrev=False,
     )
-    pi.add_argument("profile")
-    pi.add_argument("session_action", nargs="?", choices=("resume",))
-    pi.add_argument("session_id", nargs="?")
-    pi.add_argument("--host")
+    pi.add_argument(
+        "profile",
+        help="profile ID; starts a new session unless resume follows",
+    )
+    pi.add_argument(
+        "session_action",
+        nargs="?",
+        choices=("resume",),
+        help="resume a retained session, with an interactive picker by default",
+    )
+    pi.add_argument(
+        "session_id",
+        nargs="?",
+        help="exact retained session ID; valid only after resume",
+    )
+    pi.add_argument(
+        "--host",
+        help="require one exact already-managed RunPod host",
+    )
     pi.add_argument(
         "--now",
         action="store_true",
         help=(
-            "after the final Pi user exits, stop the model service and "
-            "release its RunPod claim without the model idle grace"
+            "durably request that the final Pi user exit stop the model "
+            "service and release its RunPod claim without model idle grace"
         ),
     )
 
@@ -455,9 +472,11 @@ def main(
     *,
     dependencies: Dependencies | None = None,
     dependency_factory: Callable[..., Dependencies] = build_dependencies,
+    input_stream: Any = None,
     output: Any = None,
     error: Any = None,
 ) -> int:
+    stdin = sys.stdin if input_stream is None else input_stream
     stdout = sys.stdout if output is None else output
     stderr = sys.stderr if error is None else error
     parser = _parser()
@@ -673,12 +692,12 @@ def main(
         )
         if parsed.command == "up":
             service = load_service_id(parsed.service, root=root)
-            response = dependency.supervisor.request(
-                "up",
-                {
-                    "service_id": service.service_id,
-                    "host_name": parsed.host,
-                },
+            response = dependency.supervisor.request_up(
+                service_id=service.service_id,
+                host_name=parsed.host,
+                startup_timeout_seconds=(
+                    lab.lease.startup_timeout_seconds
+                ),
             )
             result = {
                 "schema": "model-lab.up.v1",
@@ -729,7 +748,60 @@ def main(
             return 0
         if parsed.command == "pi":
             route = load_profile_route(parsed.profile, root=root)
+            resume_selection = None
+            if parsed.session_action is None:
+                try:
+                    load_profile(
+                        profile_path(route.profile_id, root).parent
+                    )
+                except ModelSessionError as error:
+                    raise ModelLabError(
+                        f"cannot start a new session from profile "
+                        f"{route.profile_id}: {error}",
+                        code=error.code,
+                    ) from error
+            else:
+                try:
+                    resume_selection = resolve_resume_selection(
+                        profile_path(route.profile_id, root).parent,
+                        parsed.session_id,
+                        input_stream=stdin,
+                        output=stdout,
+                    )
+                except ModelSessionError as error:
+                    raise ModelLabError(
+                        f"cannot resume profile {route.profile_id}: {error}",
+                        code=error.code,
+                    ) from error
             service = load_service_id(route.service_id, root=root)
+            if resume_selection is not None and (
+                resume_selection.service_id != service.service_id
+                or resume_selection.workload_sha256
+                != service.workload_sha256
+                or not set(resume_selection.input_modalities).issubset(
+                    service.endpoint.input_modalities
+                )
+            ):
+                raise ModelLabError(
+                    "selected session's frozen model workload or modalities "
+                    "differ from the active profile service",
+                    code="service_workload_mismatch",
+                )
+            required_input_modalities = require_canonical_input_modalities(
+                tuple(
+                    sorted(
+                        route.required_input_modalities
+                        if resume_selection is None
+                        else resume_selection.input_modalities
+                    )
+                ),
+                label="Pi required input modalities",
+            )
+            session_id = (
+                None
+                if resume_selection is None
+                else resume_selection.session_id
+            )
             progress_done = threading.Event()
             progress_started = time.monotonic()
             print(
@@ -758,8 +830,17 @@ def main(
             try:
                 channel = dependency.supervisor.acquire_pi(
                     profile_id=route.profile_id,
+                    project_id=route.project_id,
+                    service_id=service.service_id,
+                    service_sha256=service.service_sha256,
+                    workload_sha256=service.workload_sha256,
+                    required_input_modalities=required_input_modalities,
+                    session_id=session_id,
                     host_name=parsed.host,
                     stop_on_release=parsed.now,
+                    startup_timeout_seconds=(
+                        lab.lease.startup_timeout_seconds
+                    ),
                 )
             finally:
                 progress_done.set()
@@ -772,8 +853,14 @@ def main(
                 flush=True,
             )
             if (
-                channel.pending.service_id != service.service_id
+                channel.pending.profile_id != route.profile_id
+                or channel.pending.project_id != route.project_id
+                or channel.pending.service_id != service.service_id
+                or channel.pending.service_sha256 != service.service_sha256
                 or channel.pending.workload_sha256 != service.workload_sha256
+                or channel.pending.required_input_modalities
+                != required_input_modalities
+                or channel.pending.session_id != session_id
             ):
                 channel.close()
                 raise ModelLabError(
@@ -785,7 +872,7 @@ def main(
                 if parsed.session_action is None
                 else [
                     "resume",
-                    *([] if parsed.session_id is None else [parsed.session_id]),
+                    resume_selection.session_id,
                 ]
             )
             return dependency.run_model_session(

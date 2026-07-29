@@ -13,13 +13,15 @@ The shortest interactive workflow is:
 model-lab pi PROFILE
 model-lab pi PROFILE resume
 model-lab pi PROFILE resume SESSION_ID
+model-lab pi PROFILE --now
 ```
 
 Those commands ensure the profile's exact service, reuse or atomically acquire
 a compatible RunPod host claim, acquire a local service-use lease, and launch
 model-session. Exiting Pi releases only that use lease. The final release starts
 the configured model-service idle TTL. `--now` stops the service and releases
-its RunPod claim after the final Pi user exits.
+its RunPod claim after the final Pi user exits. That immediate-release request
+is durable: another active Pi user or a supervisor restart cannot discard it.
 
 Administrative commands are:
 
@@ -35,7 +37,7 @@ model-lab down SERVICE --now
 model-lab hf-auth push HOST
 model-lab hf-auth status HOST
 model-lab hf-auth clear HOST
-model-lab migrate LEGACY_PROFILE_ROOT --service SERVICE
+model-lab migrate SOURCE_PROFILE_ROOT --service SERVICE
 model-lab service list
 model-lab service show SERVICE
 model-lab profile list

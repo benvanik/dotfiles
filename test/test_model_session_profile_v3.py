@@ -8,7 +8,9 @@ import pathlib
 import socket
 import tempfile
 import unittest
+from unittest import mock
 
+import model_session.materialization as materialization_module
 from model_session.attachment import (
     ServiceWorkload,
 )
@@ -223,6 +225,608 @@ class ModelSessionProfileV3Test(unittest.TestCase):
             self.assertEqual(model["id"], "served-qwen")
             self.assertEqual(model["contextWindow"], 65_536)
             self.assertEqual(model["input"], ["text"])
+
+    def test_body_deadline_rolls_back_before_session_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = ProfileV3Fixture(pathlib.Path(directory))
+            clock = {"now": 0.0}
+            body_advanced = False
+            real_write = materialization_module.os.write
+
+            def write(descriptor: int, content: object) -> int:
+                nonlocal body_advanced
+                written = real_write(descriptor, content)
+                descriptor_path = os.readlink(f"/proc/self/fd/{descriptor}")
+                if (
+                    not body_advanced
+                    and not descriptor_path.endswith(
+                        tuple(
+                            materialization_module._PROJECT_LEAF_OWNERSHIP_FILES.values()
+                        )
+                    )
+                ):
+                    body_advanced = True
+                    clock["now"] = 11.0
+                return written
+
+            try:
+                profile = load_profile(fixture.profile_root)
+                with (
+                    mock.patch.object(
+                        materialization_module.os,
+                        "write",
+                        side_effect=write,
+                    ),
+                    self.assertRaises(ModelSessionError) as caught,
+                ):
+                    materialize_new_run(
+                        profile,
+                        endpoint_runtime_root=fixture.runtime_root,
+                        startup_deadline=10.0,
+                        monotonic=lambda: clock["now"],
+                    )
+            finally:
+                fixture.close()
+
+            self.assertTrue(body_advanced)
+            self.assertEqual(caught.exception.code, "service_startup_timeout")
+            profile_sessions = fixture.lab_root / "sessions" / "chat"
+            self.assertEqual(tuple(profile_sessions.iterdir()), ())
+            self.assertEqual(
+                tuple((fixture.project_root / "reports").iterdir()),
+                (),
+            )
+            self.assertEqual(
+                tuple((fixture.project_root / "memory").iterdir()),
+                (),
+            )
+
+    def test_cleanup_deadline_preserves_staging_recovery_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = ProfileV3Fixture(pathlib.Path(directory))
+            clock = {"now": 0.0}
+            body_advanced = False
+            cleanup_advanced = False
+            real_write = materialization_module.os.write
+            real_rmdir = materialization_module.os.rmdir
+
+            def write(descriptor: int, content: object) -> int:
+                nonlocal body_advanced
+                written = real_write(descriptor, content)
+                descriptor_path = os.readlink(f"/proc/self/fd/{descriptor}")
+                if (
+                    not body_advanced
+                    and not descriptor_path.endswith(
+                        tuple(
+                            materialization_module._PROJECT_LEAF_OWNERSHIP_FILES.values()
+                        )
+                    )
+                ):
+                    body_advanced = True
+                    clock["now"] = 11.0
+                return written
+
+            def rmdir(name: object, *args: object, **kwargs: object) -> None:
+                nonlocal cleanup_advanced
+                real_rmdir(name, *args, **kwargs)
+                if not cleanup_advanced:
+                    cleanup_advanced = True
+                    clock["now"] += (
+                        materialization_module.MATERIALIZATION_CLEANUP_GRACE_SECONDS
+                        + 1.0
+                    )
+
+            try:
+                profile = load_profile(fixture.profile_root)
+                with (
+                    mock.patch.object(
+                        materialization_module.os,
+                        "write",
+                        side_effect=write,
+                    ),
+                    mock.patch.object(
+                        materialization_module.os,
+                        "rmdir",
+                        side_effect=rmdir,
+                    ),
+                    self.assertRaises(ModelSessionError) as caught,
+                ):
+                    materialize_new_run(
+                        profile,
+                        endpoint_runtime_root=fixture.runtime_root,
+                        startup_deadline=10.0,
+                        monotonic=lambda: clock["now"],
+                    )
+            finally:
+                fixture.close()
+
+            self.assertTrue(body_advanced)
+            self.assertTrue(cleanup_advanced)
+            self.assertEqual(
+                caught.exception.code,
+                "session_materialization_cleanup_required",
+            )
+            profile_sessions = fixture.lab_root / "sessions" / "chat"
+            staging_entries = tuple(
+                entry
+                for entry in profile_sessions.iterdir()
+                if entry.name.startswith(".creating-")
+            )
+            published_entries = tuple(
+                entry
+                for entry in profile_sessions.iterdir()
+                if not entry.name.startswith(".creating-")
+            )
+            self.assertEqual(len(staging_entries), 1)
+            self.assertEqual(published_entries, ())
+            self.assertTrue(any(staging_entries[0].iterdir()))
+            session_id = staging_entries[0].name.removeprefix(".creating-")
+            self.assertTrue(
+                (fixture.project_root / "reports" / session_id).is_dir()
+            )
+            self.assertFalse(
+                (fixture.project_root / "memory" / session_id).exists()
+            )
+
+    def test_collision_retry_receives_a_fresh_cleanup_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = ProfileV3Fixture(pathlib.Path(directory))
+            clock = {"now": 0.0}
+            staging_attempts = 0
+            real_create = (
+                materialization_module._create_private_child_directory
+            )
+
+            def create_child(*args: object, **kwargs: object) -> int:
+                nonlocal staging_attempts
+                if kwargs.get("label") == "session staging directory":
+                    staging_attempts += 1
+                    if staging_attempts == 1:
+                        raise ModelSessionError(
+                            "controlled raced staging collision",
+                            code="session_id_collision",
+                        )
+                return real_create(*args, **kwargs)
+
+            def fail_body(*args: object, **kwargs: object) -> None:
+                clock["now"] = 10.0
+                raise ModelSessionError(
+                    "controlled body timeout",
+                    code="service_startup_timeout",
+                )
+
+            try:
+                profile = load_profile(fixture.profile_root)
+                with (
+                    mock.patch.object(
+                        materialization_module,
+                        "_create_private_child_directory",
+                        side_effect=create_child,
+                    ),
+                    mock.patch.object(
+                        materialization_module,
+                        "_materialize_staging",
+                        side_effect=fail_body,
+                    ),
+                    self.assertRaises(ModelSessionError) as caught,
+                ):
+                    materialize_new_run(
+                        profile,
+                        endpoint_runtime_root=fixture.runtime_root,
+                        startup_deadline=100.0,
+                        monotonic=lambda: clock["now"],
+                    )
+            finally:
+                fixture.close()
+
+            self.assertEqual(staging_attempts, 2)
+            self.assertEqual(caught.exception.code, "service_startup_timeout")
+            self.assertEqual(
+                tuple((fixture.lab_root / "sessions" / "chat").iterdir()),
+                (),
+            )
+            self.assertEqual(
+                tuple((fixture.project_root / "reports").iterdir()),
+                (),
+            )
+            self.assertEqual(
+                tuple((fixture.project_root / "memory").iterdir()),
+                (),
+            )
+
+    def test_final_staging_removal_may_cross_cleanup_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = ProfileV3Fixture(pathlib.Path(directory))
+            clock = {"now": 0.0}
+            staging_removed = False
+            real_materialize = materialization_module._materialize_staging
+            real_rmdir = materialization_module.os.rmdir
+
+            def materialize(*args: object, **kwargs: object) -> None:
+                real_materialize(*args, **kwargs)
+                clock["now"] = 11.0
+                raise ModelSessionError(
+                    "controlled post-body timeout",
+                    code="service_startup_timeout",
+                )
+
+            def rmdir(name: object, *args: object, **kwargs: object) -> None:
+                nonlocal staging_removed
+                real_rmdir(name, *args, **kwargs)
+                if str(name).startswith(".creating-"):
+                    staging_removed = True
+                    clock["now"] = 17.0
+
+            try:
+                profile = load_profile(fixture.profile_root)
+                with (
+                    mock.patch.object(
+                        materialization_module,
+                        "_materialize_staging",
+                        side_effect=materialize,
+                    ),
+                    mock.patch.object(
+                        materialization_module.os,
+                        "rmdir",
+                        side_effect=rmdir,
+                    ),
+                    self.assertRaises(ModelSessionError) as caught,
+                ):
+                    materialize_new_run(
+                        profile,
+                        endpoint_runtime_root=fixture.runtime_root,
+                        startup_deadline=100.0,
+                        monotonic=lambda: clock["now"],
+                    )
+            finally:
+                fixture.close()
+
+            self.assertTrue(staging_removed)
+            self.assertEqual(caught.exception.code, "service_startup_timeout")
+            self.assertEqual(
+                tuple((fixture.lab_root / "sessions" / "chat").iterdir()),
+                (),
+            )
+            self.assertEqual(
+                tuple((fixture.project_root / "reports").iterdir()),
+                (),
+            )
+            self.assertEqual(
+                tuple((fixture.project_root / "memory").iterdir()),
+                (),
+            )
+
+    def test_mkdir_before_attestation_fails_closed_on_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = ProfileV3Fixture(pathlib.Path(directory))
+            real_attest = (
+                materialization_module._write_project_leaf_attestation
+            )
+
+            def attest(*args: object, **kwargs: object):
+                if kwargs.get("root_name") == "memory":
+                    raise KeyboardInterrupt(
+                        "controlled crash before memory attestation"
+                    )
+                return real_attest(*args, **kwargs)
+
+            try:
+                profile = load_profile(fixture.profile_root)
+                with (
+                    mock.patch.object(
+                        materialization_module,
+                        "_write_project_leaf_attestation",
+                        side_effect=attest,
+                    ),
+                    self.assertRaises(KeyboardInterrupt),
+                ):
+                    materialize_new_run(
+                        profile,
+                        endpoint_runtime_root=fixture.runtime_root,
+                    )
+                staging = next(
+                    (fixture.lab_root / "sessions" / "chat").iterdir()
+                )
+                session_id = staging.name.removeprefix(".creating-")
+                report = fixture.project_root / "reports" / session_id
+                memory = fixture.project_root / "memory" / session_id
+
+                with self.assertRaises(ModelSessionError) as caught:
+                    materialize_new_run(
+                        profile,
+                        endpoint_runtime_root=fixture.runtime_root,
+                    )
+            finally:
+                fixture.close()
+
+            self.assertEqual(caught.exception.code, "session_recovery_required")
+            self.assertTrue(staging.is_dir())
+            self.assertTrue(report.is_dir())
+            self.assertTrue(memory.is_dir())
+
+    def test_recovery_rejects_a_recreated_project_leaf(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = ProfileV3Fixture(pathlib.Path(directory))
+
+            try:
+                profile = load_profile(fixture.profile_root)
+                with (
+                    mock.patch.object(
+                        materialization_module,
+                        "_materialize_staging",
+                        side_effect=KeyboardInterrupt(
+                            "controlled attested crash"
+                        ),
+                    ),
+                    self.assertRaises(KeyboardInterrupt),
+                ):
+                    materialize_new_run(
+                        profile,
+                        endpoint_runtime_root=fixture.runtime_root,
+                    )
+                staging = next(
+                    (fixture.lab_root / "sessions" / "chat").iterdir()
+                )
+                session_id = staging.name.removeprefix(".creating-")
+                report = fixture.project_root / "reports" / session_id
+                memory = fixture.project_root / "memory" / session_id
+                receipt = json.loads(
+                    (
+                        staging
+                        / materialization_module._PROJECT_LEAF_OWNERSHIP_FILES[
+                            "memory"
+                        ]
+                    ).read_text(encoding="utf-8")
+                )
+                expected_identity = (
+                    receipt["leaf"]["device"],
+                    receipt["leaf"]["inode"],
+                    receipt["leaf"]["ctime_ns"],
+                )
+                memory.rmdir()
+                memory.mkdir(mode=0o700)
+                memory.chmod(0o700)
+                actual = memory.stat()
+                self.assertNotEqual(
+                    (
+                        actual.st_dev,
+                        actual.st_ino,
+                        actual.st_ctime_ns,
+                    ),
+                    expected_identity,
+                )
+
+                with self.assertRaises(ModelSessionError) as caught:
+                    materialize_new_run(
+                        profile,
+                        endpoint_runtime_root=fixture.runtime_root,
+                    )
+            finally:
+                fixture.close()
+
+            self.assertEqual(caught.exception.code, "session_recovery_required")
+            self.assertTrue(staging.is_dir())
+            self.assertTrue(report.is_dir())
+            self.assertTrue(memory.is_dir())
+
+    def test_attested_empty_crash_state_is_recovered(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = ProfileV3Fixture(pathlib.Path(directory))
+
+            try:
+                profile = load_profile(fixture.profile_root)
+                with (
+                    mock.patch.object(
+                        materialization_module,
+                        "_materialize_staging",
+                        side_effect=KeyboardInterrupt(
+                            "controlled attested crash"
+                        ),
+                    ),
+                    self.assertRaises(KeyboardInterrupt),
+                ):
+                    materialize_new_run(
+                        profile,
+                        endpoint_runtime_root=fixture.runtime_root,
+                    )
+                staging = next(
+                    (fixture.lab_root / "sessions" / "chat").iterdir()
+                )
+                session_id = staging.name.removeprefix(".creating-")
+                self.assertEqual(
+                    set(entry.name for entry in staging.iterdir()),
+                    set(
+                        materialization_module._PROJECT_LEAF_OWNERSHIP_FILES.values()
+                    ),
+                )
+
+                run = materialize_new_run(
+                    profile,
+                    endpoint_runtime_root=fixture.runtime_root,
+                )
+            finally:
+                fixture.close()
+
+            self.assertFalse(staging.exists())
+            self.assertFalse(
+                (fixture.project_root / "reports" / session_id).exists()
+            )
+            self.assertFalse(
+                (fixture.project_root / "memory" / session_id).exists()
+            )
+            self.assertTrue(run.report_directory.is_dir())
+            self.assertTrue(run.memory_directory.is_dir())
+            self.assertFalse(
+                set(materialization_module._PROJECT_LEAF_OWNERSHIP_FILES.values())
+                & set(entry.name for entry in run.root.iterdir())
+            )
+
+    def test_leaf_open_failure_rolls_back_before_losing_ownership(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = ProfileV3Fixture(pathlib.Path(directory))
+            real_open = (
+                materialization_module._open_private_child_directory
+            )
+
+            def open_child(*args: object, **kwargs: object) -> int:
+                if kwargs.get("label") == "session report directory":
+                    raise ModelSessionError(
+                        "controlled post-mkdir open failure",
+                        code="unsafe_session_state",
+                    )
+                return real_open(*args, **kwargs)
+
+            try:
+                profile = load_profile(fixture.profile_root)
+                with (
+                    mock.patch.object(
+                        materialization_module,
+                        "_open_private_child_directory",
+                        side_effect=open_child,
+                    ),
+                    self.assertRaises(ModelSessionError) as caught,
+                ):
+                    materialize_new_run(
+                        profile,
+                        endpoint_runtime_root=fixture.runtime_root,
+                    )
+            finally:
+                fixture.close()
+
+            self.assertEqual(caught.exception.code, "unsafe_session_state")
+            self.assertEqual(
+                tuple((fixture.lab_root / "sessions" / "chat").iterdir()),
+                (),
+            )
+            self.assertEqual(
+                tuple((fixture.project_root / "reports").iterdir()),
+                (),
+            )
+
+    def test_leaf_rollback_failure_retains_staging_join_key(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = ProfileV3Fixture(pathlib.Path(directory))
+            real_open = (
+                materialization_module._open_private_child_directory
+            )
+
+            def open_child(*args: object, **kwargs: object) -> int:
+                if kwargs.get("label") == "session report directory":
+                    raise ModelSessionError(
+                        "controlled post-mkdir open failure",
+                        code="unsafe_session_state",
+                    )
+                return real_open(*args, **kwargs)
+
+            try:
+                profile = load_profile(fixture.profile_root)
+                with (
+                    mock.patch.object(
+                        materialization_module,
+                        "_open_private_child_directory",
+                        side_effect=open_child,
+                    ),
+                    mock.patch.object(
+                        materialization_module.os,
+                        "rmdir",
+                        side_effect=OSError(
+                            "controlled leaf rollback failure"
+                        ),
+                    ),
+                    self.assertRaises(ModelSessionError) as caught,
+                ):
+                    materialize_new_run(
+                        profile,
+                        endpoint_runtime_root=fixture.runtime_root,
+                    )
+            finally:
+                fixture.close()
+
+            self.assertEqual(
+                caught.exception.code,
+                "session_materialization_cleanup_required",
+            )
+            staging_entries = tuple(
+                (fixture.lab_root / "sessions" / "chat").iterdir()
+            )
+            self.assertEqual(len(staging_entries), 1)
+            self.assertTrue(staging_entries[0].name.startswith(".creating-"))
+            session_id = staging_entries[0].name.removeprefix(".creating-")
+            self.assertTrue(
+                (fixture.project_root / "reports" / session_id).is_dir()
+            )
+
+    def test_post_publication_deadline_preserves_durable_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = ProfileV3Fixture(pathlib.Path(directory))
+            clock = {"now": 0.0}
+            renamed = False
+            real_rename = materialization_module.os.rename
+            real_fsync = materialization_module.os.fsync
+
+            def rename(*args: object, **kwargs: object) -> None:
+                nonlocal renamed
+                real_rename(*args, **kwargs)
+                renamed = True
+
+            def fsync(descriptor: int) -> None:
+                real_fsync(descriptor)
+                if renamed:
+                    clock["now"] = 11.0
+
+            try:
+                profile = load_profile(fixture.profile_root)
+                with (
+                    mock.patch.object(
+                        materialization_module.os,
+                        "rename",
+                        side_effect=rename,
+                    ),
+                    mock.patch.object(
+                        materialization_module.os,
+                        "fsync",
+                        side_effect=fsync,
+                    ),
+                    mock.patch.object(
+                        materialization_module,
+                        "_rollback_unpublished_materialization",
+                    ) as rollback,
+                    self.assertRaises(ModelSessionError) as caught,
+                ):
+                    materialize_new_run(
+                        profile,
+                        endpoint_runtime_root=fixture.runtime_root,
+                        startup_deadline=10.0,
+                        monotonic=lambda: clock["now"],
+                    )
+            finally:
+                fixture.close()
+
+            self.assertTrue(renamed)
+            self.assertEqual(
+                caught.exception.code,
+                "published_session_requires_recovery",
+            )
+            rollback.assert_not_called()
+            profile_sessions = fixture.lab_root / "sessions" / "chat"
+            published = tuple(
+                entry
+                for entry in profile_sessions.iterdir()
+                if not entry.name.startswith(".creating-")
+            )
+            self.assertEqual(len(published), 1)
+            self.assertFalse(
+                any(
+                    entry.name.startswith(".creating-")
+                    for entry in profile_sessions.iterdir()
+                )
+            )
+            loaded = load_run_from_state(
+                fixture.lab_root,
+                "chat",
+                published[0].name,
+            )
+            self.assertEqual(loaded.session_id, published[0].name)
 
     def test_resume_accepts_capability_growth_but_not_workload_change(
         self,

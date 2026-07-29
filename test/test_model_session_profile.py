@@ -1008,7 +1008,7 @@ class ModelSessionProfileTest(unittest.TestCase):
                 os.close(competing_state_descriptor)
                 os.close(state_descriptor)
 
-    def test_new_run_recovers_an_unpublished_crash_staging_record(self) -> None:
+    def test_recovery_refuses_unattested_project_directories(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = self.fixture(directory)
             profile = load_profile(fixture.profile_root)
@@ -1025,10 +1025,15 @@ class ModelSessionProfileTest(unittest.TestCase):
             orphan_report.chmod(0o700)
             orphan_memory.chmod(0o700)
 
-            materialize_new_run(profile)
-            self.assertFalse(staging.exists())
-            self.assertFalse(orphan_report.exists())
-            self.assertFalse(orphan_memory.exists())
+            with self.assertRaises(ModelSessionError) as caught:
+                materialize_new_run(profile)
+            self.assertEqual(
+                caught.exception.code,
+                "session_recovery_required",
+            )
+            self.assertTrue(staging.is_dir())
+            self.assertTrue(orphan_report.is_dir())
+            self.assertTrue(orphan_memory.is_dir())
 
     def test_crash_recovery_preserves_unrecognized_staging_content(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

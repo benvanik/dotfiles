@@ -8,7 +8,9 @@ import json
 import os
 import re
 import resource
+import time
 import unicodedata
+from collections.abc import Callable
 from dataclasses import dataclass
 from types import TracebackType
 from typing import Any, Self
@@ -33,6 +35,17 @@ _PI_TIMESTAMP_PATTERN = re.compile(
     r"[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$"
 )
 _PI_HEADER_KEYS = {"type", "version", "id", "timestamp", "cwd"}
+
+
+def _require_startup_budget(
+    startup_deadline: float | None,
+    monotonic: Callable[[], float],
+) -> None:
+    if startup_deadline is not None and monotonic() >= startup_deadline:
+        _fail(
+            "resume validation exceeded the service startup deadline",
+            code="service_startup_timeout",
+        )
 
 
 @dataclass(frozen=True)
@@ -311,7 +324,10 @@ def _pi_session_metadata(
     *,
     name: str,
     session_id: str,
+    startup_deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> tuple[str, str]:
+    _require_startup_budget(startup_deadline, monotonic)
     metadata = _initial_file_metadata(descriptor, name=name)
     remaining = metadata.st_size
     line_buffer = bytearray()
@@ -388,6 +404,7 @@ def _pi_session_metadata(
         )
 
     while remaining:
+        _require_startup_budget(startup_deadline, monotonic)
         chunk = os.read(descriptor, min(remaining, 64 * 1024))
         if not chunk:
             _fail(
@@ -418,6 +435,7 @@ def _pi_session_metadata(
                 )
             line_buffer.extend(segment)
             accept_line(bytes(line_buffer))
+            _require_startup_budget(startup_deadline, monotonic)
             line_buffer.clear()
             offset = newline + 1
 
@@ -426,6 +444,7 @@ def _pi_session_metadata(
         initial=metadata,
         name=name,
     )
+    _require_startup_budget(startup_deadline, monotonic)
     if not header_seen:
         _fail(
             "Pi session has no newline-terminated header",
@@ -486,7 +505,12 @@ def _inspect_mutable_history(
         os.close(sessions_descriptor)
 
 
-def _inspect_lease_history(lease: RunLease) -> tuple[str, str, str | None]:
+def _inspect_lease_history(
+    lease: RunLease,
+    *,
+    startup_deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> tuple[str, str, str | None]:
     """Revalidate the current exact Pi target under the acquired launch lock."""
 
     names = lease.list_pi_session_names()
@@ -499,6 +523,8 @@ def _inspect_lease_history(lease: RunLease) -> tuple[str, str, str | None]:
             descriptor,
             name=name,
             session_id=lease.run.session_id,
+            startup_deadline=startup_deadline,
+            monotonic=monotonic,
         )
     finally:
         os.close(descriptor)
@@ -509,16 +535,24 @@ def acquire_history_run_from_state(
     state_root: os.PathLike[str] | str,
     profile_id: str,
     session_id: str,
+    *,
+    startup_deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> RunLease:
     """Acquire and revalidate one exact resume target without scanning siblings."""
 
     inspection = inspect_run_from_state(state_root, profile_id, session_id)
     try:
+        _require_startup_budget(startup_deadline, monotonic)
         lease = inspection.acquire()
     finally:
         inspection.close()
     try:
-        _inspect_lease_history(lease)
+        _inspect_lease_history(
+            lease,
+            startup_deadline=startup_deadline,
+            monotonic=monotonic,
+        )
         return lease
     except BaseException:
         lease.close()

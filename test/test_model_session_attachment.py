@@ -3,12 +3,14 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import datetime
+import fcntl
 import hashlib
 import json
 import os
 import pathlib
 import socket
 import tempfile
+import time
 import unittest
 from collections.abc import Callable, Iterator
 from unittest import mock
@@ -1254,6 +1256,70 @@ class ModelSessionServiceEndpointTest(unittest.TestCase):
                 published.receipt_path,
                 runtime_root / "services" / "shared-service.json",
             )
+
+    def test_persistent_service_lock_honors_endpoint_deadline_code(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            runtime_root = root / "runtime"
+            profile = self.contract(
+                root,
+                profile_id="chat",
+                project_id="playground",
+            )
+            with self.service_socket(runtime_root) as socket_path:
+                endpoint = publish_service_endpoint(
+                    "shared-service",
+                    service_sha256="b" * 64,
+                    workload=self.workload(),
+                    input_modalities=("text",),
+                    ttl_seconds=3600,
+                    socket_path=socket_path,
+                    runtime_root=runtime_root,
+                    clock=lambda: NOW,
+                )
+                lock_path = (
+                    runtime_root
+                    / "services"
+                    / ".locks"
+                    / "shared-service.lock"
+                )
+                descriptor = os.open(
+                    lock_path,
+                    os.O_RDWR | getattr(os, "O_CLOEXEC", 0),
+                )
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX)
+                    started_at = time.monotonic()
+                    with self.assertRaises(ModelSessionError) as caught:
+                        load_service_endpoint(
+                            profile,
+                            runtime_root=runtime_root,
+                            clock=lambda: NOW,
+                            deadline=started_at + 0.05,
+                            deadline_error_code=(
+                                "fixture_service_endpoint_deadline"
+                            ),
+                        )
+                    elapsed = time.monotonic() - started_at
+                finally:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    os.close(descriptor)
+
+                self.assertEqual(
+                    caught.exception.code,
+                    "fixture_service_endpoint_deadline",
+                )
+                self.assertLess(elapsed, 1.0)
+                self.assertTrue(lock_path.exists())
+                loaded = load_service_endpoint(
+                    profile,
+                    runtime_root=runtime_root,
+                    clock=lambda: NOW,
+                )
+                self.assertEqual(
+                    loaded.publication_id,
+                    endpoint.publication_id,
+                )
 
     def test_service_socket_cannot_be_a_hard_link_to_another_socket(
         self,

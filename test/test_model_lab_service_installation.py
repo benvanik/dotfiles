@@ -292,9 +292,13 @@ class ServiceInstallationTest(unittest.TestCase):
             original_locked = state.locked
 
             @contextlib.contextmanager
-            def observed_lock(scope: str):
+            def observed_lock(scope: str, **lock_arguments: object):
                 nonlocal inside_instance_lock
-                with original_locked(scope):
+                self.assertEqual(
+                    set(lock_arguments),
+                    {"deadline", "monotonic", "deadline_error_code"},
+                )
+                with original_locked(scope, **lock_arguments):
                     is_instance_lock = scope.startswith("instance-")
                     if is_instance_lock:
                         inside_instance_lock = True

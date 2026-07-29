@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import dataclasses
+import datetime
 import json
+import math
 import os
 import pathlib
 import re
 import secrets
 import stat
+import time
+from collections.abc import Callable
 from typing import Any
 
 from .documents import canonical_json_bytes
@@ -33,6 +37,7 @@ class PreparationIntent:
     service_sha256: str
     claim_request: HostClaimRequest
     created_at: str
+    startup_expires_at: str
 
     def normalized(self) -> dict[str, Any]:
         return {
@@ -44,6 +49,7 @@ class PreparationIntent:
             "service_sha256": self.service_sha256,
             "claim_request": self.claim_request.normalized(),
             "created_at": self.created_at,
+            "startup_expires_at": self.startup_expires_at,
         }
 
 
@@ -57,6 +63,7 @@ def parse_preparation_intent(value: Any) -> PreparationIntent:
         "service_sha256",
         "claim_request",
         "created_at",
+        "startup_expires_at",
     }
     if (
         not isinstance(value, dict)
@@ -73,12 +80,25 @@ def parse_preparation_intent(value: Any) -> PreparationIntent:
         or not isinstance(value.get("service_sha256"), str)
         or not _SHA256.fullmatch(value["service_sha256"])
         or not isinstance(value.get("created_at"), str)
+        or not isinstance(value.get("startup_expires_at"), str)
     ):
         raise ModelLabError(
             "preparation intent has unsupported fields or values",
             code="invalid_preparation_intent",
         )
-    parse_timestamp(value["created_at"], "preparation intent created_at")
+    created_at = parse_timestamp(
+        value["created_at"],
+        "preparation intent created_at",
+    )
+    startup_expires_at = parse_timestamp(
+        value["startup_expires_at"],
+        "preparation intent startup_expires_at",
+    )
+    if startup_expires_at <= created_at:
+        raise ModelLabError(
+            "preparation intent startup expiration is not after creation",
+            code="invalid_preparation_intent",
+        )
     claim_request = parse_host_claim_request(value["claim_request"])
     if (
         claim_request.operation_id != value["operation_id"]
@@ -97,12 +117,19 @@ def parse_preparation_intent(value: Any) -> PreparationIntent:
         service_sha256=value["service_sha256"],
         claim_request=claim_request,
         created_at=value["created_at"],
+        startup_expires_at=value["startup_expires_at"],
     )
 
 
 class PreparationIntentStore:
-    def __init__(self, root: pathlib.Path) -> None:
+    def __init__(
+        self,
+        root: pathlib.Path,
+        *,
+        clock: Callable[[], datetime.datetime] = utc_now,
+    ) -> None:
         self.root = root
+        self.clock = clock
 
     def path(self, service_id: str) -> pathlib.Path:
         return self.root / "preparation-intents" / f"{service_id}.json"
@@ -182,6 +209,7 @@ class PreparationIntentStore:
         service_id: str,
         workload_sha256: str,
         service_sha256: str,
+        startup_expires_at: str,
         claim_request_factory,
     ) -> PreparationIntent:
         current = self.load(service_id)
@@ -199,6 +227,16 @@ class PreparationIntentStore:
                 )
             return current
         operation_id = f"model-lab-{secrets.token_hex(16)}"
+        expiration = parse_timestamp(
+            startup_expires_at,
+            "preparation intent startup_expires_at",
+        )
+        created_at = self.clock()
+        if expiration <= created_at:
+            raise ModelLabError(
+                "preparation intent startup expiration has elapsed",
+                code="service_startup_timeout",
+            )
         claim_request = claim_request_factory(operation_id)
         if (
             not isinstance(claim_request, HostClaimRequest)
@@ -217,7 +255,8 @@ class PreparationIntentStore:
             workload_sha256=workload_sha256,
             service_sha256=service_sha256,
             claim_request=claim_request,
-            created_at=format_timestamp(utc_now()),
+            created_at=format_timestamp(created_at),
+            startup_expires_at=format_timestamp(expiration),
         )
         directory = ensure_private_directory(self.root / "preparation-intents")
         temporary = directory / f".{service_id}.{secrets.token_hex(12)}.tmp"
@@ -248,7 +287,43 @@ class PreparationIntentStore:
             os.close(directory_descriptor)
         return intent
 
-    def complete(self, intent: PreparationIntent) -> None:
+    @staticmethod
+    def _require_completion_budget(
+        deadline: float | None,
+        monotonic: Callable[[], float],
+        *,
+        deadline_error_code: str,
+    ) -> None:
+        if deadline is not None and monotonic() >= deadline:
+            raise ModelLabError(
+                "preparation intent completion exceeded its absolute deadline",
+                code=deadline_error_code,
+            )
+
+    def complete(
+        self,
+        intent: PreparationIntent,
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+        deadline_error_code: str = "service_cleanup_required",
+    ) -> None:
+        if deadline is not None and (
+            isinstance(deadline, bool)
+            or not isinstance(deadline, (int, float))
+            or not math.isfinite(float(deadline))
+        ):
+            raise ModelLabError(
+                "preparation intent completion deadline must be finite",
+                code="invalid_preparation_intent",
+            )
+        if deadline is not None:
+            deadline = float(deadline)
+        self._require_completion_budget(
+            deadline,
+            monotonic,
+            deadline_error_code=deadline_error_code,
+        )
         current = self.load(intent.service_id)
         if current is None:
             return
@@ -258,12 +333,20 @@ class PreparationIntentStore:
                 code="preparation_intent_conflict",
             )
         path = self.path(intent.service_id)
-        path.unlink()
         directory_descriptor = os.open(
             path.parent,
-            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
         )
         try:
+            self._require_completion_budget(
+                deadline,
+                monotonic,
+                deadline_error_code=deadline_error_code,
+            )
+            os.unlink(path.name, dir_fd=directory_descriptor)
             os.fsync(directory_descriptor)
         finally:
             os.close(directory_descriptor)

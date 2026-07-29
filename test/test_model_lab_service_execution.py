@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import unittest
 from typing import Any
+from unittest import mock
 
 from model_lab.errors import ModelLabError
 from runpod_local.remote import SshEndpoint, build_ssh_argv
@@ -498,6 +499,81 @@ class ServiceExecutionTest(unittest.TestCase):
             str(caught.exception),
             "the exact compiled cache does not match",
         )
+
+    def test_captured_execution_terminates_reaps_and_drains_at_deadline(self):
+        class ObservedPipe(io.BytesIO):
+            def __init__(self, payload: bytes) -> None:
+                super().__init__(payload)
+                self.drained = False
+
+            def read(self, size: int = -1) -> bytes:
+                payload = super().read(size)
+                if not payload:
+                    self.drained = True
+                return payload
+
+        class DeadlineProcess(CaptureProcess):
+            def __init__(self) -> None:
+                super().__init__(
+                    stdout=b'{"service_id":"fixture-dense-text"}',
+                    stderr=b"",
+                )
+                self.stdout = ObservedPipe(
+                    b'{"service_id":"fixture-dense-text"}'
+                )
+                self.stderr = ObservedPipe(b"")
+                self.reaped = False
+                self.wait_timeouts: list[float | int | None] = []
+
+            def wait(self, timeout: float | None = None) -> int:
+                self.wait_timeouts.append(timeout)
+                if not self.terminated:
+                    raise subprocess.TimeoutExpired(["ssh"], timeout)
+                self.reaped = True
+                return -15
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            plan = self.captured_plan(root)
+            process = DeadlineProcess()
+            times = iter((10.0, 10.0, 12.0))
+
+            with self.assertRaises(ModelLabError) as caught:
+                execute_service_runtime_capture(
+                    plan,
+                    resolved_endpoint=plan.endpoint,
+                    instances=FixtureInstances(),  # type: ignore[arg-type]
+                    popen_factory=CaptureProcessFactory(process),
+                    deadline=12.0,
+                    monotonic=lambda: next(times),
+                )
+
+        self.assertEqual(caught.exception.code, "service_startup_timeout")
+        self.assertTrue(process.terminated)
+        self.assertTrue(process.reaped)
+        self.assertFalse(process.killed)
+        self.assertTrue(process.stdout.drained)
+        self.assertTrue(process.stderr.drained)
+        self.assertEqual(process.wait_timeouts, [2.0, 0.0])
+
+    def test_expired_startup_deadline_does_not_start_remote_runtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            plan = self.captured_plan(root)
+            factory = mock.Mock()
+
+            with self.assertRaises(ModelLabError) as caught:
+                execute_service_runtime_capture(
+                    plan,
+                    resolved_endpoint=plan.endpoint,
+                    instances=FixtureInstances(),  # type: ignore[arg-type]
+                    popen_factory=factory,
+                    deadline=12.0,
+                    monotonic=lambda: 12.0,
+                )
+
+        self.assertEqual(caught.exception.code, "service_startup_timeout")
+        factory.assert_not_called()
 
     def test_captured_execution_rejects_output_over_one_mib(self):
         with tempfile.TemporaryDirectory() as directory:

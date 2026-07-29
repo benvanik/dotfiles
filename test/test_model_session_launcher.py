@@ -11,6 +11,7 @@ import socket
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -34,6 +35,7 @@ from model_session.launcher import (
     launch_lease,
     main,
     resolve_profile_root,
+    resolve_resume_selection,
 )
 from model_session.lease import acquire_run_from_state
 from model_session.materialization import materialize_new_run
@@ -242,7 +244,14 @@ class _FakePlan:
             self.on_close()
         self.lease.close()
 
-    def sandbox_child_pid(self, process: _FakeProcess) -> int:
+    def sandbox_child_pid(
+        self,
+        process: _FakeProcess,
+        *,
+        startup_deadline: float | None = None,
+        monotonic=time.monotonic,
+    ) -> int:
+        del startup_deadline, monotonic
         if process is not self.process:
             raise AssertionError("sandbox identity used another monitor")
         return self.child_pid
@@ -342,6 +351,8 @@ class ModelSessionLauncherTest(unittest.TestCase):
             yield [
                 "--model-lab-use-fd",
                 str(descriptor),
+                "--model-lab-use-deadline",
+                format(time.monotonic() + 5, ".17g"),
                 *arguments,
             ]
         finally:
@@ -359,9 +370,17 @@ class ModelSessionLauncherTest(unittest.TestCase):
         captured: dict[str, object] = {}
         process = _FakeProcess(return_code=return_code)
 
-        def build(lease, *, command):
+        def build(
+            lease,
+            *,
+            command,
+            startup_deadline=None,
+            monotonic=time.monotonic,
+        ):
             captured["lease"] = lease
             captured["command"] = command
+            captured["startup_deadline"] = startup_deadline
+            captured["monotonic"] = monotonic
             return _FakePlan(lease, process=process)
 
         def popen(argv, **options):
@@ -583,7 +602,14 @@ class ModelSessionLauncherTest(unittest.TestCase):
                 process.returncode = -signal_number
                 process.terminated.set()
 
-        def build(lease, *, command):
+        def build(
+            lease,
+            *,
+            command,
+            startup_deadline=None,
+            monotonic=time.monotonic,
+        ):
+            del startup_deadline, monotonic
             plan = ChannelBoundPlan(lease, process=process)
             plans.append(plan)
             return plan
@@ -625,7 +651,14 @@ class ModelSessionLauncherTest(unittest.TestCase):
         captured_prompt: list[bytes] = []
         process = _FakeProcess()
 
-        def build(lease, *, command):
+        def build(
+            lease,
+            *,
+            command,
+            startup_deadline=None,
+            monotonic=time.monotonic,
+        ):
+            del startup_deadline, monotonic
             descriptor = lease.duplicate_resource(
                 pathlib.PurePosixPath("profile/SYSTEM.md")
             )
@@ -656,34 +689,114 @@ class ModelSessionLauncherTest(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(captured_prompt, [b"system prompt v1\n"])
 
-    def test_resume_picker_returns_only_the_selected_session_identity(self) -> None:
+    def test_provider_free_resume_picker_returns_frozen_selection(self) -> None:
         older = materialize_new_run(self.fixture.profile())
         newer = materialize_new_run(self.fixture.profile())
         picker_input = _TTYBuffer("2\n")
         picker_output = _TTYBuffer()
 
         with (
-            self.authorized_arguments(["resume"]) as arguments,
-            self.fake_launch() as (captured, _process),
+            mock.patch(
+                "model_session.launcher.load_service_endpoint",
+                side_effect=AssertionError(
+                    "provider-free selection must not load a live endpoint"
+                ),
+            ),
+            mock.patch("model_session.launcher.subprocess.Popen") as popen,
         ):
-            result = main(
-                arguments,
-                argument_zero=os.fspath(self.fixture.launcher),
+            selection = resolve_resume_selection(
+                self.fixture.profile_root,
+                None,
                 input_stream=picker_input,
                 output=picker_output,
-                error=io.StringIO(),
             )
 
-        self.assertEqual(result, 0)
+        popen.assert_not_called()
         self.assertIn(older.session_id, picker_output.getvalue())
         self.assertIn(newer.session_id, picker_output.getvalue())
-        command = captured["command"]
+        self.assertEqual(selection.session_id, older.session_id)
         self.assertEqual(
-            command[command.index("--session-id") + 1],
-            older.session_id,
+            selection.service_id,
+            older.service_binding.service_id,
         )
+        self.assertEqual(
+            selection.workload_sha256,
+            older.service_binding.workload_sha256,
+        )
+        self.assertEqual(
+            selection.input_modalities,
+            older.service_binding.input_modalities,
+        )
+        with acquire_run_from_state(
+            self.fixture.state_root,
+            "fixture",
+            selection.session_id,
+        ) as lease:
+            self.assertEqual(lease.run.session_id, selection.session_id)
 
-    def test_noninteractive_resume_requires_an_explicit_id(self) -> None:
+    def test_exact_resume_selection_skips_picker_and_closes_lease(self) -> None:
+        run = materialize_new_run(self.fixture.profile())
+        output = _TTYBuffer()
+        with (
+            mock.patch(
+                "model_session.launcher.enumerate_history",
+                side_effect=AssertionError(
+                    "exact resume selection must not enumerate siblings"
+                ),
+            ),
+            mock.patch(
+                "model_session.launcher.load_service_endpoint",
+                side_effect=AssertionError(
+                    "provider-free selection must not load a live endpoint"
+                ),
+            ),
+        ):
+            selection = resolve_resume_selection(
+                self.fixture.profile_root,
+                run.session_id,
+                input_stream=io.StringIO(),
+                output=output,
+            )
+
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(selection.session_id, run.session_id)
+        self.assertEqual(selection.service_id, "fixture-service")
+        self.assertEqual(
+            selection.workload_sha256,
+            service_workload_identity(self.fixture.workload),
+        )
+        self.assertEqual(selection.input_modalities, ("text",))
+        with acquire_run_from_state(
+            self.fixture.state_root,
+            "fixture",
+            selection.session_id,
+        ) as lease:
+            self.assertEqual(lease.run.session_id, selection.session_id)
+
+    def test_resume_selection_rejects_missing_binding_and_closes_lease(
+        self,
+    ) -> None:
+        run = materialize_new_run(self.fixture.profile())
+        lease = mock.Mock()
+        lease.run = dataclasses.replace(run, service_binding=None)
+        with (
+            mock.patch(
+                "model_session.launcher.acquire_history_run_from_state",
+                return_value=lease,
+            ),
+            self.assertRaises(ModelSessionError) as caught,
+        ):
+            resolve_resume_selection(
+                self.fixture.profile_root,
+                run.session_id,
+                input_stream=io.StringIO(),
+                output=io.StringIO(),
+            )
+
+        self.assertEqual(caught.exception.code, "invalid_session_state")
+        lease.close.assert_called_once_with()
+
+    def test_model_session_resume_requires_a_preselected_id(self) -> None:
         materialize_new_run(self.fixture.profile())
         error = io.StringIO()
         with self.authorized_arguments(["resume"]) as arguments:
@@ -804,7 +917,14 @@ class ModelSessionLauncherTest(unittest.TestCase):
         close_observations: list[int | None] = []
         plans: list[_FakePlan] = []
 
-        def build(acquired_lease, *, command):
+        def build(
+            acquired_lease,
+            *,
+            command,
+            startup_deadline=None,
+            monotonic=time.monotonic,
+        ):
+            del startup_deadline, monotonic
             self.assertEqual(
                 command[command.index("--session-id") + 1],
                 run.session_id,
@@ -925,7 +1045,14 @@ class ModelSessionLauncherTest(unittest.TestCase):
         process = HostileProcess()
         close_observations: list[int | None] = []
 
-        def build(acquired_lease, *, command):
+        def build(
+            acquired_lease,
+            *,
+            command,
+            startup_deadline=None,
+            monotonic=time.monotonic,
+        ):
+            del startup_deadline, monotonic
             self.assertEqual(
                 command[command.index("--session-id") + 1],
                 run.session_id,

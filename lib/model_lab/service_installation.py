@@ -9,6 +9,7 @@ import os
 import pathlib
 import re
 import stat
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -657,6 +658,8 @@ class ServiceInstallationStore:
         endpoint: SshEndpoint,
         instances: InstanceStore,
         clock: Callable[[], datetime.datetime] | None = None,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> tuple[InstalledService, bool]:
         """Commit only while the successful remote Pod still owns the lease."""
 
@@ -679,15 +682,26 @@ class ServiceInstallationStore:
                 expected_operation_id=endpoint.operation_id,
                 expected_pod_id=endpoint.pod_id,
                 clock=clock,
+                deadline=deadline,
+                monotonic=monotonic,
             ):
                 with self.state.locked(
-                    _lock_name(endpoint.instance_name, service_id)
+                    _lock_name(endpoint.instance_name, service_id),
+                    deadline=deadline,
+                    monotonic=monotonic,
+                    deadline_error_code="remote_client_timeout",
                 ):
                     existing = self.state.read(
                         INSTALLATION_NAMESPACE,
                         record_name,
                     )
                     if existing != desired:
+                        if deadline is not None and monotonic() >= deadline:
+                            raise RunpodLocalError(
+                                "service installation publication exceeded "
+                                "its absolute deadline",
+                                code="remote_client_timeout",
+                            )
                         # Remote success authorizes replacement. Requiring the
                         # previous receipt's local materialization here would make
                         # a fresh install unable to recover from lost generated

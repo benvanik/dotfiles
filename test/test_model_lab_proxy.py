@@ -177,6 +177,65 @@ class MeteredUnixProxyTest(unittest.TestCase):
             self.assertFalse(upstream.thread.is_alive())
             self.assertTrue(upstream.finished.is_set())
 
+    def test_zero_timeout_close_revokes_idle_connection_without_waiting(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            root.chmod(0o700)
+            upstream = IdleUpstream(root / "upstream.sock")
+            upstream.start()
+            proxy = MeteredUnixProxy(
+                listen_path=root / "public.sock",
+                upstream_path=upstream.path,
+                completed=lambda: None,
+            )
+            proxy.bind()
+            serving = threading.Thread(target=proxy.serve)
+            serving.start()
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client.settimeout(2)
+            client.connect(str(root / "public.sock"))
+            client.sendall(
+                b"GET /health HTTP/1.1\r\nHost: local\r\n\r\n"
+            )
+            self.assertTrue(upstream.accepted.wait(2))
+
+            proxy.close(timeout_seconds=0.0)
+            serving.join(2)
+            upstream.thread.join(2)
+            try:
+                self.assertEqual(client.recv(1), b"")
+            except ConnectionResetError:
+                pass
+            client.close()
+
+            self.assertFalse(serving.is_alive())
+            self.assertFalse(upstream.thread.is_alive())
+            self.assertTrue(upstream.finished.is_set())
+
+    def test_connection_worker_cannot_start_after_close_wins_registration(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            root.chmod(0o700)
+            proxy = MeteredUnixProxy(
+                listen_path=root / "public.sock",
+                upstream_path=root / "upstream.sock",
+                completed=lambda: None,
+            )
+            downstream, peer = socket.socketpair()
+            peer.settimeout(2)
+            proxy._stopped.set()
+
+            started = proxy._start_connection_worker(downstream)
+
+            self.assertFalse(started)
+            self.assertEqual(proxy._workers, set())
+            self.assertEqual(peer.recv(1), b"")
+            peer.close()
+
     def test_large_fixed_bodies_retain_only_bounded_framing_state(self) -> None:
         requests = _RequestTracker()
         body_bytes = 8 * 1024 * 1024

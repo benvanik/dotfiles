@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import math
 import os
 import pathlib
 import signal
 import socket
 import stat
 import threading
+import time
 from collections.abc import Callable
 
 from .errors import ModelLabError
@@ -401,26 +403,71 @@ class MeteredUnixProxy:
             if self._stopped.is_set():
                 downstream.close()
                 break
-            worker = threading.Thread(
-                target=self._serve_connection,
-                args=(downstream,),
-                daemon=True,
-            )
-            with self._workers_lock:
-                self._workers.add(worker)
-            worker.start()
+            if not self._start_connection_worker(downstream):
+                break
 
-    def close(self) -> None:
+    def _start_connection_worker(self, downstream: socket.socket) -> bool:
+        """Register a connection atomically against authority revocation."""
+
+        worker = threading.Thread(
+            target=self._serve_connection,
+            args=(downstream,),
+            daemon=True,
+        )
+        with self._workers_lock:
+            # close() sets the stop event before taking this lock. Either this
+            # registration wins and close observes the worker, or close wins
+            # and no worker may connect the accepted socket to the upstream.
+            if self._stopped.is_set():
+                downstream.close()
+                return False
+            self._workers.add(worker)
+            try:
+                worker.start()
+            except BaseException:
+                self._workers.discard(worker)
+                downstream.close()
+                raise
+        return True
+
+    def close(self, *, timeout_seconds: float | None = None) -> bool:
+        """Revoke upstream authority and optionally bound registered joins.
+
+        The listener and every registered connection are shut down first. A
+        downstream accepted concurrently with close cannot start an upstream
+        worker after the stop event. A bounded close may return while already
+        registered daemon workers finish unwinding, but they no longer own a
+        usable listener or connection.
+        """
+
+        if timeout_seconds is not None and (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not math.isfinite(float(timeout_seconds))
+            or timeout_seconds < 0
+        ):
+            raise ValueError("proxy close timeout must be non-negative")
+        deadline = (
+            None
+            if timeout_seconds is None
+            else time.monotonic() + float(timeout_seconds)
+        )
         self._stopped.set()
         listener = self._listener
         if listener is not None:
             wake = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
+                if timeout_seconds is not None:
+                    wake.setblocking(False)
                 wake.connect(os.fspath(self.listen_path))
             except OSError:
                 pass
             finally:
                 wake.close()
+            try:
+                listener.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
             listener.close()
         with self._workers_lock:
             workers = tuple(self._workers)
@@ -431,8 +478,13 @@ class MeteredUnixProxy:
                     connection.shutdown(socket.SHUT_RDWR)
                 except OSError:
                     pass
+                connection.close()
         for worker in workers:
-            worker.join()
+            remaining = (
+                None if deadline is None else max(0.0, deadline - time.monotonic())
+            )
+            worker.join(remaining)
+        return not any(worker.is_alive() for worker in workers)
 
     def _serve_connection(self, downstream: socket.socket) -> None:
         upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

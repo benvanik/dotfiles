@@ -13,6 +13,7 @@ from typing import Any
 
 from model_lab.configuration import parse_lab_toml
 from model_lab.controller import ModelLabController
+from model_lab.errors import ModelLabError
 from model_lab.lifecycle import Deployment, DeploymentStore
 from model_lab.profile_binding import ProfileBindingStore
 from model_lab.runpod_backend import (
@@ -52,7 +53,14 @@ class _HostControl:
         self.claim: HostClaim | None = None
         self.acquisition_count = 0
 
-    def acquire(self, request: HostClaimRequest) -> HostClaim:
+    def acquire(
+        self,
+        request: HostClaimRequest,
+        *,
+        startup_deadline: float,
+        cleanup_deadline_factory=None,
+    ) -> HostClaim:
+        del startup_deadline, cleanup_deadline_factory
         if self.claim is None:
             self.acquisition_count += 1
             self.claim = HostClaim(
@@ -80,12 +88,29 @@ class _HostControl:
         claim: HostClaim,
         *,
         renewal_ttl_seconds: int,
+        startup_deadline: float,
     ) -> HostClaim:
-        del renewal_ttl_seconds
+        del renewal_ttl_seconds, startup_deadline
         return self.get(claim.host_name, claim.claim_id)
 
     def find(self, request: HostClaimRequest) -> HostClaim | None:
         return self.claim
+
+    def cancel(
+        self,
+        request: HostClaimRequest,
+        *,
+        cleanup_deadline: float | None = None,
+    ) -> None:
+        del cleanup_deadline
+        claim = self.find(request)
+        if claim is not None:
+            self.release(
+                claim.host_name,
+                claim.claim_id,
+                claim.generation,
+                now=True,
+            )
 
     def renew(
         self,
@@ -93,8 +118,20 @@ class _HostControl:
         claim_id: str,
         expected_generation: int,
         renewal_ttl_seconds: int,
+        *,
+        startup_deadline: float | None = None,
+        cancel_event=None,
     ) -> HostClaim:
-        claim = self.get(host_name, claim_id)
+        if cancel_event is not None and cancel_event.is_set():
+            raise ModelLabError(
+                "controlled renewal cancellation",
+                code="state_lock_cancelled",
+            )
+        claim = self.get(
+            host_name,
+            claim_id,
+            startup_deadline=startup_deadline,
+        )
         if claim.generation != expected_generation:
             raise AssertionError("fixture claim generation changed")
         self.claim = dataclasses.replace(
@@ -110,7 +147,9 @@ class _HostControl:
         expected_generation: int,
         *,
         now: bool = False,
+        cleanup_deadline: float | None = None,
     ) -> ClaimReleaseResult:
+        del cleanup_deadline
         claim = self.get(host_name, claim_id)
         if claim.generation != expected_generation:
             raise AssertionError("fixture claim generation changed")
@@ -132,7 +171,14 @@ class _HostControl:
             empty_deadline=None if now else "2099-01-01T00:05:00Z",
         )
 
-    def get(self, host_name: str, claim_id: str) -> HostClaim:
+    def get(
+        self,
+        host_name: str,
+        claim_id: str,
+        *,
+        startup_deadline: float | None = None,
+    ) -> HostClaim:
+        del startup_deadline
         if (
             self.claim is None
             or self.claim.host_name != host_name
@@ -175,7 +221,10 @@ class _ServiceRuntime:
         claim: HostClaim,
         *,
         deployment_id: str,
+        startup_deadline: float,
+        cleanup_budget=None,
     ) -> ServiceEndpoint:
+        del startup_deadline, cleanup_budget
         if self.endpoint is not None:
             raise AssertionError("fixture service was prepared twice")
         _private_directory(self.runtime_root / "services")
@@ -212,7 +261,10 @@ class _ServiceRuntime:
         service: ServiceDefinition,
         claim: HostClaim,
         deployment: Deployment,
+        *,
+        startup_deadline: float | None = None,
     ) -> ServiceEndpoint:
+        del startup_deadline
         if self.endpoint is None:
             raise AssertionError("fixture endpoint is absent")
         self.attest_count += 1
@@ -230,7 +282,10 @@ class _ServiceRuntime:
         service: ServiceDefinition,
         claim: HostClaim,
         deployment: Deployment,
+        *,
+        cleanup_deadline: float | None = None,
     ) -> None:
+        del cleanup_deadline
         if self.endpoint is not None:
             revoke_service_endpoint(
                 service.service_id,
@@ -253,6 +308,25 @@ class _ServiceRuntime:
                 "claim_id": claim.claim_id,
             }
         )
+
+    def cleanup_lost_claim(
+        self,
+        service: ServiceDefinition,
+        deployment: Deployment,
+        *,
+        cleanup_deadline: float | None = None,
+    ) -> None:
+        del cleanup_deadline
+        if self.endpoint is not None:
+            revoke_service_endpoint(
+                service.service_id,
+                self.endpoint.publication_id,
+                runtime_root=self.runtime_root,
+            )
+            self.endpoint = None
+        if self.listener is not None:
+            self.listener.close()
+            self.listener = None
 
 
 def _supervisor_process(
@@ -351,6 +425,7 @@ hard_ttl_seconds = 600
 service_idle_ttl_seconds = 60
 renewal_ttl_seconds = 120
 minimum_useful_seconds = 60
+startup_timeout_seconds = 300
 """,
         )
         services = _private_directory(self.authored_root / "services")

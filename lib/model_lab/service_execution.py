@@ -8,11 +8,13 @@ import pathlib
 import re
 import subprocess
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
 from .errors import ModelLabError
+from .lifecycle import format_timestamp
 from runpod_local.instances import InstanceStore
 from runpod_local.remote import (
     SshEndpoint,
@@ -183,6 +185,7 @@ class ServiceRuntimePlan:
     endpoint: SshEndpoint
     action: str
     cache_mode: str | None
+    startup_expires_at: str | None
     entrypoint: str
     manifest: str
     argv: tuple[str, ...]
@@ -200,6 +203,7 @@ class ServiceRuntimePlan:
             },
             "action": self.action,
             "cache_mode": self.cache_mode,
+            "startup_expires_at": self.startup_expires_at,
             "entrypoint": self.entrypoint,
             "manifest": self.manifest,
             "argv": list(self.argv),
@@ -212,6 +216,7 @@ def build_service_runtime_plan(
     endpoint: SshEndpoint,
     action: str,
     cache_mode: str | None = None,
+    startup_expires_at: str | None = None,
 ) -> ServiceRuntimePlan:
     """Build a shell-free runtime invocation without remote execution."""
 
@@ -232,6 +237,26 @@ def build_service_runtime_plan(
     ]
     if cache_mode is not None:
         remote_argv.extend(["--cache-mode", cache_mode])
+    if startup_expires_at is not None:
+        try:
+            normalized_expiration = format_timestamp(
+                datetime.datetime.fromisoformat(
+                    startup_expires_at.replace("Z", "+00:00")
+                )
+            )
+        except ValueError as error:
+            raise ModelLabError(
+                "remote runtime startup expiration is invalid",
+                code="invalid_service_runtime_plan",
+            ) from error
+        if normalized_expiration != startup_expires_at:
+            raise ModelLabError(
+                "remote runtime startup expiration is not canonical UTC",
+                code="invalid_service_runtime_plan",
+            )
+        remote_argv.extend(
+            ["--startup-expires-at", startup_expires_at]
+        )
     return ServiceRuntimePlan(
         materialization_root=materialization.local_root
         if isinstance(materialization, ServiceMaterializationPlan)
@@ -240,6 +265,7 @@ def build_service_runtime_plan(
         endpoint=endpoint,
         action=action,
         cache_mode=cache_mode,
+        startup_expires_at=startup_expires_at,
         entrypoint=entrypoint,
         manifest=manifest,
         argv=tuple(build_ssh_argv(endpoint, remote_argv)),
@@ -252,6 +278,8 @@ def execute_service_runtime(
     resolved_endpoint: SshEndpoint,
     instances: InstanceStore,
     popen_factory: Callable[..., Any] = subprocess.Popen,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
     """Revalidate and execute one exact runtime plan on its active Pod."""
 
@@ -261,6 +289,7 @@ def execute_service_runtime(
         endpoint=resolved_endpoint,
         action=plan.action,
         cache_mode=plan.cache_mode,
+        startup_expires_at=plan.startup_expires_at,
     )
     if plan != expected:
         _fail(
@@ -274,6 +303,8 @@ def execute_service_runtime(
         name=resolved_endpoint.instance_name,
         expected_operation_id=resolved_endpoint.operation_id,
         expected_pod_id=resolved_endpoint.pod_id,
+        deadline=deadline,
+        monotonic=monotonic,
         source=f"service-runtime-{plan.action}",
         popen_factory=popen_factory,
     )
@@ -312,13 +343,16 @@ class _BoundedPipeCapture:
     def start(self) -> None:
         self.thread.start()
 
-    def join(self) -> None:
-        self.thread.join()
+    def join(self, *, timeout_seconds: float | None = None) -> bool:
+        self.thread.join(timeout_seconds)
+        if self.thread.is_alive():
+            return False
         if self.failure is not None:
             raise ModelLabError(
                 f"cannot read remote service runtime output: {self.failure}",
                 code="service_runtime_output_failed",
             ) from self.failure
+        return True
 
     def _run(self) -> None:
         try:
@@ -368,13 +402,52 @@ def _runtime_json_object(
     return value
 
 
-def _terminate_remote_client(process: Any) -> None:
+def _background_reap(process: Any) -> None:
+    def reap() -> None:
+        try:
+            process.wait()
+        except BaseException:
+            return
+
+    threading.Thread(target=reap, daemon=True).start()
+
+
+def _terminate_remote_client(
+    process: Any,
+    *,
+    wait_timeout_seconds: float = 5.0,
+) -> None:
     process.terminate()
     try:
-        process.wait(timeout=5)
+        process.wait(timeout=max(0.0, wait_timeout_seconds))
     except subprocess.TimeoutExpired:
         process.kill()
-        process.wait()
+        try:
+            process.wait(timeout=0)
+        except subprocess.TimeoutExpired:
+            _background_reap(process)
+
+
+def _remaining_cleanup_wait(
+    deadline: float | None,
+    monotonic: Callable[[], float],
+) -> float:
+    if deadline is None:
+        return 5.0
+    return min(5.0, max(0.0, deadline - monotonic()))
+
+
+def _join_captures(
+    stdout: _BoundedPipeCapture,
+    stderr: _BoundedPipeCapture,
+    *,
+    timeout_seconds: float,
+) -> bool:
+    started = time.monotonic()
+    stdout_complete = stdout.join(timeout_seconds=timeout_seconds)
+    remaining = max(0.0, timeout_seconds - (time.monotonic() - started))
+    stderr_complete = stderr.join(timeout_seconds=remaining)
+    return stdout_complete and stderr_complete
 
 
 def execute_service_runtime_capture(
@@ -384,6 +457,8 @@ def execute_service_runtime_capture(
     instances: InstanceStore,
     popen_factory: Callable[..., Any] = subprocess.Popen,
     clock: Callable[[], datetime.datetime] | None = None,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
     """Execute and authenticate one bounded remote runtime JSON result.
 
@@ -398,6 +473,7 @@ def execute_service_runtime_capture(
         endpoint=resolved_endpoint,
         action=plan.action,
         cache_mode=plan.cache_mode,
+        startup_expires_at=plan.startup_expires_at,
     )
     if plan != expected:
         _fail(
@@ -411,7 +487,14 @@ def execute_service_runtime_capture(
         now=now(),
         expected_operation_id=resolved_endpoint.operation_id,
         expected_pod_id=resolved_endpoint.pod_id,
+        deadline=deadline,
+        monotonic=monotonic,
     )
+    if deadline is not None and monotonic() >= deadline:
+        raise ModelLabError(
+            "service runtime cannot start after its startup deadline",
+            code="service_startup_timeout",
+        )
     try:
         process = popen_factory(
             list(plan.argv),
@@ -426,7 +509,13 @@ def execute_service_runtime_capture(
             code="remote_client_start_failed",
         ) from error
     if process.stdout is None or process.stderr is None:
-        _terminate_remote_client(process)
+        _terminate_remote_client(
+            process,
+            wait_timeout_seconds=_remaining_cleanup_wait(
+                deadline,
+                monotonic,
+            ),
+        )
         raise ModelLabError(
             "remote service runtime client did not expose captured pipes",
             code="service_runtime_output_failed",
@@ -449,11 +538,20 @@ def execute_service_runtime_capture(
             source=source,
             expected_operation_id=resolved_endpoint.operation_id,
             expected_pod_id=resolved_endpoint.pod_id,
+            deadline=deadline,
+            monotonic=monotonic,
         )
     except BaseException:
-        _terminate_remote_client(process)
-        stdout.join()
-        stderr.join()
+        cleanup_wait = _remaining_cleanup_wait(deadline, monotonic)
+        _terminate_remote_client(
+            process,
+            wait_timeout_seconds=cleanup_wait,
+        )
+        _join_captures(
+            stdout,
+            stderr,
+            timeout_seconds=cleanup_wait,
+        )
         raise
     idle_timeout = record["lease"]["idle_timeout_seconds"]
     heartbeat_seconds = (
@@ -462,10 +560,42 @@ def execute_service_runtime_capture(
         else min(30, max(1, idle_timeout // 3))
     )
     while True:
+        wait_seconds = float(heartbeat_seconds)
+        if deadline is not None:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                _terminate_remote_client(
+                    process,
+                    wait_timeout_seconds=0.0,
+                )
+                _join_captures(
+                    stdout,
+                    stderr,
+                    timeout_seconds=0.0,
+                )
+                raise ModelLabError(
+                    "service runtime exceeded its startup deadline",
+                    code="service_startup_timeout",
+                )
+            wait_seconds = min(wait_seconds, remaining)
         try:
-            return_code = process.wait(timeout=heartbeat_seconds)
+            return_code = process.wait(timeout=wait_seconds)
             break
         except subprocess.TimeoutExpired:
+            if deadline is not None and monotonic() >= deadline:
+                _terminate_remote_client(
+                    process,
+                    wait_timeout_seconds=0.0,
+                )
+                _join_captures(
+                    stdout,
+                    stderr,
+                    timeout_seconds=0.0,
+                )
+                raise ModelLabError(
+                    "service runtime exceeded its startup deadline",
+                    code="service_startup_timeout",
+                )
             try:
                 instances.touch(
                     resolved_endpoint.instance_name,
@@ -474,14 +604,39 @@ def execute_service_runtime_capture(
                     expected_operation_id=resolved_endpoint.operation_id,
                     expected_pod_id=resolved_endpoint.pod_id,
                     record_event=False,
+                    deadline=deadline,
+                    monotonic=monotonic,
                 )
             except BaseException:
-                _terminate_remote_client(process)
-                stdout.join()
-                stderr.join()
+                cleanup_wait = _remaining_cleanup_wait(
+                    deadline,
+                    monotonic,
+                )
+                _terminate_remote_client(
+                    process,
+                    wait_timeout_seconds=cleanup_wait,
+                )
+                _join_captures(
+                    stdout,
+                    stderr,
+                    timeout_seconds=cleanup_wait,
+                )
                 raise
-    stdout.join()
-    stderr.join()
+    capture_wait = _remaining_cleanup_wait(deadline, monotonic)
+    if not _join_captures(
+        stdout,
+        stderr,
+        timeout_seconds=capture_wait,
+    ):
+        if deadline is not None and monotonic() >= deadline:
+            raise ModelLabError(
+                "service runtime output drain exceeded its startup deadline",
+                code="service_startup_timeout",
+            )
+        raise ModelLabError(
+            "remote service runtime output did not close after process exit",
+            code="service_runtime_output_failed",
+        )
     if stdout.overflow or stderr.overflow:
         raise ModelLabError(
             "remote service runtime output exceeded its one-MiB bound",
@@ -536,5 +691,7 @@ def execute_service_runtime_capture(
         source=source,
         expected_operation_id=resolved_endpoint.operation_id,
         expected_pod_id=resolved_endpoint.pod_id,
+        deadline=deadline,
+        monotonic=monotonic,
     )
     return result

@@ -7,7 +7,8 @@ import os
 import pathlib
 import re
 import secrets
-from collections.abc import Mapping
+import time
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from .attachment import (
@@ -413,6 +414,9 @@ def publish_service_endpoint(
     socket_path: os.PathLike[str] | str | None = None,
     clock: Clock | None = None,
     runtime_root: os.PathLike[str] | str | None = None,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+    deadline_error_code: str = "service_startup_timeout",
 ) -> ServiceEndpoint:
     """Publish one model-lab-owned, service-scoped endpoint offer."""
 
@@ -474,6 +478,9 @@ def publish_service_endpoint(
             identifier,
             exclusive=True,
             create=True,
+            deadline=deadline,
+            monotonic=monotonic,
+            deadline_error_code=deadline_error_code,
         ):
             socket_identity = _validate_socket(socket_identity.path)
             published_at = _clock_time(clock)
@@ -727,6 +734,9 @@ def revoke_service_endpoint(
     expected_publication_id: str,
     *,
     runtime_root: os.PathLike[str] | str | None = None,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+    deadline_error_code: str = "service_startup_timeout",
 ) -> None:
     """Revoke exactly one model-lab endpoint receipt.
 
@@ -788,6 +798,9 @@ def revoke_service_endpoint(
             identifier,
             exclusive=True,
             create=False,
+            deadline=deadline,
+            monotonic=monotonic,
+            deadline_error_code=deadline_error_code,
         ):
             value, _ = _read_receipt(
                 directories.attachments_descriptor,
@@ -839,6 +852,9 @@ def inspect_service_publication(
     service_id: str,
     *,
     runtime_root: os.PathLike[str] | str | None = None,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+    deadline_error_code: str = "service_startup_timeout",
 ) -> ServiceEndpoint | None:
     """Authenticate one retained publication for administrative cleanup.
 
@@ -889,6 +905,9 @@ def inspect_service_publication(
             identifier,
             exclusive=False,
             create=False,
+            deadline=deadline,
+            monotonic=monotonic,
+            deadline_error_code=deadline_error_code,
         ):
             value, _ = _read_receipt(
                 directories.attachments_descriptor,
@@ -913,6 +932,9 @@ def load_service_endpoint(
     expected_binding: ServiceEndpointBinding | None = None,
     clock: Clock | None = None,
     runtime_root: os.PathLike[str] | str | None = None,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+    deadline_error_code: str = "service_startup_timeout",
 ) -> ServiceEndpoint:
     """Load a compatible service endpoint immediately before a launch."""
 
@@ -979,6 +1001,9 @@ def load_service_endpoint(
             service_id,
             exclusive=False,
             create=False,
+            deadline=deadline,
+            monotonic=monotonic,
+            deadline_error_code=deadline_error_code,
         ):
             value, _ = _read_receipt(
                 directories.attachments_descriptor,

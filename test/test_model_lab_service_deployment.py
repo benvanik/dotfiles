@@ -6,6 +6,7 @@ import pathlib
 import tempfile
 import unittest
 from typing import Any
+from unittest import mock
 
 from model_lab.errors import ModelLabError
 from runpod_local.remote import SshEndpoint
@@ -217,6 +218,40 @@ class ServiceDeploymentTest(unittest.TestCase):
                     "service-push-install",
                 ],
             )
+
+    def test_push_threads_one_absolute_deadline_through_every_step(self):
+        with tempfile.TemporaryDirectory() as directory:
+            materialization, endpoint = self.fixture(pathlib.Path(directory))
+            plan = build_service_push_plan(
+                materialization,
+                endpoint=endpoint,
+                installer_path=INSTALLER,
+            )
+            monotonic = mock.Mock(return_value=10.0)
+            calls: list[dict[str, Any]] = []
+
+            def capture_run(*_args: object, **kwargs: Any) -> int:
+                calls.append(kwargs)
+                return 0
+
+            with mock.patch(
+                "model_lab.service_deployment.run_with_activity",
+                side_effect=capture_run,
+            ):
+                result = push_service_materialization(
+                    plan,
+                    resolved_endpoint=endpoint,
+                    instances=FixtureInstances(),  # type: ignore[arg-type]
+                    deadline=300.0,
+                    monotonic=monotonic,
+                )
+
+        self.assertEqual(result["status"], "installed")
+        self.assertEqual(len(calls), 4)
+        self.assertTrue(all(call["deadline"] == 300.0 for call in calls))
+        self.assertTrue(
+            all(call["monotonic"] is monotonic for call in calls)
+        )
 
     def test_failed_copy_stops_before_later_remote_actions(self):
         with tempfile.TemporaryDirectory() as directory:

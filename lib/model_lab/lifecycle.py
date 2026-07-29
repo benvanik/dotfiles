@@ -4,6 +4,10 @@ A RunPod host claim is held by one ready model service.  Individual Pi
 processes take local use leases against that service.  Releasing the final use
 lease starts the model-service idle interval; it does not directly release the
 RunPod claim.  Only the supervisor's explicit stop transition does that.
+
+An immediate-release request is latched as the ready deployment's ``now`` host
+release mode. It survives the requesting use lease and a supervisor restart,
+then becomes the cleanup transaction's release mode when the final use ends.
 """
 
 from __future__ import annotations
@@ -13,12 +17,14 @@ import dataclasses
 import datetime
 import fcntl
 import json
+import math
 import os
 import pathlib
 import re
 import secrets
-from collections.abc import Iterator
-from typing import Any, Callable
+import time
+from collections.abc import Callable, Iterator
+from typing import Any
 
 from .documents import canonical_json_bytes
 from .errors import ModelLabError
@@ -40,6 +46,7 @@ _PHASES = frozenset(
     }
 )
 _HOST_RELEASE_MODES = frozenset({"now", "empty-grace", "claim-gone"})
+LOCK_POLL_SECONDS = 0.05
 
 
 def utc_now() -> datetime.datetime:
@@ -72,6 +79,8 @@ class UseLease:
     owner_pid: int
     owner_start_time: str
     acquired_at: str
+    admission_expires_at: str | None
+    admission_release_mode: str | None
 
     def normalized(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -234,6 +243,8 @@ def parse_deployment(value: Any) -> Deployment:
             "owner_pid",
             "owner_start_time",
             "acquired_at",
+            "admission_expires_at",
+            "admission_release_mode",
         }:
             raise ModelLabError(
                 "use lease has unsupported fields",
@@ -252,6 +263,34 @@ def parse_deployment(value: Any) -> Deployment:
             )
         acquired = _require_string(raw["acquired_at"], "use lease acquired_at")
         parse_timestamp(acquired, "use lease acquired_at")
+        admission_expires_at = raw["admission_expires_at"]
+        if admission_expires_at is not None:
+            admission_expires_at = _require_string(
+                admission_expires_at,
+                "use lease admission_expires_at",
+            )
+            parse_timestamp(
+                admission_expires_at,
+                "use lease admission_expires_at",
+            )
+        admission_release_mode = raw["admission_release_mode"]
+        if admission_release_mode not in {
+            None,
+            "idle",
+            "stop-if-final",
+            "now",
+        }:
+            raise ModelLabError(
+                "use lease admission_release_mode is invalid",
+                code="invalid_deployment_state",
+            )
+        if (admission_expires_at is None) != (
+            admission_release_mode is None
+        ):
+            raise ModelLabError(
+                "use lease admission recovery fields must be set together",
+                code="invalid_deployment_state",
+            )
         leases.append(
             UseLease(
                 lease_id=lease_id,
@@ -260,6 +299,8 @@ def parse_deployment(value: Any) -> Deployment:
                     raw["owner_start_time"], "use lease owner_start_time"
                 ),
                 acquired_at=acquired,
+                admission_expires_at=admission_expires_at,
+                admission_release_mode=admission_release_mode,
             )
         )
     if len({lease.lease_id for lease in leases}) != len(leases):
@@ -277,12 +318,23 @@ def parse_deployment(value: Any) -> Deployment:
             "an idle deployment must have an idle deadline",
             code="invalid_deployment_state",
         )
-    if (
-        value["phase"] in {"preparing", "ready", "idle"}
-        and host_release_mode is not None
-    ):
+    if value["phase"] in {"preparing", "idle"} and host_release_mode is not None:
         raise ModelLabError(
             "an active deployment cannot carry a host release mode",
+            code="invalid_deployment_state",
+        )
+    if value["phase"] == "ready" and host_release_mode not in {None, "now"}:
+        raise ModelLabError(
+            "a ready deployment may carry only a pending immediate release",
+            code="invalid_deployment_state",
+        )
+    if (
+        value["phase"] == "ready"
+        and host_release_mode == "now"
+        and not leases
+    ):
+        raise ModelLabError(
+            "a pending immediate release requires an active use lease",
             code="invalid_deployment_state",
         )
     if (
@@ -340,20 +392,44 @@ class DeploymentStore:
         root: pathlib.Path,
         *,
         clock: Callable[[], datetime.datetime] = utc_now,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.root = root
         self.clock = clock
+        self.monotonic = monotonic
 
     def _deployment_path(self, service_id: str) -> pathlib.Path:
         return self.root / "deployments" / f"{service_id}.json"
 
     @contextlib.contextmanager
-    def locked(self, service_id: str) -> Iterator[None]:
+    def locked(
+        self,
+        service_id: str,
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] | None = None,
+        deadline_error_code: str = "service_startup_timeout",
+    ) -> Iterator[None]:
         if not _IDENTIFIER.fullmatch(service_id):
             raise ModelLabError(
                 "service ID is invalid",
                 code="invalid_service_id",
             )
+        if (
+            deadline is not None
+            and (
+                isinstance(deadline, bool)
+                or not isinstance(deadline, (int, float))
+                or not math.isfinite(float(deadline))
+            )
+        ):
+            raise ModelLabError(
+                "deployment lock deadline must be a finite number",
+                code="invalid_deployment_transition",
+            )
+        if deadline is not None:
+            deadline = float(deadline)
+        observe_time = self.monotonic if monotonic is None else monotonic
         locks = ensure_private_directory(self.root / "locks")
         path = locks / f"{service_id}.lock"
         descriptor = os.open(
@@ -368,7 +444,41 @@ class DeploymentStore:
                     f"deployment lock permissions are unsafe: {path}",
                     code="unsafe_deployment_state",
                 )
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            while True:
+                remaining_seconds: float | None = None
+                if deadline is not None:
+                    remaining_seconds = (
+                        deadline - observe_time()
+                    )
+                    if remaining_seconds <= 0:
+                        raise ModelLabError(
+                            "deployment lock exceeded its absolute deadline: "
+                            f"{service_id}",
+                            code=deadline_error_code,
+                        )
+                try:
+                    fcntl.flock(
+                        descriptor,
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
+                    break
+                except BlockingIOError:
+                    wait_seconds = LOCK_POLL_SECONDS
+                    if remaining_seconds is not None:
+                        wait_seconds = min(
+                            wait_seconds,
+                            remaining_seconds,
+                        )
+                    time.sleep(wait_seconds)
+            if (
+                deadline is not None
+                and observe_time() >= deadline
+            ):
+                raise ModelLabError(
+                    "deployment lock exceeded its absolute deadline: "
+                    f"{service_id}",
+                    code=deadline_error_code,
+                )
             yield
         finally:
             os.close(descriptor)
@@ -477,13 +587,35 @@ class DeploymentStore:
         finally:
             os.close(directory_descriptor)
 
-    def publish_ready(self, deployment: Deployment) -> Deployment:
+    @staticmethod
+    def _require_deadline(
+        deadline: float | None,
+        monotonic: Callable[[], float],
+        *,
+        message: str,
+        code: str,
+    ) -> None:
+        if deadline is not None and monotonic() >= deadline:
+            raise ModelLabError(message, code=code)
+
+    def publish_ready(
+        self,
+        deployment: Deployment,
+        *,
+        startup_deadline: float | None = None,
+        monotonic: Callable[[], float] | None = None,
+    ) -> Deployment:
         if deployment.phase != "ready" or deployment.idle_deadline is not None:
             raise ModelLabError(
                 "only a non-idle ready deployment can be published",
                 code="invalid_deployment_transition",
             )
-        with self.locked(deployment.service_id):
+        observe_time = self.monotonic if monotonic is None else monotonic
+        with self.locked(
+            deployment.service_id,
+            deadline=startup_deadline,
+            monotonic=observe_time,
+        ):
             current = self.load(deployment.service_id)
             if (
                 current is not None
@@ -494,10 +626,25 @@ class DeploymentStore:
                     "another deployment already owns this service",
                     code="deployment_conflict",
                 )
+            if (
+                startup_deadline is not None
+                and observe_time() >= startup_deadline
+            ):
+                raise ModelLabError(
+                    "ready deployment publication exceeded the service "
+                    "startup deadline",
+                    code="service_startup_timeout",
+                )
             self.save(deployment)
         return deployment
 
-    def publish_preparing(self, deployment: Deployment) -> Deployment:
+    def publish_preparing(
+        self,
+        deployment: Deployment,
+        *,
+        startup_deadline: float | None = None,
+        monotonic: Callable[[], float] | None = None,
+    ) -> Deployment:
         if (
             deployment.phase != "preparing"
             or deployment.endpoint_receipt_path is not None
@@ -508,7 +655,12 @@ class DeploymentStore:
                 "only a clean preparing deployment can be published",
                 code="invalid_deployment_transition",
             )
-        with self.locked(deployment.service_id):
+        observe_time = self.monotonic if monotonic is None else monotonic
+        with self.locked(
+            deployment.service_id,
+            deadline=startup_deadline,
+            monotonic=observe_time,
+        ):
             current = self.load(deployment.service_id)
             if (
                 current is not None
@@ -519,6 +671,15 @@ class DeploymentStore:
                     "another deployment already owns this service",
                     code="deployment_conflict",
                 )
+            if (
+                startup_deadline is not None
+                and observe_time() >= startup_deadline
+            ):
+                raise ModelLabError(
+                    "preparing deployment publication exceeded the service "
+                    "startup deadline",
+                    code="service_startup_timeout",
+                )
             self.save(deployment)
         return deployment
 
@@ -526,18 +687,70 @@ class DeploymentStore:
         self,
         service_id: str,
         *,
+        lease_id: str,
+        admission_expires_at: str,
+        admission_release_mode: str,
         expected_workload_sha256: str,
         owner_pid: int,
         owner_start_time: str,
+        stop_on_release: bool = False,
+        startup_deadline: float | None = None,
+        monotonic: Callable[[], float] | None = None,
     ) -> UseLease:
-        now_text = format_timestamp(self.clock())
-        lease = UseLease(
-            lease_id=f"use-{secrets.token_hex(16)}",
-            owner_pid=owner_pid,
-            owner_start_time=owner_start_time,
-            acquired_at=now_text,
-        )
-        with self.locked(service_id):
+        if type(stop_on_release) is not bool:
+            raise ModelLabError(
+                "use-lease stop-on-release selector must be boolean",
+                code="invalid_deployment_transition",
+            )
+        if not isinstance(lease_id, str) or not _OPAQUE_IDENTIFIER.fullmatch(
+            lease_id
+        ):
+            raise ModelLabError(
+                "use-lease identity is invalid",
+                code="invalid_use_lease_id",
+            )
+        if (
+            isinstance(owner_pid, bool)
+            or not isinstance(owner_pid, int)
+            or owner_pid < 1
+            or not isinstance(owner_start_time, str)
+            or not owner_start_time
+        ):
+            raise ModelLabError(
+                "use-lease owner identity is invalid",
+                code="invalid_use_lease_owner",
+            )
+        if not isinstance(admission_expires_at, str):
+            raise ModelLabError(
+                "use-lease admission expiration is invalid",
+                code="invalid_use_lease_admission",
+            )
+        try:
+            admission_expiration = parse_timestamp(
+                admission_expires_at,
+                "use lease admission expiration",
+            )
+        except ModelLabError as error:
+            raise ModelLabError(
+                "use-lease admission expiration is invalid",
+                code="invalid_use_lease_admission",
+            ) from error
+        if admission_release_mode not in {
+            "idle",
+            "stop-if-final",
+            "now",
+        } or (admission_release_mode == "now") != stop_on_release:
+            raise ModelLabError(
+                "use-lease admission release mode conflicts with its "
+                "stop-on-release policy",
+                code="invalid_use_lease_admission",
+            )
+        observe_time = self.monotonic if monotonic is None else monotonic
+        with self.locked(
+            service_id,
+            deadline=startup_deadline,
+            monotonic=observe_time,
+        ):
             deployment = self.load(service_id)
             if deployment is None:
                 raise ModelLabError(
@@ -549,18 +762,78 @@ class DeploymentStore:
                     "deployed service does not match the requested workload",
                     code="service_workload_mismatch",
                 )
+            retained = tuple(
+                lease
+                for lease in deployment.use_leases
+                if lease.lease_id == lease_id
+            )
+            if retained:
+                lease = retained[0]
+                if (
+                    lease.owner_pid != owner_pid
+                    or lease.owner_start_time != owner_start_time
+                    or lease.admission_expires_at
+                    != format_timestamp(admission_expiration)
+                    or lease.admission_release_mode
+                    != admission_release_mode
+                    or (
+                        stop_on_release
+                        and deployment.host_release_mode != "now"
+                    )
+                ):
+                    raise ModelLabError(
+                        "use-lease identity already belongs to another "
+                        "acquisition",
+                        code="use_lease_identity_conflict",
+                    )
+                self._require_deadline(
+                    startup_deadline,
+                    observe_time,
+                    message=(
+                        "idempotent use-lease acquisition exceeded the "
+                        "service startup deadline"
+                    ),
+                    code="service_startup_timeout",
+                )
+                return lease
             if deployment.phase not in {"ready", "idle"}:
                 raise ModelLabError(
                     f"service {service_id} is {deployment.phase}",
                     code="service_not_ready",
                 )
+            now_text = format_timestamp(self.clock())
+            lease = UseLease(
+                lease_id=lease_id,
+                owner_pid=owner_pid,
+                owner_start_time=owner_start_time,
+                acquired_at=now_text,
+                admission_expires_at=format_timestamp(
+                    admission_expiration
+                ),
+                admission_release_mode=admission_release_mode,
+            )
             updated = dataclasses.replace(
                 deployment,
                 phase="ready",
                 updated_at=now_text,
                 idle_deadline=None,
+                host_release_mode=(
+                    "now"
+                    if stop_on_release
+                    or deployment.host_release_mode == "now"
+                    else None
+                ),
                 use_leases=(*deployment.use_leases, lease),
             )
+            if (
+                startup_deadline is not None
+                and observe_time() >= startup_deadline
+            ):
+                raise ModelLabError(
+                    "use-lease acquisition exceeded the service startup "
+                    "deadline",
+                    code="service_startup_timeout",
+                )
             self.save(updated)
         return lease
 
@@ -573,6 +846,8 @@ class DeploymentStore:
         expected_owner_start_time: str,
         owner_pid: int,
         owner_start_time: str,
+        startup_deadline: float | None = None,
+        monotonic: Callable[[], float] | None = None,
     ) -> UseLease:
         """Bind a pending supervisor lease to the admitted model-session."""
 
@@ -586,8 +861,12 @@ class DeploymentStore:
                 "new use-lease owner identity is invalid",
                 code="invalid_use_lease_owner",
             )
-        now_text = format_timestamp(self.clock())
-        with self.locked(service_id):
+        observe_time = self.monotonic if monotonic is None else monotonic
+        with self.locked(
+            service_id,
+            deadline=startup_deadline,
+            monotonic=observe_time,
+        ):
             deployment = self.load(service_id)
             if deployment is None:
                 raise ModelLabError(
@@ -613,10 +892,13 @@ class DeploymentStore:
                     "pending use lease owner changed before admission",
                     code="use_lease_owner_mismatch",
                 )
+            now_text = format_timestamp(self.clock())
             replacement = dataclasses.replace(
                 current,
                 owner_pid=owner_pid,
                 owner_start_time=owner_start_time,
+                admission_expires_at=None,
+                admission_release_mode=None,
             )
             updated = dataclasses.replace(
                 deployment,
@@ -626,6 +908,15 @@ class DeploymentStore:
                     for lease in deployment.use_leases
                 ),
             )
+            if (
+                startup_deadline is not None
+                and observe_time() >= startup_deadline
+            ):
+                raise ModelLabError(
+                    "use-lease ownership transfer exceeded the service "
+                    "startup deadline",
+                    code="service_startup_timeout",
+                )
             self.save(updated)
             return replacement
 
@@ -636,6 +927,8 @@ class DeploymentStore:
         deployment_id: str,
         expected_generation: int,
         generation: int,
+        startup_deadline: float | None = None,
+        monotonic: Callable[[], float] | None = None,
     ) -> Deployment:
         """Commit the exact generation returned by a successful host renewal."""
 
@@ -648,7 +941,12 @@ class DeploymentStore:
                 "renewed claim generation is invalid",
                 code="invalid_claim_generation",
             )
-        with self.locked(service_id):
+        observe_time = self.monotonic if monotonic is None else monotonic
+        with self.locked(
+            service_id,
+            deadline=startup_deadline,
+            monotonic=observe_time,
+        ):
             deployment = self.load(service_id)
             if (
                 deployment is None
@@ -664,8 +962,59 @@ class DeploymentStore:
                 claim_generation=generation,
                 updated_at=format_timestamp(self.clock()),
             )
+            if (
+                startup_deadline is not None
+                and observe_time() >= startup_deadline
+            ):
+                raise ModelLabError(
+                    "claim-generation publication exceeded the service "
+                    "startup deadline",
+                    code="service_startup_timeout",
+                )
             self.save(updated)
             return updated
+
+    def publish_cleanup_transition(
+        self,
+        expected: Deployment,
+        replacement: Deployment,
+        *,
+        cleanup_deadline: float,
+        monotonic: Callable[[], float] | None = None,
+    ) -> Deployment:
+        """Atomically publish one reversible cleanup-state transition."""
+
+        if (
+            replacement.service_id != expected.service_id
+            or replacement.deployment_id != expected.deployment_id
+            or replacement.host_name != expected.host_name
+            or replacement.claim_id != expected.claim_id
+        ):
+            raise ModelLabError(
+                "cleanup transition changed deployment identity",
+                code="invalid_deployment_transition",
+            )
+        observe_time = self.monotonic if monotonic is None else monotonic
+        with self.locked(
+            expected.service_id,
+            deadline=cleanup_deadline,
+            monotonic=observe_time,
+            deadline_error_code="service_cleanup_required",
+        ):
+            retained = self.load(expected.service_id)
+            if retained != expected:
+                raise ModelLabError(
+                    "deployment changed during cleanup",
+                    code="deployment_changed",
+                )
+            self._require_deadline(
+                cleanup_deadline,
+                observe_time,
+                message="deployment cleanup transition exceeded its deadline",
+                code="service_cleanup_required",
+            )
+            self.save(replacement)
+        return replacement
 
     def reconcile_orphaned_uses(
         self,
@@ -678,19 +1027,34 @@ class DeploymentStore:
         for candidate in self.list():
             if not candidate.use_leases:
                 continue
-            current_time = self.clock()
             with self.locked(candidate.service_id):
                 deployment = self.load(candidate.service_id)
                 if deployment is None or not deployment.use_leases:
                     continue
+                current_time = self.clock()
+                stop_now = (
+                    deployment.host_release_mode == "now"
+                    or any(
+                        lease.admission_release_mode
+                        in {"now", "stop-if-final"}
+                        for lease in deployment.use_leases
+                    )
+                )
                 updated = dataclasses.replace(
                     deployment,
-                    phase="idle",
+                    phase="quiescing" if stop_now else "idle",
                     updated_at=format_timestamp(current_time),
-                    idle_deadline=format_timestamp(
-                        current_time
-                        + datetime.timedelta(seconds=idle_ttl_seconds)
+                    idle_deadline=(
+                        None
+                        if stop_now
+                        else format_timestamp(
+                            current_time
+                            + datetime.timedelta(
+                                seconds=idle_ttl_seconds
+                            )
+                        )
                     ),
+                    host_release_mode="now" if stop_now else None,
                     use_leases=(),
                 )
                 self.save(updated)
@@ -703,16 +1067,37 @@ class DeploymentStore:
         lease_id: str,
         *,
         idle_ttl_seconds: int,
+        expected_deployment_id: str | None = None,
         now: bool = False,
+        stop_if_final: bool = False,
+        cleanup_deadline: float | None = None,
+        monotonic: Callable[[], float] | None = None,
     ) -> UseRelease:
-        current_time = self.clock()
-        now_text = format_timestamp(current_time)
-        with self.locked(service_id):
+        if type(now) is not bool or type(stop_if_final) is not bool:
+            raise ModelLabError(
+                "use-lease release selectors must be boolean",
+                code="invalid_deployment_transition",
+            )
+        observe_time = self.monotonic if monotonic is None else monotonic
+        with self.locked(
+            service_id,
+            deadline=cleanup_deadline,
+            monotonic=observe_time,
+            deadline_error_code="service_cleanup_required",
+        ):
             deployment = self.load(service_id)
             if deployment is None:
                 raise ModelLabError(
                     f"service {service_id} has no deployment",
                     code="deployment_not_found",
+                )
+            if (
+                expected_deployment_id is not None
+                and deployment.deployment_id != expected_deployment_id
+            ):
+                raise ModelLabError(
+                    "deployment changed before exact use-lease release",
+                    code="deployment_changed",
                 )
             remaining = tuple(
                 lease for lease in deployment.use_leases if lease.lease_id != lease_id
@@ -722,12 +1107,18 @@ class DeploymentStore:
                     f"use lease is not active: {lease_id}",
                     code="use_lease_not_found",
                 )
+            current_time = self.clock()
+            now_text = format_timestamp(current_time)
             final_use = not remaining
+            latched_release = now or deployment.host_release_mode == "now"
+            immediate_release = latched_release or (
+                final_use and stop_if_final
+            )
             phase = "ready"
             deadline = None
             stop_now = False
             if final_use:
-                if now:
+                if immediate_release:
                     phase = "quiescing"
                     stop_now = True
                 else:
@@ -740,8 +1131,18 @@ class DeploymentStore:
                 phase=phase,
                 updated_at=now_text,
                 idle_deadline=deadline,
-                host_release_mode="now" if stop_now else None,
+                host_release_mode=(
+                    "now"
+                    if (latched_release and remaining) or stop_now
+                    else None
+                ),
                 use_leases=remaining,
+            )
+            self._require_deadline(
+                cleanup_deadline,
+                observe_time,
+                message="use-lease release exceeded the cleanup deadline",
+                code="service_cleanup_required",
             )
             self.save(updated)
         return UseRelease(
@@ -750,16 +1151,179 @@ class DeploymentStore:
             stop_now=stop_now,
         )
 
-    def note_inference(self, service_id: str, *, idle_ttl_seconds: int) -> Deployment:
-        current_time = self.clock()
-        now_text = format_timestamp(current_time)
-        with self.locked(service_id):
+    def release_use_exact(
+        self,
+        service_id: str,
+        lease_id: str,
+        *,
+        expected_deployment_id: str,
+        idle_ttl_seconds: int,
+        now: bool = False,
+        stop_if_final: bool = False,
+        cleanup_deadline: float,
+        monotonic: Callable[[], float] | None = None,
+    ) -> UseRelease:
+        """Release one caller-known lease and prove its durable absence."""
+
+        observe_time = self.monotonic if monotonic is None else monotonic
+        first_error: Exception | None = None
+        for _attempt in range(2):
+            try:
+                self.release_use(
+                    service_id,
+                    lease_id,
+                    expected_deployment_id=expected_deployment_id,
+                    idle_ttl_seconds=idle_ttl_seconds,
+                    now=now,
+                    stop_if_final=stop_if_final,
+                    cleanup_deadline=cleanup_deadline,
+                    monotonic=observe_time,
+                )
+            except Exception as error:
+                if first_error is None:
+                    first_error = error
+            try:
+                confirmed = self._confirm_use_absent(
+                    service_id,
+                    lease_id,
+                    expected_deployment_id=expected_deployment_id,
+                    cleanup_deadline=cleanup_deadline,
+                    monotonic=observe_time,
+                )
+            except Exception as error:
+                if first_error is None:
+                    first_error = error
+                continue
+            if confirmed is None:
+                continue
+            confirmed_deployment, same_deployment = confirmed
+            if not same_deployment:
+                raise ModelLabError(
+                    f"use lease is not active: {lease_id}",
+                    code="use_lease_not_found",
+                )
+            final_use = not confirmed_deployment.use_leases
+            return UseRelease(
+                deployment=confirmed_deployment,
+                final_use=final_use,
+                stop_now=(
+                    final_use
+                    and confirmed_deployment.host_release_mode == "now"
+                    and confirmed_deployment.phase
+                    in {"quiescing", "stopping", "failed"}
+                ),
+            )
+        raise ModelLabError(
+            "exact use-lease release could not prove the lease durably absent",
+            code="service_cleanup_required",
+        ) from first_error
+
+    def _confirm_use_absent(
+        self,
+        service_id: str,
+        lease_id: str,
+        *,
+        expected_deployment_id: str,
+        cleanup_deadline: float,
+        monotonic: Callable[[], float],
+    ) -> tuple[Deployment, bool] | None:
+        """Return durable state only after the exact lease is absent and synced."""
+
+        with self.locked(
+            service_id,
+            deadline=cleanup_deadline,
+            monotonic=monotonic,
+            deadline_error_code="service_cleanup_required",
+        ):
+            deployment = self.load(service_id)
+            if deployment is None:
+                raise ModelLabError(
+                    "deployment disappeared while confirming use-lease release",
+                    code="deployment_changed",
+                )
+            if any(
+                lease.lease_id == lease_id
+                for lease in deployment.use_leases
+            ):
+                return None
+            self._require_deadline(
+                cleanup_deadline,
+                monotonic,
+                message=(
+                    "use-lease durability confirmation exceeded the cleanup "
+                    "deadline"
+                ),
+                code="service_cleanup_required",
+            )
+            path = self._deployment_path(service_id)
+            descriptor = os.open(
+                path,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            directory_descriptor = os.open(
+                path.parent,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+            self._require_deadline(
+                cleanup_deadline,
+                monotonic,
+                message=(
+                    "use-lease durability confirmation exceeded the cleanup "
+                    "deadline"
+                ),
+                code="service_cleanup_required",
+            )
+            return (
+                deployment,
+                deployment.deployment_id == expected_deployment_id,
+            )
+
+    def note_inference(
+        self,
+        service_id: str,
+        *,
+        idle_ttl_seconds: int,
+        lock_timeout_seconds: float = 1.0,
+        monotonic: Callable[[], float] | None = None,
+    ) -> Deployment:
+        if (
+            isinstance(lock_timeout_seconds, bool)
+            or not isinstance(lock_timeout_seconds, (int, float))
+            or not math.isfinite(float(lock_timeout_seconds))
+            or lock_timeout_seconds <= 0
+        ):
+            raise ModelLabError(
+                "inference accounting timeout must be positive and finite",
+                code="invalid_deployment_transition",
+            )
+        observe_time = self.monotonic if monotonic is None else monotonic
+        deadline = observe_time() + float(lock_timeout_seconds)
+        with self.locked(
+            service_id,
+            deadline=deadline,
+            monotonic=observe_time,
+            deadline_error_code="inference_accounting_timeout",
+        ):
             deployment = self.load(service_id)
             if deployment is None or deployment.phase not in {"ready", "idle"}:
                 raise ModelLabError(
                     f"service {service_id} is not accepting inference",
                     code="service_not_ready",
                 )
+            current_time = self.clock()
+            now_text = format_timestamp(current_time)
             deadline = deployment.idle_deadline
             if deployment.phase == "idle":
                 deadline = format_timestamp(
@@ -780,20 +1344,35 @@ class DeploymentStore:
         *,
         idle_ttl_seconds: int,
         now: bool,
+        cleanup_deadline: float | None = None,
+        monotonic: Callable[[], float] | None = None,
+        deadline_error_code: str = "service_cleanup_required",
     ) -> Deployment:
-        current_time = self.clock()
-        with self.locked(service_id):
+        observe_time = self.monotonic if monotonic is None else monotonic
+        with self.locked(
+            service_id,
+            deadline=cleanup_deadline,
+            monotonic=observe_time,
+            deadline_error_code=deadline_error_code,
+        ):
             deployment = self.load(service_id)
             if deployment is None:
                 raise ModelLabError(
                     f"service {service_id} has no deployment",
                     code="deployment_not_found",
                 )
+            if deployment.phase not in {"ready", "idle"}:
+                raise ModelLabError(
+                    f"service {service_id} cannot begin idling from "
+                    f"{deployment.phase}",
+                    code="invalid_deployment_transition",
+                )
             if deployment.use_leases and not now:
                 raise ModelLabError(
                     f"service {service_id} has active Pi users",
                     code="service_in_use",
                 )
+            current_time = self.clock()
             updated = dataclasses.replace(
                 deployment,
                 phase="quiescing" if now else "idle",
@@ -808,18 +1387,90 @@ class DeploymentStore:
                 host_release_mode="now" if now else None,
                 use_leases=() if now else deployment.use_leases,
             )
+            self._require_deadline(
+                cleanup_deadline,
+                observe_time,
+                message="service idle transition exceeded the cleanup deadline",
+                code=deadline_error_code,
+            )
+            self.save(updated)
+            return updated
+
+    def escalate_cleanup_now(
+        self,
+        service_id: str,
+        *,
+        cleanup_deadline: float | None = None,
+        monotonic: Callable[[], float] | None = None,
+    ) -> Deployment:
+        """Preserve cleanup progress while latching immediate host release."""
+
+        observe_time = self.monotonic if monotonic is None else monotonic
+        with self.locked(
+            service_id,
+            deadline=cleanup_deadline,
+            monotonic=observe_time,
+            deadline_error_code="service_cleanup_required",
+        ):
+            deployment = self.load(service_id)
+            if deployment is None:
+                raise ModelLabError(
+                    f"service {service_id} has no deployment",
+                    code="deployment_not_found",
+                )
+            if deployment.phase not in {
+                "quiescing",
+                "stopping",
+                "failed",
+            }:
+                raise ModelLabError(
+                    f"service {service_id} is not awaiting cleanup",
+                    code="invalid_deployment_transition",
+                )
+            if deployment.use_leases or deployment.idle_deadline is not None:
+                raise ModelLabError(
+                    "cleanup escalation requires a quiesced deployment",
+                    code="invalid_deployment_transition",
+                )
+            if deployment.host_release_mode in {"now", "claim-gone"}:
+                return deployment
+            if deployment.host_release_mode != "empty-grace":
+                raise ModelLabError(
+                    "cleanup release mode cannot be escalated",
+                    code="invalid_deployment_transition",
+                )
+            updated = dataclasses.replace(
+                deployment,
+                updated_at=format_timestamp(self.clock()),
+                host_release_mode="now",
+            )
+            self._require_deadline(
+                cleanup_deadline,
+                observe_time,
+                message="cleanup escalation exceeded its deadline",
+                code="service_cleanup_required",
+            )
             self.save(updated)
             return updated
 
     def begin_idle_cleanup_if_due(
         self,
         service_id: str,
+        *,
+        cleanup_deadline: float | None = None,
+        monotonic: Callable[[], float] | None = None,
     ) -> Deployment | None:
         """Atomically recheck idle eligibility and claim cleanup ownership."""
 
-        current_time = self.clock()
-        with self.locked(service_id):
+        observe_time = self.monotonic if monotonic is None else monotonic
+        with self.locked(
+            service_id,
+            deadline=cleanup_deadline,
+            monotonic=observe_time,
+            deadline_error_code="service_cleanup_required",
+        ):
             deployment = self.load(service_id)
+            current_time = self.clock()
             if (
                 deployment is None
                 or deployment.phase != "idle"
@@ -840,6 +1491,12 @@ class DeploymentStore:
                 host_release_mode="empty-grace",
                 use_leases=(),
             )
+            self._require_deadline(
+                cleanup_deadline,
+                observe_time,
+                message="idle cleanup transition exceeded the cleanup deadline",
+                code="service_cleanup_required",
+            )
             self.save(quiescing)
             return quiescing
 
@@ -850,11 +1507,18 @@ class DeploymentStore:
         deployment_id: str,
         claim_id: str,
         expected_generation: int,
+        cleanup_deadline: float | None = None,
+        monotonic: Callable[[], float] | None = None,
     ) -> Deployment:
         """Atomically revoke all local authority over a vanished host claim."""
 
-        current_time = self.clock()
-        with self.locked(service_id):
+        observe_time = self.monotonic if monotonic is None else monotonic
+        with self.locked(
+            service_id,
+            deadline=cleanup_deadline,
+            monotonic=observe_time,
+            deadline_error_code="service_cleanup_required",
+        ):
             deployment = self.load(service_id)
             if (
                 deployment is None
@@ -868,6 +1532,7 @@ class DeploymentStore:
                 )
             if deployment.phase == "released":
                 return deployment
+            current_time = self.clock()
             quiescing = dataclasses.replace(
                 deployment,
                 phase="quiescing",
@@ -875,6 +1540,12 @@ class DeploymentStore:
                 idle_deadline=None,
                 host_release_mode="claim-gone",
                 use_leases=(),
+            )
+            self._require_deadline(
+                cleanup_deadline,
+                observe_time,
+                message="lost-claim transition exceeded the cleanup deadline",
+                code="service_cleanup_required",
             )
             self.save(quiescing)
             return quiescing

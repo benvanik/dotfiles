@@ -6,6 +6,7 @@ import contextlib
 import dataclasses
 import errno
 import fcntl
+import io
 import os
 import pathlib
 import socket
@@ -14,11 +15,16 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
+from model_session.errors import ModelSessionError
+from model_session.launcher import resolve_resume_selection
+from model_session.profile import load_profile
+
 from .catalog import load_profile_route, load_service_id
 from .controller import ModelLabController, ServiceUse
 from .deployed_service import DeployedServiceStore
 from .errors import ModelLabError
-from .paths import ensure_private_directory
+from .lifecycle import Deployment
+from .paths import ensure_private_directory, profile_path
 from .service_definition import ServiceDefinition
 from .supervisor_protocol import (
     PI_PENDING_SCHEMA,
@@ -32,9 +38,14 @@ from .supervisor_protocol import (
     process_start_time,
     receive_document,
     receive_document_with_credentials,
+    require_canonical_input_modalities,
     require_exact_fields,
     require_identifier,
+    require_monotonic_deadline,
+    require_nullable_opaque_identifier,
     require_process_identity,
+    require_sha256,
+    require_timestamp,
     send_document,
     supervisor_lock_path,
     supervisor_socket_path,
@@ -46,6 +57,36 @@ class SupervisorFailure:
     operation: str
     code: str
     message: str
+
+
+@dataclasses.dataclass(frozen=True)
+class _ImmediateDownFence:
+    sequence: int
+    completed: threading.Event
+
+
+@dataclasses.dataclass(frozen=True)
+class _PiOperation:
+    sequence: int
+    preceding_down: _ImmediateDownFence | None
+
+
+@dataclasses.dataclass(frozen=True)
+class _PendingUseRelease:
+    service: ServiceDefinition
+    use: ServiceUse
+    now: bool
+    stop_if_final: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class _FrozenProfileSelection:
+    """Exact provider-free profile authority admitted by one Pi request."""
+
+    profile_id: str
+    project_id: str
+    service_id: str
+    required_input_modalities: tuple[str, ...]
 
 
 FailureReporter = Callable[[SupervisorFailure], None]
@@ -84,7 +125,20 @@ class ModelLabSupervisor:
             else maintenance_interval_seconds
         )
         self.deployed_services = DeployedServiceStore(state_root)
-        self.mutation_lock = threading.RLock()
+        self._service_locks_guard = threading.Lock()
+        self._service_locks: dict[str, threading.RLock] = {}
+        self._service_operations_guard = threading.Lock()
+        self._service_operation_sequences: dict[str, int] = {}
+        self._immediate_down_fences: dict[
+            str,
+            _ImmediateDownFence,
+        ] = {}
+        self._rollback_lock = threading.Lock()
+        self._pending_release_lock = threading.Lock()
+        self._pending_use_releases: dict[
+            tuple[str, str],
+            _PendingUseRelease,
+        ] = {}
         self.stop_event = threading.Event()
         self.ready_event = threading.Event()
         self._listener: socket.socket | None = None
@@ -93,8 +147,177 @@ class ModelLabSupervisor:
         self._connections: set[socket.socket] = set()
         self._connection_services: dict[socket.socket, str] = {}
         self._connections_lock = threading.Lock()
+        # A newly created deployment is rollback-owned only while its creating
+        # ``up`` response is the latest service operation. A later up, down, or
+        # Pi admission invalidates that ownership even when it leaves the
+        # durable deployment fields byte-for-byte unchanged.
+        self._pending_up_rollbacks: dict[str, tuple[str, object]] = {}
         self._supervisor_pid = os.getpid()
         self._supervisor_start_time = process_start_time(self._supervisor_pid)
+
+    @contextlib.contextmanager
+    def _service_mutation(
+        self,
+        service_id: str,
+        *,
+        deadline: float | None = None,
+        deadline_error_code: str = "service_startup_timeout",
+    ):
+        """Serialize one service, optionally within an absolute deadline."""
+
+        with self._service_locks_guard:
+            lock = self._service_locks.setdefault(
+                service_id,
+                threading.RLock(),
+            )
+        if deadline is None:
+            lock.acquire()
+        else:
+            remaining_seconds = deadline - self.controller.monotonic()
+            if remaining_seconds <= 0 or not lock.acquire(
+                timeout=remaining_seconds
+            ):
+                raise ModelLabError(
+                    "service mutation did not begin within its absolute "
+                    "deadline",
+                    code=deadline_error_code,
+                )
+        try:
+            if (
+                deadline is not None
+                and self.controller.monotonic() >= deadline
+            ):
+                raise ModelLabError(
+                    "service mutation did not begin within its absolute "
+                    "deadline",
+                    code=deadline_error_code,
+                )
+            yield
+        finally:
+            lock.release()
+
+    def _next_service_operation_sequence(self, service_id: str) -> int:
+        sequence = self._service_operation_sequences.get(service_id, 0) + 1
+        self._service_operation_sequences[service_id] = sequence
+        return sequence
+
+    def _begin_pi_operation(self, service_id: str) -> _PiOperation:
+        with self._service_operations_guard:
+            return _PiOperation(
+                sequence=self._next_service_operation_sequence(service_id),
+                preceding_down=self._immediate_down_fences.get(service_id),
+            )
+
+    def _begin_immediate_down(self, service_id: str) -> _ImmediateDownFence:
+        with self._service_operations_guard:
+            fence = _ImmediateDownFence(
+                sequence=self._next_service_operation_sequence(service_id),
+                completed=threading.Event(),
+            )
+            self._immediate_down_fences[service_id] = fence
+            return fence
+
+    def _wait_for_preceding_down(
+        self,
+        operation: _PiOperation,
+        startup_deadline: float,
+    ) -> None:
+        fence = operation.preceding_down
+        if fence is None or fence.completed.is_set():
+            return
+        remaining_seconds = startup_deadline - self.controller.monotonic()
+        if remaining_seconds <= 0 or not fence.completed.wait(
+            remaining_seconds
+        ):
+            self.controller.require_startup_budget(startup_deadline)
+            raise AssertionError("expired startup budget was accepted")
+        self.controller.require_startup_budget(startup_deadline)
+
+    def _require_current_pi_operation(
+        self,
+        service_id: str,
+        operation: _PiOperation,
+    ) -> None:
+        with self._service_operations_guard:
+            fence = self._immediate_down_fences.get(service_id)
+        if fence is not None and fence.sequence > operation.sequence:
+            raise ModelLabError(
+                "Pi startup was superseded by a newer immediate service "
+                "shutdown",
+                code="service_startup_superseded",
+            )
+
+    def _clear_pending_up_rollback(self, service_id: str) -> None:
+        with self._rollback_lock:
+            self._pending_up_rollbacks.pop(service_id, None)
+
+    def _record_pending_up_rollback(
+        self,
+        service_id: str,
+        deployment_id: str,
+        marker: object,
+    ) -> None:
+        with self._rollback_lock:
+            self._pending_up_rollbacks[service_id] = (
+                deployment_id,
+                marker,
+            )
+
+    def _claim_pending_up_rollback(
+        self,
+        service_id: str,
+        deployment_id: str,
+        marker: object,
+    ) -> bool:
+        expected = (deployment_id, marker)
+        with self._rollback_lock:
+            if self._pending_up_rollbacks.get(service_id) != expected:
+                return False
+            self._pending_up_rollbacks.pop(service_id)
+            return True
+
+    @staticmethod
+    def _pending_release_key(
+        pending: _PendingUseRelease,
+    ) -> tuple[str, str]:
+        return (
+            pending.service.service_id,
+            pending.use.lease.lease_id,
+        )
+
+    def _queue_use_release(self, pending: _PendingUseRelease) -> None:
+        key = self._pending_release_key(pending)
+        with self._pending_release_lock:
+            retained = self._pending_use_releases.get(key)
+            if retained is not None and retained != pending:
+                raise ModelLabError(
+                    "queued use release changed identity",
+                    code="use_release_identity_changed",
+                )
+            self._pending_use_releases[key] = pending
+
+    def _complete_use_release(self, pending: _PendingUseRelease) -> None:
+        key = self._pending_release_key(pending)
+        with self._pending_release_lock:
+            if self._pending_use_releases.get(key) == pending:
+                self._pending_use_releases.pop(key)
+
+    def _pending_release_snapshot(self) -> tuple[_PendingUseRelease, ...]:
+        with self._pending_release_lock:
+            return tuple(self._pending_use_releases.values())
+
+    def _attempt_use_release(self, pending: _PendingUseRelease) -> None:
+        try:
+            self.controller.release_profile_use(
+                pending.service,
+                pending.use,
+                now=pending.now,
+                stop_if_final=pending.stop_if_final,
+            )
+        except ModelLabError as error:
+            if error.code != "use_lease_not_found":
+                raise
+        self._complete_use_release(pending)
 
     @property
     def socket_path(self) -> pathlib.Path:
@@ -170,19 +393,18 @@ class ModelLabSupervisor:
         listener: socket.socket | None = None
         maintenance: threading.Thread | None = None
         try:
-            with self.mutation_lock:
-                try:
-                    self.controller.deployments.reconcile_orphaned_uses(
-                        idle_ttl_seconds=(
-                            self.controller.lab.lease.service_idle_ttl_seconds
-                        )
+            try:
+                self.controller.deployments.reconcile_orphaned_uses(
+                    idle_ttl_seconds=(
+                        self.controller.lab.lease.service_idle_ttl_seconds
                     )
-                except Exception as error:
-                    self._report_operation_failure(
-                        "startup:orphaned-uses",
-                        error,
-                    )
-                self._reconcile_startup_deployments()
+                )
+            except Exception as error:
+                self._report_operation_failure(
+                    "startup:orphaned-uses",
+                    error,
+                )
+            self._reconcile_startup_deployments()
             listener = self._open_listener()
             maintenance = threading.Thread(
                 target=self._maintenance_loop,
@@ -393,20 +615,17 @@ class ModelLabSupervisor:
                 },
             )
 
-    def _service_snapshot_for_deployment(
+    def _deployment_snapshot(
         self,
         service_id: str,
-    ) -> ServiceDefinition:
+    ) -> Deployment:
         deployment = self.controller.deployments.load(service_id)
         if deployment is None:
             raise ModelLabError(
                 f"service {service_id} has no deployment",
                 code="deployment_not_found",
             )
-        return self.deployed_services.load(
-            service_id,
-            deployment.service_sha256,
-        )
+        return deployment
 
     def _serve_up(
         self,
@@ -416,7 +635,15 @@ class ModelLabSupervisor:
         require_exact_fields(
             request,
             schema=SUPERVISOR_REQUEST_SCHEMA,
-            fields=frozenset({"operation", "service_id", "host_name"}),
+            fields=frozenset(
+                {
+                    "operation",
+                    "service_id",
+                    "host_name",
+                    "startup_expires_at",
+                    "startup_deadline",
+                }
+            ),
         )
         service_id = require_identifier(request["service_id"], label="service ID")
         host_name = request["host_name"]
@@ -425,13 +652,35 @@ class ModelLabSupervisor:
                 "host name must be null or text",
                 code="invalid_supervisor_protocol",
             )
+        startup_expires_at = self.controller.canonical_startup_expiration(
+            require_timestamp(
+                request["startup_expires_at"],
+                label="service startup expiration",
+            )
+        )
+        startup_deadline = self.controller.startup_deadline_from_expiration(
+            startup_expires_at,
+            startup_deadline=require_monotonic_deadline(
+                request["startup_deadline"],
+                label="service startup monotonic deadline",
+            ),
+        )
         service = load_service_id(service_id, root=self.authored_root)
-        self.deployed_services.publish(service)
-        with self.mutation_lock:
+        with self._service_mutation(
+            service.service_id,
+            deadline=startup_deadline,
+        ):
+            self.deployed_services.publish(service)
+            self._clear_pending_up_rollback(service.service_id)
+            prior = self.controller.deployments.load(service.service_id)
+            rollback_deployment_id: str | None = None
+            rollback_marker: object | None = None
             try:
                 deployment, endpoint = self.controller.ensure_ready(
                     service,
                     host_name=host_name,
+                    startup_expires_at=startup_expires_at,
+                    startup_deadline=startup_deadline,
                 )
             except ModelLabError as error:
                 if error.code not in {
@@ -449,19 +698,92 @@ class ModelLabSupervisor:
                 deployment, endpoint = self.controller.ensure_ready(
                     service,
                     host_name=host_name,
+                    startup_expires_at=startup_expires_at,
+                    startup_deadline=startup_deadline,
                 )
-            deployment = self.controller.down(service, now=False)
-        send_document(
-            connection,
-            {
-                "schema": SUPERVISOR_RESULT_SCHEMA,
-                "operation": "up",
-                "result": {
-                    "deployment": deployment.normalized(),
-                    "endpoint": endpoint.as_dict(),
+            if (
+                prior is None
+                or prior.phase == "released"
+                or prior.deployment_id != deployment.deployment_id
+            ):
+                rollback_deployment_id = deployment.deployment_id
+            try:
+                self.controller.require_startup_budget(startup_deadline)
+                deployment = self.controller.down(
+                    service,
+                    now=False,
+                    cleanup_deadline=startup_deadline,
+                    deadline_error_code="service_startup_timeout",
+                )
+                self.controller.require_startup_budget(startup_deadline)
+                if rollback_deployment_id is not None:
+                    rollback_marker = object()
+                    self._record_pending_up_rollback(
+                        service.service_id,
+                        rollback_deployment_id,
+                        rollback_marker,
+                    )
+            except BaseException:
+                current = self.controller.deployments.load(
+                    service.service_id
+                )
+                if (
+                    rollback_deployment_id is not None
+                    and current is not None
+                    and current.deployment_id == rollback_deployment_id
+                ):
+                    self.controller.down(service, now=True)
+                raise
+        try:
+            send_document(
+                connection,
+                {
+                    "schema": SUPERVISOR_RESULT_SCHEMA,
+                    "operation": "up",
+                    "result": {
+                        "deployment": deployment.normalized(),
+                        "endpoint": endpoint.as_dict(),
+                    },
                 },
-            },
-        )
+                deadline=startup_deadline,
+                monotonic=self.controller.monotonic,
+                deadline_error_code="service_startup_timeout",
+            )
+            self.controller.require_startup_budget(startup_deadline)
+        except BaseException:
+            with self._service_mutation(service.service_id):
+                rollback_owned = (
+                    rollback_deployment_id is not None
+                    and rollback_marker is not None
+                    and self._claim_pending_up_rollback(
+                        service.service_id,
+                        rollback_deployment_id,
+                        rollback_marker,
+                    )
+                )
+                current = self.controller.deployments.load(
+                    service.service_id
+                )
+                if (
+                    rollback_owned
+                    and current is not None
+                    and current == deployment
+                    and current.deployment_id == rollback_deployment_id
+                    and current.phase in {"ready", "idle"}
+                    and not current.use_leases
+                ):
+                    self.controller.down(service, now=True)
+            raise
+        else:
+            if (
+                rollback_deployment_id is not None
+                and rollback_marker is not None
+            ):
+                self._claim_pending_up_rollback(
+                    service.service_id,
+                    rollback_deployment_id,
+                    rollback_marker,
+                )
 
     def _serve_down(
         self,
@@ -480,11 +802,39 @@ class ModelLabSupervisor:
                 "down now selector must be boolean",
                 code="invalid_supervisor_protocol",
             )
-        service = self._service_snapshot_for_deployment(service_id)
-        if now:
-            self._close_service_connections(service_id)
-        with self.mutation_lock:
-            deployment = self.controller.down(service, now=now)
+        fence = self._begin_immediate_down(service_id) if now else None
+        try:
+            with self._service_mutation(service_id):
+                if now:
+                    self._close_service_connections(service_id)
+                current = self._deployment_snapshot(service_id)
+                self._clear_pending_up_rollback(service_id)
+                if now and current.phase == "released":
+                    deployment = current
+                else:
+                    service = self.deployed_services.load(
+                        service_id,
+                        current.service_sha256,
+                    )
+                    if now and current.phase in {
+                        "quiescing",
+                        "stopping",
+                        "failed",
+                    }:
+                        current = (
+                            self.controller.deployments.escalate_cleanup_now(
+                                service_id
+                            )
+                        )
+                        deployment = self.controller.reconcile_cleanup(
+                            service,
+                            current,
+                        )
+                    else:
+                        deployment = self.controller.down(service, now=now)
+        finally:
+            if fence is not None:
+                fence.completed.set()
         send_document(
             connection,
             {
@@ -492,6 +842,95 @@ class ModelLabSupervisor:
                 "operation": "down",
                 "result": {"deployment": deployment.normalized()},
             },
+        )
+
+    def _validate_pi_identity(
+        self,
+        *,
+        profile_id: str,
+        project_id: str,
+        service_id: str,
+        service_sha256: str,
+        workload_sha256: str,
+        required_input_modalities: tuple[str, ...],
+        session_id: str | None,
+    ) -> tuple[_FrozenProfileSelection, ServiceDefinition]:
+        """Revalidate the caller's exact provider-free selection."""
+
+        route = load_profile_route(profile_id, root=self.authored_root)
+        if (
+            route.project_id != project_id
+            or route.service_id != service_id
+        ):
+            raise ModelLabError(
+                "Pi profile route changed after local validation",
+                code="pi_identity_changed",
+            )
+        profile_root = profile_path(profile_id, self.authored_root).parent
+        if session_id is None:
+            try:
+                loaded_profile = load_profile(profile_root)
+            except ModelSessionError as error:
+                raise ModelLabError(str(error), code=error.code) from error
+            contract = loaded_profile.contract
+            if (
+                contract.profile_id != profile_id
+                or contract.project_id != project_id
+                or contract.service_id != service_id
+                or contract.endpoint is None
+            ):
+                raise ModelLabError(
+                    "Pi profile changed after local validation",
+                    code="pi_identity_changed",
+                )
+            selected_modalities = tuple(
+                sorted(contract.endpoint.required_input_modalities)
+            )
+        else:
+            try:
+                resumed = resolve_resume_selection(
+                    profile_root,
+                    session_id,
+                    input_stream=io.StringIO(""),
+                    output=io.StringIO(),
+                )
+            except ModelSessionError as error:
+                raise ModelLabError(str(error), code=error.code) from error
+            if (
+                resumed.session_id != session_id
+                or resumed.service_id != service_id
+                or resumed.workload_sha256 != workload_sha256
+            ):
+                raise ModelLabError(
+                    "Pi resume selection changed after local validation",
+                    code="pi_identity_changed",
+                )
+            selected_modalities = tuple(sorted(resumed.input_modalities))
+        if selected_modalities != required_input_modalities:
+            raise ModelLabError(
+                "Pi input requirements changed after local validation",
+                code="pi_identity_changed",
+            )
+        service = load_service_id(service_id, root=self.authored_root)
+        if (
+            service.service_sha256 != service_sha256
+            or service.workload_sha256 != workload_sha256
+            or not set(required_input_modalities).issubset(
+                service.endpoint.input_modalities
+            )
+        ):
+            raise ModelLabError(
+                "Pi service changed after local validation",
+                code="pi_identity_changed",
+            )
+        return (
+            _FrozenProfileSelection(
+                profile_id=profile_id,
+                project_id=project_id,
+                service_id=service_id,
+                required_input_modalities=required_input_modalities,
+            ),
+            service,
         )
 
     def _serve_pi(
@@ -506,12 +945,38 @@ class ModelLabSupervisor:
                 {
                     "operation",
                     "profile_id",
+                    "project_id",
+                    "service_id",
+                    "service_sha256",
+                    "workload_sha256",
+                    "required_input_modalities",
+                    "session_id",
                     "host_name",
                     "stop_on_release",
+                    "startup_expires_at",
+                    "startup_deadline",
                 }
             ),
         )
         profile_id = require_identifier(request["profile_id"], label="profile ID")
+        project_id = require_identifier(request["project_id"], label="project ID")
+        service_id = require_identifier(request["service_id"], label="service ID")
+        service_sha256 = require_sha256(
+            request["service_sha256"],
+            label="service document",
+        )
+        workload_sha256 = require_sha256(
+            request["workload_sha256"],
+            label="service workload",
+        )
+        required_input_modalities = require_canonical_input_modalities(
+            request["required_input_modalities"],
+            label="required input modalities",
+        )
+        session_id = require_nullable_opaque_identifier(
+            request["session_id"],
+            label="session ID",
+        )
         host_name = request["host_name"]
         if host_name is not None and not isinstance(host_name, str):
             raise ModelLabError(
@@ -524,20 +989,53 @@ class ModelLabSupervisor:
                 "stop_on_release must be boolean",
                 code="invalid_supervisor_protocol",
             )
-        route = load_profile_route(profile_id, root=self.authored_root)
-        service = load_service_id(route.service_id, root=self.authored_root)
-        self.deployed_services.publish(service)
+        startup_expires_at = self.controller.canonical_startup_expiration(
+            require_timestamp(
+                request["startup_expires_at"],
+                label="Pi startup expiration",
+            )
+        )
+        startup_deadline = self.controller.startup_deadline_from_expiration(
+            startup_expires_at,
+            startup_deadline=require_monotonic_deadline(
+                request["startup_deadline"],
+                label="Pi startup monotonic deadline",
+            ),
+        )
+        operation = self._begin_pi_operation(service_id)
+        profile, service = self._validate_pi_identity(
+            profile_id=profile_id,
+            project_id=project_id,
+            service_id=service_id,
+            service_sha256=service_sha256,
+            workload_sha256=workload_sha256,
+            required_input_modalities=required_input_modalities,
+            session_id=session_id,
+        )
+        self._wait_for_preceding_down(operation, startup_deadline)
         use: ServiceUse | None = None
-        released = False
+        admitted = False
         try:
-            with self.mutation_lock:
+            with self._service_mutation(
+                service.service_id,
+                deadline=startup_deadline,
+            ):
+                self._require_current_pi_operation(
+                    service.service_id,
+                    operation,
+                )
+                self.deployed_services.publish(service)
+                self._clear_pending_up_rollback(service.service_id)
                 try:
                     use = self.controller.acquire_for_profile(
-                        route,
+                        profile,
                         service,
                         host_name=host_name,
                         owner_pid=self._supervisor_pid,
                         owner_start_time=self._supervisor_start_time,
+                        startup_expires_at=startup_expires_at,
+                        startup_deadline=startup_deadline,
+                        stop_on_release=stop_on_release,
                     )
                 except ModelLabError as error:
                     if error.code not in {
@@ -555,30 +1053,60 @@ class ModelLabSupervisor:
                         service.service_id
                     )
                     use = self.controller.acquire_for_profile(
-                        route,
+                        profile,
                         service,
                         host_name=host_name,
                         owner_pid=self._supervisor_pid,
                         owner_start_time=self._supervisor_start_time,
+                        startup_expires_at=startup_expires_at,
+                        startup_deadline=startup_deadline,
+                        stop_on_release=stop_on_release,
                     )
-            with self._connections_lock:
-                self._connection_services[connection] = service.service_id
+                self.controller.require_startup_budget(startup_deadline)
+                with self._connections_lock:
+                    self._connection_services[connection] = (
+                        service.service_id
+                    )
             enable_sender_credentials(connection)
             send_document(
                 connection,
                 {
                     "schema": PI_PENDING_SCHEMA,
-                    "profile_id": route.profile_id,
+                    "profile_id": profile.profile_id,
+                    "project_id": profile.project_id,
                     "service_id": service.service_id,
+                    "service_sha256": service.service_sha256,
                     "workload_sha256": use.deployment.workload_sha256,
+                    "required_input_modalities": list(
+                        profile.required_input_modalities
+                    ),
+                    "session_id": session_id,
                     "deployment_id": use.deployment.deployment_id,
                     "use_lease_id": use.lease.lease_id,
                 },
+                deadline=startup_deadline,
+                monotonic=self.controller.monotonic,
+                deadline_error_code="service_startup_timeout",
             )
-            connection.settimeout(self.admission_timeout_seconds)
+            self.controller.require_startup_budget(startup_deadline)
+            remaining_seconds = startup_deadline - self.controller.monotonic()
+            if remaining_seconds <= 0:
+                self.controller.require_startup_budget(startup_deadline)
+                raise AssertionError("expired startup budget was accepted")
+            admission_deadline = min(
+                startup_deadline,
+                self.controller.monotonic()
+                + self.admission_timeout_seconds,
+            )
             admission, sender_credentials = (
-                receive_document_with_credentials(connection)
+                receive_document_with_credentials(
+                    connection,
+                    deadline=admission_deadline,
+                    monotonic=self.controller.monotonic,
+                    deadline_error_code="service_startup_timeout",
+                )
             )
+            self.controller.require_startup_budget(startup_deadline)
             require_exact_fields(
                 admission,
                 schema=SESSION_USE_ADMIT_SCHEMA,
@@ -592,7 +1120,7 @@ class ModelLabSupervisor:
                 ),
             )
             if (
-                admission["profile_id"] != route.profile_id
+                admission["profile_id"] != profile.profile_id
                 or admission["service_id"] != service.service_id
             ):
                 raise ModelLabError(
@@ -613,7 +1141,11 @@ class ModelLabSupervisor:
                     "session process does not own the pending lease channel",
                     code="session_use_admission_mismatch",
                 )
-            with self.mutation_lock:
+            with self._service_mutation(
+                service.service_id,
+                deadline=startup_deadline,
+            ):
+                self.controller.require_startup_budget(startup_deadline)
                 lease = self.controller.deployments.transfer_use_owner(
                     service.service_id,
                     use.lease.lease_id,
@@ -621,13 +1153,16 @@ class ModelLabSupervisor:
                     expected_owner_start_time=self._supervisor_start_time,
                     owner_pid=session_pid,
                     owner_start_time=session_start,
+                    startup_deadline=startup_deadline,
+                    monotonic=self.controller.monotonic,
                 )
             use = dataclasses.replace(use, lease=lease)
+            self.controller.require_startup_budget(startup_deadline)
             send_document(
                 connection,
                 {
                     "schema": SESSION_USE_ACCEPTED_SCHEMA,
-                    "profile_id": route.profile_id,
+                    "profile_id": profile.profile_id,
                     "service_id": service.service_id,
                     "workload_sha256": use.deployment.workload_sha256,
                     "deployment_id": use.deployment.deployment_id,
@@ -637,7 +1172,12 @@ class ModelLabSupervisor:
                     "session_pid": session_pid,
                     "session_start_time": session_start,
                 },
+                deadline=startup_deadline,
+                monotonic=self.controller.monotonic,
+                deadline_error_code="service_startup_timeout",
             )
+            self.controller.require_startup_budget(startup_deadline)
+            admitted = True
             connection.settimeout(1.0)
             while not self.stop_event.is_set():
                 try:
@@ -653,53 +1193,95 @@ class ModelLabSupervisor:
                     code="invalid_supervisor_protocol",
                 )
         finally:
-            if use is not None and not released:
-                with self.mutation_lock:
+            if use is not None:
+                pending_release = _PendingUseRelease(
+                    service=service,
+                    use=use,
+                    now=stop_on_release,
+                    stop_if_final=not admitted,
+                )
+                self._queue_use_release(pending_release)
+                with self._service_mutation(service.service_id):
                     try:
-                        self.controller.release_profile_use(
-                            service,
-                            use,
-                            now=stop_on_release,
+                        self._attempt_use_release(pending_release)
+                    except Exception as error:
+                        self._report_operation_failure(
+                            "session-use-release:"
+                            f"{service.service_id}:"
+                            f"{use.lease.lease_id}",
+                            error,
                         )
-                    except ModelLabError as error:
-                        if error.code != "use_lease_not_found":
-                            raise
-                released = True
 
     def maintain_once(self) -> None:
         """Renew exact claims, stop due services, and retire empty hosts."""
 
-        with self.mutation_lock:
-            try:
-                intents = self.controller.preparations.list()
-            except Exception as error:
-                self._report_operation_failure("maintenance:intents", error)
-                intents = ()
-            for intent in intents:
+        for pending in self._pending_release_snapshot():
+            with self._service_mutation(pending.service.service_id):
                 try:
-                    self.controller.reconcile_acquire_intent(intent)
+                    self._attempt_use_release(pending)
+                except Exception as error:
+                    self._report_operation_failure(
+                        "maintenance:use-release:"
+                        f"{pending.service.service_id}:"
+                        f"{pending.use.lease.lease_id}",
+                        error,
+                    )
+
+        try:
+            intents = self.controller.preparations.list()
+        except Exception as error:
+            self._report_operation_failure("maintenance:intents", error)
+            intents = ()
+        for intent in intents:
+            with self._service_mutation(intent.service_id):
+                try:
+                    current_intent = self.controller.preparations.load(
+                        intent.service_id
+                    )
+                    if current_intent is not None:
+                        self.controller.reconcile_acquire_intent(
+                            current_intent
+                        )
                 except Exception as error:
                     self._report_operation_failure(
                         f"maintenance:intent:{intent.service_id}",
                         error,
                     )
 
-            try:
-                deployments = self.controller.deployments.list()
-            except Exception as error:
-                self._report_operation_failure(
-                    "maintenance:deployments",
-                    error,
+        try:
+            deployments = self.controller.deployments.list()
+        except Exception as error:
+            self._report_operation_failure(
+                "maintenance:deployments",
+                error,
+            )
+            deployments = ()
+        for observed in deployments:
+            with self._service_mutation(observed.service_id):
+                deployment = self.controller.deployments.load(
+                    observed.service_id
                 )
-                deployments = ()
-            for deployment in deployments:
-                if deployment.phase == "released":
+                if deployment is None or deployment.phase == "released":
                     continue
                 try:
                     service = self.deployed_services.load(
                         deployment.service_id,
                         deployment.service_sha256,
                     )
+                    if (
+                        deployment.phase == "ready"
+                        and self.controller.release_expired_pending_uses(
+                            service
+                        )
+                    ):
+                        deployment = self.controller.deployments.load(
+                            observed.service_id
+                        )
+                        if (
+                            deployment is None
+                            or deployment.phase == "released"
+                        ):
+                            continue
                     if deployment.phase in {
                         "quiescing",
                         "stopping",
@@ -721,7 +1303,9 @@ class ModelLabSupervisor:
                     ):
                         continue
                     try:
-                        self.controller.renew_deployment_claim(deployment)
+                        self.controller.renew_deployment_claim(
+                            deployment
+                        )
                     except Exception as error:
                         if self.controller.is_claim_quarantined(error):
                             self._close_service_connections(
@@ -746,13 +1330,13 @@ class ModelLabSupervisor:
                         f"maintenance:deployment:{deployment.service_id}",
                         error,
                     )
-            try:
-                self.controller.hosts.enforce_retirement(execute=True)
-            except Exception as error:
-                self._report_operation_failure(
-                    "maintenance:host-retirement",
-                    error,
-                )
+        try:
+            self.controller.hosts.enforce_retirement(execute=True)
+        except Exception as error:
+            self._report_operation_failure(
+                "maintenance:host-retirement",
+                error,
+            )
 
     def _report_operation_failure(
         self,

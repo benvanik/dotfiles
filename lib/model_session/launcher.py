@@ -13,7 +13,8 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass
 from types import FrameType
 from typing import IO, Any
 
@@ -49,8 +50,29 @@ ERROR_SCHEMA = "model-session.error.v1"
 CHILD_SHUTDOWN_GRACE_SECONDS = 5.0
 
 
+@dataclass(frozen=True)
+class ResumeSelection:
+    """Provider-free exact run identity selected before paid capacity."""
+
+    session_id: str
+    service_id: str
+    workload_sha256: str
+    input_modalities: tuple[str, ...]
+
+
 def _fail(message: str, *, code: str = "invalid_launcher_request") -> None:
     raise ModelSessionError(message, code=code)
+
+
+def _require_startup_budget(
+    startup_deadline: float | None,
+    monotonic: Callable[[], float],
+) -> None:
+    if startup_deadline is not None and monotonic() >= startup_deadline:
+        _fail(
+            "Pi did not become launchable within the service startup budget",
+            code="service_startup_timeout",
+        )
 
 
 def _parser(program: str) -> argparse.ArgumentParser:
@@ -76,6 +98,11 @@ def _parser(program: str) -> argparse.ArgumentParser:
     parser.add_argument(
         "--model-lab-use-fd",
         type=int,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--model-lab-use-deadline",
+        type=float,
         help=argparse.SUPPRESS,
     )
     subparsers = parser.add_subparsers(dest="command")
@@ -240,7 +267,8 @@ def build_pi_command(run: SessionRun) -> tuple[str, ...]:
     else:
         if run.profile.runtime is None:
             _fail(
-                "locked run has neither a frozen service binding nor a legacy runtime",
+                "locked run has neither a frozen service binding nor an "
+                "embedded runtime contract",
                 code="invalid_session_state",
             )
         provider = run.profile.runtime.provider
@@ -450,17 +478,33 @@ def launch_lease(
     lease: RunLease,
     *,
     service_use: SessionUseAuthority | None = None,
+    startup_deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> int:
     """Transfer one exclusive lease into a plan for the whole child lifetime."""
 
     try:
+        _require_startup_budget(startup_deadline, monotonic)
         command = build_pi_command(lease.run)
-        plan = build_sandbox_plan(lease, command=command)
+        _require_startup_budget(startup_deadline, monotonic)
+        plan_arguments: dict[str, Any] = {}
+        if startup_deadline is not None:
+            plan_arguments = {
+                "startup_deadline": startup_deadline,
+                "monotonic": monotonic,
+            }
+        plan = build_sandbox_plan(
+            lease,
+            command=command,
+            **plan_arguments,
+        )
+        _require_startup_budget(startup_deadline, monotonic)
     except BaseException:
         lease.close()
         raise
     with plan:
         try:
+            _require_startup_budget(startup_deadline, monotonic)
             process = subprocess.Popen(
                 plan.argv,
                 pass_fds=plan.pass_fds,
@@ -474,8 +518,16 @@ def launch_lease(
         child_identity_ready = False
         service_monitor: _ServiceUseMonitor | None = None
         try:
-            plan.sandbox_child_pid(process)
+            if startup_deadline is None:
+                plan.sandbox_child_pid(process)
+            else:
+                plan.sandbox_child_pid(
+                    process,
+                    startup_deadline=startup_deadline,
+                    monotonic=monotonic,
+                )
             child_identity_ready = True
+            _require_startup_budget(startup_deadline, monotonic)
             if service_use is not None:
                 service_monitor = _ServiceUseMonitor(
                     service_use,
@@ -591,7 +643,8 @@ def _pick_session(
     if not input_stream.isatty() or not output.isatty():
         _fail(
             "resume without a session ID requires an interactive terminal; "
-            "pass an exact ID from `./pi status`",
+            "pass an exact ID as "
+            "`model-lab pi PROFILE resume SESSION_ID`",
             code="session_id_required",
         )
     for index, entry in enumerate(entries, start=1):
@@ -624,9 +677,53 @@ def _pick_session(
     return entries[index - 1].session_id
 
 
+def resolve_resume_selection(
+    profile_root: pathlib.Path,
+    session_id: str | None,
+    *,
+    input_stream: IO[str],
+    output: IO[str],
+) -> ResumeSelection:
+    """Select and fully validate one frozen run before acquiring a GPU."""
+
+    route = load_profile_route(profile_root)
+    if session_id is None:
+        with enumerate_history(route.state_root, route.profile_id) as catalog:
+            selected = _pick_session(
+                catalog.entries,
+                input_stream=input_stream,
+                output=output,
+            )
+            lease = catalog.acquire(selected)
+    else:
+        lease = acquire_history_run_from_state(
+            route.state_root,
+            route.profile_id,
+            session_id,
+        )
+    try:
+        binding = lease.run.service_binding
+        if binding is None:
+            _fail(
+                "selected session has no frozen model service binding",
+                code="invalid_session_state",
+            )
+        return ResumeSelection(
+            session_id=lease.run.session_id,
+            service_id=binding.service_id,
+            workload_sha256=binding.workload_sha256,
+            input_modalities=binding.input_modalities,
+        )
+    finally:
+        lease.close()
+
+
 def _attest_lease_service(
     lease: RunLease,
     authority: SessionUseAuthority,
+    *,
+    startup_deadline: float,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> None:
     binding = lease.run.service_binding
     if binding is None:
@@ -639,6 +736,8 @@ def _attest_lease_service(
         endpoint = load_service_endpoint(
             lease.run.profile,
             expected_binding=binding,
+            deadline=startup_deadline,
+            monotonic=monotonic,
         )
         attest_workload(
             authority,
@@ -653,8 +752,13 @@ def _attest_lease_service(
 def _new_session(
     profile_root: pathlib.Path,
     authority: SessionUseAuthority,
+    *,
+    startup_deadline: float,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> int:
+    _require_startup_budget(startup_deadline, monotonic)
     profile = load_profile(profile_root)
+    _require_startup_budget(startup_deadline, monotonic)
     if (
         profile.contract.profile_id != authority.profile_id
         or profile.contract.service_id != authority.service_id
@@ -666,14 +770,27 @@ def _new_session(
     run = materialize_new_run(
         profile,
         expected_workload_sha256=authority.workload_sha256,
+        startup_deadline=startup_deadline,
+        monotonic=monotonic,
     )
+    _require_startup_budget(startup_deadline, monotonic)
     lease = acquire_run_from_state(
         profile.contract.state_root,
         profile.contract.profile_id,
         run.session_id,
     )
-    _attest_lease_service(lease, authority)
-    return launch_lease(lease, service_use=authority)
+    _attest_lease_service(
+        lease,
+        authority,
+        startup_deadline=startup_deadline,
+        monotonic=monotonic,
+    )
+    return launch_lease(
+        lease,
+        service_use=authority,
+        startup_deadline=startup_deadline,
+        monotonic=monotonic,
+    )
 
 
 def _resume_session(
@@ -683,25 +800,37 @@ def _resume_session(
     *,
     input_stream: IO[str],
     output: IO[str],
+    startup_deadline: float,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> int:
+    _require_startup_budget(startup_deadline, monotonic)
     route = load_profile_route(profile_root)
-    if session_id is not None:
-        lease = acquire_history_run_from_state(
-            route.state_root,
-            route.profile_id,
-            session_id,
+    if session_id is None:
+        _fail(
+            "resume selection must be resolved before model service "
+            "acquisition",
+            code="session_id_required",
         )
-        _attest_lease_service(lease, authority)
-        return launch_lease(lease, service_use=authority)
-    with enumerate_history(route.state_root, route.profile_id) as catalog:
-        selected = _pick_session(
-            catalog.entries,
-            input_stream=input_stream,
-            output=output,
-        )
-        lease = catalog.acquire(selected)
-    _attest_lease_service(lease, authority)
-    return launch_lease(lease, service_use=authority)
+    _require_startup_budget(startup_deadline, monotonic)
+    lease = acquire_history_run_from_state(
+        route.state_root,
+        route.profile_id,
+        session_id,
+        startup_deadline=startup_deadline,
+        monotonic=monotonic,
+    )
+    _attest_lease_service(
+        lease,
+        authority,
+        startup_deadline=startup_deadline,
+        monotonic=monotonic,
+    )
+    return launch_lease(
+        lease,
+        service_use=authority,
+        startup_deadline=startup_deadline,
+        monotonic=monotonic,
+    )
 
 
 def _status(
@@ -742,9 +871,14 @@ def main(
             authority = read_session_use_authority(
                 parsed.model_lab_use_fd,
                 route,
+                startup_deadline=parsed.model_lab_use_deadline,
             )
             try:
-                return _new_session(profile_root, authority)
+                return _new_session(
+                    profile_root,
+                    authority,
+                    startup_deadline=parsed.model_lab_use_deadline,
+                )
             finally:
                 authority.close()
         if parsed.command == "resume":
@@ -752,6 +886,7 @@ def main(
             authority = read_session_use_authority(
                 parsed.model_lab_use_fd,
                 route,
+                startup_deadline=parsed.model_lab_use_deadline,
             )
             try:
                 return _resume_session(
@@ -760,6 +895,7 @@ def main(
                     authority,
                     input_stream=stdin,
                     output=stdout,
+                    startup_deadline=parsed.model_lab_use_deadline,
                 )
             finally:
                 authority.close()

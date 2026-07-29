@@ -11,10 +11,12 @@ import json
 import os
 import pathlib
 import re
+import select
 import signal
 import stat
 import subprocess
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, Self
@@ -151,6 +153,21 @@ _FIXED_ENVIRONMENT = (
     ("TMPDIR", "/tmp"),
     ("USER", "agent"),
 )
+
+
+def _require_startup_budget(
+    startup_deadline: float | None,
+    monotonic: Callable[[], float],
+) -> float | None:
+    if startup_deadline is None:
+        return None
+    remaining = startup_deadline - monotonic()
+    if remaining <= 0:
+        _fail(
+            "sandbox launch exceeded the service startup deadline",
+            code="service_startup_timeout",
+        )
+    return remaining
 
 
 def _fail(message: str, *, code: str = "unsafe_sandbox") -> None:
@@ -315,7 +332,12 @@ def _open_validated(
         raise
 
 
-def _probe_bwrap(arguments: Sequence[str]) -> subprocess.CompletedProcess[str]:
+def _probe_bwrap(
+    arguments: Sequence[str],
+    *,
+    startup_deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
             [os.fspath(BWRAP_BINARY), *arguments],
@@ -323,7 +345,17 @@ def _probe_bwrap(arguments: Sequence[str]) -> subprocess.CompletedProcess[str]:
             capture_output=True,
             text=True,
             env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+            timeout=_require_startup_budget(
+                startup_deadline,
+                monotonic,
+            ),
         )
+    except subprocess.TimeoutExpired as error:
+        raise ModelSessionError(
+            "bubblewrap capability probe exceeded the service startup "
+            "deadline",
+            code="service_startup_timeout",
+        ) from error
     except OSError as error:
         raise ModelSessionError(
             f"cannot execute {BWRAP_BINARY}: {error}",
@@ -331,7 +363,11 @@ def _probe_bwrap(arguments: Sequence[str]) -> subprocess.CompletedProcess[str]:
         ) from error
 
 
-def validate_bwrap() -> tuple[int, int, int]:
+def validate_bwrap(
+    *,
+    startup_deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> tuple[int, int, int]:
     """Validate the exact system bubblewrap binary and required feature set."""
 
     descriptor = _open_absolute_no_symlinks(
@@ -356,7 +392,11 @@ def validate_bwrap() -> tuple[int, int, int]:
     finally:
         os.close(descriptor)
 
-    version_result = _probe_bwrap(("--version",))
+    version_result = _probe_bwrap(
+        ("--version",),
+        startup_deadline=startup_deadline,
+        monotonic=monotonic,
+    )
     if version_result.returncode != 0:
         _fail(
             f"{BWRAP_BINARY} --version failed: {version_result.stderr.strip()}",
@@ -377,7 +417,11 @@ def validate_bwrap() -> tuple[int, int, int]:
             code="bwrap_version_unsupported",
         )
 
-    help_result = _probe_bwrap(("--help",))
+    help_result = _probe_bwrap(
+        ("--help",),
+        startup_deadline=startup_deadline,
+        monotonic=monotonic,
+    )
     if help_result.returncode != 0:
         _fail(
             f"{BWRAP_BINARY} --help failed: {help_result.stderr.strip()}",
@@ -507,7 +551,13 @@ class SandboxPlan:
     def closed(self) -> bool:
         return self._closed
 
-    def sandbox_child_pid(self, monitor: subprocess.Popen[Any]) -> int:
+    def sandbox_child_pid(
+        self,
+        monitor: subprocess.Popen[Any],
+        *,
+        startup_deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> int:
         """Retain bwrap's direct child under its exact live Popen monitor."""
 
         if self._closed:
@@ -526,6 +576,23 @@ class SandboxPlan:
             self._status_write_descriptor = -1
         line = bytearray()
         while b"\n" not in line:
+            remaining = _require_startup_budget(
+                startup_deadline,
+                monotonic,
+            )
+            if remaining is not None:
+                readable, _, _ = select.select(
+                    [self._status_read_descriptor],
+                    [],
+                    [],
+                    remaining,
+                )
+                if not readable:
+                    _fail(
+                        "bubblewrap child identity exceeded the service "
+                        "startup deadline",
+                        code="service_startup_timeout",
+                    )
             try:
                 chunk = os.read(self._status_read_descriptor, 4096)
             except InterruptedError:
@@ -541,6 +608,7 @@ class SandboxPlan:
                     code="sandbox_launch_failed",
                 )
             line.extend(chunk)
+            _require_startup_budget(startup_deadline, monotonic)
             if len(line) > 64 * 1024:
                 _fail(
                     "bubblewrap child identity exceeded its protocol bound",
@@ -595,6 +663,7 @@ class SandboxPlan:
                     "bubblewrap monitor exited during child identity retention",
                     code="sandbox_launch_failed",
                 )
+            _require_startup_budget(startup_deadline, monotonic)
             self._owned_descriptors.append(pid_descriptor)
         except BaseException:
             os.close(pid_descriptor)
@@ -878,6 +947,8 @@ def build_sandbox_plan(
     *,
     command: Sequence[str],
     attachment_runtime_root: os.PathLike[str] | str | None = None,
+    startup_deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> SandboxPlan:
     """Build from an exclusive lease without reopening run-owned host paths."""
 
@@ -888,7 +959,11 @@ def build_sandbox_plan(
         )
     lease._require_open()
     run = lease.run
-    validate_bwrap()
+    _require_startup_budget(startup_deadline, monotonic)
+    validate_bwrap(
+        startup_deadline=startup_deadline,
+        monotonic=monotonic,
+    )
     arguments = _validate_command(command)
     _validate_source_relationships(run)
     current_user = os.getuid()
@@ -905,6 +980,7 @@ def build_sandbox_plan(
         exact_mode: int | None = None,
         reject_group_or_world_write: bool = True,
     ) -> int:
+        _require_startup_budget(startup_deadline, monotonic)
         descriptor = _open_validated(
             _normal_absolute_path(path, label=label),
             label=label,
@@ -926,6 +1002,7 @@ def build_sandbox_plan(
         exact_mode: int | None = None,
         reject_group_or_world_write: bool = True,
     ) -> int:
+        _require_startup_budget(startup_deadline, monotonic)
         descriptor = lease.duplicate_source(source)
         try:
             _validate_descriptor(
@@ -1012,6 +1089,8 @@ def build_sandbox_plan(
                 run.profile,
                 expected_binding=run.service_binding,
                 runtime_root=attachment_runtime_root,
+                deadline=startup_deadline,
+                monotonic=monotonic,
             )
             attachment = endpoint
         else:
@@ -1268,6 +1347,7 @@ def build_sandbox_plan(
             argv.extend(("--setenv", name, value))
         argv.extend(("--chdir", "/workspace", "--", *arguments))
         lease_owner = object()
+        _require_startup_budget(startup_deadline, monotonic)
         lease._claim_for_plan(lease_owner)
         try:
             return SandboxPlan(

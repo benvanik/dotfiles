@@ -22,6 +22,44 @@ from .timeutil import parse_utc_timestamp, utc_timestamp
 REST_BASE = "https://rest.runpod.io/v1"
 GRAPHQL_URL = "https://api.runpod.io/graphql"
 AVAILABLE_STOCK_STATUSES = frozenset({"High", "Medium", "Low"})
+GRAPHQL_OPERATION_NAMES = frozenset(
+    {
+        "accountSshKey",
+        "dataCenters",
+        "gpuTypes",
+        "podFindAndDeployOnDemand",
+        "podPolicy",
+    }
+)
+GRAPHQL_EXTENSION_CODE_CATEGORIES = {
+    "BAD_USER_INPUT": "invalid_request",
+    "FORBIDDEN": "authorization_failed",
+    "GRAPHQL_PARSE_FAILED": "invalid_request",
+    "GRAPHQL_VALIDATION_FAILED": "invalid_request",
+    "INTERNAL_SERVER_ERROR": "provider_failure",
+    "RATE_LIMITED": "rate_limited",
+    "TOO_MANY_REQUESTS": "rate_limited",
+    "UNAUTHENTICATED": "authentication_failed",
+    "UNAUTHORIZED": "authentication_failed",
+}
+MAX_GRAPHQL_ERRORS_TO_CLASSIFY = 32
+NO_INSTANCES_AVAILABLE_GRAPHQL_ERROR = (
+    "There are no longer any instances available with the requested "
+    "specifications. Please refresh and try again."
+)
+CREATE_POD_GRAPHQL_NO_CAPACITY_MESSAGES = frozenset(
+    {
+        NO_INSTANCES_AVAILABLE_GRAPHQL_ERROR,
+        "There are no instances currently available",
+        "There are no longer any instances available with the request "
+        "specifications. Please refresh and try again.",
+        "There are no longer any instances available with the request "
+        "specifications. Please try again later.",
+        "There are no longer any instances available with the requested "
+        "specifications. Please try again later.",
+    }
+)
+GRAPHQL_NO_CAPACITY_ERROR_CODE = "provider_graphql_no_capacity"
 GPU_TYPES_QUERY = """
 query {
   gpuTypes {
@@ -151,6 +189,152 @@ PROVIDER_POD_SNAPSHOT_EXPECTED_FIELDS = frozenset(
 PROVIDER_STATUS_VALUES = frozenset({"valid", "invalid", "missing"})
 HEX_DIGITS = frozenset("0123456789abcdef")
 MAX_PROVIDER_INTEGER = (1 << 63) - 1
+
+
+def _graphql_message_category(message: Any) -> str | None:
+    """Classify provider prose without retaining or displaying that prose."""
+
+    if not isinstance(message, str):
+        return None
+    normalized = " ".join(message[:4096].casefold().split())
+    if any(
+        phrase in normalized
+        for phrase in (
+            "insufficient capacity",
+            "no available gpu",
+            "no available instance",
+            "no gpu available",
+            "no instance available",
+            "no instances available",
+            "no instances currently available",
+            "no longer any instances available",
+            "out of capacity",
+            "out of stock",
+            "unable to find any gpu",
+        )
+    ):
+        return "capacity_unavailable"
+    if any(
+        phrase in normalized
+        for phrase in (
+            "api key is invalid",
+            "authentication failed",
+            "invalid api key",
+            "not authenticated",
+            "unauthenticated",
+            "unauthorized",
+        )
+    ):
+        return "authentication_failed"
+    if any(
+        phrase in normalized
+        for phrase in (
+            "access denied",
+            "forbidden",
+            "not authorized",
+            "permission denied",
+        )
+    ):
+        return "authorization_failed"
+    if any(
+        phrase in normalized
+        for phrase in (
+            "rate limit",
+            "too many requests",
+        )
+    ):
+        return "rate_limited"
+    if any(
+        phrase in normalized
+        for phrase in (
+            "bad user input",
+            "cannot query field",
+            "invalid input",
+            "invalid value",
+            "malformed",
+            "must be provided",
+            "unknown argument",
+            "validation failed",
+            "variable ",
+        )
+    ):
+        return "invalid_request"
+    if any(
+        phrase in normalized
+        for phrase in (
+            "internal server error",
+            "provider error",
+            "service unavailable",
+            "something went wrong",
+            "unexpected error",
+        )
+    ):
+        return "provider_failure"
+    return None
+
+
+def _graphql_error_category(error: Any) -> str | None:
+    if not isinstance(error, dict):
+        return None
+    message_category = _graphql_message_category(error.get("message"))
+    if message_category is not None:
+        return message_category
+    extensions = error.get("extensions")
+    if not isinstance(extensions, dict):
+        return None
+    code = extensions.get("code")
+    if not isinstance(code, str):
+        return None
+    return GRAPHQL_EXTENSION_CODE_CATEGORIES.get(code)
+
+
+def _graphql_error_diagnostic(errors: Any) -> str:
+    """Summarize a GraphQL error array without echoing provider-controlled data."""
+
+    if not isinstance(errors, list) or not errors:
+        return "error_shape=invalid"
+    categories: set[str] = set()
+    invalid_shape = False
+    for error in errors[:MAX_GRAPHQL_ERRORS_TO_CLASSIFY]:
+        if not isinstance(error, dict):
+            invalid_shape = True
+            continue
+        if not isinstance(error.get("message"), str):
+            invalid_shape = True
+        category = _graphql_error_category(error)
+        categories.add(category or "unclassified")
+    if len(errors) > MAX_GRAPHQL_ERRORS_TO_CLASSIFY:
+        categories.add("unclassified")
+    details = [f"error_count={len(errors)}"]
+    if categories:
+        details.append("classification=" + ",".join(sorted(categories)))
+    if invalid_shape:
+        details.append("error_shape=invalid")
+    return "; ".join(details)
+
+
+def _is_definitive_graphql_capacity_rejection(
+    errors: Any,
+    data: Any,
+) -> bool:
+    """Recognize only complete, exact create-capacity rejection documents."""
+
+    if (
+        not isinstance(errors, list)
+        or not errors
+        or not all(
+            isinstance(error, dict)
+            and error.get("message")
+            in CREATE_POD_GRAPHQL_NO_CAPACITY_MESSAGES
+            for error in errors
+        )
+    ):
+        return False
+    return data is None or (
+        isinstance(data, dict)
+        and set(data) == {"podFindAndDeployOnDemand"}
+        and data["podFindAndDeployOnDemand"] is None
+    )
 
 
 def _ssh_public_key_identity(value: str) -> tuple[str, str]:
@@ -1295,8 +1479,14 @@ class RunpodApi:
         self,
         query: str,
         *,
+        operation: str,
         variables: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        if operation not in GRAPHQL_OPERATION_NAMES:
+            raise RunpodLocalError(
+                "Runpod GraphQL operation has no safe diagnostic name",
+                code="invalid_graphql_operation",
+            )
         payload: dict[str, Any] = {"query": query}
         if variables is not None:
             payload["variables"] = variables
@@ -1312,9 +1502,21 @@ class RunpodApi:
                 code="invalid_provider_response",
             )
         if value.get("errors"):
+            errors = value.get("errors")
+            diagnostic = _graphql_error_diagnostic(errors)
+            error_code = "provider_graphql_error"
+            if (
+                operation == "podFindAndDeployOnDemand"
+                and _is_definitive_graphql_capacity_rejection(
+                    errors,
+                    value.get("data"),
+                )
+            ):
+                error_code = GRAPHQL_NO_CAPACITY_ERROR_CODE
             raise RunpodLocalError(
-                "Runpod GraphQL returned one or more errors",
-                code="provider_graphql_error",
+                f"Runpod GraphQL {operation} returned one or more errors "
+                f"({diagnostic}; provider messages withheld)",
+                code=error_code,
             )
         data = value.get("data")
         if not isinstance(data, dict):
@@ -1345,7 +1547,10 @@ class RunpodApi:
         """Require the profile key among the account's startup SSH keys."""
 
         expected_identity = _ssh_public_key_identity(public_key)
-        data = self._graphql(ACCOUNT_SSH_KEY_QUERY)
+        data = self._graphql(
+            ACCOUNT_SSH_KEY_QUERY,
+            operation="accountSshKey",
+        )
         myself = data.get("myself")
         if not isinstance(myself, dict):
             raise RunpodLocalError(
@@ -1422,7 +1627,10 @@ class RunpodApi:
         attestation.consumed = True
 
     def _get_pod_policy_attestation(self, pod_id: str) -> dict[str, Any]:
-        data = self._graphql(POD_POLICY_QUERY % pod_id)
+        data = self._graphql(
+            POD_POLICY_QUERY % pod_id,
+            operation="podPolicy",
+        )
         value = data.get("pod")
         if not isinstance(value, dict):
             raise RunpodLocalError(
@@ -1520,6 +1728,7 @@ class RunpodApi:
         )
         data = self._graphql(
             CREATE_POD_MUTATION,
+            operation="podFindAndDeployOnDemand",
             variables={"input": graphql_input},
         )
         value = data.get("podFindAndDeployOnDemand")
@@ -1680,7 +1889,7 @@ class RunpodApi:
             gpu_count,
             "true" if secure_cloud else "false",
         )
-        data = self._graphql(query)
+        data = self._graphql(query, operation="gpuTypes")
         raw_gpus = data.get("gpuTypes")
         if not isinstance(raw_gpus, list):
             raise RunpodLocalError(
@@ -1730,7 +1939,10 @@ class RunpodApi:
         )
         data_centers: list[dict[str, Any]] | None = None
         if include_data_centers:
-            center_data = self._graphql(DATA_CENTERS_QUERY)
+            center_data = self._graphql(
+                DATA_CENTERS_QUERY,
+                operation="dataCenters",
+            )
             raw_centers = center_data.get("dataCenters")
             if not isinstance(raw_centers, list) or not all(
                 isinstance(center, dict) for center in raw_centers

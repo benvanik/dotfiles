@@ -4,6 +4,8 @@ import math
 import unittest
 
 from runpod_local.api import (
+    GRAPHQL_NO_CAPACITY_ERROR_CODE,
+    NO_INSTANCES_AVAILABLE_GRAPHQL_ERROR,
     RunpodApi,
     gpu_stock_is_available,
     normalize_pod,
@@ -899,13 +901,17 @@ class RunpodApiTest(unittest.TestCase):
                 )
                 self.assertEqual(len(transport.requests), 1)
 
-    def test_create_pod_graphql_error_is_ambiguous_and_consumes_attestation(
+    def test_create_pod_graphql_no_capacity_is_definitive_and_consumes_attestation(
         self,
     ):
         api, transport = api_with_responses(
             account_ssh_key_response(),
             {
-                "errors": [{"message": "no instances available"}],
+                "errors": [
+                    {
+                        "message": NO_INSTANCES_AVAILABLE_GRAPHQL_ERROR
+                    }
+                ],
                 "data": None,
             },
         )
@@ -918,7 +924,13 @@ class RunpodApiTest(unittest.TestCase):
             )
 
         self.assertEqual(
-            caught.exception.code, "provider_graphql_error"
+            caught.exception.code, GRAPHQL_NO_CAPACITY_ERROR_CODE
+        )
+        self.assertEqual(
+            str(caught.exception),
+            "Runpod GraphQL podFindAndDeployOnDemand returned one or more "
+            "errors (error_count=1; classification=capacity_unavailable; "
+            "provider messages withheld)",
         )
         self.assertEqual(
             transport.requests[1]["allowed_error_responses"], frozenset()
@@ -932,6 +944,134 @@ class RunpodApiTest(unittest.TestCase):
             reused.exception.code, "account_ssh_attestation_required"
         )
         self.assertEqual(len(transport.requests), 2)
+
+    def test_create_pod_mixed_graphql_errors_remain_ambiguous(self):
+        api, _ = api_with_responses(
+            account_ssh_key_response(),
+            {
+                "errors": [
+                    {
+                        "message": NO_INSTANCES_AVAILABLE_GRAPHQL_ERROR,
+                    },
+                    {"message": "fixture unclassified provider failure"},
+                ],
+                "data": None,
+            },
+        )
+        attestation = api.attest_account_ssh_key(SSH_PUBLIC_KEY)
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            api.create_pod(
+                pod_create_payload(),
+                account_ssh_attestation=attestation,
+            )
+
+        self.assertEqual(caught.exception.code, "provider_graphql_error")
+        self.assertIn("error_count=2", str(caught.exception))
+        self.assertIn(
+            "classification=capacity_unavailable,unclassified",
+            str(caught.exception),
+        )
+
+    def test_create_pod_capacity_error_with_pod_data_remains_ambiguous(self):
+        api, _ = api_with_responses(
+            account_ssh_key_response(),
+            {
+                "errors": [
+                    {
+                        "message": NO_INSTANCES_AVAILABLE_GRAPHQL_ERROR,
+                    }
+                ],
+                "data": {
+                    "podFindAndDeployOnDemand": {
+                        "id": "pod123",
+                        "name": "fixture",
+                    }
+                },
+            },
+        )
+        attestation = api.attest_account_ssh_key(SSH_PUBLIC_KEY)
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            api.create_pod(
+                pod_create_payload(),
+                account_ssh_attestation=attestation,
+            )
+
+        self.assertEqual(caught.exception.code, "provider_graphql_error")
+
+    def test_create_pod_graphql_diagnostic_never_discloses_credentials_or_environment(
+        self,
+    ):
+        token = "fixture-runpod-token"
+        environment_secret = "fixture-environment-secret"
+        payload = pod_create_payload()
+        payload["env"]["PRIVATE_VALUE"] = environment_secret
+        api, _ = api_with_responses(
+            account_ssh_key_response(),
+            {
+                "errors": [
+                    {
+                        "message": (
+                            "No instances available; provider echoed "
+                            f"{token} and {environment_secret}"
+                        ),
+                        "path": [environment_secret],
+                        "extensions": {
+                            "code": environment_secret,
+                            "debug": token,
+                        },
+                    }
+                ],
+                "data": None,
+            },
+        )
+        attestation = api.attest_account_ssh_key(SSH_PUBLIC_KEY)
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            api.create_pod(
+                payload,
+                account_ssh_attestation=attestation,
+            )
+
+        diagnostic = str(caught.exception)
+        self.assertEqual(caught.exception.code, "provider_graphql_error")
+        self.assertIn("classification=capacity_unavailable", diagnostic)
+        self.assertIn("provider messages withheld", diagnostic)
+        self.assertNotIn(token, diagnostic)
+        self.assertNotIn(environment_secret, diagnostic)
+        self.assertNotIn(SSH_PUBLIC_KEY, diagnostic)
+        self.assertNotIn(token, repr(caught.exception.__dict__))
+        self.assertNotIn(
+            environment_secret,
+            repr(caught.exception.__dict__),
+        )
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertIsNone(caught.exception.__context__)
+
+    def test_graphql_diagnostic_rejects_malformed_error_shape_without_echoing_it(
+        self,
+    ):
+        provider_secret = "fixture-provider-secret"
+        api, _ = api_with_responses(
+            {
+                "errors": {
+                    "message": provider_secret,
+                    "extensions": {"code": provider_secret},
+                },
+                "data": None,
+            }
+        )
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            api.stock()
+
+        self.assertEqual(
+            str(caught.exception),
+            "Runpod GraphQL gpuTypes returned one or more errors "
+            "(error_shape=invalid; provider messages withheld)",
+        )
+        self.assertNotIn(provider_secret, str(caught.exception))
 
     def test_create_pod_rejects_invalid_graphql_response_identity(self):
         invalid_pods = (
@@ -1157,6 +1297,12 @@ class RunpodApiTest(unittest.TestCase):
         with self.assertRaises(RunpodLocalError) as caught:
             api.stock()
         self.assertEqual(caught.exception.code, "provider_graphql_error")
+        self.assertEqual(
+            str(caught.exception),
+            "Runpod GraphQL gpuTypes returned one or more errors "
+            "(error_count=1; classification=unclassified; provider "
+            "messages withheld)",
+        )
 
     def test_delete_pod_requires_204(self):
         api, transport = api_with_responses(None)

@@ -11,7 +11,10 @@ from runpod_local.allocation import (
     select_launch_placement,
     verify_allocated_pod,
 )
-from runpod_local.api import normalize_pod
+from runpod_local.api import (
+    GRAPHQL_NO_CAPACITY_ERROR_CODE,
+    normalize_pod,
+)
 from runpod_local.errors import HttpRequestError, RunpodLocalError
 from runpod_local.host_template import build_generic_host_template
 from runpod_local.instances import (
@@ -646,9 +649,37 @@ class LifecycleTest(unittest.TestCase):
             "intent",
         )
 
-    def test_graphql_capacity_error_is_ambiguous_and_never_reposts(self):
+    def test_definitive_graphql_no_capacity_aborts_and_allows_retry(self):
         self.api.create_error = RunpodLocalError(
             "fixture no capacity",
+            code=GRAPHQL_NO_CAPACITY_ERROR_CODE,
+        )
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            self.launch()
+
+        self.assertEqual(caught.exception.code, "no_provider_capacity")
+        first = InstanceStore(self.state).load("compiler")
+        self.assertEqual(first["phase"], "aborted")
+        self.assertEqual(
+            first["events"][-1]["event"],
+            "submission_rejected_no_capacity",
+        )
+
+        self.api.create_error = None
+        self.manager.uuid_factory = lambda: uuid.UUID(
+            "87654321-4321-4321-8321-ba9876543210"
+        )
+        second = self.launch()
+
+        self.assertEqual(second["phase"], "active")
+        self.assertEqual(self.api.create_calls, 2)
+        self.assertEqual(len(second["history"]), 1)
+        self.assertEqual(second["history"][0]["phase"], "aborted")
+
+    def test_mixed_graphql_error_is_ambiguous_and_never_reposts(self):
+        self.api.create_error = RunpodLocalError(
+            "fixture mixed provider errors",
             code="provider_graphql_error",
         )
 

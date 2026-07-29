@@ -8,7 +8,11 @@ from collections.abc import Callable
 from typing import Any
 
 from .allocation import select_launch_placement, verify_allocated_pod
-from .api import RunpodApi, provider_pod_snapshot
+from .api import (
+    GRAPHQL_NO_CAPACITY_ERROR_CODE,
+    RunpodApi,
+    provider_pod_snapshot,
+)
 from .errors import HttpRequestError, RunpodLocalError
 from .instances import (
     INSTANCE_SCHEMA,
@@ -850,7 +854,20 @@ class LifecycleManager:
                     )
                     self.instances.save(record)
                     raise
-                except RunpodLocalError:
+                except RunpodLocalError as error:
+                    if error.code == GRAPHQL_NO_CAPACITY_ERROR_CODE:
+                        transition_instance(
+                            record,
+                            "aborted",
+                            at=self._now(),
+                            event="submission_rejected_no_capacity",
+                        )
+                        self.instances.save(record)
+                        raise RunpodLocalError(
+                            "Runpod reported no instances available for the "
+                            "selected launch constraints",
+                            code="no_provider_capacity",
+                        ) from error
                     append_event(
                         record, "submission_result_unknown", at=self._now()
                     )

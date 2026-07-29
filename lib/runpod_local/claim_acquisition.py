@@ -439,6 +439,59 @@ class ClaimAcquisitionStore:
         )
         return acquisition
 
+    def advance_rejected_target(
+        self,
+        request: HostClaimRequest,
+        *,
+        rejected_host_operation_id: str,
+        new_host_operation_id: str,
+        now: datetime.datetime,
+    ) -> dict[str, Any]:
+        """Atomically replace one unbound, definitively rejected launch target."""
+
+        validate_host_operation_id(rejected_host_operation_id)
+        validate_host_operation_id(new_host_operation_id)
+        acquisition = self.load(request, required=True)
+        if acquisition is None:
+            raise AssertionError(
+                "required claim acquisition unexpectedly absent"
+            )
+        target = acquisition["target"]
+        if (
+            target is None
+            or target["host_operation_id"]
+            != rejected_host_operation_id
+        ):
+            raise RunpodLocalError(
+                "rejected host operation differs from its acquisition target",
+                code="host_claim_acquisition_drift",
+            )
+        if acquisition["host"] is not None or acquisition["claim"] is not None:
+            raise RunpodLocalError(
+                "cannot advance a rejected target after binding provider state",
+                code="host_claim_acquisition_drift",
+            )
+        if new_host_operation_id == rejected_host_operation_id:
+            raise RunpodLocalError(
+                "replacement host operation repeats its rejected predecessor",
+                code="invalid_host_operation_id",
+            )
+        acquisition["target"] = {
+            "host_name": target["host_name"],
+            "host_operation_id": new_host_operation_id,
+            "predecessor_operation_id": rejected_host_operation_id,
+            "profile": dict(target["profile"]),
+        }
+        acquisition["generation"] += 1
+        acquisition["updated_at"] = utc_timestamp(now)
+        acquisition = validate_claim_acquisition(acquisition)
+        self.state.write(
+            "hostclaimops",
+            acquisition["record_name"],
+            acquisition,
+        )
+        return acquisition
+
     def bind_host(
         self,
         request: HostClaimRequest,

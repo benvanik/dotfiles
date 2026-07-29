@@ -114,6 +114,28 @@ def _static_profile_admission_reasons(
     return sorted(set(reasons))
 
 
+def _is_definitive_no_capacity_receipt(
+    host: dict[str, Any] | None,
+    target: dict[str, Any],
+) -> bool:
+    if (
+        host is None
+        or host.get("name") != target["host_name"]
+        or host.get("operation_id") != target["host_operation_id"]
+        or host.get("profile") != target["profile"]
+        or host.get("phase") != "aborted"
+        or host.get("pod_id") is not None
+        or host.get("provider") is not None
+    ):
+        return False
+    events = host.get("events")
+    return isinstance(events, list) and any(
+        isinstance(event, dict)
+        and event.get("event") == "submission_rejected_no_capacity"
+        for event in events
+    )
+
+
 class HostControl:
     """The only supported workload-independent consumer API for Runpod hosts.
 
@@ -653,6 +675,31 @@ class HostControl:
             code="allocation_rejected",
         )
 
+    def _advance_no_capacity_target(
+        self,
+        request: HostClaimRequest,
+        acquisition: dict[str, Any],
+        host: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        target = acquisition["target"]
+        if (
+            target is None
+            or acquisition["host"] is not None
+            or acquisition["claim"] is not None
+            or not _is_definitive_no_capacity_receipt(host, target)
+        ):
+            raise RunpodLocalError(
+                "no-capacity rejection does not match the exact unbound "
+                "acquisition target",
+                code="host_claim_acquisition_drift",
+            )
+        return self.acquisitions.advance_rejected_target(
+            request,
+            rejected_host_operation_id=target["host_operation_id"],
+            new_host_operation_id=self.lifecycle.new_operation_id(),
+            now=self._now(),
+        )
+
     def _create_host(
         self,
         request: HostClaimRequest,
@@ -745,6 +792,20 @@ class HostControl:
                 required=False,
             )
             bound_host = acquisition["host"]
+            if (
+                bound_host is None
+                and target is not None
+                and _is_definitive_no_capacity_receipt(
+                    current_host,
+                    target,
+                )
+            ):
+                acquisition = self._advance_no_capacity_target(
+                    request,
+                    acquisition,
+                    current_host,
+                )
+                target = acquisition["target"]
             if bound_host is not None and (
                 current_host is None
                 or current_host["operation_id"]
@@ -851,6 +912,17 @@ class HostControl:
                             host_name=host_name,
                             operation_id=target["host_operation_id"],
                         )
+                    if error.code == "no_provider_capacity":
+                        rejected_host = self.instances.load(
+                            host_name,
+                            required=False,
+                        )
+                        self._advance_no_capacity_target(
+                            request,
+                            acquisition,
+                            rejected_host,
+                        )
+                        raise
                     if error.code != "no_eligible_gpu":
                         raise
                     ineligible_profiles.append(profile_name)

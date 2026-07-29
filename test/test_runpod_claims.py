@@ -1076,6 +1076,178 @@ class HostControlTest(unittest.TestCase):
         self.assertEqual(binding["claim_id"], claim.claim_id)
         self.assertEqual(binding["pod_id"], claim.pod_id)
 
+    def test_definitive_no_capacity_advances_acquisition_before_retry(self):
+        replacement_operation_id = (
+            "22345678-1234-4234-8234-123456789abc"
+        )
+        operation_ids = iter(
+            (HOST_OPERATION_ID, replacement_operation_id)
+        )
+        self.lifecycle.new_operation_id = lambda: next(operation_ids)
+        launch = self.lifecycle.launch
+        launch_attempts = 0
+
+        def reject_first_launch(name, profile, **kwargs):
+            nonlocal launch_attempts
+            launch_attempts += 1
+            if launch_attempts == 1:
+                self.lifecycle.launch_calls.append((name, profile, kwargs))
+                rejected = host(
+                    name=name,
+                    operation_id=kwargs["target_operation_id"],
+                    pod_id=None,
+                    phase="aborted",
+                    profile_name=profile["name"],
+                )
+                rejected["provider"] = None
+                rejected["events"] = [
+                    {
+                        "event": "submission_rejected_no_capacity",
+                        "at": utc_timestamp(self.clock.now),
+                    }
+                ]
+                self.instances.save(rejected)
+                raise RunpodLocalError(
+                    "fixture definitive no capacity",
+                    code="no_provider_capacity",
+                )
+            return launch(name, profile, **kwargs)
+
+        self.lifecycle.launch = reject_first_launch
+
+        with self.assertRaises(RunpodLocalError) as rejected:
+            self.control.acquire(request())
+
+        self.assertEqual(
+            rejected.exception.code,
+            "no_provider_capacity",
+        )
+        acquisition = self.control.acquisitions.load(
+            request(),
+            required=True,
+        )
+        self.assertEqual(
+            acquisition["target"]["host_operation_id"],
+            replacement_operation_id,
+        )
+        self.assertEqual(
+            acquisition["target"]["predecessor_operation_id"],
+            HOST_OPERATION_ID,
+        )
+        self.assertIsNone(acquisition["host"])
+        self.assertIsNone(acquisition["claim"])
+
+        claim = self.control.acquire(request())
+
+        self.assertEqual(claim.operation_id, replacement_operation_id)
+        self.assertEqual(len(self.lifecycle.launch_calls), 2)
+        self.assertEqual(len(self.instances.records), 1)
+        acquisition = self.control.acquisitions.load(
+            request(),
+            required=True,
+        )
+        self.assertEqual(
+            acquisition["host"]["host_operation_id"],
+            replacement_operation_id,
+        )
+        self.assertEqual(
+            acquisition["claim"]["claim_id"],
+            claim.claim_id,
+        )
+
+    def test_crash_before_no_capacity_advance_recovers_exact_predecessor(self):
+        skipped_operation_id = (
+            "22345678-1234-4234-8234-123456789abc"
+        )
+        recovered_operation_id = (
+            "32345678-1234-4234-8234-123456789abc"
+        )
+        operation_ids = iter(
+            (
+                HOST_OPERATION_ID,
+                skipped_operation_id,
+                recovered_operation_id,
+            )
+        )
+        self.lifecycle.new_operation_id = lambda: next(operation_ids)
+        launch = self.lifecycle.launch
+        launch_attempts = 0
+
+        def reject_first_launch(name, profile, **kwargs):
+            nonlocal launch_attempts
+            launch_attempts += 1
+            if launch_attempts == 1:
+                self.lifecycle.launch_calls.append((name, profile, kwargs))
+                rejected = host(
+                    name=name,
+                    operation_id=kwargs["target_operation_id"],
+                    pod_id=None,
+                    phase="aborted",
+                    profile_name=profile["name"],
+                )
+                rejected["provider"] = None
+                rejected["events"] = [
+                    {
+                        "event": "submission_rejected_no_capacity",
+                        "at": utc_timestamp(self.clock.now),
+                    }
+                ]
+                self.instances.save(rejected)
+                raise RunpodLocalError(
+                    "fixture definitive no capacity",
+                    code="no_provider_capacity",
+                )
+            return launch(name, profile, **kwargs)
+
+        advance = self.control.acquisitions.advance_rejected_target
+        advance_attempts = 0
+
+        def crash_first_advance(*args, **kwargs):
+            nonlocal advance_attempts
+            advance_attempts += 1
+            if advance_attempts == 1:
+                raise RuntimeError(
+                    "fixture crash before rejected-target advance"
+                )
+            return advance(*args, **kwargs)
+
+        self.lifecycle.launch = reject_first_launch
+        self.control.acquisitions.advance_rejected_target = (
+            crash_first_advance
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "rejected-target advance"):
+            self.control.acquire(request())
+
+        acquisition = self.control.acquisitions.load(
+            request(),
+            required=True,
+        )
+        self.assertEqual(
+            acquisition["target"]["host_operation_id"],
+            HOST_OPERATION_ID,
+        )
+        self.assertIsNone(acquisition["host"])
+        self.control.acquisitions.advance_rejected_target = advance
+
+        claim = self.control.acquire(request())
+
+        self.assertEqual(claim.operation_id, recovered_operation_id)
+        self.assertEqual(len(self.lifecycle.launch_calls), 2)
+        self.assertEqual(len(self.instances.records), 1)
+        acquisition = self.control.acquisitions.load(
+            request(),
+            required=True,
+        )
+        self.assertEqual(
+            acquisition["target"]["predecessor_operation_id"],
+            HOST_OPERATION_ID,
+        )
+        self.assertEqual(
+            acquisition["host"]["host_operation_id"],
+            recovered_operation_id,
+        )
+
     def test_unbound_terminal_launch_recovery_cannot_recreate(self):
         launch = self.lifecycle.launch
 

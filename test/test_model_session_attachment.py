@@ -1461,6 +1461,37 @@ class ModelSessionServiceEndpointTest(unittest.TestCase):
                     "service_endpoint_missing",
                 )
 
+    def test_revoke_does_not_require_a_healthy_serving_socket(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime_root = pathlib.Path(directory) / "runtime"
+            runtime_root.mkdir(mode=0o700)
+            services = runtime_root / "services"
+            services.mkdir(mode=0o700)
+            socket_path = services / "shared-service.sock"
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+                listener.bind(os.fspath(socket_path))
+                listener.listen(1)
+                socket_path.chmod(0o600)
+                endpoint = publish_service_endpoint(
+                    "shared-service",
+                    service_sha256="b" * 64,
+                    workload=self.workload(),
+                    input_modalities=("text",),
+                    ttl_seconds=3600,
+                    socket_path=socket_path,
+                    runtime_root=runtime_root,
+                    clock=lambda: NOW,
+                )
+
+            revoke_service_endpoint(
+                "shared-service",
+                endpoint.publication_id,
+                runtime_root=runtime_root,
+            )
+
+            self.assertFalse(endpoint.receipt_path.exists())
+            self.assertTrue(socket_path.exists())
+
     def test_stale_revoke_cannot_remove_a_newer_publication(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)

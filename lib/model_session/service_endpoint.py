@@ -527,6 +527,7 @@ def _parse_service_endpoint_receipt(
     receipt_path: pathlib.Path,
     current_time: datetime.datetime | None,
     boot_id: str,
+    require_live_socket: bool = True,
 ) -> ServiceEndpoint:
     if set(value) != _SERVICE_RECEIPT_KEYS:
         _fail(
@@ -611,7 +612,6 @@ def _parse_service_endpoint_receipt(
             f"service socket {expected_socket_path}",
             code="service_endpoint_tampered",
         )
-    socket_identity = _validate_socket(socket_path)
     socket_device = _receipt_nonnegative_integer(
         value["socket_device"],
         label="socket_device",
@@ -620,17 +620,24 @@ def _parse_service_endpoint_receipt(
         value["socket_inode"],
         label="socket_inode",
     )
-    if socket_identity.device != socket_device or socket_identity.inode != socket_inode:
-        _fail(
-            "service endpoint socket inode changed after publication",
-            code="service_endpoint_unavailable",
-        )
+    resolved_socket_path = pathlib.Path(socket_path)
+    if require_live_socket:
+        socket_identity = _validate_socket(socket_path)
+        if (
+            socket_identity.device != socket_device
+            or socket_identity.inode != socket_inode
+        ):
+            _fail(
+                "service endpoint socket inode changed after publication",
+                code="service_endpoint_unavailable",
+            )
+        resolved_socket_path = socket_identity.path
     return ServiceEndpoint(
         publication_id=publication_id,
         binding=binding,
-        socket_path=socket_identity.path,
-        socket_device=socket_identity.device,
-        socket_inode=socket_identity.inode,
+        socket_path=resolved_socket_path,
+        socket_device=socket_device,
+        socket_inode=socket_inode,
         published_at=published_at,
         admission_expires_at=admission_expires_at,
         receipt_path=receipt_path,
@@ -783,6 +790,7 @@ def revoke_service_endpoint(
                 receipt_path=receipt_path,
                 current_time=None,
                 boot_id=_read_boot_id(),
+                require_live_socket=False,
             )
             if endpoint.publication_id != expected_publication_id:
                 _fail(

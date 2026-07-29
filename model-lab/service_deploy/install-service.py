@@ -19,6 +19,7 @@ from typing import Any
 INSTALL_SCHEMA = "model-lab.service-install.v1"
 INSTALL_IDENTITY_SCHEMA = "model-lab.service-install-identity.v1"
 SESSION_ROOT = pathlib.Path("/root/runpod-session")
+MODEL_SNAPSHOTS_ROOT = SESSION_ROOT / "model-snapshots"
 INCOMING_ROOT = SESSION_ROOT / "incoming" / "service-materializations"
 IMPLEMENTATION_ROOT = SESSION_ROOT / "control" / "model-service-runtime"
 RUNTIME_CONTROL_ROOT = SESSION_ROOT / "control" / "runtime-verifier"
@@ -231,7 +232,10 @@ def incoming_path(identity: str, transfer_id: str) -> pathlib.Path:
 def expected_final_directories(
     files: list[dict[str, Any]],
 ) -> list[str]:
-    directories = {SESSION_ROOT}
+    directories = {
+        SESSION_ROOT,
+        MODEL_SNAPSHOTS_ROOT,
+    }
     for record in files:
         path = pathlib.Path(record["remote_path"])
         directories.update(

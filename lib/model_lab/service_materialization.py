@@ -29,6 +29,7 @@ INSTALLER_RELATIVE_PATH = pathlib.PurePosixPath(
     "model-lab/service_deploy/install-service.py"
 )
 REMOTE_SESSION_ROOT = pathlib.PurePosixPath("/root/runpod-session")
+REMOTE_MODEL_SNAPSHOTS_ROOT = REMOTE_SESSION_ROOT / "model-snapshots"
 REMOTE_RUNTIME_CONTROL_ROOT = REMOTE_SESSION_ROOT / "control" / "runtime-verifier"
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 SERVICE_ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
@@ -214,7 +215,10 @@ def _safe_local_file_bytes(
 def _derived_remote_directories(
     files: list[dict[str, Any]],
 ) -> list[dict[str, str]]:
-    directories = {REMOTE_SESSION_ROOT}
+    directories = {
+        REMOTE_SESSION_ROOT,
+        REMOTE_MODEL_SNAPSHOTS_ROOT,
+    }
     for record in files:
         path = pathlib.PurePosixPath(record["remote_path"])
         directories.update(

@@ -82,6 +82,13 @@ class ServiceMaterializationTest(unittest.TestCase):
             summary["materialization_sha256"],
             r"^[0-9a-f]{64}$",
         )
+        self.assertIn(
+            {
+                "path": "/root/runpod-session/model-snapshots",
+                "mode": "0700",
+            },
+            summary["directories"],
+        )
         service_files = [
             record
             for record in summary["files"]

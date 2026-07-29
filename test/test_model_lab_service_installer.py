@@ -88,6 +88,7 @@ def configure_test_root(
     root: pathlib.Path,
 ) -> None:
     module.SESSION_ROOT = root / "runpod-session"
+    module.MODEL_SNAPSHOTS_ROOT = module.SESSION_ROOT / "model-snapshots"
     module.INCOMING_ROOT = module.SESSION_ROOT / "incoming" / "service-materializations"
     module.IMPLEMENTATION_ROOT = (
         module.SESSION_ROOT / "control" / "model-service-runtime"
@@ -171,6 +172,60 @@ def copy_incoming(
 
 
 class ServiceInstallerTest(unittest.TestCase):
+    def test_validator_requires_fixed_model_snapshot_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            module = load_installer()
+            configure_test_root(module, root)
+            materialized = materialized_fixture(root / "local")
+            document = relocated_document(
+                module,
+                materialized.install_document,
+            )
+            document["directories"] = [
+                record
+                for record in document["directories"]
+                if record["path"] != str(module.MODEL_SNAPSHOTS_ROOT)
+            ]
+            identity = {
+                "schema_version": module.INSTALL_IDENTITY_SCHEMA,
+                "installer": document["installer"],
+                "directories": document["directories"],
+                "files": document["files"],
+            }
+            document["materialization_sha256"] = hashlib.sha256(
+                module.canonical_bytes(identity)
+            ).hexdigest()
+
+            with self.assertRaisesRegex(
+                module.InstallError,
+                "not derived from its files",
+            ):
+                module.validate_install_document(document)
+
+    def test_clean_install_creates_private_model_snapshot_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            module = load_installer()
+            configure_test_root(module, root)
+            materialized = materialized_fixture(root / "local")
+            document = relocated_document(
+                module,
+                materialized.install_document,
+            )
+            identity = document["materialization_sha256"]
+            module.prepare(identity, TRANSFER_ID)
+            copy_incoming(module, materialized, document)
+
+            self.assertFalse(os.path.lexists(module.MODEL_SNAPSHOTS_ROOT))
+            module.install(identity, TRANSFER_ID)
+
+            metadata = module.MODEL_SNAPSHOTS_ROOT.lstat()
+            self.assertTrue(stat.S_ISDIR(metadata.st_mode))
+            self.assertFalse(stat.S_ISLNK(metadata.st_mode))
+            self.assertEqual(metadata.st_uid, os.getuid())
+            self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o700)
+
     def test_named_publication_fallback_installs_complete_closure(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)

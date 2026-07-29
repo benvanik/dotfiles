@@ -183,6 +183,10 @@ class ClaimCliTest(unittest.TestCase):
         _, output = self.invoke(arguments)
         plan = json.loads(output)
         self.assertFalse(plan["executed"])
+        self.assertEqual(
+            plan["target"]["acquisition_timeout_seconds"],
+            300,
+        )
         self.assertEqual(self.control.calls, [])
 
         _, output = self.invoke([*arguments, "--execute"])
@@ -192,6 +196,7 @@ class ClaimCliTest(unittest.TestCase):
         self.assertEqual(request.gpu_devices, (0,))
         self.assertEqual(request.gpu_memory_gb, 24.0)
         self.assertEqual(request.endpoint_names, ("openai",))
+        self.assertEqual(request.acquisition_timeout_seconds, 300)
 
     def test_renew_and_release_require_explicit_execution(self):
         claim_id = self.control.claim.claim_id

@@ -5,12 +5,15 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import json
+import math
 import os
 import pathlib
 import re
 import stat
 import tempfile
-from collections.abc import Iterator
+import threading
+import time
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -20,6 +23,8 @@ from .paths import ensure_private_directory
 
 RECORD_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
 NAMESPACE_PATTERN = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+HOST_CONTROLLER_LOCK_SCOPE = "host-controller"
+LOCK_POLL_SECONDS = 0.05
 
 
 @dataclass(frozen=True)
@@ -176,8 +181,30 @@ class StateStore:
         return records
 
     @contextlib.contextmanager
-    def locked(self, scope: str) -> Iterator[None]:
+    def locked(
+        self,
+        scope: str,
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+        cancel_event: threading.Event | None = None,
+        deadline_error_code: str = "state_lock_timeout",
+    ) -> Iterator[None]:
         validate_record_name(scope)
+        if (
+            deadline is not None
+            and (
+                isinstance(deadline, bool)
+                or not isinstance(deadline, (int, float))
+                or not math.isfinite(float(deadline))
+            )
+        ):
+            raise RunpodLocalError(
+                "local state lock deadline must be a finite number",
+                code="invalid_state_lock_deadline",
+            )
+        if deadline is not None:
+            deadline = float(deadline)
         lock_directory = ensure_private_directory(self.root / "locks")
         lock_path = lock_directory / f"{scope}.lock"
         flags = os.O_RDWR | os.O_CREAT
@@ -190,10 +217,55 @@ class StateStore:
                 f"cannot open local state lock {lock_path}: {error}",
                 code="state_lock_error",
             ) from error
+        acquired = False
         try:
             os.fchmod(descriptor, 0o600)
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise RunpodLocalError(
+                        f"local state lock acquisition was cancelled: {scope}",
+                        code="state_lock_cancelled",
+                    )
+                remaining_seconds: float | None = None
+                if deadline is not None:
+                    remaining_seconds = deadline - monotonic()
+                    if remaining_seconds <= 0:
+                        raise RunpodLocalError(
+                            "local state lock exceeded its absolute deadline: "
+                            f"{scope}",
+                            code=deadline_error_code,
+                        )
+                try:
+                    fcntl.flock(
+                        descriptor,
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
+                    acquired = True
+                    break
+                except BlockingIOError:
+                    wait_seconds = LOCK_POLL_SECONDS
+                    if remaining_seconds is not None:
+                        wait_seconds = min(
+                            wait_seconds,
+                            remaining_seconds,
+                        )
+                    if cancel_event is None:
+                        time.sleep(wait_seconds)
+                    else:
+                        cancel_event.wait(wait_seconds)
+            if cancel_event is not None and cancel_event.is_set():
+                raise RunpodLocalError(
+                    f"local state lock acquisition was cancelled: {scope}",
+                    code="state_lock_cancelled",
+                )
+            if deadline is not None and monotonic() >= deadline:
+                raise RunpodLocalError(
+                    "local state lock exceeded its absolute deadline: "
+                    f"{scope}",
+                    code=deadline_error_code,
+                )
             yield
         finally:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            if acquired:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
             os.close(descriptor)

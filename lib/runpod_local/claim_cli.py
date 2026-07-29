@@ -40,7 +40,9 @@ Mutating operations emit a plan unless `--execute` is present:
     runpod claim enforce [--execute]
 
 The owner operation ID is the acquire idempotency key. Reusing it with a
-different request fails. Claim generations are compare-and-swap guards.
+different request fails. Acquisition is bounded from its durable journal
+creation time; a retry cannot restart that clock. Claim generations are
+compare-and-swap guards.
 Normal final release starts a `while-claimed` host's configured empty grace;
 `--now` makes that host exact-retirement-due immediately. Neither form can
 retire a manually retained host; that requires the separate operator `runpod
@@ -164,6 +166,14 @@ def add_claim_parser(subparsers: Any) -> None:
         help="Logical loopback endpoint name; repeat as needed.",
     )
     acquire.add_argument("--minimum-remaining", default="0s")
+    acquire.add_argument(
+        "--acquisition-timeout",
+        default="5m",
+        help=(
+            "Maximum durable time for a created Pod to become active "
+            "(default: 5m)."
+        ),
+    )
     acquire.add_argument("--renewal-ttl", default="2m")
     acquire.add_argument("--new-host-ttl", default="2h")
     acquire.add_argument(
@@ -275,6 +285,9 @@ def _claim_request(args: argparse.Namespace) -> HostClaimRequest:
         ephemeral_disk_gb=args.ephemeral_disk_gib,
         endpoint_names=tuple(sorted(args.endpoint_names)),
         minimum_remaining_seconds=minimum_remaining_seconds,
+        acquisition_timeout_seconds=parse_duration(
+            args.acquisition_timeout
+        ),
         renewal_ttl_seconds=parse_duration(args.renewal_ttl),
         new_host_hard_ttl_seconds=parse_duration(args.new_host_ttl),
         new_host_retention=args.new_host_retention,

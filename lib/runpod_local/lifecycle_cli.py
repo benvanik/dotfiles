@@ -17,15 +17,15 @@ from .claims import ClaimStore
 from .errors import RunpodLocalError
 from .host_control import HostControl
 from .instances import InstanceStore, lease_expiry_reasons
-from .lifecycle import (
-    HOST_CONTROLLER_LOCK_SCOPE,
-    TERMINAL_PHASES,
-    LifecycleManager,
-)
+from .lifecycle import TERMINAL_PHASES, LifecycleManager
 from .output import print_json
 from .paths import credentials_file, runpod_root, state_root
 from .profile import MAX_IMPLICIT_HARD_TTL_SECONDS, ProfileStore
-from .state import StateStore, validate_record_name
+from .state import (
+    HOST_CONTROLLER_LOCK_SCOPE,
+    StateStore,
+    validate_record_name,
+)
 from .template import redact_docker_arguments
 from .timeutil import parse_duration, parse_utc_timestamp, utc_timestamp
 
@@ -589,6 +589,7 @@ def _run_down(args: argparse.Namespace) -> int:
     state = _state(args)
     manager = LifecycleManager(_api(args), state)
     if args.execute:
+        ClaimAcquisitionStore(state).migrate_v1_records()
         with state.locked(HOST_CONTROLLER_LOCK_SCOPE):
             _guard_unclaimed_host(
                 state,
@@ -677,6 +678,7 @@ def _run_ttl(args: argparse.Namespace) -> int:
             state,
         )
         if args.execute:
+            ClaimAcquisitionStore(state).migrate_v1_records()
             claim_scan_errors: list[dict[str, Any]] = []
             with state.locked(HOST_CONTROLLER_LOCK_SCOPE):
                 protected_names = _active_claim_host_names(

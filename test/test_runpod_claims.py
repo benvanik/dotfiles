@@ -3,12 +3,21 @@ from __future__ import annotations
 import datetime
 import pathlib
 import tempfile
+import threading
+import time
 import types
 import unittest
 import uuid
 from unittest import mock
 
+from runpod_local.claim_acquisition import (
+    CLAIM_ACQUISITION_SCHEMA,
+    CLAIM_ACQUISITION_SCHEMA_V1,
+    ClaimAcquisitionStore,
+)
 from runpod_local.claims import (
+    CLAIM_REQUEST_IDENTITY_V1,
+    CLAIM_REQUEST_IDENTITY_V2,
     ClaimStore,
     HostClaimRequest,
     claim_admission_reasons,
@@ -23,7 +32,11 @@ from runpod_local.lifecycle_cli import (
     _guard_unclaimed_host,
     _run_ttl_watch_cycle,
 )
-from runpod_local.state import StateRecordScan, StateStore
+from runpod_local.state import (
+    HOST_CONTROLLER_LOCK_SCOPE,
+    StateRecordScan,
+    StateStore,
+)
 from runpod_local.timeutil import utc_timestamp
 
 
@@ -149,10 +162,28 @@ def request(**overrides) -> HostClaimRequest:
         "ephemeral_disk_gb": 10,
         "endpoint_names": ("api",),
         "minimum_remaining_seconds": 1800,
+        "acquisition_timeout_seconds": 300,
         "renewal_ttl_seconds": 120,
     }
     arguments.update(overrides)
     return HostClaimRequest(**arguments)
+
+
+def as_v1_acquisition(
+    acquisition: dict,
+    claim_request: HostClaimRequest | None = None,
+) -> dict:
+    value = dict(acquisition)
+    value["schema_version"] = CLAIM_ACQUISITION_SCHEMA_V1
+    value["request_sha256"] = (
+        claim_request or request()
+    ).sha256_for_schema(CLAIM_REQUEST_IDENTITY_V1)
+    value.pop("request_identity_schema")
+    value.pop("acquisition_closure")
+    if value["target"] is not None:
+        value["target"] = dict(value["target"])
+        value["target"].pop("created_for_acquisition")
+    return value
 
 
 class ClaimStoreTest(unittest.TestCase):
@@ -175,6 +206,19 @@ class ClaimStoreTest(unittest.TestCase):
             value,
             now=NOW,
             claim_id=claim_id_from_uuid(uuid.UUID(int=index)),
+        )
+
+    def test_acquisition_timeout_is_positive_and_request_identifying(self):
+        with self.assertRaises(RunpodLocalError) as caught:
+            request(acquisition_timeout_seconds=0).validated()
+        self.assertEqual(caught.exception.code, "invalid_host_claim")
+        self.assertNotEqual(
+            request(acquisition_timeout_seconds=300).sha256(),
+            request(acquisition_timeout_seconds=301).sha256(),
+        )
+        self.assertEqual(
+            request().identity_document()["acquisition_timeout_seconds"],
+            300,
         )
 
     def test_shared_claims_get_disjoint_ports_and_account_resources(self):
@@ -326,6 +370,17 @@ class ClaimStoreTest(unittest.TestCase):
                 retire_now=False,
             )
         self.assertEqual(release_error.exception.code, "invalid_host_claim")
+
+        with self.assertRaises(RunpodLocalError) as reason_error:
+            self.store.release(
+                "dev96",
+                claim.claim_id,
+                expected_generation=1,
+                now=NOW + datetime.timedelta(seconds=1),
+                retire_now=False,
+                reason="arbitrary-caller-reason",
+            )
+        self.assertEqual(reason_error.exception.code, "invalid_host_claim")
 
     def test_last_release_starts_grace_and_now_makes_it_due(self):
         claim = self.admit(request(), 1)
@@ -555,6 +610,7 @@ class FakeLifecycle:
         self.launch_calls = []
         self.terminate_calls = []
         self.ineligible_profiles = set()
+        self.monotonic = time.monotonic
 
     def new_operation_id(self):
         return self.launched_host["operation_id"]
@@ -623,6 +679,7 @@ class HostControlTest(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.state = StateStore(pathlib.Path(self.temporary.name) / "state")
         self.clock = MutableClock()
+        self.monotonic_now = 0.0
         self.instances = FakeInstances()
         self.lifecycle = FakeLifecycle(host(), self.instances)
         self.control = HostControl(
@@ -630,9 +687,574 @@ class HostControlTest(unittest.TestCase):
             lifecycle=self.lifecycle,
             profiles=FakeProfiles(),
             clock=self.clock,
+            monotonic=lambda: self.monotonic_now,
             uuid_factory=lambda: uuid.UUID(int=1),
         )
         self.control.instances = self.instances
+
+    def replacement_control(self) -> HostControl:
+        control = HostControl(
+            state=self.state,
+            lifecycle=self.lifecycle,
+            profiles=FakeProfiles(),
+            clock=self.clock,
+            monotonic=lambda: self.monotonic_now,
+            uuid_factory=lambda: uuid.UUID(int=1),
+        )
+        control.instances = self.instances
+        return control
+
+    def stage_v1_claim_bind_crash(
+        self,
+        target_host: dict,
+        *,
+        created_for_acquisition: bool,
+    ):
+        self.instances.save(target_host)
+        self.control.acquisitions.begin(request(), now=NOW)
+        self.control.acquisitions.select_target(
+            request(),
+            host_name=target_host["name"],
+            host_operation_id=target_host["operation_id"],
+            predecessor_operation_id=None,
+            profile=dict(target_host["profile"]),
+            created_for_acquisition=created_for_acquisition,
+            now=NOW,
+        )
+        self.control.acquisitions.bind_host(
+            request(),
+            target_host,
+            now=NOW,
+        )
+        ledger = self.control.claims.initialize(
+            host=target_host,
+            allocation=allocation(),
+            retention=target_host["retention"]["mode"],
+            empty_grace_seconds=target_host["retention"][
+                "empty_grace_seconds"
+            ],
+            now=NOW,
+        )
+        admitted = self.control.claims.admit(
+            ledger,
+            request(),
+            now=NOW,
+            claim_id=claim_id_from_uuid(uuid.UUID(int=1)),
+        )
+        ledger = self.control.claims.load(target_host["name"])
+        ledger["claims"][0]["request_sha256"] = (
+            request().sha256_for_schema(CLAIM_REQUEST_IDENTITY_V1)
+        )
+        self.control.claims.save(ledger)
+        acquisition = self.control.acquisitions.load(
+            request(),
+            required=True,
+        )
+        source = as_v1_acquisition(acquisition)
+        self.state.write(
+            "hostclaimops",
+            source["record_name"],
+            source,
+        )
+        return admitted, source
+
+    def test_v1_targetless_migration_is_explicit_idempotent_and_clock_safe(
+        self,
+    ):
+        acquisition = self.control.acquisitions.begin(
+            request(),
+            now=NOW,
+        )
+        source = as_v1_acquisition(acquisition)
+        self.state.write(
+            "hostclaimops",
+            source["record_name"],
+            source,
+        )
+        self.clock.now = NOW - datetime.timedelta(hours=1)
+        store = ClaimAcquisitionStore(self.state, clock=self.clock)
+
+        self.assertEqual(
+            self.state.read("hostclaimops", source["record_name"]),
+            source,
+        )
+        self.assertEqual(store.migrate_v1_records(), 1)
+
+        migrated = self.state.read("hostclaimops", source["record_name"])
+        self.assertEqual(
+            migrated["schema_version"],
+            CLAIM_ACQUISITION_SCHEMA,
+        )
+        self.assertEqual(
+            migrated["request_identity_schema"],
+            CLAIM_REQUEST_IDENTITY_V1,
+        )
+        self.assertEqual(migrated["generation"], source["generation"] + 1)
+        self.assertEqual(migrated["updated_at"], source["updated_at"])
+        receipts = self.state.list("migrations")
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(receipts[0]["source"], source)
+        self.assertEqual(receipts[0]["result"], migrated)
+        self.assertEqual(store.migrate_v1_records(), 0)
+
+    def test_v1_bound_claim_migrates_inert_and_cancel_uses_ledger(self):
+        self.instances.save(host())
+        active = self.control.acquire(
+            request(host_name="dev96", create_if_missing=False)
+        )
+        active_request = request(
+            host_name="dev96",
+            create_if_missing=False,
+        )
+        acquisition = self.control.acquisitions.load(
+            active_request,
+            required=True,
+        )
+        source = as_v1_acquisition(acquisition, active_request)
+        ledger = self.control.claims.load("dev96")
+        ledger["claims"][0]["request_sha256"] = source["request_sha256"]
+        self.control.claims.save(ledger)
+        self.state.write(
+            "hostclaimops",
+            source["record_name"],
+            source,
+        )
+
+        control = self.replacement_control()
+        migrated = control.acquisitions.load(
+            active_request,
+            required=True,
+        )
+        self.assertIsNone(
+            migrated["target"]["created_for_acquisition"]
+        )
+
+        control.cancel(active_request)
+
+        self.assertEqual(self.lifecycle.terminate_calls, [])
+        closed = control.claims.load("dev96")["closed_claims"][0]
+        self.assertEqual(closed["claim_id"], active.claim_id)
+
+    def test_v1_open_unbound_target_without_provenance_refuses_migration(
+        self,
+    ):
+        acquisition = self.control.acquisitions.begin(
+            request(),
+            now=NOW,
+        )
+        acquisition = self.control.acquisitions.select_target(
+            request(),
+            host_name="manual96",
+            host_operation_id=HOST_OPERATION_ID,
+            predecessor_operation_id=None,
+            profile={"name": "pro6000-is1", "sha256": PROFILE_SHA256},
+            created_for_acquisition=False,
+            now=NOW,
+        )
+        source = as_v1_acquisition(acquisition)
+        self.state.write(
+            "hostclaimops",
+            source["record_name"],
+            source,
+        )
+        store = ClaimAcquisitionStore(self.state, clock=self.clock)
+
+        self.assertEqual(store.migrate_v1_records(), 0)
+        with self.assertRaises(RunpodLocalError) as caught:
+            store.load(request(), required=True)
+
+        self.assertEqual(
+            caught.exception.code,
+            "host_claim_acquisition_migration_required",
+        )
+        self.assertEqual(
+            self.state.read("hostclaimops", source["record_name"]),
+            source,
+        )
+        self.assertEqual(self.state.list("migrations"), [])
+
+    def test_v1_replacement_target_migrates_as_owned_and_cancel_retires_it(
+        self,
+    ):
+        predecessor_operation_id = (
+            "22345678-1234-4234-8234-123456789abc"
+        )
+        acquisition = self.control.acquisitions.begin(
+            request(),
+            now=NOW,
+        )
+        acquisition = self.control.acquisitions.select_target(
+            request(),
+            host_name="replacement96",
+            host_operation_id=HOST_OPERATION_ID,
+            predecessor_operation_id=predecessor_operation_id,
+            profile={"name": "pro6000-is1", "sha256": PROFILE_SHA256},
+            created_for_acquisition=True,
+            now=NOW,
+        )
+        source = as_v1_acquisition(acquisition)
+        self.state.write(
+            "hostclaimops",
+            source["record_name"],
+            source,
+        )
+        self.instances.save(
+            host(
+                name="replacement96",
+                retention_mode="while-claimed",
+            )
+        )
+
+        control = self.replacement_control()
+        migrated = control.acquisitions.load(request(), required=True)
+        self.assertTrue(
+            migrated["target"]["created_for_acquisition"]
+        )
+
+        control.cancel(request())
+
+        self.assertEqual(
+            self.lifecycle.terminate_calls,
+            [
+                (
+                    "replacement96",
+                    {
+                        "execute": True,
+                        "reason": "claim_acquisition_timeout",
+                        "expected_operation_id": HOST_OPERATION_ID,
+                    },
+                )
+            ],
+        )
+
+    def test_v1_migration_replays_receipt_after_crash_before_rewrite(self):
+        acquisition = self.control.acquisitions.begin(
+            request(),
+            now=NOW,
+        )
+        source = as_v1_acquisition(acquisition)
+        self.state.write(
+            "hostclaimops",
+            source["record_name"],
+            source,
+        )
+        store = ClaimAcquisitionStore(self.state, clock=self.clock)
+        write = self.state.write
+
+        def crash_before_rewrite(namespace, name, value):
+            if (
+                namespace == "hostclaimops"
+                and value.get("schema_version")
+                == CLAIM_ACQUISITION_SCHEMA
+            ):
+                raise RuntimeError("fixture crash before v2 rewrite")
+            return write(namespace, name, value)
+
+        with mock.patch.object(
+            self.state,
+            "write",
+            side_effect=crash_before_rewrite,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "fixture crash"):
+                store.migrate_v1_records()
+
+        self.assertEqual(
+            self.state.read("hostclaimops", source["record_name"]),
+            source,
+        )
+        self.assertEqual(len(self.state.list("migrations")), 1)
+        later_clock = MutableClock()
+        later_clock.now = NOW + datetime.timedelta(hours=1)
+        replay = ClaimAcquisitionStore(
+            self.state,
+            clock=later_clock,
+        )
+        self.assertEqual(replay.migrate_v1_records(), 1)
+        migrated = self.state.read(
+            "hostclaimops",
+            source["record_name"],
+        )
+        self.assertEqual(
+            migrated,
+            self.state.list("migrations")[0]["result"],
+        )
+
+    def test_recent_v1_targetless_acquire_promotes_request_and_retries(self):
+        acquisition = self.control.acquisitions.begin(
+            request(),
+            now=NOW,
+        )
+        source = as_v1_acquisition(acquisition)
+        self.state.write(
+            "hostclaimops",
+            source["record_name"],
+            source,
+        )
+        control = self.replacement_control()
+
+        first = control.acquire(request())
+        second = control.acquire(request())
+
+        self.assertEqual(second.claim_id, first.claim_id)
+        migrated = control.acquisitions.load(request(), required=True)
+        self.assertEqual(
+            migrated["request_identity_schema"],
+            CLAIM_REQUEST_IDENTITY_V2,
+        )
+        self.assertEqual(migrated["request_sha256"], request().sha256())
+        self.assertEqual(len(self.lifecycle.launch_calls), 1)
+
+    def test_migrated_v1_claim_crash_before_journal_bind_recovers(self):
+        predecessor_operation_id = (
+            "22345678-1234-4234-8234-123456789abc"
+        )
+        replacement = host(
+            name="replacement96",
+            retention_mode="while-claimed",
+        )
+        self.instances.save(replacement)
+        acquisition = self.control.acquisitions.begin(
+            request(),
+            now=NOW,
+        )
+        self.control.acquisitions.select_target(
+            request(),
+            host_name=replacement["name"],
+            host_operation_id=replacement["operation_id"],
+            predecessor_operation_id=predecessor_operation_id,
+            profile=dict(replacement["profile"]),
+            created_for_acquisition=True,
+            now=NOW,
+        )
+        self.control.acquisitions.bind_host(
+            request(),
+            replacement,
+            now=NOW,
+        )
+        ledger = self.control.claims.initialize(
+            host=replacement,
+            allocation=allocation(),
+            retention="while-claimed",
+            empty_grace_seconds=300,
+            now=NOW,
+        )
+        admitted = self.control.claims.admit(
+            ledger,
+            request(),
+            now=NOW,
+            claim_id=claim_id_from_uuid(uuid.UUID(int=1)),
+        )
+        ledger = self.control.claims.load("replacement96")
+        ledger["claims"][0]["request_sha256"] = request().sha256_for_schema(
+            CLAIM_REQUEST_IDENTITY_V1
+        )
+        self.control.claims.save(ledger)
+        acquisition = self.control.acquisitions.load(
+            request(),
+            required=True,
+        )
+        source = as_v1_acquisition(acquisition)
+        self.state.write(
+            "hostclaimops",
+            source["record_name"],
+            source,
+        )
+        control = self.replacement_control()
+
+        recovered = control.acquire(request())
+        retried = control.acquire(request())
+
+        self.assertEqual(recovered.claim_id, admitted.claim_id)
+        self.assertEqual(retried.claim_id, admitted.claim_id)
+        migrated = control.acquisitions.load(request(), required=True)
+        self.assertEqual(
+            migrated["request_identity_schema"],
+            CLAIM_REQUEST_IDENTITY_V1,
+        )
+        self.assertEqual(
+            migrated["claim"]["claim_id"],
+            admitted.claim_id,
+        )
+        self.assertEqual(self.lifecycle.launch_calls, [])
+
+    def test_v1_fresh_target_claim_bind_crash_recovers_and_cleans_up(self):
+        admitted, _ = self.stage_v1_claim_bind_crash(
+            host(
+                name="fresh96",
+                retention_mode="while-claimed",
+            ),
+            created_for_acquisition=True,
+        )
+
+        control = self.replacement_control()
+        migrated = control.acquisitions.load(request(), required=True)
+
+        self.assertIsNone(
+            migrated["target"]["created_for_acquisition"]
+        )
+        self.assertEqual(
+            migrated["claim"]["claim_id"],
+            admitted.claim_id,
+        )
+        control.cancel(request())
+        self.assertEqual(
+            self.lifecycle.terminate_calls,
+            [
+                (
+                    "fresh96",
+                    {
+                        "execute": True,
+                        "reason": "claim_acquisition_cancelled",
+                        "expected_operation_id": HOST_OPERATION_ID,
+                    },
+                )
+            ],
+        )
+        closed = control.claims.load("fresh96")["closed_claims"][0]
+        self.assertEqual(closed["claim_id"], admitted.claim_id)
+
+    def test_v1_reused_target_claim_bind_crash_recovers_without_retirement(
+        self,
+    ):
+        admitted, _ = self.stage_v1_claim_bind_crash(
+            host(
+                name="reused96",
+                retention_mode="manual",
+            ),
+            created_for_acquisition=False,
+        )
+
+        control = self.replacement_control()
+        recovered = control.acquire(request())
+        released = control.release(
+            recovered.host_name,
+            recovered.claim_id,
+            recovered.generation,
+        )
+
+        self.assertEqual(recovered.claim_id, admitted.claim_id)
+        self.assertEqual(released.retention, "manual")
+        self.assertFalse(released.retirement_due)
+        self.assertEqual(self.lifecycle.launch_calls, [])
+        self.assertEqual(self.lifecycle.terminate_calls, [])
+        migrated = control.acquisitions.load(request(), required=True)
+        self.assertIsNone(
+            migrated["target"]["created_for_acquisition"]
+        )
+        self.assertEqual(
+            migrated["claim_closure"]["reason"],
+            "released",
+        )
+
+    def test_v1_claim_bind_crash_recovers_closed_ledger_witness(self):
+        admitted, _ = self.stage_v1_claim_bind_crash(
+            host(
+                name="reused96",
+                retention_mode="manual",
+            ),
+            created_for_acquisition=False,
+        )
+        self.control.claims.release(
+            "reused96",
+            admitted.claim_id,
+            expected_generation=admitted.generation,
+            now=NOW + datetime.timedelta(seconds=1),
+            retire_now=False,
+        )
+
+        control = self.replacement_control()
+        migrated = control.acquisitions.load(request(), required=True)
+
+        self.assertIsNone(
+            migrated["target"]["created_for_acquisition"]
+        )
+        self.assertEqual(
+            migrated["claim"]["claim_id"],
+            admitted.claim_id,
+        )
+        self.assertEqual(
+            migrated["claim_closure"]["reason"],
+            "released",
+        )
+        with self.assertRaises(RunpodLocalError) as caught:
+            control.acquire(request())
+        self.assertEqual(
+            caught.exception.code,
+            "host_claim_operation_closed",
+        )
+        self.assertEqual(self.lifecycle.launch_calls, [])
+        self.assertEqual(self.lifecycle.terminate_calls, [])
+
+    def test_v1_claim_bind_crash_refuses_mismatched_ledger_request(self):
+        _, source = self.stage_v1_claim_bind_crash(
+            host(
+                name="fresh96",
+                retention_mode="while-claimed",
+            ),
+            created_for_acquisition=True,
+        )
+        ledger = self.control.claims.load("fresh96")
+        ledger["claims"][0]["request_sha256"] = request().sha256()
+        self.control.claims.save(ledger)
+        store = ClaimAcquisitionStore(self.state, clock=self.clock)
+
+        self.assertEqual(store.migrate_v1_records(), 0)
+        with self.assertRaises(RunpodLocalError) as caught:
+            store.load(request(), required=True)
+
+        self.assertEqual(
+            caught.exception.code,
+            "host_claim_acquisition_migration_required",
+        )
+        self.assertEqual(
+            self.state.read("hostclaimops", source["record_name"]),
+            source,
+        )
+        self.assertEqual(self.state.list("migrations"), [])
+
+    def test_malformed_v1_generation_is_isolated_without_mutation(self):
+        acquisition = self.control.acquisitions.begin(
+            request(),
+            now=NOW,
+        )
+        for malformed_generation in (True, "bad"):
+            with self.subTest(generation=malformed_generation):
+                source = as_v1_acquisition(acquisition)
+                source["generation"] = malformed_generation
+                self.state.write(
+                    "hostclaimops",
+                    source["record_name"],
+                    source,
+                )
+                store = ClaimAcquisitionStore(
+                    self.state,
+                    clock=self.clock,
+                )
+                self.assertEqual(store.migrate_v1_records(), 0)
+                self.assertEqual(
+                    self.state.read(
+                        "hostclaimops",
+                        source["record_name"],
+                    ),
+                    source,
+                )
+
+    def test_reconstructed_control_isolates_unrelated_corrupt_acquisition(
+        self,
+    ):
+        self.state.write(
+            "hostclaimops",
+            "claimop-" + "f" * 55,
+            {"schema_version": "not-an-acquisition"},
+        )
+        self.instances.save(host())
+
+        control = self.replacement_control()
+        claim = control.acquire(
+            request(host_name="dev96", create_if_missing=False)
+        )
+
+        self.assertEqual(claim.host_name, "dev96")
 
     def test_acquire_reuses_compatible_active_host(self):
         self.instances.save(host())
@@ -1076,6 +1698,175 @@ class HostControlTest(unittest.TestCase):
         self.assertEqual(binding["claim_id"], claim.claim_id)
         self.assertEqual(binding["pod_id"], claim.pod_id)
 
+    def test_absolute_acquisition_expiry_never_launches_a_host(self):
+        expired_request = request(
+            acquisition_expires_at=utc_timestamp(NOW),
+        )
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            self.control.acquire(expired_request)
+
+        self.assertEqual(caught.exception.code, "host_acquisition_timeout")
+        self.assertEqual(self.lifecycle.launch_calls, [])
+        acquisition = self.control.acquisitions.load(
+            expired_request,
+            required=True,
+        )
+        self.assertIsNone(acquisition["target"])
+        self.assertIsNone(acquisition["host"])
+        self.assertIsNone(acquisition["claim"])
+
+    def test_expired_retry_retires_unbound_pod_without_relaunch(self):
+        expiring_request = request(
+            acquisition_expires_at=utc_timestamp(
+                NOW + datetime.timedelta(seconds=1)
+            ),
+        )
+        launch = self.lifecycle.launch
+
+        def crash_after_provider_return(*args, **kwargs):
+            launch(*args, **kwargs)
+            raise RuntimeError("fixture crash after provider return")
+
+        self.lifecycle.launch = crash_after_provider_return
+        with self.assertRaisesRegex(RuntimeError, "fixture crash"):
+            self.control.acquire(expiring_request)
+        self.assertEqual(len(self.lifecycle.launch_calls), 1)
+        launched_name = self.lifecycle.launch_calls[0][0]
+
+        self.clock.now += datetime.timedelta(seconds=1)
+        self.lifecycle.launch = launch
+        with self.assertRaises(RunpodLocalError) as caught:
+            self.control.acquire(expiring_request)
+
+        self.assertEqual(caught.exception.code, "host_acquisition_timeout")
+        self.assertEqual(len(self.lifecycle.launch_calls), 1)
+        self.assertEqual(
+            self.lifecycle.terminate_calls,
+            [
+                (
+                    launched_name,
+                    {
+                        "execute": True,
+                        "reason": "claim_acquisition_timeout",
+                        "expected_operation_id": HOST_OPERATION_ID,
+                        "deadline": 60.0,
+                    },
+                )
+            ],
+        )
+
+    def test_expired_retry_reconciles_ambiguous_submitting_target(self):
+        expiring_request = request(
+            acquisition_expires_at=utc_timestamp(
+                NOW + datetime.timedelta(seconds=1)
+            ),
+        )
+
+        def crash_after_ambiguous_submission(name, profile, **kwargs):
+            self.lifecycle.launch_calls.append((name, profile, kwargs))
+            submitted = host(
+                name=name,
+                operation_id=kwargs["target_operation_id"],
+                pod_id=None,
+                phase="submitting",
+                profile_name=profile["name"],
+                retention_mode="while-claimed",
+            )
+            self.instances.save(submitted)
+            raise RuntimeError("fixture ambiguous provider submission")
+
+        self.lifecycle.launch = crash_after_ambiguous_submission
+        with self.assertRaisesRegex(RuntimeError, "ambiguous provider"):
+            self.control.acquire(expiring_request)
+        submitted_name = self.lifecycle.launch_calls[0][0]
+
+        self.clock.now += datetime.timedelta(seconds=1)
+        with self.assertRaises(RunpodLocalError) as caught:
+            self.control.acquire(expiring_request)
+
+        self.assertEqual(caught.exception.code, "host_acquisition_timeout")
+        self.assertEqual(len(self.lifecycle.launch_calls), 1)
+        self.assertEqual(
+            self.lifecycle.terminate_calls,
+            [
+                (
+                    submitted_name,
+                    {
+                        "execute": True,
+                        "reason": "claim_acquisition_timeout",
+                        "expected_operation_id": HOST_OPERATION_ID,
+                        "deadline": 60.0,
+                    },
+                )
+            ],
+        )
+
+    def test_unbound_cancel_retains_retry_key_until_exact_cleanup(self):
+        pending_request = request()
+
+        def crash_after_ambiguous_submission(name, profile, **kwargs):
+            self.lifecycle.launch_calls.append((name, profile, kwargs))
+            submitted = host(
+                name=name,
+                operation_id=kwargs["target_operation_id"],
+                pod_id=None,
+                phase="submitting",
+                profile_name=profile["name"],
+                retention_mode="while-claimed",
+            )
+            self.instances.save(submitted)
+            raise RuntimeError("fixture ambiguous provider submission")
+
+        self.lifecycle.launch = crash_after_ambiguous_submission
+        with self.assertRaisesRegex(RuntimeError, "ambiguous provider"):
+            self.control.acquire(pending_request)
+
+        termination = self.lifecycle.terminate
+        attempts = 0
+
+        def fail_first_termination(*args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RunpodLocalError(
+                    "fixture exact provider cleanup unavailable",
+                    code="http_error",
+                )
+            return termination(*args, **kwargs)
+
+        self.lifecycle.terminate = fail_first_termination
+        with self.assertRaises(RunpodLocalError) as caught:
+            self.control.cancel(pending_request)
+
+        self.assertEqual(
+            caught.exception.code,
+            "host_acquisition_timeout_cleanup_required",
+        )
+        acquisition = self.control.acquisitions.load(
+            pending_request,
+            required=True,
+        )
+        self.assertIsNone(acquisition["acquisition_closure"])
+
+        self.control.cancel(pending_request)
+
+        acquisition = self.control.acquisitions.load(
+            pending_request,
+            required=True,
+        )
+        self.assertEqual(
+            acquisition["acquisition_closure"]["reason"],
+            "cancelled",
+        )
+        with self.assertRaises(RunpodLocalError) as retry:
+            self.control.acquire(pending_request)
+        self.assertEqual(
+            retry.exception.code,
+            "host_claim_operation_closed",
+        )
+        self.assertEqual(len(self.lifecycle.launch_calls), 1)
+
     def test_definitive_no_capacity_advances_acquisition_before_retry(self):
         replacement_operation_id = (
             "22345678-1234-4234-8234-123456789abc"
@@ -1364,6 +2155,343 @@ class HostControlTest(unittest.TestCase):
         self.assertEqual(len(renewals), 1)
         self.assertEqual(claim.generation, renewals[0].generation)
 
+    def test_provisioning_timeout_closes_claim_and_retires_exact_host(self):
+        launch = self.lifecycle.launch
+
+        def never_active(*args, **kwargs):
+            value = launch(*args, **kwargs)
+            value["phase"] = "provisioning"
+            self.instances.save(value)
+            return value
+
+        def advance_provisioning(_seconds):
+            self.clock.now += datetime.timedelta(seconds=30)
+
+        self.lifecycle.launch = never_active
+        self.control.readiness_waiter = advance_provisioning
+        timed_request = request(acquisition_timeout_seconds=180)
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            self.control.acquire(timed_request)
+
+        self.assertEqual(caught.exception.code, "host_acquisition_timeout")
+        ledger = self.control.claims.list()[0]
+        self.assertEqual(ledger["claims"], [])
+        self.assertEqual(
+            ledger["closed_claims"],
+            [
+                {
+                    "claim_id": "claim-" + "0" * 31 + "1",
+                    "owner_system": timed_request.owner_system,
+                    "owner_instance": timed_request.owner_instance,
+                    "owner_operation_id": timed_request.owner_operation_id,
+                    "request_sha256": timed_request.sha256(),
+                    "generation": 3,
+                    "reason": "acquisition-timeout",
+                    "closed_at": utc_timestamp(
+                        NOW + datetime.timedelta(seconds=180)
+                    ),
+                }
+            ],
+        )
+        self.assertEqual(
+            ledger["retire_at"],
+            utc_timestamp(NOW + datetime.timedelta(seconds=180)),
+        )
+        acquisition = self.control.acquisitions.load(
+            timed_request,
+            required=True,
+        )
+        self.assertEqual(
+            acquisition["claim_closure"],
+            {
+                "reason": "acquisition-timeout",
+                "closed_at": utc_timestamp(
+                    NOW + datetime.timedelta(seconds=180)
+                ),
+                "generation": 3,
+            },
+        )
+        self.assertEqual(
+            self.lifecycle.terminate_calls,
+            [
+                (
+                    ledger["host_name"],
+                    {
+                        "execute": True,
+                        "reason": "claim_acquisition_timeout",
+                        "expected_operation_id": (
+                            ledger["host_operation_id"]
+                        ),
+                        "deadline": 60.0,
+                    },
+                )
+            ],
+        )
+
+        launch_count = len(self.lifecycle.launch_calls)
+        with self.assertRaises(RunpodLocalError) as retry:
+            self.control.acquire(timed_request)
+        self.assertEqual(
+            retry.exception.code,
+            "host_claim_operation_closed",
+        )
+        self.assertEqual(len(self.lifecycle.launch_calls), launch_count)
+
+    def test_manual_host_acquisition_timeout_never_retires_the_host(self):
+        launch = self.lifecycle.launch
+
+        def never_active(*args, **kwargs):
+            value = launch(*args, **kwargs)
+            value["phase"] = "provisioning"
+            self.instances.save(value)
+            return value
+
+        self.lifecycle.launch = never_active
+        self.control.readiness_waiter = lambda _seconds: setattr(
+            self.clock,
+            "now",
+            self.clock.now + datetime.timedelta(seconds=1),
+        )
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            self.control.acquire(
+                request(
+                    acquisition_timeout_seconds=2,
+                    new_host_retention="manual",
+                )
+            )
+
+        self.assertEqual(caught.exception.code, "host_acquisition_timeout")
+        ledger = self.control.claims.list()[0]
+        self.assertEqual(ledger["claims"], [])
+        self.assertEqual(
+            ledger["closed_claims"][0]["reason"],
+            "acquisition-timeout",
+        )
+        self.assertIsNone(ledger["retire_at"])
+        self.assertEqual(self.lifecycle.terminate_calls, [])
+
+    def test_provisioning_timeout_retirement_failure_remains_retryable(self):
+        launch = self.lifecycle.launch
+
+        def never_active(*args, **kwargs):
+            value = launch(*args, **kwargs)
+            value["phase"] = "provisioning"
+            self.instances.save(value)
+            return value
+
+        terminate = self.lifecycle.terminate
+        attempts = 0
+
+        def fail_first_termination(*args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RunpodLocalError(
+                    "fixture provider deletion failed",
+                    code="http_error",
+                )
+            return terminate(*args, **kwargs)
+
+        self.lifecycle.launch = never_active
+        self.lifecycle.terminate = fail_first_termination
+        self.control.readiness_waiter = lambda _seconds: setattr(
+            self.clock,
+            "now",
+            self.clock.now + datetime.timedelta(seconds=1),
+        )
+        timed_request = request(acquisition_timeout_seconds=2)
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            self.control.acquire(timed_request)
+
+        self.assertEqual(
+            caught.exception.code,
+            "host_acquisition_timeout_cleanup_required",
+        )
+        ledger = self.control.claims.list()[0]
+        self.assertEqual(ledger["claims"], [])
+        self.assertEqual(
+            ledger["closed_claims"][0]["reason"],
+            "acquisition-timeout",
+        )
+        self.assertEqual(
+            ledger["retire_at"],
+            utc_timestamp(NOW + datetime.timedelta(seconds=2)),
+        )
+        acquisition = self.control.acquisitions.load(
+            timed_request,
+            required=True,
+        )
+        self.assertEqual(
+            acquisition["claim_closure"]["reason"],
+            "acquisition-timeout",
+        )
+
+        enforced = self.control.enforce_retirement(execute=True)
+
+        self.assertEqual(attempts, 2)
+        self.assertTrue(enforced["actions"][0]["due"])
+        self.assertTrue(enforced["actions"][0]["executed"])
+
+    def test_provisioning_retry_keeps_original_acquisition_deadline(self):
+        launch = self.lifecycle.launch
+        calls = 0
+
+        def interrupted_provisioning(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RunpodLocalError(
+                    "fixture provider is not converged",
+                    code="submission_ambiguous",
+                )
+            value = launch(*args, **kwargs)
+            value["phase"] = "provisioning"
+            self.instances.save(value)
+            return value
+
+        self.lifecycle.launch = interrupted_provisioning
+        timed_request = request(
+            acquisition_timeout_seconds=300,
+            renewal_ttl_seconds=600,
+        )
+
+        with self.assertRaises(RunpodLocalError) as interrupted:
+            self.control.acquire(timed_request)
+        self.assertEqual(interrupted.exception.code, "submission_ambiguous")
+        self.clock.now += datetime.timedelta(seconds=300)
+
+        with self.assertRaises(RunpodLocalError) as timed_out:
+            self.control.acquire(timed_request)
+
+        self.assertEqual(
+            timed_out.exception.code,
+            "host_acquisition_timeout",
+        )
+        ledger = self.control.claims.list()[0]
+        self.assertEqual(ledger["claims"], [])
+        self.assertEqual(
+            ledger["closed_claims"][0]["closed_at"],
+            utc_timestamp(NOW + datetime.timedelta(seconds=300)),
+        )
+        self.assertEqual(
+            ledger["closed_claims"][0]["reason"],
+            "acquisition-timeout",
+        )
+
+    def test_host_becoming_active_at_deadline_still_fails_closed(self):
+        launch = self.lifecycle.launch
+
+        def initially_provisioning(*args, **kwargs):
+            value = launch(*args, **kwargs)
+            value["phase"] = "provisioning"
+            self.instances.save(value)
+            return value
+
+        def become_active_at_deadline(_seconds):
+            self.clock.now += datetime.timedelta(seconds=2)
+            value = next(iter(self.instances.records.values()))
+            value["phase"] = "active"
+            self.instances.save(value)
+
+        self.lifecycle.launch = initially_provisioning
+        self.control.readiness_waiter = become_active_at_deadline
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            self.control.acquire(request(acquisition_timeout_seconds=2))
+
+        self.assertEqual(caught.exception.code, "host_acquisition_timeout")
+        ledger = self.control.claims.list()[0]
+        self.assertEqual(ledger["claims"], [])
+        self.assertEqual(
+            ledger["closed_claims"][0]["reason"],
+            "acquisition-timeout",
+        )
+
+    def test_final_readiness_poll_is_capped_to_acquisition_deadline(self):
+        launch = self.lifecycle.launch
+        launch_advanced_clock = False
+
+        def provisioning_after_provider_cost(*args, **kwargs):
+            nonlocal launch_advanced_clock
+            value = launch(*args, **kwargs)
+            value["phase"] = "provisioning"
+            self.instances.save(value)
+            if not launch_advanced_clock:
+                launch_advanced_clock = True
+                self.clock.now += datetime.timedelta(seconds=1.75)
+            return value
+
+        waits = []
+
+        def advance_by_requested_wait(seconds):
+            waits.append(seconds)
+            self.clock.now += datetime.timedelta(seconds=seconds)
+
+        self.lifecycle.launch = provisioning_after_provider_cost
+        self.control.readiness_waiter = advance_by_requested_wait
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            self.control.acquire(request(acquisition_timeout_seconds=2))
+
+        self.assertEqual(caught.exception.code, "host_acquisition_timeout")
+        self.assertEqual(waits, [0.25])
+        ledger = self.control.claims.list()[0]
+        self.assertEqual(ledger["claims"], [])
+        self.assertEqual(
+            ledger["closed_claims"][0]["reason"],
+            "acquisition-timeout",
+        )
+
+    def test_wall_rollback_cannot_refresh_provider_acquisition_deadline(self):
+        launch = self.lifecycle.launch
+        launch_count = 0
+
+        def remain_provisioning(*args, **kwargs):
+            nonlocal launch_count
+            launch_count += 1
+            value = launch(*args, **kwargs)
+            value["phase"] = "provisioning"
+            self.instances.save(value)
+            if launch_count == 2:
+                self.clock.now += datetime.timedelta(seconds=100)
+                self.clock.now -= datetime.timedelta(seconds=50)
+                self.monotonic_now = 1.5
+            return value
+
+        waits = []
+
+        def advance_monotonic(seconds):
+            waits.append(seconds)
+            self.monotonic_now += seconds
+
+        self.lifecycle.launch = remain_provisioning
+        self.control.readiness_waiter = advance_monotonic
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            self.control.acquire(
+                request(acquisition_timeout_seconds=300),
+                startup_deadline=2.0,
+            )
+
+        self.assertEqual(caught.exception.code, "host_acquisition_timeout")
+        self.assertEqual(waits, [0.5])
+        self.assertEqual(
+            [
+                call[2]["acquisition_deadline"]
+                for call in self.lifecycle.launch_calls
+            ],
+            [2.0, 2.0],
+        )
+        ledger = self.control.claims.list()[0]
+        self.assertEqual(ledger["claims"], [])
+        self.assertEqual(
+            ledger["closed_claims"][0]["reason"],
+            "acquisition-timeout",
+        )
+
     def test_active_handoff_rechecks_minimum_useful_hard_lifetime(self):
         self.lifecycle.launched_host["provider_termination_at"] = (
             utc_timestamp(NOW + datetime.timedelta(minutes=31))
@@ -1387,8 +2515,9 @@ class HostControlTest(unittest.TestCase):
             self.control.acquire(
                 request(
                     minimum_remaining_seconds=30 * 60,
+                    acquisition_timeout_seconds=20 * 60,
                     renewal_ttl_seconds=10 * 60,
-                    new_host_hard_ttl_seconds=31 * 60,
+                    new_host_hard_ttl_seconds=60 * 60,
                 )
             )
 
@@ -1453,6 +2582,23 @@ class HostControlTest(unittest.TestCase):
         self.assertEqual(caught.exception.code, "no_eligible_host_profile")
         self.assertEqual(self.lifecycle.launch_calls, [])
 
+    def test_new_host_lifetime_must_cover_acquisition_and_remaining_time(self):
+        with self.assertRaises(RunpodLocalError) as caught:
+            self.control.acquire(
+                request(
+                    minimum_remaining_seconds=6900,
+                    acquisition_timeout_seconds=300,
+                    new_host_hard_ttl_seconds=7200,
+                )
+            )
+
+        self.assertEqual(caught.exception.code, "no_eligible_host_profile")
+        self.assertIn(
+            "cannot cover claim acquisition",
+            str(caught.exception),
+        )
+        self.assertEqual(self.lifecycle.launch_calls, [])
+
     def test_actual_allocation_rejection_terminates_new_host(self):
         self.lifecycle.launched_host["expected"] = {
             **self.lifecycle.launched_host["expected"],
@@ -1513,6 +2659,50 @@ class HostControlTest(unittest.TestCase):
             "host_claim_acquisition_terminal",
         )
         self.assertEqual(len(self.lifecycle.launch_calls), 1)
+
+    def test_expired_allocation_rollback_cannot_mint_termination_budget(self):
+        launch = self.lifecycle.launch
+        terminate = self.lifecycle.terminate
+        rollback_deadlines = []
+
+        def fail_first_delete(*args, **kwargs):
+            receipt = launch(*args, **kwargs)
+            cleanup_deadline = kwargs["cleanup_deadline_factory"]()
+            rollback_deadlines.append(cleanup_deadline)
+            self.monotonic_now = cleanup_deadline + 1.0
+            receipt["phase"] = "rollback_required"
+            self.instances.save(receipt)
+            raise RunpodLocalError(
+                "controlled allocation delete deadline",
+                code="rollback_required",
+            )
+
+        def reject_expired_termination(name, **kwargs):
+            result = terminate(name, **kwargs)
+            if kwargs["deadline"] <= self.monotonic_now:
+                raise RunpodLocalError(
+                    "controlled expired termination deadline",
+                    code="instance_termination_timeout",
+                )
+            return result
+
+        self.lifecycle.launch = fail_first_delete
+        self.lifecycle.terminate = reject_expired_termination
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            self.control.acquire(request())
+
+        self.assertEqual(caught.exception.code, "rollback_required")
+        self.assertEqual(rollback_deadlines, [60.0])
+        self.assertEqual(len(self.lifecycle.terminate_calls), 1)
+        self.assertEqual(
+            self.lifecycle.terminate_calls[0][1]["deadline"],
+            rollback_deadlines[0],
+        )
+        self.assertEqual(
+            next(iter(self.instances.records.values()))["phase"],
+            "rollback_required",
+        )
 
     def test_terminal_acquisition_cleanup_cannot_mint_replacement_pod(self):
         self.lifecycle.launched_host["expected"] = {
@@ -1634,6 +2824,7 @@ class HostControlTest(unittest.TestCase):
             ephemeral_disk_bytes=10 * 1024**3,
             endpoint_names=("openai",),
             minimum_remaining_seconds=1800,
+            acquisition_timeout_seconds=300,
             renewal_ttl_seconds=120,
             new_host_hard_ttl_seconds=7200,
             new_host_retention="while-claimed",
@@ -1780,6 +2971,119 @@ class HostControlTest(unittest.TestCase):
         enforced = self.control.enforce_retirement(execute=True)
         self.assertTrue(enforced["actions"][0]["executed"])
         self.assertEqual(len(self.lifecycle.terminate_calls), 1)
+
+    def test_release_cannot_mutate_after_held_controller_lock_deadline(self):
+        claim = self.control.acquire(request())
+        lock_acquired = threading.Event()
+        release_lock = threading.Event()
+
+        def hold_controller_lock():
+            with self.state.locked(HOST_CONTROLLER_LOCK_SCOPE):
+                lock_acquired.set()
+                release_lock.wait()
+
+        holder = threading.Thread(target=hold_controller_lock)
+        holder.start()
+        self.assertTrue(lock_acquired.wait(1))
+        self.control.monotonic = time.monotonic
+        try:
+            with self.assertRaises(RunpodLocalError) as caught:
+                self.control.release(
+                    claim.host_name,
+                    claim.claim_id,
+                    claim.generation,
+                    now=True,
+                    cleanup_deadline=time.monotonic() + 0.1,
+                )
+        finally:
+            release_lock.set()
+            holder.join()
+
+        self.assertEqual(caught.exception.code, "host_claim_release_timeout")
+        ledger = self.control.claims.load(claim.host_name, required=True)
+        self.assertEqual(
+            [value["claim_id"] for value in ledger["claims"]],
+            [claim.claim_id],
+        )
+        self.assertEqual(self.lifecycle.terminate_calls, [])
+
+    def test_cancel_cannot_mutate_after_held_controller_lock_deadline(self):
+        claim_request = request()
+        claim = self.control.acquire(claim_request)
+        lock_acquired = threading.Event()
+        release_lock = threading.Event()
+
+        def hold_controller_lock():
+            with self.state.locked(HOST_CONTROLLER_LOCK_SCOPE):
+                lock_acquired.set()
+                release_lock.wait()
+
+        holder = threading.Thread(target=hold_controller_lock)
+        holder.start()
+        self.assertTrue(lock_acquired.wait(1))
+        self.control.monotonic = time.monotonic
+        try:
+            with self.assertRaises(RunpodLocalError) as caught:
+                self.control.cancel(
+                    claim_request,
+                    cleanup_deadline=time.monotonic() + 0.1,
+                )
+        finally:
+            release_lock.set()
+            holder.join()
+
+        self.assertEqual(
+            caught.exception.code,
+            "host_acquisition_timeout_cleanup_required",
+        )
+        retained = self.control.claims.load(claim.host_name, required=True)
+        self.assertEqual(
+            [value["claim_id"] for value in retained["claims"]],
+            [claim.claim_id],
+        )
+        self.assertEqual(self.lifecycle.terminate_calls, [])
+
+    def test_releasing_one_shared_claim_preserves_its_peer_and_host(self):
+        claim_ids = iter((uuid.UUID(int=1), uuid.UUID(int=2)))
+        self.control.uuid_factory = lambda: next(claim_ids)
+        first = self.control.acquire(request())
+        second = self.control.acquire(
+            request(
+                owner_instance="embeddings",
+                owner_operation_id=(
+                    "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+                ),
+                gpu_memory_gb=32,
+            )
+        )
+
+        first_release = self.control.release(
+            first.host_name,
+            first.claim_id,
+            first.generation,
+            now=True,
+        )
+
+        self.assertFalse(first_release.retirement_due)
+        self.assertIsNone(first_release.retire_at)
+        self.assertEqual(self.lifecycle.terminate_calls, [])
+        ledger = self.control.claims.load(first.host_name)
+        self.assertEqual(
+            [claim["claim_id"] for claim in ledger["claims"]],
+            [second.claim_id],
+        )
+
+        final_release = self.control.release(
+            second.host_name,
+            second.claim_id,
+            second.generation,
+        )
+
+        self.assertFalse(final_release.retirement_due)
+        self.assertEqual(
+            final_release.retire_at,
+            utc_timestamp(NOW + datetime.timedelta(minutes=5)),
+        )
 
     def test_last_release_now_exactly_retires_while_claimed_host(self):
         claim = self.control.acquire(request())

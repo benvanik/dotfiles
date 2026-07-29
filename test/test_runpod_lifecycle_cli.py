@@ -20,7 +20,7 @@ from runpod_local.lifecycle_cli import (
     _run_ttl_watch_cycle,
     _run_up,
 )
-from runpod_local.lifecycle import HOST_CONTROLLER_LOCK_SCOPE
+from runpod_local.state import HOST_CONTROLLER_LOCK_SCOPE
 from runpod_local.state import StateStore
 
 
@@ -28,6 +28,12 @@ class RecordingState:
     def __init__(self):
         self.lock_scopes = []
         self.in_controller_lock = False
+
+    @staticmethod
+    def scan(namespace):
+        if namespace != "hostclaimops":
+            raise AssertionError(f"unexpected state scan: {namespace}")
+        return []
 
     @contextlib.contextmanager
     def locked(self, scope):
@@ -192,7 +198,10 @@ class LifecycleCliTest(unittest.TestCase):
                 _run_down(args)
 
         self.assertEqual(caught.exception.code, "host_has_active_claims")
-        self.assertEqual(state.lock_scopes, [HOST_CONTROLLER_LOCK_SCOPE])
+        self.assertEqual(
+            state.lock_scopes,
+            [HOST_CONTROLLER_LOCK_SCOPE, HOST_CONTROLLER_LOCK_SCOPE],
+        )
         manager.terminate.assert_not_called()
 
     def test_execute_down_isolates_unrelated_malformed_claim_state(self):
@@ -279,7 +288,10 @@ class LifecycleCliTest(unittest.TestCase):
         ), contextlib.redirect_stdout(output):
             self.assertEqual(_run_ttl(args), 0)
 
-        self.assertEqual(state.lock_scopes, [HOST_CONTROLLER_LOCK_SCOPE])
+        self.assertEqual(
+            state.lock_scopes,
+            [HOST_CONTROLLER_LOCK_SCOPE, HOST_CONTROLLER_LOCK_SCOPE],
+        )
         manager.enforce_ttl.assert_called_once()
 
     def test_ttl_enforcement_reports_claim_scan_error_and_continues(self):

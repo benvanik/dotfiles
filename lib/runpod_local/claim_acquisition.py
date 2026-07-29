@@ -5,10 +5,13 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
+from collections.abc import Callable
 from typing import Any
 
 from .claims import (
     CLAIM_ID_PATTERN,
+    CLAIM_REQUEST_IDENTITY_V1,
+    CLAIM_REQUEST_IDENTITY_V2,
     CLOSED_CLAIM_REASONS,
     SHA256_PATTERN,
     HostClaim,
@@ -20,11 +23,44 @@ from .claims import (
     validate_host_operation_id,
 )
 from .errors import RunpodLocalError
-from .state import StateRecordScan, StateStore, validate_record_name
+from .state import (
+    HOST_CONTROLLER_LOCK_SCOPE,
+    StateRecordScan,
+    StateStore,
+    validate_record_name,
+)
 from .timeutil import parse_utc_timestamp, utc_timestamp
 
 
-CLAIM_ACQUISITION_SCHEMA = "runpod.host-claim-acquisition.v1"
+CLAIM_ACQUISITION_SCHEMA_V1 = "runpod.host-claim-acquisition.v1"
+CLAIM_ACQUISITION_SCHEMA = "runpod.host-claim-acquisition.v2"
+CLAIM_ACQUISITION_MIGRATION_SCHEMA = (
+    "runpod.host-claim-acquisition-migration.v1"
+)
+CLAIM_ACQUISITION_FIELDS = {
+    "schema_version",
+    "record_name",
+    "owner_system",
+    "owner_instance",
+    "owner_operation_id",
+    "request_sha256",
+    "request_identity_schema",
+    "target",
+    "host",
+    "claim",
+    "claim_closure",
+    "acquisition_closure",
+    "generation",
+    "created_at",
+    "updated_at",
+}
+CLAIM_ACQUISITION_V1_FIELDS = CLAIM_ACQUISITION_FIELDS - {
+    "acquisition_closure",
+    "request_identity_schema",
+}
+CLAIM_ACQUISITION_V1_EXTENDED_FIELDS = (
+    CLAIM_ACQUISITION_V1_FIELDS | {"acquisition_closure"}
+)
 
 
 def _acquisition_record_name(
@@ -41,6 +77,55 @@ def _acquisition_record_name(
     return f"claimop-{digest[:55]}"
 
 
+def _json_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _migration_record_name(record_name: str) -> str:
+    digest = hashlib.sha256(record_name.encode("ascii")).hexdigest()
+    return f"hostclaim-v2-{digest[:50]}"
+
+
+def _validate_v1_migration_shape(document: Any) -> dict[str, Any]:
+    fields = frozenset(document) if isinstance(document, dict) else None
+    if (
+        not isinstance(document, dict)
+        or document.get("schema_version")
+        != CLAIM_ACQUISITION_SCHEMA_V1
+        or fields
+        not in {
+            frozenset(CLAIM_ACQUISITION_V1_FIELDS),
+            frozenset(CLAIM_ACQUISITION_V1_EXTENDED_FIELDS),
+        }
+    ):
+        raise RunpodLocalError(
+            "host claim acquisition v1 migration source has invalid fields",
+            code="invalid_host_claim_acquisition",
+        )
+    target = document.get("target")
+    if target is not None and (
+        not isinstance(target, dict)
+        or set(target)
+        != {
+            "host_name",
+            "host_operation_id",
+            "predecessor_operation_id",
+            "profile",
+        }
+    ):
+        raise RunpodLocalError(
+            "host claim acquisition v1 migration target has invalid fields",
+            code="invalid_host_claim_acquisition",
+        )
+    return dict(document)
+
+
 def validate_claim_acquisition(document: Any) -> dict[str, Any]:
     """Validate one durable owner-operation idempotency journal."""
 
@@ -50,6 +135,11 @@ def validate_claim_acquisition(document: Any) -> dict[str, Any]:
     ):
         raise RunpodLocalError(
             "host claim acquisition has an unsupported schema",
+            code="invalid_host_claim_acquisition",
+        )
+    if set(document) != CLAIM_ACQUISITION_FIELDS:
+        raise RunpodLocalError(
+            "host claim acquisition has invalid top-level fields",
             code="invalid_host_claim_acquisition",
         )
     owner_system = validate_claim_owner_name(
@@ -83,6 +173,15 @@ def validate_claim_acquisition(document: Any) -> dict[str, Any]:
             "host claim acquisition has an invalid request identity",
             code="invalid_host_claim_acquisition",
         )
+    request_identity_schema = document.get("request_identity_schema")
+    if request_identity_schema not in {
+        CLAIM_REQUEST_IDENTITY_V1,
+        CLAIM_REQUEST_IDENTITY_V2,
+    }:
+        raise RunpodLocalError(
+            "host claim acquisition has an invalid request identity schema",
+            code="invalid_host_claim_acquisition",
+        )
     generation = document.get("generation")
     if (
         not isinstance(generation, int)
@@ -100,6 +199,7 @@ def validate_claim_acquisition(document: Any) -> dict[str, Any]:
             "host_operation_id",
             "predecessor_operation_id",
             "profile",
+            "created_for_acquisition",
         }:
             raise RunpodLocalError(
                 "host claim acquisition has an invalid launch target",
@@ -134,6 +234,14 @@ def validate_claim_acquisition(document: Any) -> dict[str, Any]:
                 code="invalid_host_claim_acquisition",
             )
         validate_record_name(target_profile["name"])
+        if (
+            target["created_for_acquisition"] is not None
+            and type(target["created_for_acquisition"]) is not bool
+        ):
+            raise RunpodLocalError(
+                "host claim acquisition target has invalid provenance",
+                code="invalid_host_claim_acquisition",
+            )
     host_binding = document.get("host")
     if host_binding is not None:
         if not isinstance(host_binding, dict) or set(host_binding) != {
@@ -241,6 +349,32 @@ def validate_claim_acquisition(document: Any) -> dict[str, Any]:
                 code="invalid_host_claim_acquisition",
             )
         parse_utc_timestamp(claim_closure["closed_at"])
+    acquisition_closure = document.get("acquisition_closure")
+    if acquisition_closure is not None:
+        if (
+            not isinstance(acquisition_closure, dict)
+            or set(acquisition_closure) != {"reason", "closed_at"}
+            or acquisition_closure["reason"]
+            not in {"cancelled", "expired-before-admission"}
+            or not isinstance(acquisition_closure["closed_at"], str)
+            or binding is not None
+            or claim_closure is not None
+        ):
+            raise RunpodLocalError(
+                "host claim acquisition has an invalid pre-claim closure",
+                code="invalid_host_claim_acquisition",
+            )
+        parse_utc_timestamp(acquisition_closure["closed_at"])
+    if (
+        target is not None
+        and target["created_for_acquisition"] is None
+        and binding is None
+        and acquisition_closure is None
+    ):
+        raise RunpodLocalError(
+            "open unbound host claim acquisition has unknown target provenance",
+            code="invalid_host_claim_acquisition",
+        )
     timestamps = {}
     for field in ("created_at", "updated_at"):
         timestamp = document.get(field)
@@ -263,6 +397,9 @@ def validate_claim_acquisition(document: Any) -> dict[str, Any]:
             "predecessor_operation_id"
         ],
         "profile": dict(target["profile"]),
+        "created_for_acquisition": target[
+            "created_for_acquisition"
+        ],
     }
     normalized["host"] = (
         None if host_binding is None else dict(host_binding)
@@ -271,14 +408,310 @@ def validate_claim_acquisition(document: Any) -> dict[str, Any]:
     normalized["claim_closure"] = (
         None if claim_closure is None else dict(claim_closure)
     )
+    normalized["acquisition_closure"] = (
+        None
+        if acquisition_closure is None
+        else dict(acquisition_closure)
+    )
     return normalized
 
 
 class ClaimAcquisitionStore:
     """Permanent request bindings for claim owner-operation idempotency."""
 
-    def __init__(self, state: StateStore) -> None:
+    def __init__(
+        self,
+        state: StateStore,
+        *,
+        clock: Callable[[], datetime.datetime] | None = None,
+    ) -> None:
         self.state = state
+        self.clock = clock or (
+            lambda: datetime.datetime.now(datetime.timezone.utc)
+        )
+        self._migration_errors_by_name: dict[str, RunpodLocalError] = {}
+
+    def _now(self) -> datetime.datetime:
+        now = self.clock()
+        utc_timestamp(now)
+        return now
+
+    @staticmethod
+    def _v2_candidate_from_v1(
+        source: dict[str, Any],
+        *,
+        created_for_acquisition: bool | None,
+        now: datetime.datetime,
+    ) -> dict[str, Any]:
+        candidate = dict(source)
+        candidate["schema_version"] = CLAIM_ACQUISITION_SCHEMA
+        candidate["request_identity_schema"] = CLAIM_REQUEST_IDENTITY_V1
+        candidate["acquisition_closure"] = source.get(
+            "acquisition_closure"
+        )
+        target = source.get("target")
+        if target is not None:
+            if not isinstance(target, dict):
+                raise RunpodLocalError(
+                    "v1 host claim acquisition has an invalid launch target",
+                    code="invalid_host_claim_acquisition",
+                )
+            candidate["target"] = {
+                **target,
+                "created_for_acquisition": created_for_acquisition,
+            }
+        candidate = validate_claim_acquisition(candidate)
+        candidate["generation"] += 1
+        previous_updated_at = parse_utc_timestamp(source.get("updated_at"))
+        candidate["updated_at"] = utc_timestamp(max(previous_updated_at, now))
+        return validate_claim_acquisition(candidate)
+
+    @staticmethod
+    def _v1_target_provenance(
+        source: dict[str, Any],
+    ) -> bool | None:
+        """Recover only provenance proved by the v1 journal itself."""
+
+        target = source.get("target")
+        if target is None:
+            return False
+        if not isinstance(target, dict):
+            raise RunpodLocalError(
+                "v1 host claim acquisition has an invalid launch target",
+                code="invalid_host_claim_acquisition",
+            )
+        if (
+            source.get("claim") is not None
+            or source.get("claim_closure") is not None
+            or source.get("acquisition_closure") is not None
+        ):
+            # Once a claim or closure exists, cleanup is owned by that durable
+            # binding. Historical pre-claim provenance is unknowable in v1 and
+            # can never again authorize unbound destructive cleanup.
+            return None
+        if target.get("predecessor_operation_id") is not None:
+            # Replacement operations were minted only after a definitive
+            # acquisition-owned no-capacity receipt.
+            return True
+        raise RunpodLocalError(
+            "open unbound v1 acquisition target has no durable ownership "
+            f"proof: {source.get('record_name')} / "
+            f"{target.get('host_name')} / "
+            f"{target.get('host_operation_id')}",
+            code="host_claim_acquisition_migration_required",
+        )
+
+    def _v1_exact_ledger_witness(
+        self,
+        source: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Recover a claim admitted just before its v1 journal binding."""
+
+        if (
+            source.get("claim") is not None
+            or source.get("claim_closure") is not None
+            or source.get("acquisition_closure") is not None
+        ):
+            return None
+        target = source.get("target")
+        host = source.get("host")
+        if (
+            not isinstance(target, dict)
+            or not isinstance(host, dict)
+            or set(host)
+            != {"host_name", "host_operation_id", "pod_id"}
+            or host["host_name"] != target.get("host_name")
+            or host["host_operation_id"]
+            != target.get("host_operation_id")
+        ):
+            return None
+        ledger_value = self.state.read("hostclaims", host["host_name"])
+        if ledger_value is None:
+            return None
+        ledger = validate_claim_ledger(ledger_value)
+        if (
+            ledger["host_name"] != host["host_name"]
+            or ledger["host_operation_id"] != host["host_operation_id"]
+            or ledger["pod_id"] != host["pod_id"]
+            or ledger["profile"] != target.get("profile")
+        ):
+            return None
+        owner_identity = (
+            source.get("owner_system"),
+            source.get("owner_instance"),
+            source.get("owner_operation_id"),
+        )
+        matches = [
+            (claim, None)
+            for claim in ledger["claims"]
+            if (
+                claim["owner_system"],
+                claim["owner_instance"],
+                claim["owner_operation_id"],
+            )
+            == owner_identity
+        ]
+        matches.extend(
+            (
+                claim,
+                {
+                    "reason": claim["reason"],
+                    "closed_at": claim["closed_at"],
+                    "generation": claim["generation"],
+                },
+            )
+            for claim in ledger["closed_claims"]
+            if (
+                claim["owner_system"],
+                claim["owner_instance"],
+                claim["owner_operation_id"],
+            )
+            == owner_identity
+        )
+        if (
+            len(matches) != 1
+            or matches[0][0]["request_sha256"]
+            != source.get("request_sha256")
+        ):
+            return None
+        claim, closure = matches[0]
+        return {
+            "host": {
+                "host_name": ledger["host_name"],
+                "host_operation_id": ledger["host_operation_id"],
+                "pod_id": ledger["pod_id"],
+            },
+            "claim": {
+                "host_name": ledger["host_name"],
+                "host_operation_id": ledger["host_operation_id"],
+                "pod_id": ledger["pod_id"],
+                "claim_id": claim["claim_id"],
+            },
+            "claim_closure": closure,
+        }
+
+    def _migrate_v1_record(
+        self,
+        source: dict[str, Any],
+        *,
+        stored_name: str,
+    ) -> None:
+        source = _validate_v1_migration_shape(source)
+        migration_name = _migration_record_name(stored_name)
+        existing = self.state.read("migrations", migration_name)
+        if existing is not None:
+            if (
+                existing.get("schema_version")
+                != CLAIM_ACQUISITION_MIGRATION_SCHEMA
+                or existing.get("record_name") != migration_name
+                or existing.get("source_record_name") != stored_name
+                or existing.get("source_schema_version")
+                != CLAIM_ACQUISITION_SCHEMA_V1
+                or existing.get("target_schema_version")
+                != CLAIM_ACQUISITION_SCHEMA
+                or existing.get("source") != source
+                or existing.get("source_sha256") != _json_sha256(source)
+            ):
+                raise RunpodLocalError(
+                    "host claim acquisition migration receipt differs from "
+                    "the retained v1 state",
+                    code="host_claim_acquisition_migration_conflict",
+                )
+            retained_result = existing.get("result")
+            result = validate_claim_acquisition(retained_result)
+            if (
+                result["record_name"] != stored_name
+                or existing.get("result_sha256") != _json_sha256(result)
+            ):
+                raise RunpodLocalError(
+                    "host claim acquisition migration result drifted",
+                    code="host_claim_acquisition_migration_conflict",
+                )
+            self.state.write("hostclaimops", stored_name, result)
+            return
+
+        now = self._now()
+        ledger_witness = self._v1_exact_ledger_witness(source)
+        created_for_acquisition = (
+            None
+            if ledger_witness is not None
+            else self._v1_target_provenance(source)
+        )
+        migration_source = source
+        if ledger_witness is not None:
+            migration_source = {
+                **source,
+                **ledger_witness,
+            }
+        result = self._v2_candidate_from_v1(
+            migration_source,
+            created_for_acquisition=created_for_acquisition,
+            now=now,
+        )
+        if result["record_name"] != stored_name:
+            raise RunpodLocalError(
+                "v1 host claim acquisition is stored under another name",
+                code="invalid_host_claim_acquisition",
+            )
+        migration = {
+            "schema_version": CLAIM_ACQUISITION_MIGRATION_SCHEMA,
+            "record_name": migration_name,
+            "source_record_name": stored_name,
+            "source_schema_version": CLAIM_ACQUISITION_SCHEMA_V1,
+            "target_schema_version": CLAIM_ACQUISITION_SCHEMA,
+            "source_sha256": _json_sha256(source),
+            "result_sha256": _json_sha256(result),
+            "created_for_acquisition": (
+                created_for_acquisition
+                if source.get("target") is not None
+                else None
+            ),
+            "migrated_at": utc_timestamp(now),
+            "source": source,
+            "result": result,
+        }
+        self.state.write("migrations", migration_name, migration)
+        self.state.write("hostclaimops", stored_name, result)
+
+    def migrate_v1_records(self) -> int:
+        """Transition all provable v1 journals under the claim mutation lock."""
+
+        migrated = 0
+        self._migration_errors_by_name = {}
+        with self.state.locked(HOST_CONTROLLER_LOCK_SCOPE):
+            for scanned in self.state.scan("hostclaimops"):
+                if scanned.error is not None:
+                    self._migration_errors_by_name[scanned.name] = (
+                        scanned.error
+                    )
+                    continue
+                if scanned.value is None:
+                    continue
+                source = scanned.value
+                if (
+                    source.get("schema_version")
+                    != CLAIM_ACQUISITION_SCHEMA_V1
+                ):
+                    try:
+                        acquisition = validate_claim_acquisition(source)
+                        if acquisition["record_name"] != scanned.name:
+                            raise RunpodLocalError(
+                                "host claim acquisition is stored under "
+                                "another name",
+                                code="invalid_host_claim_acquisition",
+                            )
+                    except RunpodLocalError as error:
+                        self._migration_errors_by_name[scanned.name] = error
+                    continue
+                try:
+                    self._migrate_v1_record(
+                        source,
+                        stored_name=scanned.name,
+                    )
+                    migrated += 1
+                except RunpodLocalError as error:
+                    self._migration_errors_by_name[scanned.name] = error
+        return migrated
 
     @staticmethod
     def _name(request: HostClaimRequest) -> str:
@@ -304,7 +737,9 @@ class ClaimAcquisitionStore:
                 "host claim acquisition record identity collided",
                 code="host_claim_operation_collision",
             )
-        if acquisition["request_sha256"] != request.sha256():
+        if acquisition["request_sha256"] != request.sha256_for_schema(
+            acquisition["request_identity_schema"]
+        ):
             raise RunpodLocalError(
                 "owner operation already names a different claim request",
                 code="host_claim_operation_conflict",
@@ -325,6 +760,11 @@ class ClaimAcquisitionStore:
                     code="host_claim_acquisition_not_found",
                 )
             return None
+        migration_error = self._migration_errors_by_name.get(
+            self._name(request)
+        )
+        if migration_error is not None:
+            raise migration_error
         acquisition = validate_claim_acquisition(value)
         self._assert_request(acquisition, request)
         return acquisition
@@ -348,15 +788,106 @@ class ClaimAcquisitionStore:
                 "owner_instance": request.owner_instance,
                 "owner_operation_id": request.owner_operation_id,
                 "request_sha256": request.sha256(),
+                "request_identity_schema": CLAIM_REQUEST_IDENTITY_V2,
                 "target": None,
                 "host": None,
                 "claim": None,
                 "claim_closure": None,
+                "acquisition_closure": None,
                 "generation": 1,
                 "created_at": timestamp,
                 "updated_at": timestamp,
             }
         )
+        self.state.write(
+            "hostclaimops",
+            acquisition["record_name"],
+            acquisition,
+        )
+        return acquisition
+
+    def close_unbound(
+        self,
+        request: HostClaimRequest,
+        *,
+        reason: str,
+        now: datetime.datetime,
+    ) -> dict[str, Any]:
+        """Permanently close one owner operation before claim admission."""
+
+        if reason not in {"cancelled", "expired-before-admission"}:
+            raise RunpodLocalError(
+                "unsupported pre-claim acquisition closure reason",
+                code="invalid_host_claim_acquisition",
+            )
+        acquisition = self.load(request, required=True)
+        if acquisition is None:
+            raise AssertionError(
+                "required claim acquisition unexpectedly absent"
+            )
+        closure = {
+            "reason": reason,
+            "closed_at": utc_timestamp(now),
+        }
+        existing = acquisition["acquisition_closure"]
+        if existing is not None:
+            if existing != closure and existing["reason"] != reason:
+                raise RunpodLocalError(
+                    "pre-claim acquisition closure changed",
+                    code="host_claim_acquisition_drift",
+                )
+            return acquisition
+        if acquisition["claim"] is not None:
+            raise RunpodLocalError(
+                "cannot close an acquisition after claim admission",
+                code="host_claim_acquisition_drift",
+            )
+        acquisition["acquisition_closure"] = closure
+        acquisition["generation"] += 1
+        acquisition["updated_at"] = utc_timestamp(now)
+        acquisition = validate_claim_acquisition(acquisition)
+        self.state.write(
+            "hostclaimops",
+            acquisition["record_name"],
+            acquisition,
+        )
+        return acquisition
+
+    def promote_request_identity(
+        self,
+        request: HostClaimRequest,
+        *,
+        now: datetime.datetime,
+    ) -> dict[str, Any]:
+        """Promote one verified unbound v1 request before new admission."""
+
+        acquisition = self.load(request, required=True)
+        if acquisition is None:
+            raise AssertionError(
+                "required claim acquisition unexpectedly absent"
+            )
+        if (
+            acquisition["request_identity_schema"]
+            == CLAIM_REQUEST_IDENTITY_V2
+        ):
+            return acquisition
+        if (
+            acquisition["claim"] is not None
+            or acquisition["claim_closure"] is not None
+            or acquisition["acquisition_closure"] is not None
+        ):
+            raise RunpodLocalError(
+                "bound or closed v1 claim acquisition cannot change request "
+                "identity",
+                code="host_claim_acquisition_drift",
+            )
+        # load() already proved the exact v1 request identity, including its
+        # original 300-second relative budget.
+        acquisition["request_identity_schema"] = CLAIM_REQUEST_IDENTITY_V2
+        acquisition["request_sha256"] = request.sha256()
+        acquisition["generation"] += 1
+        acquisition["updated_at"] = utc_timestamp(now)
+        acquisition = validate_claim_acquisition(acquisition)
         self.state.write(
             "hostclaimops",
             acquisition["record_name"],
@@ -372,6 +903,7 @@ class ClaimAcquisitionStore:
         host_operation_id: str,
         predecessor_operation_id: str | None,
         profile: dict[str, str],
+        created_for_acquisition: bool,
         now: datetime.datetime,
     ) -> dict[str, Any]:
         validate_record_name(host_name)
@@ -385,6 +917,7 @@ class ClaimAcquisitionStore:
             "host_operation_id": host_operation_id,
             "predecessor_operation_id": predecessor_operation_id,
             "profile": dict(profile),
+            "created_for_acquisition": created_for_acquisition,
         }
         existing = acquisition["target"]
         if existing is not None:
@@ -481,6 +1014,7 @@ class ClaimAcquisitionStore:
             "host_operation_id": new_host_operation_id,
             "predecessor_operation_id": rejected_host_operation_id,
             "profile": dict(target["profile"]),
+            "created_for_acquisition": True,
         }
         acquisition["generation"] += 1
         acquisition["updated_at"] = utc_timestamp(now)
@@ -574,6 +1108,7 @@ class ClaimAcquisitionStore:
             acquisition["target"] = {
                 **target_identity,
                 "predecessor_operation_id": None,
+                "created_for_acquisition": False,
             }
         else:
             recorded_target = acquisition["target"]
@@ -669,6 +1204,7 @@ class ClaimAcquisitionStore:
             acquisition["target"] = {
                 **target_identity,
                 "predecessor_operation_id": None,
+                "created_for_acquisition": False,
             }
         elif any(
             acquisition["target"][field] != expected

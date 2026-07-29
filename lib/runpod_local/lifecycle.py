@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import datetime
+import math
+import time
 import uuid
 from collections.abc import Callable
 from typing import Any
@@ -43,7 +45,7 @@ from .timeutil import parse_utc_timestamp, utc_timestamp
 TERMINAL_PHASES = {"rolled_back", "terminated", "aborted"}
 LAUNCH_PHASES = {"intent", "submitting", "provisioning"}
 MAX_OPERATION_HISTORY = 20
-HOST_CONTROLLER_LOCK_SCOPE = "host-controller"
+LIFECYCLE_CLEANUP_TIMEOUT_SECONDS = 60.0
 
 
 def _host_retention(
@@ -177,6 +179,7 @@ class LifecycleManager:
         state: StateStore,
         *,
         clock: Callable[[], datetime.datetime] | None = None,
+        monotonic: Callable[[], float] | None = None,
         uuid_factory: Callable[[], uuid.UUID] | None = None,
         profile_ssh_validator: Callable[[dict[str, Any]], Any] | None = None,
         key_pair_validator: Callable[[str, str], None] | None = None,
@@ -187,6 +190,7 @@ class LifecycleManager:
         self.clock = clock or (
             lambda: datetime.datetime.now(datetime.timezone.utc)
         )
+        self.monotonic = monotonic or time.monotonic
         self.uuid_factory = uuid_factory or uuid.uuid4
         self.profile_ssh_validator = (
             profile_ssh_validator or validate_profile_ssh_files
@@ -205,6 +209,53 @@ class LifecycleManager:
         now = self.clock()
         utc_timestamp(now)
         return now
+
+    def _provider_deadline(
+        self,
+        acquisition_expires_at: datetime.datetime | None,
+        *,
+        acquisition_deadline: float | None = None,
+    ) -> float | None:
+        if acquisition_deadline is not None and (
+            isinstance(acquisition_deadline, bool)
+            or not isinstance(acquisition_deadline, (int, float))
+            or not math.isfinite(float(acquisition_deadline))
+        ):
+            raise RunpodLocalError(
+                "RunPod launch monotonic deadline is invalid",
+                code="invalid_operation_identity",
+            )
+        deadline = (
+            None
+            if acquisition_deadline is None
+            else float(acquisition_deadline)
+        )
+        if acquisition_expires_at is not None:
+            utc_timestamp(acquisition_expires_at)
+            remaining = (
+                acquisition_expires_at - self._now()
+            ).total_seconds()
+            wall_deadline = self.monotonic() + remaining
+            deadline = (
+                wall_deadline
+                if deadline is None
+                else min(deadline, wall_deadline)
+            )
+        if deadline is not None and self.monotonic() >= deadline:
+            raise RunpodLocalError(
+                "RunPod launch cannot make another provider request after "
+                "its acquisition deadline",
+                code="remote_client_timeout",
+            )
+        return deadline
+
+    def _provider_call_arguments(
+        self,
+        deadline: float | None,
+    ) -> dict[str, Any]:
+        if deadline is None:
+            return {}
+        return {"deadline": deadline, "monotonic": self.monotonic}
 
     def new_operation_id(self) -> str:
         """Return one canonical identity for an operation not yet launched."""
@@ -248,11 +299,19 @@ class LifecycleManager:
         self.key_pair_validator(str(identity_path), public_key)
         return public_key
 
-    def _attest_record_template(self, record: dict[str, Any]) -> None:
+    def _attest_record_template(
+        self,
+        record: dict[str, Any],
+        *,
+        deadline: float | None = None,
+    ) -> None:
         contract = record["expected"].get("template_contract")
         if contract is None:
             return
-        observed = self._api().get_template(contract["id"])
+        observed = self._api().get_template(
+            contract["id"],
+            **self._provider_call_arguments(deadline),
+        )
         violations = template_contract_violations(observed, contract)
         if violations:
             raise RunpodLocalError(
@@ -262,12 +321,18 @@ class LifecycleManager:
             )
 
     def _volume_for_profile(
-        self, profile: dict[str, Any]
+        self,
+        profile: dict[str, Any],
+        *,
+        deadline: float | None = None,
     ) -> tuple[dict[str, Any] | None, str | None]:
         volume_id = profile["pod"]["network_volume_id"]
         if volume_id is None:
             return None, None
-        volume = self._api().get_network_volume(volume_id)
+        volume = self._api().get_network_volume(
+            volume_id,
+            **self._provider_call_arguments(deadline),
+        )
         if volume.get("id") != volume_id:
             raise RunpodLocalError(
                 "Runpod returned the wrong network volume",
@@ -286,12 +351,17 @@ class LifecycleManager:
         profile: dict[str, Any],
         *,
         allowed_gpu_ids: set[str] | None,
+        deadline: float | None = None,
     ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
-        volume, data_center_id = self._volume_for_profile(profile)
+        volume, data_center_id = self._volume_for_profile(
+            profile,
+            deadline=deadline,
+        )
         stock = self._api().stock(
             gpu_count=profile["pod"]["gpu_count"],
             secure_cloud=True,
             include_data_centers=data_center_id is not None,
+            **self._provider_call_arguments(deadline),
         )
         placement = select_launch_placement(
             profile,
@@ -396,9 +466,16 @@ class LifecycleManager:
         require_absent: bool = False,
         target_operation_id: str | None = None,
         predecessor_operation_id: str | None = None,
+        acquisition_expires_at: datetime.datetime | None = None,
+        acquisition_deadline: float | None = None,
+        cleanup_deadline_factory: Callable[[], float] | None = None,
     ) -> dict[str, Any]:
         validate_record_name(name)
         profile = validate_profile(profile)
+        provider_deadline = self._provider_deadline(
+            acquisition_expires_at,
+            acquisition_deadline=acquisition_deadline,
+        )
         if type(require_absent) is not bool:
             raise RunpodLocalError(
                 "launch absence guard must be boolean",
@@ -457,7 +534,12 @@ class LifecycleManager:
             empty_grace_seconds=empty_grace_seconds,
         )
         validate_lease_request(ttl_seconds, idle_timeout_seconds)
-        with self.state.locked(instance_lock_scope(name)):
+        with self.state.locked(
+            instance_lock_scope(name),
+            deadline=provider_deadline,
+            monotonic=self.monotonic,
+            deadline_error_code="remote_client_timeout",
+        ):
             record = self.instances.load(name, required=False)
             if require_absent and record is not None:
                 raise RunpodLocalError(
@@ -515,13 +597,18 @@ class LifecycleManager:
                 _provider_termination_deadline(record)
                 if record["phase"] == "intent":
                     self._validate_record_ssh_identity(record)
-                return self._advance_launch(record)
+                return self._advance_launch(
+                    record,
+                    deadline=provider_deadline,
+                    cleanup_deadline_factory=cleanup_deadline_factory,
+                )
             if (
                 record is not None
                 and _submission_may_have_been_sent(record)
             ):
                 name_matches = self._exact_remote_name_matches(
-                    record["remote_name"]
+                    record["remote_name"],
+                    deadline=provider_deadline,
                 )
                 conflict_observed = (
                     self._persist_terminal_exact_name_ids(
@@ -546,6 +633,7 @@ class LifecycleManager:
                     self._find_owned_remote(
                         record,
                         name_matches=name_matches,
+                        deadline=provider_deadline,
                     )
                     is not None
                 ):
@@ -556,7 +644,9 @@ class LifecycleManager:
 
             self.profile_ssh_validator(profile)
             volume, placement = self._placement(
-                profile, allowed_gpu_ids=allowed_gpu_ids
+                profile,
+                allowed_gpu_ids=allowed_gpu_ids,
+                deadline=provider_deadline,
             )
             selected = placement["selected"]
             if selected is None:
@@ -710,10 +800,28 @@ class LifecycleManager:
                 record["pod_payload"]
             )
             append_event(record, "launch_intent_saved", at=now)
+            if (
+                provider_deadline is not None
+                and self.monotonic() >= provider_deadline
+            ):
+                raise RunpodLocalError(
+                    "RunPod launch intent exceeded its acquisition deadline",
+                    code="remote_client_timeout",
+                )
             self.instances.save(record)
-            return self._advance_launch(record)
+            return self._advance_launch(
+                record,
+                deadline=provider_deadline,
+                cleanup_deadline_factory=cleanup_deadline_factory,
+            )
 
-    def _advance_launch(self, record: dict[str, Any]) -> dict[str, Any]:
+    def _advance_launch(
+        self,
+        record: dict[str, Any],
+        *,
+        deadline: float | None = None,
+        cleanup_deadline_factory: Callable[[], float] | None = None,
+    ) -> dict[str, Any]:
         phase = record["phase"]
         if phase in LAUNCH_PHASES:
             _provider_termination_deadline(record)
@@ -728,10 +836,11 @@ class LifecycleManager:
         account_ssh_attestation: Any = None
         matches: list[dict[str, Any]] | None = None
         if phase == "intent":
-            self._attest_record_template(record)
+            self._attest_record_template(record, deadline=deadline)
             public_key = self._validate_record_ssh_identity(record)
             account_ssh_attestation = self._api().attest_account_ssh_key(
-                public_key
+                public_key,
+                **self._provider_call_arguments(deadline),
             )
             now = self._now()
             reasons = lease_expiry_reasons(record, now=now)
@@ -742,7 +851,8 @@ class LifecycleManager:
                     code="launch_expired",
                 )
             matches = self._exact_remote_name_matches(
-                record["remote_name"]
+                record["remote_name"],
+                deadline=deadline,
             )
             if matches:
                 now = self._now()
@@ -770,7 +880,7 @@ class LifecycleManager:
             # This is deliberately the final provider read before the create.
             # The following receipt transition/fsync records ambiguity before
             # the billable request without opening another network TOCTOU.
-            self._attest_record_template(record)
+            self._attest_record_template(record, deadline=deadline)
             transition_instance(
                 record,
                 "submitting",
@@ -795,7 +905,8 @@ class LifecycleManager:
         if phase == "submitting":
             if matches is None:
                 matches = self._exact_remote_name_matches(
-                    record["remote_name"]
+                    record["remote_name"],
+                    deadline=deadline,
                 )
             if len(matches) > 1:
                 conflict_pod_ids = sorted(
@@ -847,6 +958,7 @@ class LifecycleManager:
                     pod = self._api().create_pod(
                         record["pod_payload"],
                         account_ssh_attestation=account_ssh_attestation,
+                        **self._provider_call_arguments(deadline),
                     )
                 except HttpRequestError:
                     append_event(
@@ -898,7 +1010,10 @@ class LifecycleManager:
 
         if phase == "provisioning":
             try:
-                pod = self._api().get_pod(record["pod_id"])
+                pod = self._api().get_pod(
+                    record["pod_id"],
+                    **self._provider_call_arguments(deadline),
+                )
             except HttpRequestError as error:
                 if error.status == 404:
                     append_event(
@@ -910,7 +1025,11 @@ class LifecycleManager:
             violations, pending = verify_allocated_pod(record, pod)
             record["provider"] = _durable_provider_snapshot(record, pod)
             if violations:
-                return self._rollback(record, violations)
+                return self._rollback(
+                    record,
+                    violations,
+                    cleanup_deadline_factory=cleanup_deadline_factory,
+                )
             if pending:
                 append_event(
                     record,
@@ -951,8 +1070,17 @@ class LifecycleManager:
         return record
 
     def _rollback(
-        self, record: dict[str, Any], violations: list[str]
+        self,
+        record: dict[str, Any],
+        violations: list[str],
+        *,
+        cleanup_deadline_factory: Callable[[], float] | None = None,
     ) -> dict[str, Any]:
+        cleanup_deadline = (
+            self.monotonic() + LIFECYCLE_CLEANUP_TIMEOUT_SECONDS
+            if cleanup_deadline_factory is None
+            else cleanup_deadline_factory()
+        )
         now = self._now()
         record["rollback_reasons"] = violations
         transition_instance(
@@ -964,7 +1092,10 @@ class LifecycleManager:
         )
         self.instances.save(record)
         try:
-            self._api().delete_pod(record["pod_id"])
+            self._api().delete_pod(
+                record["pod_id"],
+                **self._provider_call_arguments(cleanup_deadline),
+            )
         except HttpRequestError as error:
             if error.status != 404:
                 append_event(
@@ -991,11 +1122,16 @@ class LifecycleManager:
         )
 
     def _exact_remote_name_matches(
-        self, remote_name: str
+        self,
+        remote_name: str,
+        *,
+        deadline: float | None = None,
     ) -> list[dict[str, Any]]:
         matches = [
             pod
-            for pod in self._api().list_pods()
+            for pod in self._api().list_pods(
+                **self._provider_call_arguments(deadline)
+            )
             if pod.get("name") == remote_name
         ]
         pod_ids = [pod.get("id") for pod in matches]
@@ -1016,16 +1152,23 @@ class LifecycleManager:
         record: dict[str, Any],
         *,
         name_matches: list[dict[str, Any]] | None = None,
+        deadline: float | None = None,
     ) -> list[dict[str, Any]]:
         matches = (
-            self._exact_remote_name_matches(record["remote_name"])
+            self._exact_remote_name_matches(
+                record["remote_name"],
+                deadline=deadline,
+            )
             if name_matches is None
             else name_matches
         )
         live_by_id: dict[str, dict[str, Any]] = {}
         for pod_id in _durable_current_pod_ids(record):
             try:
-                pod = self._api().get_pod(pod_id)
+                pod = self._api().get_pod(
+                    pod_id,
+                    **self._provider_call_arguments(deadline),
+                )
             except HttpRequestError as error:
                 if error.status != 404:
                     raise
@@ -1075,9 +1218,13 @@ class LifecycleManager:
         record: dict[str, Any],
         *,
         name_matches: list[dict[str, Any]] | None = None,
+        deadline: float | None = None,
     ) -> dict[str, Any] | None:
         matches = (
-            self._exact_remote_name_matches(record["remote_name"])
+            self._exact_remote_name_matches(
+                record["remote_name"],
+                deadline=deadline,
+            )
             if name_matches is None
             else name_matches
         )
@@ -1089,6 +1236,7 @@ class LifecycleManager:
         candidates = self._owned_remote_candidates(
             record,
             name_matches=matches,
+            deadline=deadline,
         )
         if self._has_remote_identity_conflict(record, candidates):
             raise RunpodLocalError(
@@ -1160,6 +1308,7 @@ class LifecycleManager:
         execute: bool,
         reason: str,
         authorize_conflict_cleanup: bool,
+        deadline: float | None = None,
     ) -> dict[str, Any]:
         conflict_pod_id_set = {pod["id"] for pod in matches}
         conflict_pod_id_set.update(_durable_current_pod_ids(record))
@@ -1178,6 +1327,7 @@ class LifecycleManager:
                 execute=False,
                 reason=reason,
                 authorize_conflict_cleanup=authorize_conflict_cleanup,
+                deadline=deadline,
             )
 
         record["conflict_pod_ids"] = conflict_pod_ids
@@ -1210,6 +1360,7 @@ class LifecycleManager:
             execute=True,
             reason=reason,
             authorize_conflict_cleanup=authorize_conflict_cleanup,
+            deadline=deadline,
         )
 
     def _terminate_conflict(
@@ -1219,11 +1370,14 @@ class LifecycleManager:
         execute: bool,
         reason: str,
         authorize_conflict_cleanup: bool,
+        deadline: float | None = None,
     ) -> dict[str, Any]:
         recorded_pod_ids = _recorded_conflict_pod_ids(record)
         recorded_pod_id_set = set(recorded_pod_ids)
         remote_name = record["remote_name"]
-        listed_pods = self._api().list_pods()
+        listed_pods = self._api().list_pods(
+            **self._provider_call_arguments(deadline)
+        )
         listed_name_matches = [
             pod for pod in listed_pods if pod.get("name") == remote_name
         ]
@@ -1315,7 +1469,10 @@ class LifecycleManager:
         live_by_id: dict[str, dict[str, Any]] = {}
         for pod_id in recorded_pod_ids:
             try:
-                pod = self._api().get_pod(pod_id)
+                pod = self._api().get_pod(
+                    pod_id,
+                    **self._provider_call_arguments(deadline),
+                )
             except HttpRequestError as error:
                 if error.status == 404:
                     continue
@@ -1372,7 +1529,10 @@ class LifecycleManager:
         self.instances.save(record)
         for pod_id in target_pod_ids:
             try:
-                self._api().delete_pod(pod_id)
+                self._api().delete_pod(
+                    pod_id,
+                    **self._provider_call_arguments(deadline),
+                )
             except HttpRequestError as error:
                 if error.status == 404:
                     continue
@@ -1412,9 +1572,15 @@ class LifecycleManager:
         require_expired: bool = False,
         observed_terminal_pod_ids: tuple[str, ...] | None = None,
         authorize_conflict_cleanup: bool = True,
+        deadline: float | None = None,
     ) -> dict[str, Any]:
         validate_record_name(name)
-        with self.state.locked(instance_lock_scope(name)):
+        with self.state.locked(
+            instance_lock_scope(name),
+            deadline=deadline,
+            monotonic=self.monotonic,
+            deadline_error_code="instance_termination_timeout",
+        ):
             record = self.instances.load(name)
             if record is None:
                 raise AssertionError("required instance unexpectedly absent")
@@ -1483,10 +1649,12 @@ class LifecycleManager:
                     authorize_conflict_cleanup=(
                         authorize_conflict_cleanup
                     ),
+                    deadline=deadline,
                 )
             if record["phase"] in TERMINAL_PHASES:
                 name_matches = self._exact_remote_name_matches(
-                    record["remote_name"]
+                    record["remote_name"],
+                    deadline=deadline,
                 )
                 if self._has_exact_name_identity_conflict(
                     record, name_matches
@@ -1499,10 +1667,12 @@ class LifecycleManager:
                         authorize_conflict_cleanup=(
                             authorize_conflict_cleanup
                         ),
+                        deadline=deadline,
                     )
                 candidates = self._owned_remote_candidates(
                     record,
                     name_matches=name_matches,
+                    deadline=deadline,
                 )
                 if self._has_remote_identity_conflict(
                     record, candidates
@@ -1515,6 +1685,7 @@ class LifecycleManager:
                         authorize_conflict_cleanup=(
                             authorize_conflict_cleanup
                         ),
+                        deadline=deadline,
                     )
                 remote = candidates[0] if candidates else None
                 if remote is not None:
@@ -1552,7 +1723,10 @@ class LifecycleManager:
                     )
                     self.instances.save(record)
                     try:
-                        self._api().delete_pod(remote["id"])
+                        self._api().delete_pod(
+                            remote["id"],
+                            **self._provider_call_arguments(deadline),
+                        )
                     except HttpRequestError as error:
                         if error.status != 404:
                             append_event(
@@ -1595,7 +1769,8 @@ class LifecycleManager:
                     self.instances.save(record)
                 return result
             name_matches = self._exact_remote_name_matches(
-                record["remote_name"]
+                record["remote_name"],
+                deadline=deadline,
             )
             if self._has_exact_name_identity_conflict(
                 record, name_matches
@@ -1606,10 +1781,12 @@ class LifecycleManager:
                     execute=execute,
                     reason=reason,
                     authorize_conflict_cleanup=authorize_conflict_cleanup,
+                    deadline=deadline,
                 )
             candidates = self._owned_remote_candidates(
                 record,
                 name_matches=name_matches,
+                deadline=deadline,
             )
             if self._has_remote_identity_conflict(record, candidates):
                 return self._capture_remote_conflict(
@@ -1618,6 +1795,7 @@ class LifecycleManager:
                     execute=execute,
                     reason=reason,
                     authorize_conflict_cleanup=authorize_conflict_cleanup,
+                    deadline=deadline,
                 )
             remote = candidates[0] if candidates else None
             if remote is None:
@@ -1713,7 +1891,10 @@ class LifecycleManager:
                 )
             self.instances.save(record)
             try:
-                self._api().delete_pod(remote["id"])
+                self._api().delete_pod(
+                    remote["id"],
+                    **self._provider_call_arguments(deadline),
+                )
             except HttpRequestError as error:
                 if error.status != 404:
                     append_event(

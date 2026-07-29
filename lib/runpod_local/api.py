@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import math
+import time
 import urllib.parse
+from collections.abc import Callable
 from typing import Any
 
 from .auth import ApiCredential
@@ -1462,6 +1464,9 @@ class RunpodApi:
         payload: Any | None = None,
         expected_statuses: tuple[int, ...] = (200,),
         allowed_error_responses: frozenset[tuple[int, str]] = frozenset(),
+        timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> Any:
         url = f"{self.rest_base}/{path.lstrip('/')}"
         if query:
@@ -1473,6 +1478,9 @@ class RunpodApi:
             payload=payload,
             expected_statuses=expected_statuses,
             allowed_error_responses=allowed_error_responses,
+            timeout_seconds=timeout_seconds,
+            deadline=deadline,
+            monotonic=monotonic,
         )
 
     def _graphql(
@@ -1481,6 +1489,9 @@ class RunpodApi:
         *,
         operation: str,
         variables: dict[str, Any] | None = None,
+        timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> dict[str, Any]:
         if operation not in GRAPHQL_OPERATION_NAMES:
             raise RunpodLocalError(
@@ -1495,6 +1506,9 @@ class RunpodApi:
             self.graphql_url,
             headers=self._headers(),
             payload=payload,
+            timeout_seconds=timeout_seconds,
+            deadline=deadline,
+            monotonic=monotonic,
         )
         if not isinstance(value, dict):
             raise RunpodLocalError(
@@ -1526,11 +1540,18 @@ class RunpodApi:
             )
         return data
 
-    def list_pods(self) -> list[dict[str, Any]]:
+    def list_pods(
+        self,
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> list[dict[str, Any]]:
         value = self._rest(
             "GET",
             "pods",
             query={"includeMachine": "true", "includeNetworkVolume": "true"},
+            deadline=deadline,
+            monotonic=monotonic,
         )
         if not isinstance(value, list) or not all(
             isinstance(pod, dict) for pod in value
@@ -1542,7 +1563,11 @@ class RunpodApi:
         return [normalize_pod(pod) for pod in value]
 
     def attest_account_ssh_key(
-        self, public_key: str
+        self,
+        public_key: str,
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> _AccountSshKeyAttestation:
         """Require the profile key among the account's startup SSH keys."""
 
@@ -1550,6 +1575,8 @@ class RunpodApi:
         data = self._graphql(
             ACCOUNT_SSH_KEY_QUERY,
             operation="accountSshKey",
+            deadline=deadline,
+            monotonic=monotonic,
         )
         myself = data.get("myself")
         if not isinstance(myself, dict):
@@ -1626,10 +1653,18 @@ class RunpodApi:
             )
         attestation.consumed = True
 
-    def _get_pod_policy_attestation(self, pod_id: str) -> dict[str, Any]:
+    def _get_pod_policy_attestation(
+        self,
+        pod_id: str,
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> dict[str, Any]:
         data = self._graphql(
             POD_POLICY_QUERY % pod_id,
             operation="podPolicy",
+            deadline=deadline,
+            monotonic=monotonic,
         )
         value = data.get("pod")
         if not isinstance(value, dict):
@@ -1674,12 +1709,21 @@ class RunpodApi:
             "interruptible": POD_TYPE_INTERRUPTIBLE[pod_type],
         }
 
-    def get_pod(self, pod_id: str) -> dict[str, Any]:
+    def get_pod(
+        self,
+        pod_id: str,
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> dict[str, Any]:
         pod_id = _provider_id(pod_id, label="Pod ID")
+
         value = self._rest(
             "GET",
             f"pods/{urllib.parse.quote(pod_id, safe='')}",
             query={"includeMachine": "true", "includeNetworkVolume": "true"},
+            deadline=deadline,
+            monotonic=monotonic,
         )
         if not isinstance(value, dict):
             raise RunpodLocalError(
@@ -1691,7 +1735,11 @@ class RunpodApi:
                 "Runpod REST Pod response ID did not match the requested Pod",
                 code="invalid_provider_response",
             )
-        policy = self._get_pod_policy_attestation(pod_id)
+        policy = self._get_pod_policy_attestation(
+            pod_id,
+            deadline=deadline,
+            monotonic=monotonic,
+        )
         rest_gpu_count = normalize_pod(value)["gpu_count"]
         if rest_gpu_count is not None and (
             not isinstance(rest_gpu_count, int)
@@ -1721,8 +1769,15 @@ class RunpodApi:
         payload: dict[str, Any],
         *,
         account_ssh_attestation: Any = None,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> dict[str, Any]:
         graphql_input = _pod_graphql_input(payload)
+        if deadline is not None and monotonic() >= deadline:
+            raise RunpodLocalError(
+                "RunPod provider request cannot start after its deadline",
+                code="remote_client_timeout",
+            )
         self._consume_account_ssh_key_attestation(
             payload, account_ssh_attestation
         )
@@ -1730,6 +1785,8 @@ class RunpodApi:
             CREATE_POD_MUTATION,
             operation="podFindAndDeployOnDemand",
             variables={"input": graphql_input},
+            deadline=deadline,
+            monotonic=monotonic,
         )
         value = data.get("podFindAndDeployOnDemand")
         if not isinstance(value, dict):
@@ -1774,12 +1831,20 @@ class RunpodApi:
             expected_statuses=(200,),
         )
 
-    def delete_pod(self, pod_id: str) -> None:
+    def delete_pod(
+        self,
+        pod_id: str,
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
         pod_id = _provider_id(pod_id, label="Pod ID")
         self._rest(
             "DELETE",
             f"pods/{urllib.parse.quote(pod_id, safe='')}",
             expected_statuses=(204,),
+            deadline=deadline,
+            monotonic=monotonic,
         )
 
     def list_network_volumes(self) -> list[dict[str, Any]]:
@@ -1793,10 +1858,19 @@ class RunpodApi:
             )
         return [normalize_volume(volume) for volume in value]
 
-    def get_network_volume(self, volume_id: str) -> dict[str, Any]:
+    def get_network_volume(
+        self,
+        volume_id: str,
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> dict[str, Any]:
         volume_id = _provider_id(volume_id, label="network volume ID")
         value = self._rest(
-            "GET", f"networkvolumes/{urllib.parse.quote(volume_id, safe='')}"
+            "GET",
+            f"networkvolumes/{urllib.parse.quote(volume_id, safe='')}",
+            deadline=deadline,
+            monotonic=monotonic,
         )
         if not isinstance(value, dict):
             raise RunpodLocalError(
@@ -1837,11 +1911,19 @@ class RunpodApi:
             )
         return [normalize_template(template) for template in value]
 
-    def get_template(self, template_id: str) -> dict[str, Any]:
+    def get_template(
+        self,
+        template_id: str,
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> dict[str, Any]:
         template_id = _provider_id(template_id, label="template ID")
         value = self._rest(
             "GET",
             f"templates/{urllib.parse.quote(template_id, safe='')}",
+            deadline=deadline,
+            monotonic=monotonic,
         )
         if not isinstance(value, dict):
             raise RunpodLocalError(
@@ -1879,6 +1961,8 @@ class RunpodApi:
         gpu_count: int = 1,
         secure_cloud: bool = True,
         include_data_centers: bool = False,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> dict[str, Any]:
         if gpu_count <= 0:
             raise RunpodLocalError(
@@ -1889,7 +1973,12 @@ class RunpodApi:
             gpu_count,
             "true" if secure_cloud else "false",
         )
-        data = self._graphql(query, operation="gpuTypes")
+        data = self._graphql(
+            query,
+            operation="gpuTypes",
+            deadline=deadline,
+            monotonic=monotonic,
+        )
         raw_gpus = data.get("gpuTypes")
         if not isinstance(raw_gpus, list):
             raise RunpodLocalError(
@@ -1942,6 +2031,8 @@ class RunpodApi:
             center_data = self._graphql(
                 DATA_CENTERS_QUERY,
                 operation="dataCenters",
+                deadline=deadline,
+                monotonic=monotonic,
             )
             raw_centers = center_data.get("dataCenters")
             if not isinstance(raw_centers, list) or not all(

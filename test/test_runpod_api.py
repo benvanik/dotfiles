@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 import unittest
 
 from runpod_local.api import (
@@ -69,7 +70,15 @@ class FakeTransport:
         payload=None,
         expected_statuses=(200,),
         allowed_error_responses=frozenset(),
+        timeout_seconds=None,
+        deadline=None,
+        monotonic=time.monotonic,
     ):
+        if deadline is not None and monotonic() >= deadline:
+            raise RunpodLocalError(
+                "controlled provider request exceeded its deadline",
+                code="remote_client_timeout",
+            )
         self.requests.append(
             {
                 "method": method,
@@ -78,6 +87,8 @@ class FakeTransport:
                 "payload": payload,
                 "expected_statuses": expected_statuses,
                 "allowed_error_responses": allowed_error_responses,
+                "timeout_seconds": timeout_seconds,
+                "deadline": deadline,
             }
         )
         if not self.responses:
@@ -418,6 +429,39 @@ class RunpodApiTest(unittest.TestCase):
                 self.assertIn("gpuCount", query)
                 self.assertIn("locked", query)
                 self.assertIn("podType", query)
+
+    def test_get_pod_does_not_start_policy_read_after_deadline(self):
+        api, transport = api_with_responses(
+            {
+                "id": "pod123",
+                "name": "fixture",
+                "gpu": {"id": "NVIDIA H200"},
+                "gpuCount": 1,
+            },
+            {
+                "data": {
+                    "pod": {
+                        "id": "pod123",
+                        "gpuCount": 1,
+                        "locked": False,
+                        "podType": "RESERVED",
+                    }
+                }
+            },
+        )
+        readings = iter((2.0, 10.0))
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            api.get_pod(
+                "pod123",
+                deadline=10.0,
+                monotonic=lambda: next(readings),
+            )
+
+        self.assertEqual(caught.exception.code, "remote_client_timeout")
+        self.assertEqual(len(transport.requests), 1)
+        self.assertIsNone(transport.requests[0]["timeout_seconds"])
+        self.assertEqual(transport.requests[0]["deadline"], 10.0)
 
     def test_get_pod_rejects_mismatched_provider_ids(self):
         valid_policy = {
@@ -824,6 +868,25 @@ class RunpodApiTest(unittest.TestCase):
                 }
             },
         )
+
+    def test_create_pod_does_not_start_after_preflight_deadline_expires(self):
+        api, transport = api_with_responses(
+            account_ssh_key_response(),
+            pod_create_response(),
+        )
+        attestation = api.attest_account_ssh_key(SSH_PUBLIC_KEY)
+        readings = iter((1.0, 5.0))
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            api.create_pod(
+                pod_create_payload(),
+                account_ssh_attestation=attestation,
+                deadline=5.0,
+                monotonic=lambda: next(readings),
+            )
+
+        self.assertEqual(caught.exception.code, "remote_client_timeout")
+        self.assertEqual(len(transport.requests), 1)
 
     def test_create_pod_maps_template_and_ephemeral_volume(self):
         payload = pod_create_payload()
@@ -1251,6 +1314,25 @@ class RunpodApiTest(unittest.TestCase):
             centers[0]["gpu_availability"][0]["stock_status"], "None"
         )
 
+    def test_stock_does_not_start_data_center_read_after_deadline(self):
+        api, transport = api_with_responses(
+            {"data": {"gpuTypes": []}},
+            {"data": {"dataCenters": []}},
+        )
+        readings = iter((4.0, 5.0))
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            api.stock(
+                include_data_centers=True,
+                deadline=5.0,
+                monotonic=lambda: next(readings),
+            )
+
+        self.assertEqual(caught.exception.code, "remote_client_timeout")
+        self.assertEqual(len(transport.requests), 1)
+        self.assertIsNone(transport.requests[0]["timeout_seconds"])
+        self.assertEqual(transport.requests[0]["deadline"], 5.0)
+
     def test_stock_status_remains_usable_when_count_hints_are_empty(self):
         api, _ = api_with_responses(
             {
@@ -1309,6 +1391,18 @@ class RunpodApiTest(unittest.TestCase):
         api.delete_pod("pod123")
         self.assertEqual(transport.requests[0]["method"], "DELETE")
         self.assertEqual(transport.requests[0]["expected_statuses"], (204,))
+
+    def test_expired_read_deadline_does_not_gate_delete_cleanup(self):
+        api, transport = api_with_responses(None)
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            api.list_pods(deadline=10.0, monotonic=lambda: 10.0)
+        api.delete_pod("pod123")
+
+        self.assertEqual(caught.exception.code, "remote_client_timeout")
+        self.assertEqual(len(transport.requests), 1)
+        self.assertEqual(transport.requests[0]["method"], "DELETE")
+        self.assertIsNone(transport.requests[0]["timeout_seconds"])
 
 
 if __name__ == "__main__":

@@ -10,12 +10,18 @@ import shlex
 import socket
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
 from runpod_local.cli import build_parser, parse_arguments
 from runpod_local.errors import RunpodLocalError
-from runpod_local.instances import InstanceStore, json_document_hash
+from runpod_local.instances import (
+    InstanceStore,
+    instance_lock_scope,
+    json_document_hash,
+)
 from runpod_local.remote import (
     build_copy_argv,
     build_ssh_argv,
@@ -201,7 +207,7 @@ class FakeApi:
     def __init__(self, pod=None):
         self.pod = pod or live_pod()
 
-    def get_pod(self, pod_id):
+    def get_pod(self, pod_id, **kwargs):
         if pod_id != self.pod["id"]:
             raise AssertionError("unexpected Pod ID")
         return dict(self.pod)
@@ -616,6 +622,148 @@ class RemoteBoundaryTest(unittest.TestCase):
         record = store.load("compiler")
         self.assertEqual(record["lease"]["expires_at"], original_deadline)
         self.assertEqual(record["lease"]["activity_source"], "fixture_remote")
+
+    def test_remote_process_is_terminated_and_reaped_at_absolute_deadline(self):
+        class DeadlineClock:
+            def __init__(self):
+                self.value = 10.0
+
+            def __call__(self):
+                return self.value
+
+        clock = DeadlineClock()
+
+        class DeadlineProcess:
+            def __init__(self):
+                self.terminated = False
+                self.killed = False
+                self.reaped = False
+                self.wait_timeouts = []
+
+            def wait(self, timeout=None):
+                self.wait_timeouts.append(timeout)
+                if not self.terminated:
+                    clock.value = 12.0
+                    raise subprocess.TimeoutExpired(["ssh"], timeout)
+                self.reaped = True
+                return -15
+
+            def terminate(self):
+                self.terminated = True
+
+            def kill(self):
+                self.killed = True
+
+        process = DeadlineProcess()
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            run_with_activity(
+                ["ssh", "fixture"],
+                instances=InstanceStore(self.state),
+                name="compiler",
+                expected_operation_id=(
+                    "12345678-1234-4234-8234-123456789abc"
+                ),
+                expected_pod_id="pod123",
+                source="bounded_remote",
+                popen_factory=lambda *_args, **_kwargs: process,
+                deadline=12.0,
+                monotonic=clock,
+            )
+
+        self.assertEqual(caught.exception.code, "remote_client_timeout")
+        self.assertTrue(process.terminated)
+        self.assertTrue(process.reaped)
+        self.assertFalse(process.killed)
+        self.assertEqual(process.wait_timeouts, [2.0, 0.0])
+
+    def test_blocked_post_spawn_activity_cannot_outlive_remote_deadline(self):
+        store = InstanceStore(self.state)
+        lock_acquired = threading.Event()
+        release_lock = threading.Event()
+
+        def hold_instance_lock():
+            with self.state.locked(instance_lock_scope("compiler")):
+                lock_acquired.set()
+                release_lock.wait()
+
+        class DeadlineProcess:
+            def __init__(self):
+                self.terminated = False
+                self.killed = False
+                self.reaped = False
+
+            def terminate(self):
+                self.terminated = True
+
+            def kill(self):
+                self.killed = True
+
+            def wait(self, timeout=None):
+                if not self.terminated:
+                    raise subprocess.TimeoutExpired(["ssh"], timeout)
+                self.reaped = True
+                return -15
+
+        process = DeadlineProcess()
+        deadline = time.monotonic() + 0.25
+        holder: threading.Thread | None = None
+
+        def popen(*_args, **_kwargs):
+            nonlocal holder
+            holder = threading.Thread(target=hold_instance_lock)
+            holder.start()
+            self.assertTrue(lock_acquired.wait(1))
+            return process
+
+        try:
+            with self.assertRaises(RunpodLocalError) as caught:
+                run_with_activity(
+                    ["ssh", "fixture"],
+                    instances=store,
+                    name="compiler",
+                    expected_operation_id=(
+                        "12345678-1234-4234-8234-123456789abc"
+                    ),
+                    expected_pod_id="pod123",
+                    source="blocked_remote",
+                    popen_factory=popen,
+                    deadline=deadline,
+                )
+        finally:
+            release_lock.set()
+            if holder is not None:
+                holder.join()
+
+        self.assertEqual(caught.exception.code, "remote_client_timeout")
+        self.assertTrue(process.terminated)
+        self.assertTrue(process.reaped)
+        self.assertFalse(process.killed)
+        self.assertNotEqual(
+            store.load("compiler")["lease"]["activity_source"],
+            "blocked_remote",
+        )
+
+    def test_expired_remote_deadline_does_not_start_a_child(self):
+        popen = mock.Mock()
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            run_with_activity(
+                ["ssh", "fixture"],
+                instances=InstanceStore(self.state),
+                name="compiler",
+                expected_operation_id=(
+                    "12345678-1234-4234-8234-123456789abc"
+                ),
+                expected_pod_id="pod123",
+                source="expired_remote",
+                popen_factory=popen,
+                deadline=12.0,
+                monotonic=lambda: 12.0,
+            )
+
+        self.assertEqual(caught.exception.code, "remote_client_timeout")
+        popen.assert_not_called()
 
     def test_remote_process_can_stream_one_explicit_input_file(self):
         token_path = self.root / "token"

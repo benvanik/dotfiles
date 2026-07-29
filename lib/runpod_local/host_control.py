@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import hashlib
+import math
+import threading
 import time
 import uuid
 from collections.abc import Callable
@@ -11,6 +14,7 @@ from typing import Any
 
 from .claim_acquisition import ClaimAcquisitionStore
 from .claims import (
+    CLAIM_REQUEST_IDENTITY_V1,
     ClaimReleaseResult,
     ClaimStore,
     HostClaim,
@@ -23,18 +27,45 @@ from .claims import (
 )
 from .errors import RunpodLocalError
 from .instances import InstanceStore, profile_hash
-from .lifecycle import (
-    HOST_CONTROLLER_LOCK_SCOPE,
-    LifecycleManager,
-    TERMINAL_PHASES,
-)
+from .lifecycle import LifecycleManager, TERMINAL_PHASES
 from .profile import ProfileStore
-from .state import StateStore, validate_record_name
+from .state import (
+    HOST_CONTROLLER_LOCK_SCOPE,
+    StateStore,
+    validate_record_name,
+)
 from .timeutil import parse_utc_timestamp, utc_timestamp
 
 
 DEFAULT_EMPTY_GRACE_SECONDS = 5 * 60
+HOST_CLEANUP_TIMEOUT_SECONDS = 60.0
 READINESS_POLL_SECONDS = 1.0
+
+
+class _CleanupBudget:
+    """One lazy absolute deadline shared by an acquisition rollback."""
+
+    def __init__(
+        self,
+        monotonic: Callable[[], float],
+        deadline_factory: Callable[[], float] | None = None,
+    ) -> None:
+        self.monotonic = monotonic
+        self.deadline_factory = deadline_factory
+        self._deadline: float | None = None
+        self._lock = threading.Lock()
+
+    def deadline(self) -> float:
+        with self._lock:
+            if self._deadline is None:
+                self._deadline = float(
+                    (
+                        self.monotonic() + HOST_CLEANUP_TIMEOUT_SECONDS
+                        if self.deadline_factory is None
+                        else self.deadline_factory()
+                    )
+                )
+            return self._deadline
 
 
 def _automatic_host_name(
@@ -103,8 +134,15 @@ def _static_profile_admission_reasons(
             reasons.append("profile GPU memory may be insufficient")
     if request.ephemeral_disk_gb > pod["container_disk_gb"]:
         reasons.append("profile ephemeral disk is insufficient")
-    if request.minimum_remaining_seconds >= request.new_host_hard_ttl_seconds:
-        reasons.append("new-host hard lifetime is too short")
+    if (
+        request.minimum_remaining_seconds
+        + request.acquisition_timeout_seconds
+        >= request.new_host_hard_ttl_seconds
+    ):
+        reasons.append(
+            "new-host hard lifetime cannot cover claim acquisition and "
+            "the requested remaining lifetime"
+        )
     minimum_cpu = pod["min_vcpu_per_gpu"] * gpu_count
     if request.cpu_count > minimum_cpu:
         reasons.append("profile CPU guarantee is insufficient")
@@ -151,6 +189,7 @@ class HostControl:
         lifecycle: LifecycleManager,
         profiles: ProfileStore,
         clock: Callable[[], datetime.datetime] | None = None,
+        monotonic: Callable[[], float] | None = None,
         uuid_factory: Callable[[], uuid.UUID] | None = None,
         readiness_waiter: Callable[[float], None] | None = None,
     ) -> None:
@@ -159,10 +198,15 @@ class HostControl:
         self.profiles = profiles
         self.instances = InstanceStore(state)
         self.claims = ClaimStore(state)
-        self.acquisitions = ClaimAcquisitionStore(state)
         self.clock = clock or (
             lambda: datetime.datetime.now(datetime.timezone.utc)
         )
+        self.monotonic = monotonic or lifecycle.monotonic
+        self.acquisitions = ClaimAcquisitionStore(
+            state,
+            clock=self.clock,
+        )
+        self.acquisitions.migrate_v1_records()
         self.uuid_factory = uuid_factory or uuid.uuid4
         self.readiness_waiter = readiness_waiter or time.sleep
 
@@ -231,6 +275,280 @@ class HostControl:
                 closed_claim,
                 ledger=ledger,
                 now=now,
+            )
+
+    def _raise_acquisition_timeout(
+        self,
+        request: HostClaimRequest,
+        claim: HostClaim,
+        *,
+        now: datetime.datetime,
+        cleanup_budget: _CleanupBudget,
+    ) -> None:
+        """Close one timed-out claim and retire its exact disposable host."""
+
+        cleanup_deadline = cleanup_budget.deadline()
+        try:
+            release = self.claims.release(
+                claim.host_name,
+                claim.claim_id,
+                expected_generation=claim.generation,
+                now=now,
+                retire_now=True,
+                reason="acquisition-timeout",
+            )
+            closed_ledger = self.claims.load(claim.host_name)
+            if closed_ledger is None:
+                raise AssertionError(
+                    "timed-out claim ledger unexpectedly absent"
+                )
+            self._record_closed_claims(
+                closed_ledger,
+                [claim.claim_id],
+                now=now,
+            )
+            if release.retirement_due:
+                self.lifecycle.terminate(
+                    claim.host_name,
+                    execute=True,
+                    reason="claim_acquisition_timeout",
+                    expected_operation_id=claim.operation_id,
+                    deadline=cleanup_deadline,
+                )
+        except Exception as cleanup_error:
+            raise RunpodLocalError(
+                f"host claim acquisition exceeded "
+                f"{request.acquisition_timeout_seconds} seconds and exact "
+                f"cleanup requires reconciliation: {cleanup_error}",
+                code="host_acquisition_timeout_cleanup_required",
+            ) from cleanup_error
+        raise RunpodLocalError(
+            f"host {claim.host_name} did not become active within "
+            f"{request.acquisition_timeout_seconds} seconds",
+            code="host_acquisition_timeout",
+        )
+
+    def _raise_acquisition_lock_timeout(
+        self,
+        request: HostClaimRequest,
+        claim: HostClaim,
+        cleanup_budget: _CleanupBudget,
+    ) -> None:
+        """Use the acquisition cleanup budget after startup lock expiry."""
+
+        cleanup_deadline = cleanup_budget.deadline()
+        try:
+            with self.state.locked(
+                HOST_CONTROLLER_LOCK_SCOPE,
+                deadline=cleanup_deadline,
+                monotonic=self.monotonic,
+                deadline_error_code=(
+                    "host_acquisition_timeout_cleanup_required"
+                ),
+            ):
+                _, ledger = self._current_host_ledger(claim.host_name)
+                matches = [
+                    value
+                    for value in ledger["claims"]
+                    if value["claim_id"] == claim.claim_id
+                ]
+                if not matches:
+                    raise RunpodLocalError(
+                        "timed-out host claim disappeared before cleanup",
+                        code="host_claim_not_found",
+                    )
+                current = HostClaim.from_documents(ledger, matches[0])
+                self._raise_acquisition_timeout(
+                    request,
+                    current,
+                    now=self._now(),
+                    cleanup_budget=cleanup_budget,
+                )
+        except RunpodLocalError as error:
+            if error.code == "host_acquisition_timeout":
+                raise
+            raise RunpodLocalError(
+                "host claim acquisition startup lock expired and exact "
+                f"cleanup requires reconciliation: {error}",
+                code="host_acquisition_timeout_cleanup_required",
+            ) from error
+
+    @contextlib.contextmanager
+    def _locked_acquisition_iteration(
+        self,
+        request: HostClaimRequest,
+        claim: HostClaim,
+        *,
+        startup_deadline: float,
+        cleanup_budget: _CleanupBudget,
+    ):
+        try:
+            with self.state.locked(
+                HOST_CONTROLLER_LOCK_SCOPE,
+                deadline=startup_deadline,
+                monotonic=self.monotonic,
+                deadline_error_code="host_acquisition_lock_timeout",
+            ):
+                yield
+        except RunpodLocalError as error:
+            if error.code != "host_acquisition_lock_timeout":
+                raise
+            self._raise_acquisition_lock_timeout(
+                request,
+                claim,
+                cleanup_budget,
+            )
+
+    @staticmethod
+    def _acquisition_deadline(
+        request: HostClaimRequest,
+        acquisition: dict[str, Any],
+    ) -> datetime.datetime:
+        deadline = parse_utc_timestamp(
+            acquisition["created_at"]
+        ) + datetime.timedelta(
+            seconds=request.acquisition_timeout_seconds
+        )
+        if request.acquisition_expires_at is not None:
+            deadline = min(
+                deadline,
+                parse_utc_timestamp(request.acquisition_expires_at),
+            )
+        return deadline
+
+    def _bound_acquisition_deadline(
+        self,
+        request: HostClaimRequest,
+        acquisition: dict[str, Any],
+        *,
+        startup_deadline: float | None,
+    ) -> float:
+        """Bind durable wall state without replenishing a live caller budget."""
+
+        wall_remaining = (
+            self._acquisition_deadline(request, acquisition) - self._now()
+        ).total_seconds()
+        wall_deadline = self.monotonic() + wall_remaining
+        if startup_deadline is None:
+            return wall_deadline
+        if (
+            isinstance(startup_deadline, bool)
+            or not isinstance(startup_deadline, (int, float))
+            or not math.isfinite(float(startup_deadline))
+        ):
+            raise RunpodLocalError(
+                "host acquisition monotonic deadline is invalid",
+                code="invalid_host_claim_request",
+            )
+        return min(float(startup_deadline), wall_deadline)
+
+    def _cleanup_unbound_acquisition(
+        self,
+        request: HostClaimRequest,
+        acquisition: dict[str, Any],
+        *,
+        cleanup_deadline: float | None = None,
+    ) -> None:
+        """Retire an exact disposable host created before claim admission."""
+
+        if acquisition["claim"] is not None:
+            raise RunpodLocalError(
+                "bound claim acquisition cannot use pre-claim cleanup",
+                code="host_claim_acquisition_drift",
+            )
+        target = acquisition["target"]
+        if (
+            target is not None
+            and target["created_for_acquisition"] is None
+        ):
+            raise RunpodLocalError(
+                "unbound claim acquisition has unknown target provenance",
+                code="host_claim_acquisition_migration_required",
+            )
+        host = None
+        if target is not None:
+            candidate = self.instances.load(
+                target["host_name"],
+                required=False,
+            )
+            if (
+                candidate is not None
+                and candidate["operation_id"]
+                == target["host_operation_id"]
+                and candidate["phase"] not in TERMINAL_PHASES
+            ):
+                host = candidate
+        if (
+            host is not None
+            and target is not None
+            and target["created_for_acquisition"] is True
+            and request.new_host_retention == "while-claimed"
+        ):
+            ledger = self.claims.load(
+                host["name"],
+                required=False,
+            )
+            if ledger is None or not ledger["claims"]:
+                self.lifecycle.terminate(
+                    host["name"],
+                    execute=True,
+                    reason="claim_acquisition_timeout",
+                    expected_operation_id=host["operation_id"],
+                    **(
+                        {}
+                        if cleanup_deadline is None
+                        else {"deadline": cleanup_deadline}
+                    ),
+                )
+
+    def _raise_unbound_acquisition_timeout(
+        self,
+        request: HostClaimRequest,
+        acquisition: dict[str, Any],
+        *,
+        cleanup_budget: _CleanupBudget,
+    ) -> None:
+        """Close one expired pre-claim operation after exact Pod cleanup."""
+
+        try:
+            self._cleanup_unbound_acquisition(
+                request,
+                acquisition,
+                cleanup_deadline=cleanup_budget.deadline(),
+            )
+            self.acquisitions.close_unbound(
+                request,
+                reason="expired-before-admission",
+                now=self._now(),
+            )
+        except Exception as cleanup_error:
+            raise RunpodLocalError(
+                "host claim acquisition expired before admission and exact "
+                f"cleanup requires reconciliation: {cleanup_error}",
+                code="host_acquisition_timeout_cleanup_required",
+            ) from cleanup_error
+        raise RunpodLocalError(
+            "host claim acquisition expired before admission",
+            code="host_acquisition_timeout",
+        )
+
+    def _require_unbound_acquisition_budget(
+        self,
+        request: HostClaimRequest,
+        acquisition: dict[str, Any],
+        *,
+        startup_deadline: float,
+        cleanup_budget: _CleanupBudget,
+    ) -> None:
+        if (
+            self.monotonic() >= startup_deadline
+            or self._now()
+            >= self._acquisition_deadline(request, acquisition)
+        ):
+            self._raise_unbound_acquisition_timeout(
+                request,
+                acquisition,
+                cleanup_budget=cleanup_budget,
             )
 
     def _expire_claims(
@@ -407,6 +725,13 @@ class HostControl:
         request: HostClaimRequest,
     ) -> HostClaim | None:
         acquisition = self.acquisitions.load(request)
+        request_sha256 = (
+            request.sha256()
+            if acquisition is None
+            else request.sha256_for_schema(
+                acquisition["request_identity_schema"]
+            )
+        )
         strict_host_names: set[str] = set()
         if request.host_name is not None:
             strict_host_names.add(request.host_name)
@@ -446,7 +771,7 @@ class HostControl:
         )
         if closed is not None:
             closed_ledger, claim = closed
-            if claim["request_sha256"] != request.sha256():
+            if claim["request_sha256"] != request_sha256:
                 raise RunpodLocalError(
                     "owner operation already names a different closed claim",
                     code="host_claim_operation_conflict",
@@ -475,7 +800,7 @@ class HostControl:
                 )
             return None
         ledger, claim = existing
-        if claim["request_sha256"] != request.sha256():
+        if claim["request_sha256"] != request_sha256:
             raise RunpodLocalError(
                 "owner operation already names a different claim request",
                 code="host_claim_operation_conflict",
@@ -511,6 +836,11 @@ class HostControl:
                     "name": result.profile_name,
                     "sha256": result.profile_sha256,
                 },
+                "created_for_acquisition": (
+                    acquisition["target"]["created_for_acquisition"]
+                    if acquisition["target"] is not None
+                    else False
+                ),
             }
             expected_host = {
                 "host_name": result.host_name,
@@ -656,6 +986,7 @@ class HostControl:
         *,
         host_name: str,
         operation_id: str,
+        cleanup_budget: _CleanupBudget,
     ) -> None:
         try:
             self.lifecycle.terminate(
@@ -663,6 +994,7 @@ class HostControl:
                 execute=True,
                 reason="claim_launch_allocation_rejected",
                 expected_operation_id=operation_id,
+                deadline=cleanup_budget.deadline(),
             )
         except RunpodLocalError as error:
             raise RunpodLocalError(
@@ -703,12 +1035,21 @@ class HostControl:
     def _create_host(
         self,
         request: HostClaimRequest,
+        *,
+        startup_deadline: float,
+        cleanup_budget: _CleanupBudget,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         acquisition = self.acquisitions.load(request, required=True)
         if acquisition is None:
             raise AssertionError(
                 "required claim acquisition unexpectedly absent"
             )
+        self._require_unbound_acquisition_budget(
+            request,
+            acquisition,
+            startup_deadline=startup_deadline,
+            cleanup_budget=cleanup_budget,
+        )
         target = acquisition["target"]
         profile_names = request.allowed_profile_names
         if target is not None:
@@ -778,6 +1119,7 @@ class HostControl:
                         else None
                     ),
                     profile=profile_identity,
+                    created_for_acquisition=True,
                     now=self._now(),
                 )
                 target = acquisition["target"]
@@ -850,6 +1192,7 @@ class HostControl:
                 self._finish_rejected_host_cleanup(
                     host_name=host_name,
                     operation_id=target["host_operation_id"],
+                    cleanup_budget=cleanup_budget,
                 )
             if (
                 current_host is not None
@@ -893,6 +1236,12 @@ class HostControl:
             if resumed_active_host:
                 host = current_host
             else:
+                self._require_unbound_acquisition_budget(
+                    request,
+                    acquisition,
+                    startup_deadline=startup_deadline,
+                    cleanup_budget=cleanup_budget,
+                )
                 try:
                     host = self.lifecycle.launch(
                         host_name,
@@ -905,12 +1254,25 @@ class HostControl:
                         predecessor_operation_id=target[
                             "predecessor_operation_id"
                         ],
+                        acquisition_expires_at=self._acquisition_deadline(
+                            request,
+                            acquisition,
+                        ),
+                        acquisition_deadline=startup_deadline,
+                        cleanup_deadline_factory=cleanup_budget.deadline,
                     )
                 except RunpodLocalError as error:
+                    if error.code == "remote_client_timeout":
+                        self._raise_unbound_acquisition_timeout(
+                            request,
+                            acquisition,
+                            cleanup_budget=cleanup_budget,
+                        )
                     if error.code == "rollback_required":
                         self._finish_rejected_host_cleanup(
                             host_name=host_name,
                             operation_id=target["host_operation_id"],
+                            cleanup_budget=cleanup_budget,
                         )
                     if error.code == "no_provider_capacity":
                         rejected_host = self.instances.load(
@@ -940,6 +1302,12 @@ class HostControl:
                     host,
                     now=self._now(),
                 )
+            self._require_unbound_acquisition_budget(
+                request,
+                acquisition,
+                startup_deadline=startup_deadline,
+                cleanup_budget=cleanup_budget,
+            )
             if host["phase"] not in {"provisioning", "active"} or not isinstance(
                 host.get("pod_id"), str
             ):
@@ -975,6 +1343,7 @@ class HostControl:
                     execute=True,
                     reason="new_host_claim_not_admitted",
                     expected_operation_id=host["operation_id"],
+                    deadline=cleanup_budget.deadline(),
                 )
                 raise RunpodLocalError(
                     "new host cannot admit its exact acquisition request: "
@@ -992,11 +1361,33 @@ class HostControl:
         self,
         request: HostClaimRequest,
         claim: HostClaim,
+        *,
+        startup_deadline: float,
+        cleanup_budget: _CleanupBudget,
     ) -> HostClaim:
         """Reconcile one claimed Pod to active without monopolizing claim CAS."""
 
+        acquisition = self.acquisitions.load(request, required=True)
+        if acquisition is None:
+            raise AssertionError(
+                "required claim acquisition unexpectedly absent"
+            )
+        acquisition_deadline = self._acquisition_deadline(
+            request,
+            acquisition,
+        )
+        startup_deadline = self._bound_acquisition_deadline(
+            request,
+            acquisition,
+            startup_deadline=startup_deadline,
+        )
         while True:
-            with self.state.locked(HOST_CONTROLLER_LOCK_SCOPE):
+            with self._locked_acquisition_iteration(
+                request,
+                claim,
+                startup_deadline=startup_deadline,
+                cleanup_budget=cleanup_budget,
+            ):
                 now = self._now()
                 host, ledger = self._current_host_ledger(claim.host_name)
                 ledger, expired_claim_ids = self._expire_claims(
@@ -1025,6 +1416,16 @@ class HostControl:
                         code="host_claim_not_found",
                     )
                 claim = HostClaim.from_documents(ledger, matches[0])
+                if (
+                    self.monotonic() >= startup_deadline
+                    or now >= acquisition_deadline
+                ):
+                    self._raise_acquisition_timeout(
+                        request,
+                        claim,
+                        now=now,
+                        cleanup_budget=cleanup_budget,
+                    )
                 if host["phase"] == "active":
                     provider_remaining = (
                         parse_utc_timestamp(
@@ -1036,6 +1437,7 @@ class HostControl:
                         provider_remaining
                         < request.minimum_remaining_seconds
                     ):
+                        cleanup_deadline = cleanup_budget.deadline()
                         release = self.claims.release(
                             claim.host_name,
                             claim.claim_id,
@@ -1059,6 +1461,7 @@ class HostControl:
                                 execute=True,
                                 reason="claim_minimum_lifetime_elapsed",
                                 expected_operation_id=claim.operation_id,
+                                deadline=cleanup_deadline,
                             )
                         raise RunpodLocalError(
                             f"host {claim.host_name} became active with less "
@@ -1115,17 +1518,32 @@ class HostControl:
                     "current authored definition",
                     code="host_profile_drift",
                 )
-            advanced = self.lifecycle.launch(
-                claim.host_name,
-                profile,
-                ttl_seconds=lease_request["ttl_seconds"],
-                idle_timeout_seconds=lease_request[
-                    "idle_timeout_seconds"
-                ],
-                retention_mode=retention["mode"],
-                empty_grace_seconds=retention["empty_grace_seconds"],
-                expected_operation_id=claim.operation_id,
-            )
+            try:
+                advanced = self.lifecycle.launch(
+                    claim.host_name,
+                    profile,
+                    ttl_seconds=lease_request["ttl_seconds"],
+                    idle_timeout_seconds=lease_request[
+                        "idle_timeout_seconds"
+                    ],
+                    retention_mode=retention["mode"],
+                    empty_grace_seconds=retention[
+                        "empty_grace_seconds"
+                    ],
+                    expected_operation_id=claim.operation_id,
+                    acquisition_expires_at=acquisition_deadline,
+                    acquisition_deadline=startup_deadline,
+                    cleanup_deadline_factory=cleanup_budget.deadline,
+                )
+            except RunpodLocalError as error:
+                if error.code == "remote_client_timeout":
+                    self._raise_acquisition_timeout(
+                        request,
+                        claim,
+                        now=self._now(),
+                        cleanup_budget=cleanup_budget,
+                    )
+                raise
             if advanced["phase"] == "active":
                 continue
             if advanced["phase"] != "provisioning":
@@ -1134,26 +1552,90 @@ class HostControl:
                     f"{advanced['phase']} while provisioning",
                     code="host_not_claimable_yet",
                 )
-            self.readiness_waiter(READINESS_POLL_SECONDS)
-
-    def acquire(self, request: HostClaimRequest | Any) -> HostClaim:
-        request = normalize_host_claim_request(request)
-        with self.state.locked(HOST_CONTROLLER_LOCK_SCOPE):
             now = self._now()
-            self.acquisitions.begin(request, now=now)
+            remaining_seconds = (
+                acquisition_deadline - now
+            ).total_seconds()
+            remaining_seconds = min(
+                remaining_seconds,
+                startup_deadline - self.monotonic(),
+            )
+            if remaining_seconds <= 0:
+                self._raise_acquisition_timeout(
+                    request,
+                    claim,
+                    now=now,
+                    cleanup_budget=cleanup_budget,
+                )
+            self.readiness_waiter(
+                min(READINESS_POLL_SECONDS, remaining_seconds)
+            )
+
+    def acquire(
+        self,
+        request: HostClaimRequest | Any,
+        *,
+        startup_deadline: float | None = None,
+        cleanup_deadline_factory: Callable[[], float] | None = None,
+    ) -> HostClaim:
+        request = normalize_host_claim_request(request)
+        cleanup_budget = _CleanupBudget(
+            self.monotonic,
+            deadline_factory=cleanup_deadline_factory,
+        )
+        with self.state.locked(
+            HOST_CONTROLLER_LOCK_SCOPE,
+            deadline=startup_deadline,
+            monotonic=self.monotonic,
+            deadline_error_code="host_acquisition_timeout",
+        ):
+            now = self._now()
+            acquisition = self.acquisitions.begin(request, now=now)
+            startup_deadline = self._bound_acquisition_deadline(
+                request,
+                acquisition,
+                startup_deadline=startup_deadline,
+            )
+            if acquisition["acquisition_closure"] is not None:
+                raise RunpodLocalError(
+                    "owner operation acquisition is already closed",
+                    code="host_claim_operation_closed",
+                )
             self._expire_all_current_claims(now=now)
             existing = self._find_idempotent(request)
             if existing is not None:
+                if (
+                    self.monotonic() >= startup_deadline
+                    or now
+                    >= self._acquisition_deadline(
+                        request,
+                        acquisition,
+                    )
+                ):
+                    self._raise_acquisition_timeout(
+                        request,
+                        existing,
+                        now=now,
+                        cleanup_budget=cleanup_budget,
+                    )
                 claim = existing
             else:
-                acquisition = self.acquisitions.load(
-                    request,
-                    required=True,
-                )
-                if acquisition is None:
-                    raise AssertionError(
-                        "required claim acquisition unexpectedly absent"
+                if (
+                    acquisition["request_identity_schema"]
+                    == CLAIM_REQUEST_IDENTITY_V1
+                ):
+                    acquisition = (
+                        self.acquisitions.promote_request_identity(
+                            request,
+                            now=now,
+                        )
                     )
+                self._require_unbound_acquisition_budget(
+                    request,
+                    acquisition,
+                    startup_deadline=startup_deadline,
+                    cleanup_budget=cleanup_budget,
+                )
                 candidates = (
                     []
                     if acquisition["target"] is not None
@@ -1167,6 +1649,7 @@ class HostControl:
                         host_operation_id=host["operation_id"],
                         predecessor_operation_id=None,
                         profile=host["profile"],
+                        created_for_acquisition=False,
                         now=self._now(),
                     )
                     self.acquisitions.bind_host(
@@ -1185,7 +1668,25 @@ class HostControl:
                             f"{target} cannot admit the requested claim",
                             code="no_compatible_host",
                         )
-                    _, ledger = self._create_host(request)
+                    _, ledger = self._create_host(
+                        request,
+                        startup_deadline=startup_deadline,
+                        cleanup_budget=cleanup_budget,
+                    )
+                acquisition = self.acquisitions.load(
+                    request,
+                    required=True,
+                )
+                if acquisition is None:
+                    raise AssertionError(
+                        "required claim acquisition unexpectedly absent"
+                    )
+                self._require_unbound_acquisition_budget(
+                    request,
+                    acquisition,
+                    startup_deadline=startup_deadline,
+                    cleanup_budget=cleanup_budget,
+                )
                 now = self._now()
                 ledger, _ = self._expire_claims(ledger, now=now)
                 claim = self.claims.admit(
@@ -1199,13 +1700,105 @@ class HostControl:
                 claim,
                 now=self._now(),
             )
-        return self._await_active(request, claim)
+        return self._await_active(
+            request,
+            claim,
+            startup_deadline=startup_deadline,
+            cleanup_budget=cleanup_budget,
+        )
+
+    def cancel(
+        self,
+        request: HostClaimRequest | Any,
+        *,
+        cleanup_deadline: float | None = None,
+    ) -> None:
+        """Close one exact acquisition without creating replacement work."""
+
+        request = normalize_host_claim_request(request)
+        with self.state.locked(
+            HOST_CONTROLLER_LOCK_SCOPE,
+            deadline=cleanup_deadline,
+            monotonic=self.monotonic,
+            deadline_error_code=(
+                "host_acquisition_timeout_cleanup_required"
+            ),
+        ):
+            acquisition = self.acquisitions.load(request)
+            if acquisition is None:
+                return
+            if (
+                acquisition["acquisition_closure"] is not None
+                or acquisition["claim_closure"] is not None
+            ):
+                return
+            now = self._now()
+            self._expire_all_current_claims(now=now)
+            existing = self._find_idempotent(request)
+            if existing is not None:
+                release = self.claims.release(
+                    existing.host_name,
+                    existing.claim_id,
+                    expected_generation=existing.generation,
+                    now=now,
+                    retire_now=True,
+                    reason="released",
+                )
+                ledger = self.claims.load(existing.host_name)
+                if ledger is None:
+                    raise AssertionError(
+                        "cancelled claim ledger unexpectedly absent"
+                    )
+                self._record_closed_claims(
+                    ledger,
+                    [existing.claim_id],
+                    now=now,
+                )
+                if release.retirement_due:
+                    self.lifecycle.terminate(
+                        existing.host_name,
+                        execute=True,
+                        reason="claim_acquisition_cancelled",
+                        expected_operation_id=existing.operation_id,
+                        **(
+                            {}
+                            if cleanup_deadline is None
+                            else {"deadline": cleanup_deadline}
+                        ),
+                    )
+                return
+            try:
+                self._cleanup_unbound_acquisition(
+                    request,
+                    acquisition,
+                    cleanup_deadline=cleanup_deadline,
+                )
+                self.acquisitions.close_unbound(
+                    request,
+                    reason="cancelled",
+                    now=self._now(),
+                )
+            except Exception as cleanup_error:
+                raise RunpodLocalError(
+                    "host claim acquisition cancellation requires exact "
+                    f"cleanup reconciliation: {cleanup_error}",
+                    code="host_acquisition_timeout_cleanup_required",
+                ) from cleanup_error
 
     def find(self, request: HostClaimRequest | Any) -> HostClaim | None:
         """Return one exact active owner operation without creating a claim."""
 
         request = normalize_host_claim_request(request)
         with self.state.locked(HOST_CONTROLLER_LOCK_SCOPE):
+            acquisition = self.acquisitions.load(request)
+            if (
+                acquisition is not None
+                and acquisition["acquisition_closure"] is not None
+            ):
+                raise RunpodLocalError(
+                    "owner operation acquisition is already closed",
+                    code="host_claim_operation_closed",
+                )
             now = self._now()
             self._expire_all_current_claims(now=now)
             return self._find_idempotent(request)
@@ -1216,8 +1809,22 @@ class HostControl:
         claim_id: str,
         expected_generation: int,
         renewal_ttl_seconds: int,
+        *,
+        startup_deadline: float | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> HostClaim:
-        with self.state.locked(HOST_CONTROLLER_LOCK_SCOPE):
+        with self.state.locked(
+            HOST_CONTROLLER_LOCK_SCOPE,
+            deadline=startup_deadline,
+            monotonic=self.monotonic,
+            cancel_event=cancel_event,
+            deadline_error_code="host_claim_renewal_timeout",
+        ):
+            if cancel_event is not None and cancel_event.is_set():
+                raise RunpodLocalError(
+                    "host claim renewal was cancelled before mutation",
+                    code="state_lock_cancelled",
+                )
             now = self._now()
             _, ledger = self._current_host_ledger(host_name)
             ledger, expired_claim_ids = self._expire_claims(
@@ -1244,8 +1851,14 @@ class HostControl:
         expected_generation: int,
         *,
         now: bool = False,
+        cleanup_deadline: float | None = None,
     ) -> ClaimReleaseResult:
-        with self.state.locked(HOST_CONTROLLER_LOCK_SCOPE):
+        with self.state.locked(
+            HOST_CONTROLLER_LOCK_SCOPE,
+            deadline=cleanup_deadline,
+            monotonic=self.monotonic,
+            deadline_error_code="host_claim_release_timeout",
+        ):
             current_time = self._now()
             _, ledger = self._current_host_ledger(host_name)
             ledger, expired_claim_ids = self._expire_claims(
@@ -1295,12 +1908,28 @@ class HostControl:
                         else "quarantined_host_claims_closed"
                     ),
                     expected_operation_id=ledger["host_operation_id"],
+                    **(
+                        {}
+                        if cleanup_deadline is None
+                        else {"deadline": cleanup_deadline}
+                    ),
                 )
             return result
 
-    def get(self, host_name: str, claim_id: str) -> HostClaim:
+    def get(
+        self,
+        host_name: str,
+        claim_id: str,
+        *,
+        startup_deadline: float | None = None,
+    ) -> HostClaim:
         validate_record_name(host_name)
-        with self.state.locked(HOST_CONTROLLER_LOCK_SCOPE):
+        with self.state.locked(
+            HOST_CONTROLLER_LOCK_SCOPE,
+            deadline=startup_deadline,
+            monotonic=self.monotonic,
+            deadline_error_code="host_claim_observation_timeout",
+        ):
             _, ledger = self._current_host_ledger(host_name)
             ledger, expired_claim_ids = self._expire_claims(
                 ledger,

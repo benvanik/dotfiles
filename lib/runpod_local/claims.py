@@ -19,6 +19,8 @@ from .timeutil import MAX_DURATION_SECONDS, parse_utc_timestamp, utc_timestamp
 CLAIM_LEDGER_SCHEMA = "runpod.host-claim-ledger.v1"
 CLAIM_SCHEMA = "runpod.host-claim.v1"
 CLAIM_RELEASE_SCHEMA = "runpod.host-claim-release.v1"
+CLAIM_REQUEST_IDENTITY_V1 = "runpod.host-claim-request.v1"
+CLAIM_REQUEST_IDENTITY_V2 = "runpod.host-claim-request.v2"
 CLAIM_MODES = frozenset({"shared", "gpu-exclusive", "host-exclusive"})
 RETENTION_MODES = frozenset({"manual", "while-claimed"})
 ENDPOINT_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
@@ -32,7 +34,15 @@ MAX_CLAIMS_PER_HOST = 256
 MAX_CLOSED_CLAIMS_PER_HOST = 4096
 MAX_ENDPOINTS_PER_CLAIM = 32
 CLOSED_CLAIM_REASONS = frozenset(
-    {"expired", "host-operation-ended", "released"}
+    {
+        "acquisition-timeout",
+        "expired",
+        "host-operation-ended",
+        "released",
+    }
+)
+CLAIM_RELEASE_REASONS = frozenset(
+    {"acquisition-timeout", "released"}
 )
 CLAIM_EXPIRY_QUARANTINE_REASON = "expired-claim-cleanup-unproven"
 HOST_OPERATION_END_REASON = "host-operation-ended"
@@ -218,6 +228,8 @@ class HostClaimRequest:
     ephemeral_disk_gb: int = 0
     endpoint_names: tuple[str, ...] = ()
     minimum_remaining_seconds: int = 0
+    acquisition_timeout_seconds: int = 300
+    acquisition_expires_at: str | None = None
     renewal_ttl_seconds: int = 120
     new_host_hard_ttl_seconds: int = 7200
     new_host_retention: Literal["manual", "while-claimed"] = "while-claimed"
@@ -255,6 +267,17 @@ class HostClaimRequest:
             self.minimum_remaining_seconds,
             label="minimum remaining lifetime",
         )
+        _positive_duration(
+            self.acquisition_timeout_seconds,
+            label="claim acquisition timeout",
+        )
+        if self.acquisition_expires_at is not None:
+            if not isinstance(self.acquisition_expires_at, str):
+                raise RunpodLocalError(
+                    "claim acquisition expiration must be a UTC timestamp",
+                    code="invalid_host_claim",
+                )
+            parse_utc_timestamp(self.acquisition_expires_at)
         _positive_duration(
             self.renewal_ttl_seconds,
             label="claim renewal TTL",
@@ -299,14 +322,37 @@ class HostClaimRequest:
             },
             "endpoint_names": list(self.endpoint_names),
             "minimum_remaining_seconds": self.minimum_remaining_seconds,
+            "acquisition_timeout_seconds": self.acquisition_timeout_seconds,
+            "acquisition_expires_at": self.acquisition_expires_at,
             "renewal_ttl_seconds": self.renewal_ttl_seconds,
             "new_host_hard_ttl_seconds": self.new_host_hard_ttl_seconds,
             "new_host_retention": self.new_host_retention,
         }
 
     def sha256(self) -> str:
+        return self.sha256_for_schema(CLAIM_REQUEST_IDENTITY_V2)
+
+    def sha256_for_schema(self, schema: str) -> str:
+        document = self.identity_document()
+        if schema == CLAIM_REQUEST_IDENTITY_V1:
+            if (
+                self.acquisition_timeout_seconds != 300
+                or self.acquisition_expires_at is not None
+            ):
+                raise RunpodLocalError(
+                    "v1 host claim operations require the original "
+                    "300-second relative acquisition budget",
+                    code="host_claim_operation_conflict",
+                )
+            document.pop("acquisition_timeout_seconds")
+            document.pop("acquisition_expires_at")
+        elif schema != CLAIM_REQUEST_IDENTITY_V2:
+            raise RunpodLocalError(
+                "unsupported host claim request identity schema",
+                code="invalid_host_claim",
+            )
         encoded = json.dumps(
-            self.identity_document(),
+            document,
             sort_keys=True,
             separators=(",", ":"),
             allow_nan=False,
@@ -368,6 +414,12 @@ def normalize_host_claim_request(value: Any) -> HostClaimRequest:
         ephemeral_disk_gb=math.ceil(ephemeral_disk_bytes / gib),
         endpoint_names=tuple(sorted(value.endpoint_names)),
         minimum_remaining_seconds=value.minimum_remaining_seconds,
+        acquisition_timeout_seconds=value.acquisition_timeout_seconds,
+        acquisition_expires_at=getattr(
+            value,
+            "acquisition_expires_at",
+            None,
+        ),
         renewal_ttl_seconds=value.renewal_ttl_seconds,
         new_host_hard_ttl_seconds=value.new_host_hard_ttl_seconds,
         new_host_retention=value.new_host_retention,
@@ -1828,6 +1880,7 @@ class ClaimStore:
         expected_generation: int,
         now: datetime.datetime,
         retire_now: bool,
+        reason: str = "released",
     ) -> ClaimReleaseResult:
         validate_record_name(host_name)
         _positive_integer(
@@ -1837,6 +1890,11 @@ class ClaimStore:
         if type(retire_now) is not bool:
             raise RunpodLocalError(
                 "retire-now selector must be boolean",
+                code="invalid_host_claim",
+            )
+        if reason not in CLAIM_RELEASE_REASONS:
+            raise RunpodLocalError(
+                "claim release reason is unsupported",
                 code="invalid_host_claim",
             )
         ledger = self.load(host_name)
@@ -1872,7 +1930,7 @@ class ClaimStore:
         self._close_claim(
             ledger,
             claim,
-            reason="released",
+            reason=reason,
             now=now,
         )
         ledger["generation"] += 1

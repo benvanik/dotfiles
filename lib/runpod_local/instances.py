@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 import re
+import time
 from collections.abc import Callable, Iterator
 from typing import Any
 
@@ -1056,6 +1057,8 @@ class InstanceStore:
         expected_operation_id: str | None = None,
         expected_pod_id: str | None = None,
         record_event: bool = True,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> dict[str, Any]:
         if (
             not source
@@ -1066,7 +1069,12 @@ class InstanceStore:
                 "activity source must be a short printable string",
                 code="invalid_activity_source",
             )
-        with self.state.locked(instance_lock_scope(name)):
+        with self.state.locked(
+            instance_lock_scope(name),
+            deadline=deadline,
+            monotonic=monotonic,
+            deadline_error_code="remote_client_timeout",
+        ):
             record = self.load(name)
             if record is None:
                 raise AssertionError("required instance unexpectedly absent")
@@ -1092,6 +1100,11 @@ class InstanceStore:
                     f"cannot record activity after instance {name} has expired",
                     code="lease_expired",
                 )
+            if deadline is not None and monotonic() >= deadline:
+                raise RunpodLocalError(
+                    "instance activity exceeded the remote-client deadline",
+                    code="remote_client_timeout",
+                )
             record["lease"]["last_activity_at"] = utc_timestamp(now)
             record["lease"]["activity_source"] = source
             if record_event:
@@ -1100,6 +1113,11 @@ class InstanceStore:
                     "activity",
                     at=now,
                     details={"source": source},
+                )
+            if deadline is not None and monotonic() >= deadline:
+                raise RunpodLocalError(
+                    "instance activity exceeded the remote-client deadline",
+                    code="remote_client_timeout",
                 )
             self.save(record)
             return record
@@ -1111,12 +1129,16 @@ class InstanceStore:
         now: datetime.datetime,
         expected_operation_id: str,
         expected_pod_id: str,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> dict[str, Any]:
         with self.locked_active_lease(
             name,
             expected_operation_id=expected_operation_id,
             expected_pod_id=expected_pod_id,
             clock=lambda: now,
+            deadline=deadline,
+            monotonic=monotonic,
         ) as record:
             return record
 
@@ -1128,13 +1150,20 @@ class InstanceStore:
         expected_operation_id: str,
         expected_pod_id: str,
         clock: Callable[[], datetime.datetime] | None = None,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> Iterator[dict[str, Any]]:
         """Hold the instance CAS boundary while a dependent receipt commits."""
 
         current_time = clock or (
             lambda: datetime.datetime.now(datetime.timezone.utc)
         )
-        with self.state.locked(instance_lock_scope(name)):
+        with self.state.locked(
+            instance_lock_scope(name),
+            deadline=deadline,
+            monotonic=monotonic,
+            deadline_error_code="remote_client_timeout",
+        ):
             now = current_time()
             record = self.load(name)
             if record is None:
@@ -1157,5 +1186,10 @@ class InstanceStore:
                 raise RunpodLocalError(
                     "instance lease has expired: " + ", ".join(reasons),
                     code="lease_expired",
+                )
+            if deadline is not None and monotonic() >= deadline:
+                raise RunpodLocalError(
+                    "instance lease check exceeded the remote-client deadline",
+                    code="remote_client_timeout",
                 )
             yield record

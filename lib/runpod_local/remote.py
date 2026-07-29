@@ -12,6 +12,8 @@ import shlex
 import socket
 import stat
 import subprocess
+import threading
+import time
 from dataclasses import asdict, dataclass
 from typing import Any, BinaryIO, Callable
 
@@ -457,6 +459,8 @@ def resolve_endpoint(
     instances: InstanceStore,
     api: RunpodApi,
     state: StateStore,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> SshEndpoint:
     validate_record_name(name)
     record = instances.load(name)
@@ -476,7 +480,11 @@ def resolve_endpoint(
             code="lease_expired",
         )
     pod_id = _provider_id(record.get("pod_id"), label="Pod ID")
-    pod = api.get_pod(pod_id)
+    pod = api.get_pod(
+        pod_id,
+        deadline=deadline,
+        monotonic=monotonic,
+    )
     return endpoint_from_record_pod(record, pod=pod, state=state)
 
 
@@ -790,6 +798,43 @@ def sanitized_subprocess_environment(
     }
 
 
+def _background_reap(process: Any) -> None:
+    def reap() -> None:
+        try:
+            process.wait()
+        except BaseException:
+            return
+
+    threading.Thread(target=reap, daemon=True).start()
+
+
+def _terminate_remote_client(
+    process: Any,
+    *,
+    wait_timeout_seconds: float = 5.0,
+) -> None:
+    """Terminate and reap one exact remote-client child process."""
+
+    process.terminate()
+    try:
+        process.wait(timeout=max(0.0, wait_timeout_seconds))
+    except subprocess.TimeoutExpired:
+        process.kill()
+        try:
+            process.wait(timeout=0)
+        except subprocess.TimeoutExpired:
+            _background_reap(process)
+
+
+def _remaining_cleanup_wait(
+    deadline: float | None,
+    monotonic: Callable[[], float],
+) -> float:
+    if deadline is None:
+        return 5.0
+    return min(5.0, max(0.0, deadline - monotonic()))
+
+
 def run_with_activity(
     argv: list[str],
     *,
@@ -802,6 +847,8 @@ def run_with_activity(
     stdin: BinaryIO | None = None,
     popen_factory: Callable[..., Any] = subprocess.Popen,
     clock: Callable[[], datetime.datetime] | None = None,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> int:
     now = clock or (lambda: datetime.datetime.now(datetime.timezone.utc))
     record = instances.check_active_lease(
@@ -809,7 +856,14 @@ def run_with_activity(
         now=now(),
         expected_operation_id=expected_operation_id,
         expected_pod_id=expected_pod_id,
+        deadline=deadline,
+        monotonic=monotonic,
     )
+    if deadline is not None and monotonic() >= deadline:
+        raise RunpodLocalError(
+            "remote client cannot start after its absolute deadline",
+            code="remote_client_timeout",
+        )
     try:
         process_arguments: dict[str, Any] = {
             "env": sanitized_subprocess_environment(),
@@ -831,14 +885,17 @@ def run_with_activity(
                 source=source,
                 expected_operation_id=expected_operation_id,
                 expected_pod_id=expected_pod_id,
+                deadline=deadline,
+                monotonic=monotonic,
             )
-        except RunpodLocalError:
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+        except BaseException:
+            _terminate_remote_client(
+                process,
+                wait_timeout_seconds=_remaining_cleanup_wait(
+                    deadline,
+                    monotonic,
+                ),
+            )
             raise
     idle_timeout = record["lease"]["idle_timeout_seconds"]
     heartbeat_seconds = (
@@ -847,10 +904,32 @@ def run_with_activity(
         else min(30, max(1, idle_timeout // 3))
     )
     while True:
+        wait_seconds = float(heartbeat_seconds)
+        if deadline is not None:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                _terminate_remote_client(
+                    process,
+                    wait_timeout_seconds=0.0,
+                )
+                raise RunpodLocalError(
+                    "remote client exceeded its absolute deadline",
+                    code="remote_client_timeout",
+                )
+            wait_seconds = min(wait_seconds, remaining)
         try:
-            return_code = process.wait(timeout=heartbeat_seconds)
+            return_code = process.wait(timeout=wait_seconds)
             break
         except subprocess.TimeoutExpired:
+            if deadline is not None and monotonic() >= deadline:
+                _terminate_remote_client(
+                    process,
+                    wait_timeout_seconds=0.0,
+                )
+                raise RunpodLocalError(
+                    "remote client exceeded its absolute deadline",
+                    code="remote_client_timeout",
+                )
             try:
                 if maintain_activity:
                     instances.touch(
@@ -860,6 +939,8 @@ def run_with_activity(
                         expected_operation_id=expected_operation_id,
                         expected_pod_id=expected_pod_id,
                         record_event=False,
+                        deadline=deadline,
+                        monotonic=monotonic,
                     )
                 else:
                     instances.check_active_lease(
@@ -867,14 +948,17 @@ def run_with_activity(
                         now=now(),
                         expected_operation_id=expected_operation_id,
                         expected_pod_id=expected_pod_id,
+                        deadline=deadline,
+                        monotonic=monotonic,
                     )
-            except RunpodLocalError:
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
+            except BaseException:
+                _terminate_remote_client(
+                    process,
+                    wait_timeout_seconds=_remaining_cleanup_wait(
+                        deadline,
+                        monotonic,
+                    ),
+                )
                 raise
     if return_code == 0 and maintain_activity:
         instances.touch(
@@ -883,5 +967,7 @@ def run_with_activity(
             source=source,
             expected_operation_id=expected_operation_id,
             expected_pod_id=expected_pod_id,
+            deadline=deadline,
+            monotonic=monotonic,
         )
     return int(return_code)

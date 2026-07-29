@@ -550,11 +550,28 @@ def _check_claim_state(
         host_binding = acquisition["host"]
         claim_binding = acquisition["claim"]
         claim_closure = acquisition["claim_closure"]
+        acquisition_closure = acquisition["acquisition_closure"]
         host = (
             instances_by_name.get(target["host_name"])
             if target is not None
             else None
         )
+
+        if acquisition_closure is not None:
+            exact_live_target = (
+                host is not None
+                and target is not None
+                and target["created_for_acquisition"] is True
+                and host["operation_id"] == target["host_operation_id"]
+                and host["phase"] not in TERMINAL_INSTANCE_PHASES
+            )
+            if exact_live_target:
+                collector.add(
+                    f"claim_acquisition_cleanup_{identifier}",
+                    "error",
+                    "closed pre-claim acquisition retains its exact live host",
+                )
+            continue
 
         if claim_closure is not None:
             ledger = (
@@ -778,6 +795,7 @@ def _check_claim_state(
                     and binding != expected_binding
                 )
                 or acquisition["claim_closure"] is not None
+                or acquisition["acquisition_closure"] is not None
             ):
                 collector.add(
                     f"claim_journal_{claim['claim_id']}",

@@ -66,6 +66,7 @@ def claim_request() -> HostClaimRequest:
         owner_instance="doctor",
         owner_operation_id="doctor-acquisition-1",
         allowed_profile_names=("pro-dev",),
+        acquisition_timeout_seconds=300,
     )
 
 
@@ -404,6 +405,7 @@ class DoctorTest(unittest.TestCase):
             ),
             predecessor_operation_id=predecessor["operation_id"],
             profile={"name": "pro-dev", "sha256": "1" * 64},
+            created_for_acquisition=True,
             now=now,
         )
         collector = CheckCollector()
@@ -436,6 +438,7 @@ class DoctorTest(unittest.TestCase):
             host_operation_id=target["operation_id"],
             predecessor_operation_id=None,
             profile=dict(target["profile"]),
+            created_for_acquisition=True,
             now=now,
         )
         collector = CheckCollector()
@@ -453,6 +456,41 @@ class DoctorTest(unittest.TestCase):
 
         self.assertEqual(recovery["status"], "warning")
 
+    def test_doctor_accepts_closed_reused_target_remaining_live(self):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        reused = claim_host("shared96", created_at=now)
+        request = claim_request()
+        acquisitions = ClaimAcquisitionStore(self.state)
+        acquisitions.begin(request, now=now)
+        acquisitions.select_target(
+            request,
+            host_name=reused["name"],
+            host_operation_id=reused["operation_id"],
+            predecessor_operation_id=None,
+            profile=dict(reused["profile"]),
+            created_for_acquisition=False,
+            now=now,
+        )
+        acquisitions.close_unbound(
+            request,
+            reason="cancelled",
+            now=now,
+        )
+        collector = CheckCollector()
+
+        _check_claim_state(
+            state=self.state,
+            instances=[reused],
+            collector=collector,
+        )
+
+        cleanup_checks = [
+            check
+            for check in collector.result()["checks"]
+            if check["id"].startswith("claim_acquisition_cleanup_")
+        ]
+        self.assertEqual(cleanup_checks, [])
+
     def test_doctor_rejects_unbound_claim_on_different_target(self):
         now = datetime.datetime.now(datetime.timezone.utc)
         claim_host_receipt = claim_host("claim96", created_at=now)
@@ -469,6 +507,7 @@ class DoctorTest(unittest.TestCase):
             host_operation_id=other_host["operation_id"],
             predecessor_operation_id=None,
             profile=dict(other_host["profile"]),
+            created_for_acquisition=False,
             now=now,
         )
         acquisitions.bind_host(request, other_host, now=now)

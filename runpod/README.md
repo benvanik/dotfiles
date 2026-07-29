@@ -25,6 +25,8 @@ The three state classes never overlap:
   archive/                        superseded authored material
 
 ~/.local/state/runpod/             machine-local receipts, locks, and SSH state
+  hostclaimops/                    durable owner-operation acquisitions
+  migrations/                     source-preserving state-transition receipts
 $XDG_RUNTIME_DIR/runpod/           boot-local coordination
 ~/.config/runpod-local/api-key     private RunPod API credential
 ~/.ssh/id_ed25519_runpod           dedicated private SSH identity
@@ -158,11 +160,21 @@ runpod claim acquire \
   --cpu-count 8 \
   --memory-gib 32 \
   --ephemeral-disk-gib 20 \
+  --acquisition-timeout 5m \
   --endpoint api
 ```
 
 Mutating claim commands are also plans without `--execute`. Acquisition is
-idempotent by exact owner operation ID. Claim generations are compare-and-swap
+idempotent by exact owner operation ID. Its timeout starts when the durable
+acquisition journal is created, so restarting or retrying the owner operation
+cannot reset the clock. An owning service may also supply an earlier absolute
+expiration; the effective deadline is the earlier boundary. Volume, stock,
+template, account-key, Pod-list, create, and allocation-verification calls each
+consume only the remaining budget, and no later provider request begins after
+expiration. Cleanup and exact Pod deletion remain available after it. A
+timeout releases the exact claim immediately and retires its final
+`while-claimed` host without empty-host grace; a manually retained host is
+never retired by a consumer timeout. Claim generations are compare-and-swap
 guards for renew and release:
 
 ```sh
@@ -200,9 +212,15 @@ but it protects only its exact provider operation and cannot shield a proven
 replacement that reuses the local host name. A genuinely new exact operation
 starts with clean admission state.
 
-The acquisition journal is durable before provider launch. The claim ledger
-binds the exact host operation and resource allocation. Recovery converges
-against those identities rather than issuing an untracked second create.
+The acquisition journal is durable before provider launch. It records whether
+the operation created its target or selected already-managed capacity.
+Pre-claim cancellation may retire only an exact live target explicitly marked
+as acquisition-created; it preserves reused and manually retained hosts. The
+v1-to-v2 journal transition keeps a complete private migration receipt before
+rewriting the active record and refuses ambiguous open-target ownership. The
+claim ledger binds the exact host operation and resource allocation. Recovery
+converges against those identities rather than issuing an untracked second
+create.
 
 ## TTL and retirement
 

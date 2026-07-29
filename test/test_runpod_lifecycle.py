@@ -4,6 +4,8 @@ import copy
 import datetime
 import pathlib
 import tempfile
+import threading
+import time
 import unittest
 import uuid
 
@@ -19,6 +21,7 @@ from runpod_local.errors import HttpRequestError, RunpodLocalError
 from runpod_local.host_template import build_generic_host_template
 from runpod_local.instances import (
     InstanceStore,
+    instance_lock_scope,
     json_document_hash,
     lease_expiry_reasons,
     validate_instance_record,
@@ -147,6 +150,14 @@ class MutableClock:
         return self.now
 
 
+class MutableMonotonic:
+    def __init__(self, now=100.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+
 class FakeApi:
     def __init__(self):
         self.pods = []
@@ -165,8 +176,15 @@ class FakeApi:
         self.templates = {}
         self.template_get_calls = 0
         self.before_get_template = None
+        self.provider_deadlines = []
 
-    def get_network_volume(self, volume_id):
+    def _record_deadline(self, operation, deadline, monotonic):
+        self.provider_deadlines.append((operation, deadline, monotonic))
+
+    def get_network_volume(
+        self, volume_id, *, deadline=None, monotonic=None
+    ):
+        self._record_deadline("get_network_volume", deadline, monotonic)
         return {
             "id": volume_id,
             "name": "model-cache",
@@ -174,19 +192,25 @@ class FakeApi:
             "data_center_id": "US-NC-2",
         }
 
-    def stock(self, **_):
+    def stock(self, *, deadline=None, monotonic=None, **_):
+        self._record_deadline("stock", deadline, monotonic)
         return stock()
 
-    def get_template(self, template_id):
+    def get_template(self, template_id, *, deadline=None, monotonic=None):
+        self._record_deadline("get_template", deadline, monotonic)
         self.template_get_calls += 1
         if self.before_get_template is not None:
             self.before_get_template(self.template_get_calls)
         return dict(self.templates[template_id])
 
-    def list_pods(self):
+    def list_pods(self, *, deadline=None, monotonic=None):
+        self._record_deadline("list_pods", deadline, monotonic)
         return [dict(pod) for pod in self.pods]
 
-    def attest_account_ssh_key(self, public_key):
+    def attest_account_ssh_key(
+        self, public_key, *, deadline=None, monotonic=None
+    ):
+        self._record_deadline("attest_account_ssh_key", deadline, monotonic)
         self.account_ssh_attestation_calls.append(public_key)
         if self.before_attest is not None:
             self.before_attest()
@@ -194,7 +218,15 @@ class FakeApi:
             raise self.account_ssh_attestation_error
         return self.account_ssh_attestation
 
-    def create_pod(self, payload, *, account_ssh_attestation):
+    def create_pod(
+        self,
+        payload,
+        *,
+        account_ssh_attestation,
+        deadline=None,
+        monotonic=None,
+    ):
+        self._record_deadline("create_pod", deadline, monotonic)
         if account_ssh_attestation is not self.account_ssh_attestation:
             raise AssertionError("wrong account SSH-key attestation")
         self.create_calls += 1
@@ -284,7 +316,8 @@ class FakeApi:
             "ports": ["22/tcp"],
         }
 
-    def get_pod(self, pod_id):
+    def get_pod(self, pod_id, *, deadline=None, monotonic=None):
+        self._record_deadline("get_pod", deadline, monotonic)
         if self.before_get is not None:
             self.before_get()
         for pod in self.pods:
@@ -292,7 +325,8 @@ class FakeApi:
                 return dict(pod)
         raise HttpRequestError("fixture missing", status=404)
 
-    def delete_pod(self, pod_id):
+    def delete_pod(self, pod_id, *, deadline=None, monotonic=None):
+        self._record_deadline("delete_pod", deadline, monotonic)
         self.delete_calls.append(pod_id)
         if self.delete_error is not None:
             raise self.delete_error
@@ -317,10 +351,12 @@ class LifecycleTest(unittest.TestCase):
         template = self.launch_profile["pod"]["template_contract"]
         self.api.templates[template["id"]] = template
         self.clock = MutableClock()
+        self.monotonic = MutableMonotonic()
         self.manager = LifecycleManager(
             self.api,
             self.state,
             clock=self.clock,
+            monotonic=self.monotonic,
             uuid_factory=lambda: OPERATION_ID,
             profile_ssh_validator=lambda _: None,
             key_pair_validator=lambda _identity, _public: None,
@@ -335,6 +371,66 @@ class LifecycleTest(unittest.TestCase):
         }
         arguments.update(overrides)
         return self.manager.launch(**arguments)
+
+    def test_termination_cannot_start_after_held_instance_lock_deadline(self):
+        self.launch()
+        lock_acquired = threading.Event()
+        release_lock = threading.Event()
+
+        def hold_instance_lock():
+            with self.state.locked(instance_lock_scope("compiler")):
+                lock_acquired.set()
+                release_lock.wait()
+
+        holder = threading.Thread(target=hold_instance_lock)
+        holder.start()
+        self.assertTrue(lock_acquired.wait(1))
+        self.manager.monotonic = time.monotonic
+        try:
+            with self.assertRaises(RunpodLocalError) as caught:
+                self.manager.terminate(
+                    "compiler",
+                    execute=True,
+                    reason="deadline-witness",
+                    deadline=time.monotonic() + 0.1,
+                )
+        finally:
+            release_lock.set()
+            holder.join()
+
+        self.assertEqual(caught.exception.code, "instance_termination_timeout")
+        self.assertEqual(
+            InstanceStore(self.state).load("compiler")["phase"],
+            "active",
+        )
+        self.assertEqual(self.api.delete_calls, [])
+
+    def test_termination_shares_one_deadline_with_all_provider_requests(self):
+        self.launch()
+        self.api.provider_deadlines.clear()
+
+        self.manager.terminate(
+            "compiler",
+            execute=True,
+            reason="deadline-witness",
+            deadline=200.0,
+        )
+
+        self.assertTrue(self.api.provider_deadlines)
+        self.assertEqual(
+            {deadline for _, deadline, _ in self.api.provider_deadlines},
+            {200.0},
+        )
+        self.assertIn(
+            "delete_pod",
+            [operation for operation, _, _ in self.api.provider_deadlines],
+        )
+        self.assertTrue(
+            all(
+                monotonic is self.monotonic
+                for _, _, monotonic in self.api.provider_deadlines
+            )
+        )
 
     def enter_conflict(self):
         self.api.create_error = HttpRequestError("fixture timeout")
@@ -375,6 +471,71 @@ class LifecycleTest(unittest.TestCase):
 
         self.assertTrue(result["ready"])
         self.assertEqual(self.api.create_calls, 0)
+        self.assertIsNone(
+            InstanceStore(self.state).load("compiler", required=False)
+        )
+
+    def test_launch_threads_one_acquisition_deadline_to_every_provider_call(self):
+        result = self.launch(
+            acquisition_expires_at=NOW + datetime.timedelta(seconds=300)
+        )
+
+        self.assertEqual(result["phase"], "active")
+        self.assertEqual(
+            [operation for operation, _, _ in self.api.provider_deadlines],
+            [
+                "get_network_volume",
+                "stock",
+                "get_template",
+                "attest_account_ssh_key",
+                "list_pods",
+                "get_template",
+                "create_pod",
+                "get_pod",
+            ],
+        )
+        for _, deadline, monotonic in self.api.provider_deadlines:
+            self.assertEqual(deadline, 400.0)
+            self.assertIs(monotonic, self.monotonic)
+
+    def test_wall_rollback_cannot_refresh_reconciliation_deadline(self):
+        def leave_allocation_pending():
+            self.api.pods[0]["desired_status"] = None
+
+        self.api.before_get = leave_allocation_pending
+        first = self.launch(
+            acquisition_expires_at=NOW + datetime.timedelta(seconds=300),
+            acquisition_deadline=400.0,
+        )
+        self.assertEqual(first["phase"], "provisioning")
+
+        self.api.before_get = None
+        self.api.pods[0]["desired_status"] = "RUNNING"
+        self.clock.now = NOW + datetime.timedelta(seconds=180)
+        self.clock.now -= datetime.timedelta(seconds=60)
+        self.monotonic.now = 390.0
+        second = self.launch(
+            expected_operation_id=first["operation_id"],
+            acquisition_expires_at=NOW + datetime.timedelta(seconds=300),
+            acquisition_deadline=400.0,
+        )
+
+        self.assertEqual(second["phase"], "active")
+        self.assertEqual(
+            self.api.provider_deadlines[-1][0],
+            "get_pod",
+        )
+        self.assertEqual(
+            {deadline for _, deadline, _ in self.api.provider_deadlines},
+            {400.0},
+        )
+
+    def test_expired_acquisition_starts_no_provider_call_or_launch_receipt(self):
+        with self.assertRaises(RunpodLocalError) as caught:
+            self.launch(acquisition_expires_at=NOW)
+
+        self.assertEqual(caught.exception.code, "remote_client_timeout")
+        self.assertEqual(self.api.provider_deadlines, [])
         self.assertIsNone(
             InstanceStore(self.state).load("compiler", required=False)
         )
@@ -1078,6 +1239,28 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual(
             InstanceStore(self.state).load("compiler")["phase"], "rolled_back"
         )
+
+    def test_allocation_rollback_delete_uses_caller_cleanup_deadline_once(self):
+        self.api.created_cost = 3.01
+        factory_calls = []
+
+        def cleanup_deadline():
+            factory_calls.append(self.monotonic.now)
+            deadline = self.monotonic.now + 60.0
+            self.monotonic.now += 20.0
+            return deadline
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            self.launch(cleanup_deadline_factory=cleanup_deadline)
+
+        self.assertEqual(caught.exception.code, "allocation_rejected")
+        self.assertEqual(factory_calls, [100.0])
+        delete_calls = [
+            (deadline, monotonic)
+            for operation, deadline, monotonic in self.api.provider_deadlines
+            if operation == "delete_pod"
+        ]
+        self.assertEqual(delete_calls, [(160.0, self.monotonic)])
 
     def test_template_launch_attests_provider_before_billable_create(self):
         self.launch_profile = template_profile(

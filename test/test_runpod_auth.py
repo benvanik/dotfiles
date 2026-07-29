@@ -9,6 +9,17 @@ from runpod_local.errors import RunpodLocalError
 
 
 class CredentialStoreTest(unittest.TestCase):
+    def test_missing_credential_names_the_canonical_login_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "missing-api-key"
+
+            with self.assertRaises(RunpodLocalError) as caught:
+                CredentialStore(path, environment={}).load()
+
+            self.assertEqual(caught.exception.code, "credential_missing")
+            self.assertIn("runpod auth login", str(caught.exception))
+            self.assertNotIn("runpod-auth", str(caught.exception))
+
     def test_store_is_private_and_repr_is_redacted(self):
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory) / "config" / "api-key"
@@ -21,14 +32,17 @@ class CredentialStoreTest(unittest.TestCase):
             self.assertNotIn("fixture-runpod-token", repr(credential))
             self.assertEqual(store.load().token, "fixture-runpod-token")
 
-    def test_environment_takes_precedence_without_reporting_a_file_path(self):
+    def test_inherited_environment_credential_is_rejected(self):
         store = CredentialStore(
             pathlib.Path("/not/read"),
             environment={"RUNPOD_API_KEY": "environment-fixture-token"},
         )
-        credential = store.load()
-        self.assertEqual(credential.source, "environment")
-        self.assertIsNone(store.status()["path"])
+        with self.assertRaises(RunpodLocalError) as caught:
+            store.load()
+        self.assertEqual(
+            caught.exception.code,
+            "inherited_credential_forbidden",
+        )
 
     def test_broad_file_permissions_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -64,7 +78,7 @@ class CredentialStoreTest(unittest.TestCase):
                 CredentialStore(link, environment={}).load()
             self.assertEqual(caught.exception.code, "unsafe_credential_file")
 
-    def test_remove_never_changes_environment_credential(self):
+    def test_remove_never_treats_environment_as_stored_credential(self):
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory) / "api-key"
             store = CredentialStore(
@@ -72,7 +86,12 @@ class CredentialStoreTest(unittest.TestCase):
                 environment={"RUNPOD_API_KEY": "environment-fixture-token"},
             )
             self.assertFalse(store.remove())
-            self.assertEqual(store.load().source, "environment")
+            with self.assertRaises(RunpodLocalError) as caught:
+                store.load()
+            self.assertEqual(
+                caught.exception.code,
+                "inherited_credential_forbidden",
+            )
 
     def test_api_credential_rejects_whitespace(self):
         with self.assertRaises(RunpodLocalError):

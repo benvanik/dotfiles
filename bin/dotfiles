@@ -27,7 +27,7 @@ ${BOLD}USAGE${NC}
     dotfiles <command> [options]
 
 ${BOLD}COMMANDS${NC}
-    ${BOLD}test${NC}              Run Tier 1 fast tests (<5 seconds)
+    ${BOLD}test${NC}              Run Tier 1 fast local tests
     ${BOLD}test --full${NC}       Run Tier 1 + Tier 2 Docker tests
     ${BOLD}doctor${NC}            Health check (tools, symlinks, configs)
     ${BOLD}fixup${NC}             Integrate installer changes to shell configs

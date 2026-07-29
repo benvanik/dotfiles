@@ -22,8 +22,8 @@ Machine-parseable `phase=apt-start`, `phase=apt-complete`,
 records expose the cold-start boundary without polling or wall-clock sleeps.
 The key phases include SHA-256 fingerprints, never key material.
 
-The controller binds the exact script bytes and SHA-256 identity from the
-selected runtime contract into the durable allocation receipt. The script is
-passed directly as one argument to the pinned upstream image. It is never
-uploaded as a layer, fetched from a mutable URL, or expanded into a derived
-base image.
+The generic template builder binds the exact script bytes and SHA-256 identity
+into the private template contract, and every profile and allocation attests
+that contract. The script is passed directly as one argument to the pinned
+upstream image. It is never uploaded as a layer, fetched from a mutable URL,
+or expanded into a derived base image.

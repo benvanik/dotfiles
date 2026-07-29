@@ -11,6 +11,7 @@ import re
 import stat
 import tempfile
 from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import Any
 
 from .errors import RunpodLocalError
@@ -19,6 +20,15 @@ from .paths import ensure_private_directory
 
 RECORD_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
 NAMESPACE_PATTERN = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+
+
+@dataclass(frozen=True)
+class StateRecordScan:
+    """One independently readable state record or its exact local failure."""
+
+    name: str
+    value: dict[str, Any] | None
+    error: RunpodLocalError | None
 
 
 def validate_record_name(name: str) -> str:
@@ -117,6 +127,17 @@ class StateStore:
         _write_json_atomic(path, value)
 
     def list(self, namespace: str) -> list[dict[str, Any]]:
+        records = []
+        for scanned in self.scan(namespace):
+            if scanned.error is not None:
+                raise scanned.error
+            if scanned.value is not None:
+                records.append(scanned.value)
+        return records
+
+    def scan(self, namespace: str) -> list[StateRecordScan]:
+        """Read records independently so one corrupt file cannot hide peers."""
+
         directory = self._namespace_directory(namespace)
         try:
             paths = sorted(directory.glob("*.json"))
@@ -125,12 +146,33 @@ class StateStore:
                 f"cannot list state namespace {namespace}: {error}",
                 code="state_list_error",
             ) from error
-        records = []
+        records: list[StateRecordScan] = []
         for path in paths:
             name = path.stem
-            record = self.read(namespace, name)
+            try:
+                validate_record_name(name)
+                record = self.read(namespace, name)
+            except RunpodLocalError as error:
+                records.append(
+                    StateRecordScan(name=name, value=None, error=error)
+                )
+                continue
+            except OSError as error:
+                records.append(
+                    StateRecordScan(
+                        name=name,
+                        value=None,
+                        error=RunpodLocalError(
+                            f"cannot read state record {path}: {error}",
+                            code="state_read_error",
+                        ),
+                    )
+                )
+                continue
             if record is not None:
-                records.append(record)
+                records.append(
+                    StateRecordScan(name=name, value=record, error=None)
+                )
         return records
 
     @contextlib.contextmanager

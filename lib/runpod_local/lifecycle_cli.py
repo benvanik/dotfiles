@@ -12,22 +12,22 @@ from typing import Any
 
 from .api import RunpodApi
 from .auth import CredentialStore
-from .cache import JsonCache
+from .claim_acquisition import ClaimAcquisitionStore
+from .claims import ClaimStore
 from .errors import RunpodLocalError
-from .huggingface_credentials import configured_huggingface_token
+from .host_control import HostControl
 from .instances import InstanceStore, lease_expiry_reasons
-from .lifecycle import LifecycleManager
-from .output import print_json
-from .paths import credentials_file, state_root
-from .profile import MAX_IMPLICIT_HARD_TTL_SECONDS, ProfileStore
-from .state import StateStore
-from .template import redact_docker_arguments
-from .timeutil import parse_duration, utc_timestamp
-from .workload import (
-    HuggingFaceWorkload,
-    WorkloadPlacementRequest,
-    plan_workload,
+from .lifecycle import (
+    HOST_CONTROLLER_LOCK_SCOPE,
+    TERMINAL_PHASES,
+    LifecycleManager,
 )
+from .output import print_json
+from .paths import credentials_file, runpod_root, state_root
+from .profile import MAX_IMPLICIT_HARD_TTL_SECONDS, ProfileStore
+from .state import StateStore, validate_record_name
+from .template import redact_docker_arguments
+from .timeutil import parse_duration, parse_utc_timestamp, utc_timestamp
 
 LIFECYCLE_COMMANDS = ("up", "status", "down", "ttl")
 
@@ -40,7 +40,12 @@ def _add_common(
     parser.add_argument(
         "--state-root",
         metavar="PATH",
-        help="Override RUNPOD_HOME (default: ~/.local/runpod).",
+        help="Override RUNPOD_STATE_HOME for machine receipts and locks.",
+    )
+    parser.add_argument(
+        "--runpod-root",
+        metavar="PATH",
+        help="Override RUNPOD_ROOT (default: /mnt/dev/runpod).",
     )
     if credentials:
         parser.add_argument(
@@ -57,33 +62,6 @@ def _add_common(
         "--agents-md",
         action="store_true",
         help="Print the agent operating contract and exit.",
-    )
-
-
-def _add_model_options(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--model",
-        metavar="NAMESPACE/REPOSITORY",
-        help="Inspect this exact Hugging Face model and restrict GPU placement.",
-    )
-    parser.add_argument("--revision", default="main")
-    parser.add_argument("--index-file")
-    parser.add_argument("--context", type=int, default=32768)
-    parser.add_argument("--sequences", type=int, default=1)
-    parser.add_argument(
-        "--kv-dtype", choices=("bf16", "fp16", "fp8"), default="bf16"
-    )
-    parser.add_argument(
-        "--weight-format",
-        choices=("native", "bf16", "fp8", "int8", "q8"),
-        default="native",
-    )
-    parser.add_argument("--offline", action="store_true")
-    parser.add_argument("--refresh", action="store_true")
-    parser.add_argument(
-        "--allow-indeterminate-fit",
-        action="store_true",
-        help="Admit indeterminate static placement; never admits tight/impossible.",
     )
 
 
@@ -112,10 +90,9 @@ def add_lifecycle_parsers(subparsers: Any) -> None:
         "--idle-ttl",
         help=(
             "Local-watcher idle timeout after no explicit heartbeat "
-            "(minimum: 30s); Pi/vLLM tunnel traffic is not observed."
+            "(minimum: 30s); tunnel traffic is not observed."
         ),
     )
-    _add_model_options(up)
     up.add_argument(
         "--execute",
         action="store_true",
@@ -161,8 +138,7 @@ def add_lifecycle_parsers(subparsers: Any) -> None:
     ttl_set = ttl_actions.add_parser(
         "set",
         help=(
-            "Set local lifetime from launch intent, bounded by the provider "
-            "deadline."
+            "Set local lifetime from launch intent, bounded by the provider deadline."
         ),
     )
     _add_common(ttl_set, credentials=False)
@@ -231,47 +207,280 @@ def _api(args: argparse.Namespace) -> RunpodApi:
     return RunpodApi(credential)
 
 
-def _manager(
-    args: argparse.Namespace, *, provider_required: bool
-) -> LifecycleManager:
+def _manager(args: argparse.Namespace, *, provider_required: bool) -> LifecycleManager:
     return LifecycleManager(_api(args) if provider_required else None, _state(args))
 
 
-def _model_placement(
+def _claim_ledger_protects_current_host(
+    instances: InstanceStore,
+    ledger: dict[str, Any],
+) -> bool:
+    """Scope one ledger's safety authority to its exact host operation."""
+
+    try:
+        current_instance = instances.load(
+            ledger["host_name"],
+            required=False,
+        )
+    except RunpodLocalError:
+        return True
+    if current_instance is None:
+        return ledger["operation_end"] is None
+    if current_instance["operation_id"] != ledger["host_operation_id"]:
+        return False
+    return current_instance["phase"] not in TERMINAL_PHASES
+
+
+def _active_claim_host_names(
+    state: StateStore,
+    *,
+    now: datetime.datetime,
+    expire: bool,
+    errors: list[dict[str, Any]] | None = None,
+) -> set[str]:
+    claims = ClaimStore(state)
+    acquisitions = ClaimAcquisitionStore(state)
+    instances = InstanceStore(state)
+    active_hosts = set()
+    for scanned in claims.scan():
+        if scanned.error is not None:
+            try:
+                validate_record_name(scanned.name)
+            except RunpodLocalError:
+                pass
+            else:
+                active_hosts.add(scanned.name)
+            if errors is not None:
+                errors.append(
+                    {
+                        "host_name": scanned.name,
+                        "host_operation_id": None,
+                        "protects_current_host": True,
+                        "record_namespace": "hostclaims",
+                        "record_name": scanned.name,
+                        "error": {
+                            "code": scanned.error.code,
+                            "message": str(scanned.error),
+                        },
+                    }
+                )
+            continue
+        ledger = scanned.value
+        if ledger is None:
+            continue
+        protects_current_host = _claim_ledger_protects_current_host(
+            instances,
+            ledger,
+        )
+        if expire:
+            try:
+                ledger, _ = claims.expire_claims(
+                    ledger,
+                    now=now,
+                )
+                acquisitions.reconcile_closed_claims(
+                    [ledger],
+                    now=now,
+                )
+            except RunpodLocalError as error:
+                if protects_current_host:
+                    active_hosts.add(ledger["host_name"])
+                if errors is not None:
+                    errors.append(
+                        {
+                            "host_name": ledger["host_name"],
+                            "host_operation_id": ledger[
+                                "host_operation_id"
+                            ],
+                            "protects_current_host": (
+                                protects_current_host
+                            ),
+                            "record_namespace": "hostclaims",
+                            "record_name": scanned.name,
+                            "error": {
+                                "code": error.code,
+                                "message": str(error),
+                            },
+                        }
+                    )
+                continue
+            active_claims = ledger["claims"]
+        else:
+            active_claims = [
+                claim
+                for claim in ledger["claims"]
+                if now < parse_utc_timestamp(claim["renewal_deadline"])
+            ]
+        if active_claims and protects_current_host:
+            active_hosts.add(ledger["host_name"])
+    return active_hosts
+
+
+def _claim_scan_error_actions(
+    errors: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    actions = []
+    for failure in errors:
+        host_name = failure["host_name"]
+        cause = failure["error"]
+        actions.append(
+            {
+                "instance_name": host_name,
+                "phase": None,
+                "reasons": ["claim_state_ambiguous"],
+                "executed": False,
+                "blocked_by_active_claims": failure[
+                    "protects_current_host"
+                ],
+                "host_operation_id": failure["host_operation_id"],
+                "state_record": {
+                    "namespace": failure["record_namespace"],
+                    "name": failure["record_name"],
+                },
+                "error": {
+                    "code": "host_claim_state_ambiguous",
+                    "message": (
+                        f"claim state for instance {host_name} is ambiguous: "
+                        f"{cause['message']}"
+                    ),
+                    "cause_code": cause["code"],
+                },
+            }
+        )
+    return actions
+
+
+def _with_claim_scan_errors(
+    result: dict[str, Any],
+    errors: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not errors:
+        return result
+    combined = dict(result)
+    combined["actions"] = [
+        *result["actions"],
+        *_claim_scan_error_actions(errors),
+    ]
+    combined["actions"].sort(
+        key=lambda action: (
+            action["instance_name"],
+            action["reasons"],
+        )
+    )
+    return combined
+
+
+def _run_ttl_watch_cycle(
+    *,
+    state: StateStore,
+    lifecycle: LifecycleManager,
+    hosts: HostControl,
+    now: datetime.datetime,
+) -> dict[str, Any]:
+    """Enforce claim quarantine retirement and host TTL in one watch cycle."""
+
+    claim_retirement = hosts.enforce_retirement(execute=True)
+    claim_scan_errors: list[dict[str, Any]] = []
+    with state.locked(HOST_CONTROLLER_LOCK_SCOPE):
+        protected_names = _active_claim_host_names(
+            state,
+            now=now,
+            expire=True,
+            errors=claim_scan_errors,
+        )
+        ttl_enforcement = lifecycle.enforce_ttl(
+            execute=True,
+            protected_instance_names=protected_names,
+        )
+        ttl_enforcement = _with_claim_scan_errors(
+            ttl_enforcement,
+            claim_scan_errors,
+        )
+    claim_actions = [
+        action
+        for action in claim_retirement["actions"]
+        if (
+            action["expired_claim_ids"]
+            or action["due"]
+            or action["executed"]
+            or action.get("manual_action_required", False)
+            or "error" in action
+        )
+    ]
+    return {
+        "schema_version": "runpod.ttl-watch-cycle.v1",
+        "evaluated_at": utc_timestamp(now),
+        "claim_retirement": claim_retirement,
+        "ttl_enforcement": ttl_enforcement,
+        "actions": [
+            *[
+                {
+                    "controller": "claim-retirement",
+                    "action": action,
+                }
+                for action in claim_actions
+            ],
+            *[
+                {
+                    "controller": "host-ttl",
+                    "action": action,
+                }
+                for action in ttl_enforcement["actions"]
+            ],
+        ],
+    }
+
+
+def _guard_unclaimed_host(
+    state: StateStore,
+    *,
+    name: str,
+    now: datetime.datetime,
+    expire: bool = True,
+) -> None:
+    claim_scan_errors: list[dict[str, Any]] = []
+    active_host_names = _active_claim_host_names(
+        state,
+        now=now,
+        expire=expire,
+        errors=claim_scan_errors,
+    )
+    exact_errors = [
+        failure
+        for failure in claim_scan_errors
+        if failure["host_name"] == name
+        and failure["protects_current_host"]
+    ]
+    if exact_errors:
+        cause = exact_errors[0]["error"]
+        raise RunpodLocalError(
+            f"claim state for instance {name} is ambiguous: "
+            f"{cause['message']}",
+            code="host_claim_state_ambiguous",
+        )
+    if name in active_host_names:
+        raise RunpodLocalError(
+            f"instance {name} has active host claims; release them before "
+            "direct termination",
+            code="host_has_active_claims",
+        )
+
+
+def _allowed_gpu_ids(
     args: argparse.Namespace,
     profile: dict[str, Any],
-) -> tuple[set[str] | None, dict[str, Any] | None]:
-    root = state_root(args.state_root)
-    model = (
-        HuggingFaceWorkload(
-            repository=args.model,
-            revision=args.revision,
-            index_file=args.index_file,
-            context_tokens=args.context,
-            sequences=args.sequences,
-            kv_dtype=args.kv_dtype,
-            weight_format=args.weight_format,
-            offline=args.offline,
-            refresh=args.refresh,
+) -> set[str] | None:
+    if not args.gpu:
+        return None
+    requested = set(args.gpu)
+    allowed = set(profile["pod"]["gpu_type_ids"])
+    unknown = sorted(requested.difference(allowed))
+    if unknown:
+        raise RunpodLocalError(
+            "requested GPU is not admitted by the host profile: " + ", ".join(unknown),
+            code="invalid_gpu_restriction",
         )
-        if args.model is not None
-        else None
-    )
-    placement = plan_workload(
-        WorkloadPlacementRequest(
-            allowed_gpu_ids=tuple(profile["pod"]["gpu_type_ids"]),
-            requested_gpus=tuple(args.gpu),
-            model=model,
-            allow_indeterminate_fit=args.allow_indeterminate_fit,
-            gpu_count=profile["pod"]["gpu_count"],
-        ),
-        cache=JsonCache(root / "cache" / "huggingface"),
-        token=configured_huggingface_token(),
-    )
-    return (
-        placement.admitted_gpu_ids,
-        placement.model_summary,
-    )
+    return requested
 
 
 def _print(value: Any, *, as_json: bool) -> None:
@@ -282,10 +491,7 @@ def _print(value: Any, *, as_json: bool) -> None:
     if isinstance(value, dict) and value.get("schema_version") == (
         "runpod.launch-plan.v1"
     ):
-        print(
-            f"{value['action']}: "
-            f"{'ready' if value.get('ready') else 'blocked'}"
-        )
+        print(f"{value['action']}: {'ready' if value.get('ready') else 'blocked'}")
         placement = value.get("placement", {})
         for evaluation in placement.get("evaluations", []):
             status = "eligible" if evaluation["eligible"] else "blocked"
@@ -332,28 +538,28 @@ def _run_up(args: argparse.Namespace) -> int:
             code="missing_launch_target",
         )
     state = _state(args)
-    profile = ProfileStore(state).load(args.profile)
+    profile = ProfileStore(runpod_root(args.runpod_root)).load(args.profile)
     ttl_seconds = _resolve_launch_ttl_seconds(
         args.ttl,
         profile["lease"]["default_ttl_seconds"],
     )
     idle_timeout_seconds = _resolve_idle_timeout_seconds(args.idle_ttl)
-    admitted_ids, model = _model_placement(args, profile)
+    admitted_ids = _allowed_gpu_ids(args, profile)
     manager = LifecycleManager(_api(args), state)
     if args.execute:
-        instance = manager.launch(
-            args.name,
-            profile,
-            ttl_seconds=ttl_seconds,
-            idle_timeout_seconds=idle_timeout_seconds,
-            allowed_gpu_ids=admitted_ids,
-            model=model,
-        )
-        result = {
-            "schema_version": "runpod.launch-result.v1",
-            "executed": True,
-            "instance": instance,
-        }
+        with state.locked(HOST_CONTROLLER_LOCK_SCOPE):
+            instance = manager.launch(
+                args.name,
+                profile,
+                ttl_seconds=ttl_seconds,
+                idle_timeout_seconds=idle_timeout_seconds,
+                allowed_gpu_ids=admitted_ids,
+            )
+            result = {
+                "schema_version": "runpod.launch-result.v1",
+                "executed": True,
+                "instance": instance,
+            }
     else:
         result = manager.plan_launch(
             args.name,
@@ -361,16 +567,15 @@ def _run_up(args: argparse.Namespace) -> int:
             ttl_seconds=ttl_seconds,
             idle_timeout_seconds=idle_timeout_seconds,
             allowed_gpu_ids=admitted_ids,
-            model=model,
         )
     _print(result, as_json=args.json)
     return 0
 
 
 def _run_status(args: argparse.Namespace) -> int:
-    result = _manager(
-        args, provider_required=not args.local_only
-    ).status(args.name, live=not args.local_only)
+    result = _manager(args, provider_required=not args.local_only).status(
+        args.name, live=not args.local_only
+    )
     _print(result, as_json=args.json)
     return 0
 
@@ -381,11 +586,32 @@ def _run_down(args: argparse.Namespace) -> int:
             "down requires NAME",
             code="missing_instance_name",
         )
-    result = _manager(args, provider_required=True).terminate(
-        args.name,
-        execute=args.execute,
-        reason="operator_request",
-    )
+    state = _state(args)
+    manager = LifecycleManager(_api(args), state)
+    if args.execute:
+        with state.locked(HOST_CONTROLLER_LOCK_SCOPE):
+            _guard_unclaimed_host(
+                state,
+                name=args.name,
+                now=datetime.datetime.now(datetime.timezone.utc),
+            )
+            result = manager.terminate(
+                args.name,
+                execute=True,
+                reason="operator_request",
+            )
+    else:
+        _guard_unclaimed_host(
+            state,
+            name=args.name,
+            now=datetime.datetime.now(datetime.timezone.utc),
+            expire=False,
+        )
+        result = manager.terminate(
+            args.name,
+            execute=False,
+            reason="operator_request",
+        )
     _print(result, as_json=args.json)
     return 0
 
@@ -429,23 +655,60 @@ def _run_ttl(args: argparse.Namespace) -> int:
     if args.ttl_action == "show":
         result = _local_lease_status(store, name=args.name, now=now)
     elif args.ttl_action == "set":
-        result = store.set_ttl(
-            args.name,
-            ttl_seconds=parse_duration(args.duration),
-            now=now,
-        )
+        with state.locked(HOST_CONTROLLER_LOCK_SCOPE):
+            result = store.set_ttl(
+                args.name,
+                ttl_seconds=parse_duration(args.duration),
+                now=now,
+            )
     elif args.ttl_action == "extend":
-        result = store.extend_ttl(
-            args.name,
-            extension_seconds=parse_duration(args.duration),
-            now=now,
-        )
+        with state.locked(HOST_CONTROLLER_LOCK_SCOPE):
+            result = store.extend_ttl(
+                args.name,
+                extension_seconds=parse_duration(args.duration),
+                now=now,
+            )
     elif args.ttl_action == "touch":
-        result = store.touch(args.name, now=now, source=args.source)
+        with state.locked(HOST_CONTROLLER_LOCK_SCOPE):
+            result = store.touch(args.name, now=now, source=args.source)
     elif args.ttl_action == "enforce":
-        result = _manager(
-            args, provider_required=args.execute
-        ).enforce_ttl(execute=args.execute)
+        manager = LifecycleManager(
+            _api(args) if args.execute else None,
+            state,
+        )
+        if args.execute:
+            claim_scan_errors: list[dict[str, Any]] = []
+            with state.locked(HOST_CONTROLLER_LOCK_SCOPE):
+                protected_names = _active_claim_host_names(
+                    state,
+                    now=now,
+                    expire=True,
+                    errors=claim_scan_errors,
+                )
+                result = manager.enforce_ttl(
+                    execute=True,
+                    protected_instance_names=protected_names,
+                )
+                result = _with_claim_scan_errors(
+                    result,
+                    claim_scan_errors,
+                )
+        else:
+            claim_scan_errors = []
+            protected_names = _active_claim_host_names(
+                state,
+                now=now,
+                expire=False,
+                errors=claim_scan_errors,
+            )
+            result = manager.enforce_ttl(
+                execute=False,
+                protected_instance_names=protected_names,
+            )
+            result = _with_claim_scan_errors(
+                result,
+                claim_scan_errors,
+            )
     else:
         if not args.execute:
             raise RunpodLocalError(
@@ -459,9 +722,21 @@ def _run_ttl(args: argparse.Namespace) -> int:
                 code="invalid_watch_interval",
             )
         manager = _manager(args, provider_required=True)
+        hosts = HostControl(
+            state=state,
+            lifecycle=manager,
+            profiles=ProfileStore(
+                runpod_root(getattr(args, "runpod_root", None))
+            ),
+        )
         try:
             while True:
-                result = manager.enforce_ttl(execute=True)
+                result = _run_ttl_watch_cycle(
+                    state=state,
+                    lifecycle=manager,
+                    hosts=hosts,
+                    now=datetime.datetime.now(datetime.timezone.utc),
+                )
                 if args.json:
                     print(
                         json.dumps(
@@ -477,9 +752,8 @@ def _run_ttl(args: argparse.Namespace) -> int:
         except KeyboardInterrupt:
             return 130
     _print(result, as_json=args.json)
-    if (
-        args.ttl_action == "enforce"
-        and any("error" in action for action in result["actions"])
+    if args.ttl_action == "enforce" and any(
+        "error" in action for action in result["actions"]
     ):
         return 1
     return 0

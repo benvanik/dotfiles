@@ -39,6 +39,42 @@ from .timeutil import parse_utc_timestamp, utc_timestamp
 TERMINAL_PHASES = {"rolled_back", "terminated", "aborted"}
 LAUNCH_PHASES = {"intent", "submitting", "provisioning"}
 MAX_OPERATION_HISTORY = 20
+HOST_CONTROLLER_LOCK_SCOPE = "host-controller"
+
+
+def _host_retention(
+    profile: dict[str, Any],
+    *,
+    retention_mode: str | None,
+    empty_grace_seconds: int | None,
+) -> dict[str, Any]:
+    profile_retention = profile["retention"]
+    mode = (
+        profile_retention["mode"]
+        if retention_mode is None
+        else retention_mode
+    )
+    grace = (
+        profile_retention["empty_grace_seconds"]
+        if empty_grace_seconds is None
+        else empty_grace_seconds
+    )
+    if mode not in {"manual", "while-claimed"}:
+        raise RunpodLocalError(
+            "host retention must be manual or while-claimed",
+            code="invalid_host_retention",
+        )
+    if (
+        not isinstance(grace, int)
+        or isinstance(grace, bool)
+        or grace < 0
+        or grace > 30 * 24 * 60 * 60
+    ):
+        raise RunpodLocalError(
+            "empty-host grace must be from 0 seconds through 30 days",
+            code="invalid_host_retention",
+        )
+    return {"mode": mode, "empty_grace_seconds": grace}
 
 
 def _provider_termination_deadline(
@@ -166,6 +202,24 @@ class LifecycleManager:
         utc_timestamp(now)
         return now
 
+    def new_operation_id(self) -> str:
+        """Return one canonical identity for an operation not yet launched."""
+
+        operation_id = str(self.uuid_factory())
+        try:
+            operation_uuid = uuid.UUID(operation_id)
+        except (AttributeError, TypeError, ValueError) as error:
+            raise RunpodLocalError(
+                "generated launch operation ID must be a UUID",
+                code="invalid_operation_identity",
+            ) from error
+        if str(operation_uuid) != operation_id:
+            raise RunpodLocalError(
+                "generated launch operation ID must be canonical UUID text",
+                code="invalid_operation_identity",
+            )
+        return operation_id
+
     def _validate_record_ssh_identity(self, record: dict[str, Any]) -> str:
         connection = record.get("connection")
         payload = record.get("pod_payload")
@@ -251,10 +305,16 @@ class LifecycleManager:
         ttl_seconds: int,
         idle_timeout_seconds: int | None,
         allowed_gpu_ids: set[str] | None = None,
-        model: dict[str, Any] | None = None,
+        retention_mode: str | None = None,
+        empty_grace_seconds: int | None = None,
     ) -> dict[str, Any]:
         validate_record_name(name)
         profile = validate_profile(profile)
+        retention = _host_retention(
+            profile,
+            retention_mode=retention_mode,
+            empty_grace_seconds=empty_grace_seconds,
+        )
         validate_lease_request(ttl_seconds, idle_timeout_seconds)
         existing = self.instances.load(name, required=False)
         if existing is not None and existing["phase"] not in TERMINAL_PHASES:
@@ -262,6 +322,12 @@ class LifecycleManager:
                 raise RunpodLocalError(
                     f"instance {name} has unfinished work for another profile",
                     code="instance_profile_conflict",
+                )
+            if existing["retention"] != retention:
+                raise RunpodLocalError(
+                    f"instance {name} has unfinished work for another "
+                    "retention policy",
+                    code="instance_retention_conflict",
                 )
             if existing["phase"] == "intent":
                 self._validate_record_ssh_identity(existing)
@@ -308,7 +374,7 @@ class LifecycleManager:
                 "ttl_seconds": ttl_seconds,
                 "idle_timeout_seconds": idle_timeout_seconds,
             },
-            "model": model,
+            "retention": retention,
             "executed": False,
         }
 
@@ -320,18 +386,127 @@ class LifecycleManager:
         ttl_seconds: int,
         idle_timeout_seconds: int | None,
         allowed_gpu_ids: set[str] | None = None,
-        model: dict[str, Any] | None = None,
+        retention_mode: str | None = None,
+        empty_grace_seconds: int | None = None,
+        expected_operation_id: str | None = None,
+        require_absent: bool = False,
+        target_operation_id: str | None = None,
+        predecessor_operation_id: str | None = None,
     ) -> dict[str, Any]:
         validate_record_name(name)
         profile = validate_profile(profile)
+        if type(require_absent) is not bool:
+            raise RunpodLocalError(
+                "launch absence guard must be boolean",
+                code="invalid_operation_identity",
+            )
+        operation_guards = sum(
+            (
+                expected_operation_id is not None,
+                require_absent,
+                target_operation_id is not None,
+            )
+        )
+        if operation_guards > 1:
+            raise RunpodLocalError(
+                "launch operation guards are mutually exclusive",
+                code="invalid_operation_identity",
+            )
+        if (
+            predecessor_operation_id is not None
+            and target_operation_id is None
+        ):
+            raise RunpodLocalError(
+                "launch predecessor requires an exact target operation",
+                code="invalid_operation_identity",
+            )
+        for label, operation_id in (
+            ("expected", expected_operation_id),
+            ("target", target_operation_id),
+            ("predecessor", predecessor_operation_id),
+        ):
+            if operation_id is None:
+                continue
+            try:
+                operation_uuid = uuid.UUID(operation_id)
+            except (AttributeError, TypeError, ValueError) as error:
+                raise RunpodLocalError(
+                    f"{label} launch operation ID must be a UUID",
+                    code="invalid_operation_identity",
+                ) from error
+            if str(operation_uuid) != operation_id:
+                raise RunpodLocalError(
+                    f"{label} launch operation ID must be canonical UUID text",
+                    code="invalid_operation_identity",
+                )
+        if (
+            target_operation_id is not None
+            and target_operation_id == predecessor_operation_id
+        ):
+            raise RunpodLocalError(
+                "launch target operation repeats its predecessor",
+                code="invalid_operation_identity",
+            )
+        retention = _host_retention(
+            profile,
+            retention_mode=retention_mode,
+            empty_grace_seconds=empty_grace_seconds,
+        )
         validate_lease_request(ttl_seconds, idle_timeout_seconds)
         with self.state.locked(instance_lock_scope(name)):
             record = self.instances.load(name, required=False)
+            if require_absent and record is not None:
+                raise RunpodLocalError(
+                    f"instance {name} appeared before guarded launch",
+                    code="instance_operation_changed",
+                )
+            if expected_operation_id is not None and (
+                record is None
+                or record["operation_id"] != expected_operation_id
+                or record["phase"] in TERMINAL_PHASES
+            ):
+                raise RunpodLocalError(
+                    f"instance {name} no longer names the expected live "
+                    "operation",
+                    code="instance_operation_changed",
+                )
+            if target_operation_id is not None:
+                target_is_live = (
+                    record is not None
+                    and record["operation_id"] == target_operation_id
+                    and record["phase"] not in TERMINAL_PHASES
+                )
+                predecessor_is_terminal = (
+                    predecessor_operation_id is not None
+                    and record is not None
+                    and record["operation_id"]
+                    == predecessor_operation_id
+                    and record["phase"] in TERMINAL_PHASES
+                )
+                target_can_start_absent = (
+                    predecessor_operation_id is None and record is None
+                )
+                if not (
+                    target_is_live
+                    or predecessor_is_terminal
+                    or target_can_start_absent
+                ):
+                    raise RunpodLocalError(
+                        f"instance {name} no longer names the target "
+                        "operation boundary",
+                        code="instance_operation_changed",
+                    )
             if record is not None and record["phase"] not in TERMINAL_PHASES:
                 if record["profile"]["sha256"] != profile_hash(profile):
                     raise RunpodLocalError(
                         f"instance {name} has unfinished work for another profile",
                         code="instance_profile_conflict",
+                    )
+                if record["retention"] != retention:
+                    raise RunpodLocalError(
+                        f"instance {name} has unfinished work for another "
+                        "retention policy",
+                        code="instance_retention_conflict",
                     )
                 _provider_termination_deadline(record)
                 if record["phase"] == "intent":
@@ -382,11 +557,11 @@ class LifecycleManager:
             selected = placement["selected"]
             if selected is None:
                 raise RunpodLocalError(
-                    "no allowed GPU satisfies live stock, datacenter, model, "
+                    "no allowed GPU satisfies live stock, datacenter, "
                     "and hourly-price constraints",
                     code="no_eligible_gpu",
                 )
-            operation_id = str(self.uuid_factory())
+            operation_id = target_operation_id or self.new_operation_id()
             operation_uuid = uuid.UUID(operation_id)
             remote_name = f"rp-{name}-{operation_uuid.hex[:12]}"
             if record is not None:
@@ -457,6 +632,9 @@ class LifecycleManager:
                 "expected": {
                     "gpu_id": gpu_id,
                     "gpu_count": profile["pod"]["gpu_count"],
+                    "gpu_memory_gb": profile["pod"][
+                        "gpu_memory_gb_by_type"
+                    ][gpu_id],
                     "network_volume_id": (
                         volume.get("id") if volume is not None else None
                     ),
@@ -466,6 +644,14 @@ class LifecycleManager:
                     "container_disk_gb": profile["pod"][
                         "container_disk_gb"
                     ],
+                    "min_vcpu_count": (
+                        profile["pod"]["min_vcpu_per_gpu"]
+                        * profile["pod"]["gpu_count"]
+                    ),
+                    "min_ram_gb": (
+                        profile["pod"]["min_ram_per_gpu"]
+                        * profile["pod"]["gpu_count"]
+                    ),
                     "volume_in_gb": (
                         0
                         if profile["pod"]["network_volume_id"] is not None
@@ -491,7 +677,6 @@ class LifecycleManager:
                         else None
                     ),
                     "ports": profile["pod"]["ports"],
-                    "runtime": profile["pod"]["runtime"],
                     "template_contract": profile["pod"][
                         "template_contract"
                     ],
@@ -513,7 +698,7 @@ class LifecycleManager:
                 "lease": None,
                 "pod_id": None,
                 "provider": None,
-                "model": model,
+                "retention": retention,
                 "events": [],
                 "history": history,
             }
@@ -1649,10 +1834,38 @@ class LifecycleManager:
             "unmanaged_pods": unmanaged,
         }
 
-    def enforce_ttl(self, *, execute: bool) -> dict[str, Any]:
+    def enforce_ttl(
+        self,
+        *,
+        execute: bool,
+        protected_instance_names: set[str] | None = None,
+    ) -> dict[str, Any]:
+        protected_names = set(protected_instance_names or ())
+        for name in protected_names:
+            validate_record_name(name)
         now = self._now()
         actions = []
-        records = self.instances.list()
+        records = []
+        for scanned in self.instances.scan():
+            if scanned.error is not None:
+                actions.append(
+                    {
+                        "instance_name": scanned.name,
+                        "phase": None,
+                        "reasons": ["invalid_instance_state"],
+                        "executed": False,
+                        "blocked_by_active_claims": (
+                            scanned.name in protected_names
+                        ),
+                        "error": {
+                            "code": scanned.error.code,
+                            "message": str(scanned.error),
+                        },
+                    }
+                )
+                continue
+            if scanned.value is not None:
+                records.append(scanned.value)
         terminal_live_operations: dict[
             tuple[str, str], tuple[str, ...]
         ] = {}
@@ -1710,8 +1923,18 @@ class LifecycleManager:
                 "phase": record["phase"],
                 "reasons": reasons,
                 "executed": False,
+                "blocked_by_active_claims": (
+                    record["name"] in protected_names
+                ),
             }
-            if execute:
+            if execute and record["name"] in protected_names:
+                action["error"] = {
+                    "code": "host_has_active_claims",
+                    "message": (
+                        f"instance {record['name']} has active host claims"
+                    ),
+                }
+            elif execute:
                 try:
                     action["termination"] = self.terminate(
                         record["name"],
@@ -1733,6 +1956,7 @@ class LifecycleManager:
                         "message": str(error),
                     }
             actions.append(action)
+        actions.sort(key=lambda action: action["instance_name"])
         return {
             "schema_version": "runpod.ttl-enforcement.v1",
             "evaluated_at": utc_timestamp(now),

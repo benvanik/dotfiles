@@ -1,0 +1,49 @@
+schema = "model-lab.service.v1"
+service_id = "fixture-dense-text"
+driver = "vllm-openai.v1"
+runtime_id = "vllm-cu129-v0.25.1"
+
+[model]
+source = "huggingface"
+repository = "fixture-org/fixture-dense-text-7b"
+revision = "2222222222222222222222222222222222222222"
+checkpoint = "model.safetensors"
+weight_format = "native"
+
+[endpoint]
+input_modalities = ["text"]
+reasoning = false
+max_output_tokens = 2048
+
+[compatibility]
+minimum_compute_capability = "8.0"
+
+[resources]
+gpu_count = 1
+gpu_memory_gib = 24
+cpu_count = 8
+memory_gib = 32
+ephemeral_disk_gib = 50
+claim_mode = "shared"
+
+[vllm]
+model_implementation = "vllm"
+dtype = "bfloat16"
+quantization = "none"
+tensor_parallel_size = 1
+max_model_len = 8192
+max_num_sequences = 2
+max_num_batched_tokens = 4096
+kv_cache_dtype = "bfloat16"
+gpu_memory_utilization = 0.75
+chunked_prefill = true
+load_format = "safetensors"
+safetensors_load_strategy = "lazy"
+language_model_only = true
+mamba_cache_mode = "none"
+prefix_caching = true
+reasoning_parser = "none"
+tool_call_parser = "none"
+speculative_method = "none"
+speculative_tokens = 0
+generation_config = "auto"

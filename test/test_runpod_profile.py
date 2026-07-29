@@ -9,8 +9,8 @@ import unittest
 from unittest import mock
 
 from runpod_local.errors import RunpodLocalError
+from runpod_local.host_template import build_generic_host_template
 from runpod_local.profile import (
-    DEFAULT_CACHE_ENVIRONMENT,
     ProfileStore,
     create_profile,
     load_ssh_public_key_file,
@@ -20,7 +20,6 @@ from runpod_local.profile import (
     validate_ssh_key_pair,
     validate_ssh_public_key,
 )
-from runpod_local.runtime_catalog import load_runtime
 from runpod_local.state import StateStore
 from runpod_local.template import (
     build_private_template_contract,
@@ -37,8 +36,22 @@ IMAGE = (
     "runpod/pytorch@sha256:"
     "1111111111111111111111111111111111111111111111111111111111111111"
 )
-RUNTIME_ID = "vllm-cu129-v0.25.1"
-RUNTIME = load_runtime(RUNTIME_ID)
+TEMPLATE_IMAGE = (
+    "runpod/pytorch@sha256:"
+    "2222222222222222222222222222222222222222222222222222222222222222"
+)
+GPU_TYPE_IDS = [
+    "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "NVIDIA H200",
+    "NVIDIA B200",
+    "NVIDIA B300 SXM6 AC",
+]
+GPU_MEMORY_GB_BY_TYPE = {
+    "NVIDIA RTX PRO 6000 Blackwell Server Edition": 96.0,
+    "NVIDIA H200": 141.0,
+    "NVIDIA B200": 180.0,
+    "NVIDIA B300 SXM6 AC": 288.0,
+}
 
 
 def _ssh_wire_string(value: bytes) -> bytes:
@@ -55,12 +68,21 @@ OTHER_SSH_PUBLIC_KEY = (
 
 
 def profile(**overrides):
+    contract = build_generic_host_template(
+        name="generic-host",
+        image=IMAGE,
+        container_disk_gb=50,
+        template_id="template-default",
+    )
     arguments = {
         "name": "nvidia-dev",
-        "gpu_names": ["pro6000", "h200", "b200", "b300"],
+        "gpu_type_ids": GPU_TYPE_IDS,
+        "gpu_memory_gb_by_type": GPU_MEMORY_GB_BY_TYPE,
         "max_hourly_usd": 8.0,
         "default_ttl_seconds": 4 * 60 * 60,
         "image_name": IMAGE,
+        "template_id": "template-default",
+        "template_contract": contract,
         "network_volume_id": "volume123",
         "ssh_public_key": SSH_PUBLIC_KEY,
     }
@@ -69,15 +91,16 @@ def profile(**overrides):
 
 
 def template_profile(**overrides):
-    contract = RUNTIME.template_contract(
+    contract = build_generic_host_template(
         name="upstream-runtime",
+        image=TEMPLATE_IMAGE,
+        container_disk_gb=50,
         template_id="template123",
     )
     return profile(
-        image_name=RUNTIME.image,
+        image_name=TEMPLATE_IMAGE,
         template_id="template123",
         template_contract=contract,
-        runtime_id=RUNTIME_ID,
         **overrides,
     )
 
@@ -88,7 +111,7 @@ class ProfileTest(unittest.TestCase):
     ):
         requested = {
             "SSH_PUBLIC_KEY": SSH_PUBLIC_KEY,
-            "MODEL_CACHE": "/workspace/models",
+            "APPLICATION_CACHE": "/workspace/cache",
         }
 
         effective = provider_effective_environment_summary(requested)
@@ -113,11 +136,11 @@ class ProfileTest(unittest.TestCase):
         )
         self.assertIsNone(
             provider_effective_environment_summary(
-                {"MODEL_CACHE": "/workspace/models"}
+                {"APPLICATION_CACHE": "/workspace/cache"}
             )
         )
 
-    def test_profile_pins_private_cache_and_safety_policy(self):
+    def test_profile_contains_only_generic_host_environment_and_safety_policy(self):
         value = profile()
         pod = value["pod"]
         self.assertEqual(pod["cloud_type"], "SECURE")
@@ -125,65 +148,81 @@ class ProfileTest(unittest.TestCase):
         self.assertFalse(pod["interruptible"])
         self.assertEqual(pod["storage_mode"], "network_volume")
         self.assertEqual(
-            pod["environment"]["HF_HUB_CACHE"],
-            DEFAULT_CACHE_ENVIRONMENT["HF_HUB_CACHE"],
-        )
-        self.assertEqual(
-            pod["environment"]["HF_TOKEN_PATH"],
-            "/root/runpod-session/secrets/huggingface/token",
-        )
-        self.assertEqual(
-            pod["environment"]["TORCH_HOME"],
-            "/root/runpod-session/cache/torch",
-        )
-        self.assertEqual(
-            pod["environment"]["VLLM_CACHE_ROOT"],
-            "/root/runpod-session/cache/vllm",
-        )
-        self.assertEqual(
-            pod["environment"]["XDG_CACHE_HOME"],
-            "/root/runpod-session/cache",
+            pod["environment"],
+            {"SSH_PUBLIC_KEY": SSH_PUBLIC_KEY},
         )
         self.assertEqual(value["limits"]["max_hourly_usd"], 8.0)
         self.assertEqual(value["lease"]["expiry_action"], "terminate")
         self.assertEqual(
-            pod["environment"]["SSH_PUBLIC_KEY"], SSH_PUBLIC_KEY
+            value["retention"],
+            {"mode": "manual", "empty_grace_seconds": 300},
         )
+        self.assertEqual(
+            pod["gpu_memory_gb_by_type"],
+            GPU_MEMORY_GB_BY_TYPE,
+        )
+
+    def test_profile_requires_exact_capacity_for_each_gpu_type(self):
+        for capacities in (
+            {},
+            {GPU_TYPE_IDS[0]: 96.0},
+            {**GPU_MEMORY_GB_BY_TYPE, "unknown": 1.0},
+            {**GPU_MEMORY_GB_BY_TYPE, GPU_TYPE_IDS[0]: 0},
+            {**GPU_MEMORY_GB_BY_TYPE, GPU_TYPE_IDS[0]: float("nan")},
+        ):
+            with self.subTest(capacities=capacities):
+                with self.assertRaises(RunpodLocalError) as caught:
+                    profile(gpu_memory_gb_by_type=capacities)
+                self.assertEqual(caught.exception.code, "invalid_profile")
 
     def test_literal_secret_is_rejected(self):
         with self.assertRaises(RunpodLocalError) as caught:
-            profile(environment={"HF_TOKEN": "literal-fixture-value"})
+            profile(environment={"SERVICE_TOKEN": "literal-fixture-value"})
         self.assertEqual(
-            caught.exception.code, "invalid_profile_environment"
+            caught.exception.code, "literal_secret_rejected"
         )
 
-    def test_hugging_face_secret_references_are_rejected(self):
-        for name in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+    def test_provider_secret_references_are_rejected(self):
+        for name in ("SERVICE_TOKEN", "REGISTRY_PASSWORD"):
             with self.subTest(name=name):
                 with self.assertRaises(RunpodLocalError) as caught:
                     profile(
                         environment={
-                            name: "{{ RUNPOD_SECRET_huggingface }}"
+                            name: "{{ RUNPOD_SECRET_workload }}"
                         }
                     )
                 self.assertEqual(
                     caught.exception.code, "invalid_profile_environment"
                 )
 
-    def test_hugging_face_token_path_cannot_use_persistent_storage(self):
+    def test_credential_path_is_not_host_profile_policy(self):
         with self.assertRaises(RunpodLocalError) as caught:
             profile(
                 environment={
-                    "HF_TOKEN_PATH": "/workspace/.cache/huggingface/token"
+                    "SERVICE_TOKEN_PATH": "/workspace/secrets/service-token"
                 }
             )
         self.assertEqual(
-            caught.exception.code, "invalid_profile_environment"
+            caught.exception.code, "literal_secret_rejected"
         )
 
     def test_non_secret_name_containing_key_letters_is_allowed(self):
         value = profile(environment={"MONKEY": "banana"})
         self.assertEqual(value["pod"]["environment"]["MONKEY"], "banana")
+
+    def test_non_sensitive_environment_names_are_opaque(self):
+        for name in (
+            "APPLICATION_CACHE",
+            "COMPILER_CACHE",
+            "CUSTOM_HOME",
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    profile(environment={name: "/workspace/cache"})["pod"][
+                        "environment"
+                    ][name],
+                    "/workspace/cache",
+                )
 
     def test_other_runpod_secret_references_are_rejected(self):
         for value in (
@@ -199,8 +238,8 @@ class ProfileTest(unittest.TestCase):
 
     def test_runpod_startup_shell_metacharacters_are_rejected(self):
         for value in (
-            "$(cat /root/runpod-session/secrets/huggingface/token)",
-            "`cat /root/runpod-session/secrets/huggingface/token`",
+            "$(cat /root/runpod-session/secrets/workload/token)",
+            "`cat /root/runpod-session/secrets/workload/token`",
             'escaped"quote',
             "escaped\\quote",
             "line\nbreak",
@@ -264,10 +303,11 @@ class ProfileTest(unittest.TestCase):
         ephemeral = profile(network_volume_id=None, ephemeral=True)
         self.assertEqual(ephemeral["pod"]["storage_mode"], "ephemeral")
 
-    def test_explicit_images_require_immutable_digests(self):
+    def test_profile_requires_the_reviewed_generic_ssh_template(self):
         with self.assertRaises(RunpodLocalError) as caught:
             profile(
                 template_id=None,
+                template_contract=None,
                 image_name="runpod/pytorch:mutable",
             )
         self.assertEqual(caught.exception.code, "invalid_profile")
@@ -276,13 +316,18 @@ class ProfileTest(unittest.TestCase):
             "runpod/pytorch@sha256:"
             "1111111111111111111111111111111111111111111111111111111111111111"
         )
-        value = profile(template_id=None, image_name=image)
-        self.assertEqual(value["pod"]["image_name"], image)
+        with self.assertRaises(RunpodLocalError) as caught:
+            profile(
+                template_id=None,
+                template_contract=None,
+                image_name=image,
+            )
+        self.assertEqual(caught.exception.code, "invalid_profile")
 
-    def test_template_profile_pins_full_provider_runtime_contract(self):
+    def test_template_profile_pins_full_provider_contract(self):
         value = template_profile()
 
-        self.assertEqual(value["pod"]["image_name"], RUNTIME.image)
+        self.assertEqual(value["pod"]["image_name"], TEMPLATE_IMAGE)
         self.assertEqual(
             value["pod"]["template_contract"]["docker_entrypoint"],
             ["/bin/bash", "-c"],
@@ -293,22 +338,24 @@ class ProfileTest(unittest.TestCase):
 
     def test_template_profile_requires_matching_contract(self):
         with self.assertRaises(RunpodLocalError) as missing:
-            profile(template_id="template123")
+            profile(
+                template_id="template123",
+                template_contract=None,
+            )
         self.assertEqual(missing.exception.code, "invalid_profile")
 
         contract = build_private_template_contract(
             name="upstream-runtime",
-            image="vllm/vllm-openai@sha256:" + "2" * 64,
+            image="example/runtime@sha256:" + "2" * 64,
             docker_entrypoint=["/bin/bash", "-c"],
             docker_start_cmd=["exec /usr/sbin/sshd -D -e\n"],
             template_id="template123",
         )
         with self.assertRaises(RunpodLocalError) as mismatch:
             profile(
-                image_name=RUNTIME.image,
+                image_name=TEMPLATE_IMAGE,
                 template_id="template123",
                 template_contract=contract,
-                runtime_id=RUNTIME_ID,
             )
         self.assertEqual(mismatch.exception.code, "invalid_profile")
 
@@ -318,10 +365,9 @@ class ProfileTest(unittest.TestCase):
 
         with self.assertRaises(RunpodLocalError) as caught:
             profile(
-                image_name=RUNTIME.image,
+                image_name=TEMPLATE_IMAGE,
                 template_id="template123",
                 template_contract=contract,
-                runtime_id=RUNTIME_ID,
             )
 
         self.assertEqual(caught.exception.code, "invalid_profile")
@@ -337,17 +383,49 @@ class ProfileTest(unittest.TestCase):
 
         self.assertEqual(caught.exception.code, "invalid_profile")
 
-    def test_template_profile_requires_separate_network_volume(self):
-        with self.assertRaises(RunpodLocalError) as caught:
-            template_profile(
-                network_volume_id=None,
-                ephemeral=True,
+    def test_profile_loader_rejects_self_consistent_noncanonical_template(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            authored_root = root / "runpod"
+            store = ProfileStore(
+                authored_root,
+                lock_state=StateStore(root / "state"),
             )
-        self.assertEqual(caught.exception.code, "invalid_profile")
+            store.save(template_profile())
+            profile_path = (
+                authored_root / "profiles" / "nvidia-dev.toml"
+            )
+            lines = profile_path.read_text(encoding="utf-8").splitlines()
+            replacements = 0
+            for index, line in enumerate(lines):
+                if line.startswith('"docker_start_cmd" = '):
+                    lines[index] = (
+                        '"docker_start_cmd" = ["exec sleep infinity\\n"]'
+                    )
+                    replacements += 1
+            self.assertEqual(replacements, 1)
+            profile_path.write_text(
+                "\n".join(lines) + "\n",
+                encoding="utf-8",
+            )
 
-    def test_runtime_identity_tamper_invalidates_stored_profile(self):
+            with self.assertRaises(RunpodLocalError) as caught:
+                ProfileStore(authored_root).load("nvidia-dev")
+
+            self.assertEqual(caught.exception.code, "invalid_profile")
+
+    def test_generic_ssh_template_supports_explicit_ephemeral_storage(self):
+        value = template_profile(
+            network_volume_id=None,
+            ephemeral=True,
+        )
+        self.assertEqual(value["pod"]["storage_mode"], "ephemeral")
+
+    def test_workload_runtime_field_is_rejected_from_host_profile(self):
         value = template_profile()
-        value["pod"]["runtime"]["manifest"]["sha256"] = "0" * 64
+        value["pod"]["runtime"] = {"id": "not-host-policy"}
 
         with self.assertRaises(RunpodLocalError) as caught:
             validate_profile(value)
@@ -356,18 +434,58 @@ class ProfileTest(unittest.TestCase):
 
     def test_profile_store_is_private_and_refuses_implicit_replacement(self):
         with tempfile.TemporaryDirectory() as directory:
-            state = StateStore(pathlib.Path(directory) / "state")
-            store = ProfileStore(state)
+            root = pathlib.Path(directory)
+            state = StateStore(root / "state")
+            authored_root = root / "runpod"
+            store = ProfileStore(authored_root, lock_state=state)
             value = profile()
             store.save(value)
 
-            record_path = state.record_path("profiles", "nvidia-dev")
+            record_path = authored_root / "profiles" / "nvidia-dev.toml"
             self.assertEqual(record_path.stat().st_mode & 0o777, 0o600)
             self.assertEqual(record_path.parent.stat().st_mode & 0o777, 0o700)
             self.assertEqual(store.load("nvidia-dev")["name"], "nvidia-dev")
+            self.assertFalse((state.root / "profiles").exists())
             with self.assertRaises(RunpodLocalError) as caught:
                 store.save(value)
             self.assertEqual(caught.exception.code, "profile_exists")
+
+    def test_read_only_profile_listing_does_not_create_authored_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            authored_root = pathlib.Path(directory) / "runpod"
+
+            self.assertEqual(ProfileStore(authored_root).list(), [])
+            self.assertFalse(authored_root.exists())
+
+    def test_authored_profile_symlink_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            authored_root = root / "runpod"
+            profile_dir = authored_root / "profiles"
+            profile_dir.mkdir(parents=True)
+            target = root / "target.toml"
+            target.write_text("", encoding="utf-8")
+            (profile_dir / "nvidia-dev.toml").symlink_to(target)
+
+            with self.assertRaises(RunpodLocalError) as caught:
+                ProfileStore(authored_root).load("nvidia-dev")
+            self.assertEqual(caught.exception.code, "profile_store_error")
+
+    def test_authored_profile_directory_symlink_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            authored_root = root / "runpod"
+            authored_root.mkdir()
+            target = root / "elsewhere"
+            target.mkdir()
+            (authored_root / "profiles").symlink_to(
+                target,
+                target_is_directory=True,
+            )
+
+            with self.assertRaises(RunpodLocalError) as caught:
+                ProfileStore(authored_root).list()
+            self.assertEqual(caught.exception.code, "profile_store_error")
 
     def test_state_record_symlink_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:

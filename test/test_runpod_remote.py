@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
+import io
 import os
 import pathlib
 import shlex
@@ -96,12 +98,14 @@ def active_record(identity_file: pathlib.Path):
             "docker_entrypoint": None,
             "docker_start_cmd": None,
             "container_disk_gb": 50,
+            "gpu_memory_gb": 96.0,
+            "min_vcpu_count": 8,
+            "min_ram_gb": 32,
             "volume_in_gb": 0,
             "volume_mount_path": "/workspace",
             **normalized_environment,
             "has_registry_auth": False,
             "ports": ["22/tcp"],
-            "runtime": None,
             "template_contract": None,
         },
         "quoted_total_price_per_hour": 1.99,
@@ -128,7 +132,10 @@ def active_record(identity_file: pathlib.Path):
         },
         "pod_id": "pod123",
         "provider": None,
-        "model": None,
+        "retention": {
+            "mode": "manual",
+            "empty_grace_seconds": 300,
+        },
         "events": [],
         "history": [],
     }
@@ -776,6 +783,18 @@ class RemoteBoundaryTest(unittest.TestCase):
                     "8000",
                 ],
             )
+
+    def test_tunnel_help_names_the_state_home_contract(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            with self.assertRaises(SystemExit) as caught:
+                build_parser().parse_args(["tunnel", "--help"])
+
+        self.assertEqual(caught.exception.code, 0)
+        help_text = output.getvalue()
+        self.assertIn("RUNPOD_STATE_HOME", help_text)
+        self.assertIn("~/.local/state/runpod", help_text)
+        self.assertNotIn("RUNPOD_HOME", help_text)
 
     def test_cli_prepares_unix_listener_only_for_execution(self):
         socket_path = self.root / "tunnels" / "inference.sock"

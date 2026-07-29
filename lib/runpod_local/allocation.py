@@ -118,7 +118,7 @@ def select_launch_placement(
         reasons = []
         gpu = gpus.get(gpu_id)
         if allowed_gpu_ids is not None and gpu_id not in allowed_gpu_ids:
-            reasons.append("model placement policy did not admit this GPU")
+            reasons.append("caller placement constraint did not admit this GPU")
         if gpu is None:
             reasons.append("GPU is absent from the live stock response")
             price = None

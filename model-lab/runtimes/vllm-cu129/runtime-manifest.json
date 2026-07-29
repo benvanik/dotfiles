@@ -1,0 +1,22 @@
+{
+  "architecture": "linux/amd64",
+  "image": "vllm/vllm-openai@sha256:fb463d6a216c7ee82bf947f321cae7dd7105bfb5084ea35827c2ceb816994b15",
+  "image_compressed_bytes": 11735080839,
+  "oci_entrypoint": [
+    "vllm",
+    "serve"
+  ],
+  "oci_working_directory": "/vllm-workspace",
+  "runtime_id": "vllm-cu129-v0.25.1",
+  "schema_version": "model-lab.upstream-runtime.v1",
+  "upstream_revision": "752a3a504485790a2e8491cacbb35c137339ad34",
+  "upstream_source": "https://github.com/vllm-project/vllm",
+  "versions": {
+    "cuda": "12.9",
+    "flashinfer": "0.6.13",
+    "flashinfer_jit_cache": "0.6.13+cu129",
+    "python": "3.12",
+    "torch": "2.11.0+cu129",
+    "vllm": "0.25.1+cu129"
+  }
+}

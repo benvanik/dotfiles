@@ -11,6 +11,7 @@ from unittest import mock
 
 from runpod_local.cli import build_parser
 from runpod_local.errors import RunpodLocalError
+from runpod_local.host_template import build_generic_host_template
 from runpod_local.profile import (
     DEFAULT_PROFILE_HARD_TTL,
     ProfileStore,
@@ -23,17 +24,20 @@ from runpod_local.provider_cli import (
     template_lock_scope,
     volume_lock_scope,
 )
-from runpod_local.runtime_catalog import load_runtime
-from runpod_local.state import StateStore
+from runpod_local.template import (
+    build_private_template_contract,
+    docker_arguments_summary,
+)
 
 SSH_PUBLIC_KEY = (
     "ssh-ed25519 "
     "AAAAC3NzaC1lZDI1NTE5AAAAIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f "
     "fixture@example"
 )
-RUNTIME_ID = "vllm-cu129-v0.25.1"
-RUNTIME = load_runtime(RUNTIME_ID)
-IMAGE = RUNTIME.image
+IMAGE = "vllm/vllm-openai@sha256:" + "1" * 64
+GPU_ID = "NVIDIA RTX PRO 6000 Blackwell Server Edition"
+GPU_MEMORY_GB = 96.0
+TEMPLATE_NAME = "generic-ssh"
 
 
 class FakeVolumeApi:
@@ -68,10 +72,20 @@ class FakeVolumeApi:
 
 
 class FakeTemplateApi:
-    def __init__(self, *, templates=None, created=None):
+    def __init__(self, *, templates=None, created=None, gpus=None):
         self.templates = list(templates or [])
         self.created = created
         self.create_calls = []
+        self.gpus = (
+            [
+                {
+                    "gpu_id": GPU_ID,
+                    "memory_gb": GPU_MEMORY_GB,
+                }
+            ]
+            if gpus is None
+            else list(gpus)
+        )
 
     def list_templates(self):
         return [dict(template) for template in self.templates]
@@ -91,6 +105,9 @@ class FakeTemplateApi:
         if self.created is not None:
             return dict(self.created)
         return {**contract, "id": "template123"}
+
+    def stock(self, **_kwargs):
+        return {"gpus": list(self.gpus)}
 
 
 def volume_args(root: pathlib.Path, *, execute: bool) -> argparse.Namespace:
@@ -113,7 +130,9 @@ class ProviderCliTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.root = pathlib.Path(self.temporary.name) / "state"
+        self.temporary_root = pathlib.Path(self.temporary.name)
+        self.root = self.temporary_root / "state"
+        self.authored_root = self.temporary_root / "runpod"
 
     def run_volume(self, api: FakeVolumeApi, *, execute: bool):
         output = io.StringIO()
@@ -124,8 +143,10 @@ class ProviderCliTest(unittest.TestCase):
         return status, output.getvalue()
 
     def template_contract(self, **overrides):
-        contract = RUNTIME.template_contract(
-            name="upstream-vllm",
+        contract = build_generic_host_template(
+            name=TEMPLATE_NAME,
+            image=IMAGE,
+            container_disk_gb=50,
             template_id="template123",
         )
         contract.update(overrides)
@@ -136,9 +157,9 @@ class ProviderCliTest(unittest.TestCase):
             [
                 "template",
                 "create",
-                "upstream-vllm",
-                "--runtime",
-                RUNTIME_ID,
+                TEMPLATE_NAME,
+                "--image",
+                IMAGE,
                 "--state-root",
                 str(self.root),
                 "--json",
@@ -175,11 +196,11 @@ class ProviderCliTest(unittest.TestCase):
                 "profile",
                 "create",
                 "bounded-default",
-                "--image",
-                "runpod/pytorch@sha256:" + "1" * 64,
+                "--template-id",
+                "template123",
                 "--ephemeral",
                 "--gpu",
-                "pro6000-server",
+                GPU_ID,
                 "--max-hourly",
                 "2.25",
             ]
@@ -194,36 +215,108 @@ class ProviderCliTest(unittest.TestCase):
                 "profile",
                 "create",
                 "bounded-default",
-                "--image",
-                "runpod/pytorch@sha256:" + "1" * 64,
+                "--template-id",
+                "template123",
                 "--ephemeral",
                 "--gpu",
-                "pro6000-server",
+                GPU_ID,
                 "--max-hourly",
                 "2.25",
                 "--state-root",
                 str(self.root),
+                "--runpod-root",
+                str(self.authored_root),
                 "--json",
             ]
         )
         output = io.StringIO()
-        with mock.patch(
-            "runpod_local.provider_cli.load_ssh_public_key_file",
-            return_value=(
-                pathlib.Path("/fixture/id_ed25519_runpod.pub"),
-                SSH_PUBLIC_KEY,
+        api = FakeTemplateApi(templates=[self.template_contract()])
+        with (
+            mock.patch(
+                "runpod_local.provider_cli._api",
+                return_value=api,
             ),
-        ), mock.patch(
-            "runpod_local.provider_cli.validate_ssh_identity_file"
-        ), mock.patch(
-            "runpod_local.provider_cli.validate_ssh_key_pair"
-        ), contextlib.redirect_stdout(output):
+            mock.patch(
+                "runpod_local.provider_cli.load_ssh_public_key_file",
+                return_value=(
+                    pathlib.Path("/fixture/id_ed25519_runpod.pub"),
+                    SSH_PUBLIC_KEY,
+                ),
+            ),
+            mock.patch(
+                "runpod_local.provider_cli.validate_ssh_identity_file"
+            ),
+            mock.patch(
+                "runpod_local.provider_cli.validate_ssh_key_pair"
+            ),
+            contextlib.redirect_stdout(output),
+        ):
             self.assertEqual(_run_profile(args), 0)
 
         emitted = json.loads(output.getvalue())
-        stored = ProfileStore(StateStore(self.root)).load("bounded-default")
+        stored = ProfileStore(self.authored_root).load("bounded-default")
         self.assertEqual(emitted["lease"]["default_ttl_seconds"], 1800)
         self.assertEqual(stored["lease"]["default_ttl_seconds"], 1800)
+        self.assertEqual(
+            stored["pod"]["gpu_memory_gb_by_type"],
+            {GPU_ID: GPU_MEMORY_GB},
+        )
+        self.assertFalse((self.root / "profiles").exists())
+
+    def test_profile_rejects_unverified_provider_gpu_capacity(self):
+        args = build_parser().parse_args(
+            [
+                "profile",
+                "create",
+                "capacity-unknown",
+                "--template-id",
+                "template123",
+                "--ephemeral",
+                "--gpu",
+                GPU_ID,
+                "--max-hourly",
+                "2.25",
+                "--state-root",
+                str(self.root),
+                "--runpod-root",
+                str(self.authored_root),
+            ]
+        )
+        invalid_stock = (
+            [{"gpu_id": GPU_ID, "memory_gb": None}],
+            [
+                {"gpu_id": GPU_ID, "memory_gb": GPU_MEMORY_GB},
+                {"gpu_id": GPU_ID, "memory_gb": GPU_MEMORY_GB},
+            ],
+        )
+        for gpus in invalid_stock:
+            with (
+                self.subTest(gpus=gpus),
+                mock.patch(
+                    "runpod_local.provider_cli._api",
+                    return_value=FakeTemplateApi(
+                        templates=[self.template_contract()],
+                        gpus=gpus,
+                    ),
+                ),
+                mock.patch(
+                    "runpod_local.provider_cli.load_ssh_public_key_file",
+                    return_value=(
+                        pathlib.Path("/fixture/id_ed25519_runpod.pub"),
+                        SSH_PUBLIC_KEY,
+                    ),
+                ),
+                mock.patch(
+                    "runpod_local.provider_cli.validate_ssh_identity_file"
+                ),
+                mock.patch(
+                    "runpod_local.provider_cli.validate_ssh_key_pair"
+                ),
+                self.assertRaises(RunpodLocalError) as caught,
+            ):
+                _run_profile(args)
+            self.assertEqual(caught.exception.code, "invalid_profile_gpu")
+        self.assertFalse(self.authored_root.exists())
 
     def test_template_create_reconciles_exact_private_overlay(self):
         api = FakeTemplateApi()
@@ -234,26 +327,25 @@ class ProviderCliTest(unittest.TestCase):
         self.assertEqual(result["verification"]["status"], "verified")
         self.assertEqual(len(api.create_calls), 1)
         request = api.create_calls[0]
-        self.assertEqual(request["image"], IMAGE)
-        self.assertEqual(request["docker_entrypoint"], ["/bin/bash", "-c"])
-        self.assertEqual(
-            request["docker_start_cmd"],
-            [RUNTIME.bootstrap_text],
+        expected = build_generic_host_template(
+            name=TEMPLATE_NAME,
+            image=IMAGE,
+            container_disk_gb=50,
         )
+        self.assertEqual(request, expected)
+        self.assertEqual(request["docker_entrypoint"], ["/bin/bash", "-c"])
         self.assertEqual(request["volume_in_gb"], 0)
         self.assertFalse(request["is_public"])
         self.assertFalse(request["is_serverless"])
-        self.assertNotIn(RUNTIME.bootstrap_text, json.dumps(result))
+        self.assertNotIn(request["docker_start_cmd"][0], json.dumps(result))
         self.assertEqual(
             result["request"]["docker_start_cmd"]["sha256"],
-            RUNTIME.safe_summary()["launch_overlay"][
-                "docker_start_cmd_summary"
-            ]["sha256"],
+            docker_arguments_summary(request["docker_start_cmd"])["sha256"],
         )
         lock = (
             self.root
             / "locks"
-            / f"{template_lock_scope('upstream-vllm')}.lock"
+            / f"{template_lock_scope(TEMPLATE_NAME)}.lock"
         )
         self.assertEqual(lock.stat().st_mode & 0o777, 0o600)
 
@@ -266,7 +358,7 @@ class ProviderCliTest(unittest.TestCase):
         self.assertTrue(result["reconciled_existing"])
         self.assertEqual(api.create_calls, [])
 
-    def test_template_create_rejects_same_name_runtime_drift(self):
+    def test_template_create_rejects_same_name_ssh_overlay_drift(self):
         drifted = self.template_contract()
         drifted["docker_start_cmd"] = ["different\n"]
         api = FakeTemplateApi(templates=[drifted])
@@ -276,9 +368,8 @@ class ProviderCliTest(unittest.TestCase):
 
         self.assertEqual(caught.exception.code, "template_name_conflict")
 
-    def test_template_create_has_no_arbitrary_image_or_command_surface(self):
+    def test_template_create_has_no_arbitrary_command_surface(self):
         for forbidden_arguments in (
-            ["--image", IMAGE],
             ["--entrypoint-json", '["/bin/sh","-c"]'],
             ["--start-cmd-file", "/tmp/operator-command"],
         ):
@@ -289,28 +380,28 @@ class ProviderCliTest(unittest.TestCase):
                     [
                         "template",
                         "create",
-                        "upstream-vllm",
-                        "--runtime",
-                        RUNTIME_ID,
+                        TEMPLATE_NAME,
+                        "--image",
+                        IMAGE,
                         *forbidden_arguments,
                     ]
                 )
 
-    def test_unknown_template_runtime_fails_before_provider_access(self):
+    def test_mutable_template_image_fails_before_provider_access(self):
         arguments = build_parser().parse_args(
             [
                 "template",
                 "create",
-                "upstream-vllm",
-                "--runtime",
-                "operator-authored-runtime",
+                TEMPLATE_NAME,
+                "--image",
+                "vllm/vllm-openai:latest",
             ]
         )
         with mock.patch(
             "runpod_local.provider_cli._api"
         ) as provider, self.assertRaises(RunpodLocalError) as caught:
             _run_template(arguments)
-        self.assertEqual(caught.exception.code, "unknown_runtime")
+        self.assertEqual(caught.exception.code, "invalid_image_digest")
         provider.assert_not_called()
 
     def test_template_list_and_get_redact_provider_docker_arguments(self):
@@ -338,26 +429,28 @@ class ProviderCliTest(unittest.TestCase):
                 self.assertIn('"argument_count": 1', emitted)
                 self.assertIn('"sha256":', emitted)
 
-    def test_template_profile_snapshots_provider_runtime_contract(self):
+    def test_template_profile_snapshots_provider_host_contract_and_capacity(
+        self,
+    ):
         contract = self.template_contract()
         api = FakeTemplateApi(templates=[contract])
         arguments = build_parser().parse_args(
             [
                 "profile",
                 "create",
-                "template-runtime",
-                "--runtime",
-                RUNTIME_ID,
+                "template-host",
                 "--template-id",
                 "template123",
                 "--network-volume-id",
                 "volume123",
                 "--gpu",
-                "pro6000-server",
+                GPU_ID,
                 "--max-hourly",
                 "2.25",
                 "--state-root",
                 str(self.root),
+                "--runpod-root",
+                str(self.authored_root),
                 "--json",
             ]
         )
@@ -377,62 +470,61 @@ class ProviderCliTest(unittest.TestCase):
         ), contextlib.redirect_stdout(output):
             self.assertEqual(_run_profile(arguments), 0)
 
-        stored = ProfileStore(StateStore(self.root)).load(
-            "template-runtime"
-        )
+        stored = ProfileStore(self.authored_root).load("template-host")
         self.assertEqual(stored["pod"]["image_name"], IMAGE)
         self.assertEqual(stored["pod"]["template_contract"], contract)
         self.assertEqual(
-            stored["pod"]["runtime"]["runtime_id"],
-            RUNTIME_ID,
+            stored["pod"]["gpu_memory_gb_by_type"],
+            {GPU_ID: GPU_MEMORY_GB},
         )
+        self.assertNotIn("runtime", stored["pod"])
 
     def test_template_profile_rejects_arbitrary_image_ingress(self):
-        arguments = build_parser().parse_args(
-            [
-                "profile",
-                "create",
-                "custom-template",
-                "--image",
-                IMAGE,
-                "--template-id",
-                "template123",
-                "--network-volume-id",
-                "volume123",
-                "--gpu",
-                "pro6000-server",
-                "--max-hourly",
-                "2.25",
-            ]
-        )
-        with self.assertRaises(RunpodLocalError) as caught:
-            _run_profile(arguments)
-        self.assertEqual(caught.exception.code, "invalid_profile_source")
+        with self.assertRaises(SystemExit):
+            build_parser().parse_args(
+                [
+                    "profile",
+                    "create",
+                    "custom-template",
+                    "--image",
+                    IMAGE,
+                    "--template-id",
+                    "template123",
+                    "--network-volume-id",
+                    "volume123",
+                    "--gpu",
+                    GPU_ID,
+                    "--max-hourly",
+                    "2.25",
+                ]
+            )
 
-    def test_profile_runtime_requires_template_id(self):
-        arguments = build_parser().parse_args(
-            [
-                "profile",
-                "create",
-                "runtime-without-template",
-                "--runtime",
-                RUNTIME_ID,
-                "--ephemeral",
-                "--gpu",
-                "pro6000-server",
-                "--max-hourly",
-                "2.25",
-            ]
-        )
-        with self.assertRaises(RunpodLocalError) as caught:
-            _run_profile(arguments)
-        self.assertEqual(caught.exception.code, "invalid_profile_source")
+    def test_profile_parser_has_no_workload_runtime_surface(self):
+        with self.assertRaises(SystemExit):
+            build_parser().parse_args(
+                [
+                    "profile",
+                    "create",
+                    "runtime-shaped-host",
+                    "--template-id",
+                    "template123",
+                    "--runtime",
+                    "vllm-cu129",
+                    "--ephemeral",
+                    "--gpu",
+                    GPU_ID,
+                    "--max-hourly",
+                    "2.25",
+                ]
+            )
 
-    def test_selected_runtime_rejects_a_self_consistent_custom_template(self):
-        contract = self.template_contract(
+    def test_profile_rejects_self_consistent_non_ssh_template(self):
+        contract = build_private_template_contract(
+            name="arbitrary-command",
             image="operator/image@sha256:" + "2" * 64,
             docker_entrypoint=["/bin/sh", "-c"],
-            docker_start_cmd=["operator-bootstrap\n"],
+            docker_start_cmd=["exec sleep infinity\n"],
+            template_id="template123",
         )
         api = FakeTemplateApi(templates=[contract])
         arguments = build_parser().parse_args(
@@ -440,16 +532,18 @@ class ProviderCliTest(unittest.TestCase):
                 "profile",
                 "create",
                 "custom-template",
-                "--runtime",
-                RUNTIME_ID,
                 "--template-id",
                 "template123",
                 "--network-volume-id",
                 "volume123",
                 "--gpu",
-                "pro6000-server",
+                GPU_ID,
                 "--max-hourly",
                 "2.25",
+                "--state-root",
+                str(self.root),
+                "--runpod-root",
+                str(self.authored_root),
             ]
         )
         with (
@@ -481,11 +575,11 @@ class ProviderCliTest(unittest.TestCase):
                 "profile",
                 "create",
                 "unsafe-default",
-                "--image",
-                "runpod/pytorch@sha256:" + "1" * 64,
+                "--template-id",
+                "template123",
                 "--ephemeral",
                 "--gpu",
-                "pro6000-server",
+                GPU_ID,
                 "--max-hourly",
                 "2.25",
                 "--ttl",

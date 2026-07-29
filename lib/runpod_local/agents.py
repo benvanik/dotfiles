@@ -1,530 +1,121 @@
-"""Agent-facing command contracts."""
+"""Agent-facing contract for the generic Runpod host control plane."""
 
 AGENT_DOCS = {
-    "root": """# Runpod local control plane
+    "root": """\
+# Runpod host control plane
 
-The `runpod-*` commands emit stable JSON with `--json`. Run `--agents-md` on
-an individual command for its contract. Remote Runpod state is authoritative;
-`~/.local/runpod` contains private local cache, intent, receipts, and leases.
-Never pass API or Hugging Face tokens on a command line.
+`runpod` owns provider credentials, generic host profiles, Pods, volumes,
+claims, SSH endpoints, and host retirement. It has no model, Hugging Face,
+vLLM, inference-service, or project-profile semantics; those belong to the
+sibling `model-lab` tool.
 
-Planning commands:
+Authored host configuration lives under `/mnt/dev/runpod`. Machine-local
+receipts and locks live under `~/.local/state/runpod`. Boot-local coordination
+lives under `$XDG_RUNTIME_DIR/runpod`. Credentials remain separately private
+under `~/.config/runpod-local`.
 
-- `runpod-model`: resolve an exact Hugging Face revision and checkpoint.
-- `runpod-place`: apply the versioned static VRAM placement policy.
-- `runpod-stock`: query live stock and on-demand price.
-- `runpod-volume`: plan/reconcile persistent cache-volume creation.
-- `runpod-template`: reconcile private Pod-template overlays without environment
-  data.
-- `runpod-profile`: author validated reusable launch policy.
-
-Session commands:
-
-- `runpod-up`: plan or execute one crash-reconcilable Pod launch.
-- `runpod-status`: reconcile receipts against exact live Pod identities.
-- `runpod-down`: plan or delete one Pod while preserving its volume.
-- `runpod-ttl`: inspect/mutate leases or run the foreground cleanup watcher.
-- `runpod-ssh`: open a validated session or one quoted remote command.
-- `runpod-tunnel`: open one loopback-only tunnel without faking activity.
-- `runpod-copy`: copy persistent cache/tool data or ephemeral session data.
-- `runpod-hf-auth`: lease one local Hugging Face token to ephemeral Pod storage.
-- `runpod-service`: validate, resolve, materialize, install, and operate one
-  config-only inference service on an already-active Pod.
-- `runpod-doctor`: read-only local/provider integrity audit.
-
-Paid mutations always require `--execute`. `runpod-ttl set`, `extend`, and
-`touch` are immediate local lease mutations; they do not contact Runpod and
-cannot move a lease beyond the provider-owned launch deadline. Network volumes
-outlive Pods and are never deleted by this suite.
-""",
-    "service": """# `runpod-service`
-
-Validate one declarative inference-service TOML file, resolve its generated
-Hugging Face closure, materialize and install the generic runtime, or operate
-that exact deployment on an already-active Pod. The model file is the sole
-authored per-model object. Generic controller/runtime code and generated
-artifact, process, cache, and benchmark state are never copied beside it.
+Core commands:
 
 ```sh
-CONFIG=~/.local/share/model-services/MODEL.toml
-CLOSURE=~/.local/runpod/closures/huggingface/HASH/closure.json
-NAME=compiler
-
-runpod-service validate "$CONFIG" --json
-runpod-service resolve "$CONFIG" --json
-runpod-service materialize "$CONFIG" --closure "$CLOSURE" --json
-runpod-service install "$CONFIG" "$NAME" --closure "$CLOSURE"
-
-runpod-hf-auth push "$NAME"
-runpod-service stage-snapshot "$CONFIG" "$NAME" --closure "$CLOSURE"
-runpod-hf-auth clear "$NAME"
-runpod-service prepare-cache "$CONFIG" "$NAME" --closure "$CLOSURE" \\
-  --cache-mode ephemeral
-runpod-service setup "$CONFIG" "$NAME" --closure "$CLOSURE" \\
-  --cache-mode ephemeral
-runpod-service start "$CONFIG" "$NAME" --closure "$CLOSURE" \\
-  --cache-mode ephemeral
-runpod-service status "$CONFIG" "$NAME"
-runpod-service stop "$CONFIG" "$NAME"
+runpod stock --available-only
+runpod volume list
+runpod template list
+runpod profile list
+runpod up HOST --profile PROFILE
+runpod status [HOST]
+runpod claim list [HOST]
+runpod ssh HOST
+runpod copy push HOST SOURCE /workspace/DESTINATION
+runpod down HOST
+runpod ttl enforce
+runpod claim enforce
+runpod doctor
 ```
 
-`validate` and `plan` are read-only and do not contact Hugging Face. `resolve`
-reads only Hugging Face metadata, downloads no model bytes, and writes one
-private content-addressed generated closure beneath RUNPOD_HOME; callers
-cannot redirect it beside the authored TOML. `bundle` and
-`materialize --json` are non-writing plans. Plain `materialize` publishes the
-exact local transfer closure. `install --json` revalidates the active endpoint
-and reports the local materialization required before transfer; it publishes
-no local files and opens no SSH process. Plain `install` performs that local
-publication and four content-bound SSH/SCP installation steps, then atomically
-records the exact Pod operation, service request, implementation, deployment
-manifest, and local materialization in a private generated installation
-receipt.
-
-Every runtime action with `--json` revalidates the active endpoint and emits
-the exact SSH argv from that installed receipt without materializing, changing
-the receipt, or executing it. Without `--json`, the command invokes only the
-receipt's installed content-addressed entrypoint with its generated
-`deployment.json`. Local controller/runtime source upgrades therefore cannot
-retarget an already-installed service. Each generated manifest has an
-immutable deployment-ID path beneath the stable service root. Installing a
-changed version requires the service lifecycle and serving leases to be free
-and no process receipt to remain; old generated versions stay addressable.
-`stage-snapshot`, `prepare-cache`, `setup`, and `start` fail when the requested
-TOML, closure, or port differs from the receipt. `status` and `stop`
-deliberately remain available for the installed deployment during that drift
-and need no closure unless the caller wants the JSON plan to compare a
-still-available desired closure.
-
-If an installation succeeded but its local receipt was lost, recover with
-`--installed-materialization` and the exact generated materialization SHA-256
-or its path beneath RUNPOD_HOME. Both planned and executing runtime actions
-leave installation state unchanged; only a successful `install` publishes a
-receipt. No service action creates, deletes, starts, or stops a Pod or volume.
-The Runpod API is used only to reconcile the named active Pod before SSH.
-
-`prepare-cache`, `setup`, and `start` require exactly one explicit cache mode:
-`ephemeral`, `author`, `candidate-proof`, or `accepted`. The other runtime
-actions reject a cache mode. Hugging Face authentication is a separate
-ephemeral file lease used only while staging; clear it before start.
-Neither credential can appear in the generated manifest, local/remote argv,
-or child environment. `start` owns readiness and may remain foreground for up
-to five minutes before it stops and reports an unready process.
+Provider mutations require `--execute`. Local TTL and claim mutations are
+explicitly identified by their subcommands. Network volumes are preserved by
+host termination and this tool has no volume-delete action.
 """,
-    "model": """# `runpod-model`
+    "auth": """\
+# `runpod auth`
 
-Resolve `namespace/model` once to a Hugging Face commit, select only the exact
-root checkpoint referenced by its index, and report serialized tensor facts
-separately from runtime estimates.
-
-```sh
-runpod-model Qwen/Qwen3-32B --context 32768 --sequences 1 --json
-runpod-model openai/gpt-oss-120b --context 131072 --kv-dtype bf16 --json
-```
-
-The default `--weight-format native` uses the selected checkpoint's declared
-tensor bytes. A non-native format is a low-confidence uniform projection; it
-does not assert that a runnable converted checkpoint exists. `--offline` never
-contacts Hugging Face and fails on a cache miss. Use `--index-file` when a
-repository intentionally has multiple root checkpoints.
-
-Exact byte counts are facts. KV cache values are architecture estimates and
-say when a layout is unsupported. Training memory is outside this contract.
+Store, validate, inspect, or remove only the dedicated private Runpod API
+credential. Inherited `RUNPOD_API_KEY` authority is rejected; secret bytes
+never appear in argv or JSON.
 """,
-    "place": """# `runpod-place`
+    "stock": """\
+# `runpod stock`
 
-Inspect a pinned Hugging Face checkpoint and compare it against the versioned
-Runpod GPU catalog and explicit memory policy.
-
-```sh
-runpod-place Qwen/Qwen3-32B --gpu pro6000 --gpu h200 --gpu b200 --json
-runpod-place --list-gpus
-```
-
-Statuses have strict meanings:
-
-- `candidate`: the supported single-GPU estimate fits the policy envelope.
-- `tight`: weights fit, but the requested workload exceeds that envelope.
-- `impossible`: the weight residency basis alone exceeds physical VRAM.
-- `indeterminate`: cache layout, format support, or multi-GPU partitioning is
-  not modeled well enough to claim fit.
-- `verified` is never produced by static placement; only a measured profile can
-  establish it.
-
-Provider memory, the 0.90 allocation fraction, 1.03 weight slack, and 4 GiB
-framework reserve are visible and overrideable. Live price/stock is a separate
-provider query and never changes these memory facts.
+Read current provider GPU stock and hourly prices. Filters never mutate
+provider state.
 """,
-    "auth": """# `runpod-auth`
+    "volume": """\
+# `runpod volume`
 
-`runpod-auth login` is a human-only credential bootstrap. It reads the key from
-a no-echo terminal prompt, validates it with a read-only Pod-list request, and
-then stores it at `~/.config/runpod-local/api-key` with mode 0600 inside a
-mode-0700 directory. Never paste a key into chat, pass it as an argument, or
-write it into a launch profile.
-
-```sh
-runpod-auth login
-runpod-auth status --check --json
-```
-
-`RUNPOD_API_KEY` is an environment-only override. The key is sent in an
-Authorization header, never in a URL. `logout` is plan-only unless
-`--execute` is present and removes no Runpod account resources.
+List/get volumes or reconcile one exact name, size, and datacenter. Creation
+requires `--execute`; deletion is intentionally absent.
 """,
-    "stock": """# `runpod-stock`
+    "template": """\
+# `runpod template`
 
-Query live Runpod GraphQL stock and on-demand prices using header
-authentication. Global price/stock is advisory; the launch receipt's actual
-GPU, datacenter, and hourly price are authoritative.
-
-```sh
-runpod-stock --gpu pro --gpu h200 --gpu b200 --min-memory 96 \\
-  --available-only --json
-runpod-stock --data-centers --json
-```
-
-Filters are local and deterministic. `--max-hourly` applies to price per GPU
-times `--gpu-count`.
+List/get templates or create a private SSH-only overlay on an immutable
+upstream image digest. The checked generic overlay installs OpenSSH; it carries
+no model runtime.
 """,
-    "volume": """# `runpod-volume`
+    "profile": """\
+# `runpod profile`
 
-List, inspect, and create persistent network volumes. Creation is plan-only
-without `--execute`.
-
-```sh
-runpod-volume list --json
-runpod-volume create model-cache --size-gb 250 \\
-  --data-center DATA_CENTER_ID --json
-```
-
-Network volumes pin Pods to one Secure Cloud datacenter and survive Pod
-termination. Creation validates the live datacenter, reports the dated standard
-storage estimate, and reconciles one exact existing name/size/datacenter match
-before any POST. Same-state-root creates for one name are serialized, and the
-returned ID/name/size/datacenter must match before success is reported. Never
-blindly retry an ambiguous create; inspect `list` first.
-This command intentionally has no volume-delete action: model-cache deletion is
-a separate console/API action, not session cleanup.
+Author portable generic host policy under `/mnt/dev/runpod/profiles`: exact
+GPU IDs and capacities, price cap, immutable image or private template,
+storage, SSH identity, and host retention.
 """,
-    "template": """# `runpod-template`
+    "up": """\
+# `runpod up`
 
-List templates visible to the authenticated account while omitting all
-environment values, or reconcile one exact private, non-serverless Pod
-template from the checked-in reviewed runtime catalog. There is no arbitrary
-image, entrypoint, or command input.
-
-```sh
-runpod-template create upstream-vllm \\
-  --runtime vllm-cu129-v0.25.1 --json
-runpod-template create upstream-vllm \\
-  --runtime vllm-cu129-v0.25.1 --execute --json
-```
-
-The catalog pins the official upstream image digest plus exact manifest and
-tiny SSH-bootstrap hashes. Source files are opened beneath the installed
-controller tree through owned, bounded, no-follow descriptors; unknown IDs,
-symlinks, unsafe ownership/permissions, schema drift, or hash drift fail
-closed. Creation is name-reconciled and serialized. An exact existing
-template is reused; a same-name image, entrypoint, command, port, privacy,
-Serverless, environment, registry-auth, disk, or mount mismatch fails closed.
-The template-local volume is exactly integer zero because Pod launch attaches
-its separately managed network volume. Public list/get/plan/error output never
-prints Docker argv; it exposes only argument counts, byte counts, and hashes.
+Plan or execute one crash-reconcilable generic Pod launch from an authored host
+profile. The host may later be shared by independent claims.
 """,
-    "profile": """# `runpod-profile`
+    "status": """\
+# `runpod status`
 
-Profiles are non-secret, mode-0600 local policy records under
-`~/.local/runpod/profiles`. They always pin an immutable image digest. A
-template-backed profile additionally requires a reviewed runtime ID and
-snapshots its safe manifest/bootstrap identity plus the exact normalized
-private template contract beside its ID. Profiles also pin allowed GPU IDs,
-network-volume identity, cache paths, price cap, SSH identity, and a hard-TTL
-default no greater than 30 minutes.
-
-```sh
-runpod-profile create nvidia-dev \\
-  --runtime vllm-cu129-v0.25.1 --template-id TEMPLATE_ID \\
-  --network-volume-id VOLUME_ID \\
-  --gpu pro6000-server --gpu h200 \\
-  --max-hourly 4.50 --ttl 30m \\
-  --identity-file ~/.ssh/id_ed25519_runpod \\
-  --public-key-file ~/.ssh/id_ed25519_runpod.pub --json
-```
-
-`--image` remains available only for direct-image profiles; combining it with
-`--template-id`, or using `--runtime` without `--template-id`, fails closed.
-Profile creation fetches a referenced template and accepts it only when its
-full private Pod contract matches the selected reviewed runtime. Every
-executed launch fetches that template before credential attestation, then
-fetches it again after account-key/name checks as the final provider read
-before the Pod create. Runpod exposes no template-version CAS, so provider-side
-mutation in the final read/create interval remains an unavoidable TOCTOU; the
-resolved Pod is still verified exactly and deleted on contradiction.
-Environment
-names containing TOKEN, KEY, SECRET, PASSWORD, or CREDENTIAL are rejected, as
-are all Runpod-secret environment references. Values cross the provider and
-container-launch boundary and may later be serialized by startup tooling or an
-interactive shell, so controls and shell expansion/quoting characters are
-also rejected in every value. `HF_TOKEN_PATH` is the one
-constrained non-secret exception and is fixed to ephemeral
-`/root/runpod-session/secrets/huggingface/token`; credentials never belong in a
-profile. Shell-startup controls such as `BASH_ENV`, `ENV`, and `ZDOTDIR` are
-reserved by the reconciled SSH control plane, as are dynamic-loader controls
-such as `LD_*`, `GLIBC_TUNABLES`, and `GCONV_PATH`. `PUBLIC_KEY` is
-provider-owned; the tool validates and injects one profile-specific
-`SSH_PUBLIC_KEY` as profile/receipt identity, not as proof of full-TCP
-authorization. Immediately before a fresh billable create, the controller
-requires the same algorithm and key body among the newline-separated keys in
-Runpod account `myself.pubKey`; comments are ignored. The private/public pair
-is also revalidated. Local profiles are advisory across machines; provider
-state and exact Pod IDs remain authoritative.
+Inspect local receipts or reconcile them with exact live Pod identities.
 """,
-    "up": """# `runpod-up`
+    "down": """\
+# `runpod down`
 
-Plan by default. `--execute` fsyncs a unique local launch intent before the
-first create request, reconciles an ambiguous request by exact UUID-bearing
-remote name, verifies the actual GPU/count/datacenter/volume/image/security/
-container disk/local-volume size/volume mount/Docker entrypoint/Docker
-command/effective environment/absence of registry auth/ports/total price, and
-rolls back a contradictory allocation. Environment values are never retained:
-the receipt binds the sorted names and a canonical SHA-256 of the complete
-string map. Provider audit evidence retains only match booleans, numeric or
-boolean facts, counts, and hashes; arbitrary provider strings cannot enter a
-receipt, rollback reason, event, or public error.
-
-```sh
-runpod-up compiler --profile pro-h200 --model Qwen/Qwen3-32B \\
-  --context 32768 --ttl 30m --json
-runpod-up compiler --profile pro-h200 --model Qwen/Qwen3-32B \\
-  --context 32768 --ttl 30m --execute --json
-```
-
-Static model placement admits only `candidate` by default.
-`--allow-indeterminate-fit` is explicit and never admits `tight` or
-`impossible`. Omitting `--model` means the profile/operator owns fit.
-
-The hard deadline starts when the launch intent is durably written, so
-credential attestation and provisioning count. That one absolute timestamp is
-hashed into the receipt and sent in Runpod's create mutation as
-`terminateAfter`; Runpod terminates the Pod even if this controller, terminal,
-or UI disappears. Profiles default to 30 minutes, and an omitted launch TTL is
-capped at 30 minutes even when a stale profile from another machine contains a
-longer default. This is a hard lifetime, not inactivity detection: an active
-session also ends at 30 minutes. Longer sessions require an explicit per-launch
-TTL and deliberately increase lost-controller billing exposure.
-
-A submission with an ambiguous response and no visible matching Pod is never
-re-submitted automatically. Retry the same command only to reconcile. Once the
-provider deadline has elapsed, an exact absence check may close the receipt
-because Runpod owns the hard lifetime. If the exact Pod appears while that
-terminal receipt remains current, status reports it and TTL enforcement deletes
-it as a terminal leak. Local locks coordinate only one machine. A second
-machine with a split state root can launch another Pod; `runpod-status` exposes
-it as unmanaged here.
-
-An `intent` receipt proves no create request was sent. Its preflight requires
-the remote name to be absent; a match is an unmanaged collision, atomically
-aborts that operation, and is never adopted or deleted by it. A retry mints a
-distinct UUID name. Aborting or expiring any other unsubmitted intent likewise
-does not change its ownership proof.
-
-Before entering the ambiguous submission state, `--execute` checks the
-profile's exact SSH algorithm and key body against Runpod account
-`myself.pubKey`. A missing or mismatched account key returns
-`account_ssh_key_not_authorized`, leaves the receipt in retryable `intent`, and
-sends no Pod create request. Add the configured `.pub` line to the Runpod
-account's **SSH Public Keys** field and retry the same command.
+Plan or terminate one exact Pod while preserving its network volume.
 """,
-    "status": """# `runpod-status`
+    "ttl": """\
+# `runpod ttl`
 
-Join private local receipts to the live provider by immutable Pod ID and report
-drift plus unmanaged Pods. Remote state is authoritative. No mutation occurs.
-
-```sh
-runpod-status --json
-runpod-status compiler --json
-runpod-status --local-only --json
-```
-
-`--local-only` needs no API credential and makes no claim that a locally active
-Pod still exists. A UUID-prefixed Pod without a receipt can belong to another
-controller and is never deleted automatically.
+Inspect or enforce provider-bounded host lifetimes. The foreground watcher is
+explicit, also enforces quarantined `while-claimed` host retirement, and
+provider deletion still requires `--execute`.
 """,
-    "down": """# `runpod-down`
+    "ssh": """\
+# `runpod ssh`
 
-Plan by default. `--execute` re-fetches the exact receipt Pod ID, requires its
-remote name to match, persists termination intent, and deletes the Pod.
-
-```sh
-runpod-down compiler --json
-runpod-down compiler --execute --json
-```
-
-Session cleanup never calls Pod stop and never deletes the network volume.
-Network-volume model caches survive termination. A duplicate-name conflict is
-deleted only by explicit `--execute`, using its durably recorded Pod-ID set
-after every ID and name agree with live provider reads. Duplicates first seen
-during teardown are saved before the first delete, and the cleanup authorization
-is durable so the watcher retries partial failures. A newly observed ID expands
-the conflict set and revokes that authorization; no remaining member is deleted
-until the expanded set receives another explicit `--execute`. Ambiguous
-submissions fail closed before their provider deadline instead of guessing
-which Pod to delete. At or after that deadline, an exact absence check closes
-the receipt without issuing another create request.
+Open a reconciled direct SSH session or execute one literal remote argv.
+OpenSSH config, proxies, and agents are disabled.
 """,
-    "ttl": """# `runpod-ttl`
+    "tunnel": """\
+# `runpod tunnel`
 
-Hard TTL is an absolute billing guard anchored to the durable launch intent and
-embedded in the Pod creation request as Runpod `terminateAfter`. Idle TTL means
-no explicit heartbeat from these local tools; it does not inspect GPU
-utilization, Pi, or vLLM requests through a tunnel. Long-running attached SSH
-commands heartbeat while the process remains attached, even if the human is
-idle. Heartbeats never move the hard deadline.
-
-```sh
-runpod-ttl show compiler --json
-runpod-ttl set compiler 20m --json
-runpod-ttl extend compiler 5m --json
-runpod-ttl touch compiler --source benchmark_driver --json
-runpod-ttl enforce --json
-runpod-ttl enforce --execute --json
-runpod-ttl watch --execute --interval 30s
-```
-
-`set` changes local total lifetime while retaining the original intent anchor;
-`extend` moves a previously shortened local deadline. Neither may pass the
-immutable provider deadline. `enforce` is one-shot and plan-only without
-`--execute`; `watch` is a foreground enforcer and requires `--execute`. With
-`--json`, watcher output is one compact JSON object per line. Provider
-termination owns the hard fleet deadline; the credentialed local watcher is
-still required for idle or deliberately shortened expiry, and this suite does
-not install that watcher as a user service. The default provider hard lifetime
-is 30 minutes and terminates active sessions too. An explicit longer
-`runpod-up --ttl` raises the lost-controller billing bound. Expired leases
-cannot be touched or extended. Pending cleanup is retried, stale scans recheck
-operation identity and expiry, and exact deletion always preserves the network
-volume.
+Open one loopback-only TCP or Unix-socket tunnel to an explicitly selected
+remote loopback port. Tunnel existence is not workload activity.
 """,
-    "ssh": """# `runpod-ssh`
+    "copy": """\
+# `runpod copy`
 
-Resolve an active local receipt against the exact live Pod, validate its
-allocation and mapped SSH endpoint, then use one dedicated identity and one
-per-Pod known-hosts file.
-
-```sh
-runpod-ssh compiler
-runpod-ssh compiler -- nvidia-smi --query-gpu=name,memory.total --format=csv
-runpod-ssh --json compiler
-```
-
-Remote arguments after `--` are encoded as one `exec` command with POSIX shell
-quoting; they are never appended as raw OpenSSH arguments. Endpoint inspection
-is mutually exclusive with a remote command so command arguments are not
-printed accidentally. First connection uses explicit per-Pod TOFU
-(`accept-new`); a later key change fails and is never silently removed.
-
-The subprocess receives neither Runpod/Hugging Face credentials nor an SSH
-agent socket. Attached SSH commands emit explicit idle heartbeats bound to the
-exact operation/Pod, but never move the hard deadline.
+Copy through the reconciled SSH endpoint. Remote paths are restricted to
+`/workspace` and `/root/runpod-session`.
 """,
-    "tunnel": """# `runpod-tunnel`
+    "doctor": """\
+# `runpod doctor`
 
-Open one foreground SSH tunnel to remote loopback. The local listener is
-either loopback TCP or a private Unix-domain socket.
-
-```sh
-runpod-tunnel compiler --local-port 8000 --remote-port 8000
-runpod-tunnel compiler \\
-  --local-socket /run/user/1000/model-session/gemma4.sock \\
-  --remote-port 8000
-runpod-tunnel --json compiler --local-port 8000 --remote-port 8000
-```
-
-TCP uses `127.0.0.1:LOCAL:127.0.0.1:REMOTE`; there is no public-bind option.
-Unix mode requires a normalized absolute path below an owned mode-0700 real
-directory and creates missing private parent directories. It emits a
-mode-0600 socket, refuses active, foreign, permissive, symlink, and nonsocket
-paths, and removes only an unchanged owned socket after both a refused AF_UNIX
-stream connection and absence from the Linux kernel socket table. If that
-proof is unavailable, cleanup fails closed. OpenSSH itself is forbidden from
-unlinking the path. Run vLLM on remote `127.0.0.1` and expose only `22/tcp`.
-The foreground process checks the lease but does not refresh idle activity
-merely because a tunnel exists. The request/benchmark driver should call
-`runpod-ttl touch` after real work.
-""",
-    "copy": """# `runpod-copy`
-
-Copy in either direction through the reconciled direct SSH endpoint.
-
-```sh
-runpod-copy push compiler ./bench.py /workspace/tools/bench.py
-runpod-copy pull compiler /workspace/results/profile.json ./profile.json
-runpod-copy push --recursive compiler ./loom /workspace/src/loom
-```
-
-Remote operands must be canonical absolute paths beneath persistent
-`/workspace` or ephemeral `/root/runpod-session` and use a conservative
-literal-segment grammar: no traversal, whitespace, globs, colons, shell syntax,
-backslashes, or tildes. Local operands are made absolute, OpenSSH
-config/proxies/agents are disabled, and every transfer uses the per-Pod
-known-hosts file. `--json` or `--print` inspects without copying.
-""",
-    "hf-auth": """# `runpod-hf-auth`
-
-Lease only the local active Hugging Face token to one active Pod:
-
-```sh
-runpod-hf-auth push compiler
-runpod-hf-auth status compiler --json
-runpod-hf-auth clear compiler
-```
-
-`push` opens `${HF_TOKEN_PATH:-~/.config/huggingface/token}` only after proving
-it is a bounded, owned, non-symlink, private regular file. A first non-secret
-SSH probe establishes the dedicated per-Pod host key; a second connection
-streams the already-open file as stdin to a fixed remote program. Token bytes
-never enter argv, environment, provider metadata, profile, receipt, JSON,
-logs, or `/workspace`.
-
-The remote program accepts one token, creates only real owner-controlled 0700
-directories below `/root/runpod-session`, and atomically installs a mode-0600
-token through absolute isolated system Python with an empty environment. An
-orphaned atomic-install temporary makes `status` fail unsafe; a valid `push` or
-`clear` removes it. The profile sets `HF_TOKEN_PATH` there before Hugging Face
-libraries import. Pod deletion removes it; `clear` removes it earlier. Neither
-action revokes the source token at Hugging Face, and browser-OAuth refresh state
-is never copied. Push the current active token again if it expires. Pod-root
-code can read the lease; this boundary prevents persistence and accidental
-disclosure rather than hiding a credential from the selected workload.
-`push` requires the active receipt to attest an immutable image. A
-template-backed receipt is accepted only when its saved template ID, resolved
-image, reviewed runtime identity, and full Docker override snapshot agree;
-`status` and `clear` remain available for cleanup.
-
-These explicit credential actions execute immediately. `--json` formats the
-safe result; it is not a plan mode.
-""",
-    "doctor": """# `runpod-doctor`
-
-Run a read-only integrity audit over command availability, credential and state
-permissions, profile/receipt schemas, SSH identities, dedicated host keys, and
-overdue leases.
-
-```sh
-runpod-doctor
-runpod-doctor --live --json
-```
-
-`--live` additionally lists Pods once, volumes once, and stock once, then joins
-active receipts to immutable Pod IDs and validates allocation, price cap,
-volume, and SSH readiness. Missing endpoint mappings during initialization are
-warnings; identity/policy drift and terminal receipts with live Pods are
-errors. Pods owned by a split-state controller are reported as unmanaged and
-never mutated.
-
-Doctor never creates, starts, stops, or deletes provider resources and never
-prints credential or remote environment values. Its exit status is nonzero
-when any check is an error.
+Run a read-only integrity audit over generic configuration, receipts, SSH
+identities, leases, claim acquisition journals, claim ledgers, orphaned
+while-claimed hosts, expired-claim quarantine, due retirement, and optionally
+live provider state.
 """,
 }

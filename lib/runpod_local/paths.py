@@ -16,13 +16,64 @@ def dotfiles_root() -> pathlib.Path:
     return pathlib.Path(__file__).resolve().parents[2]
 
 
-def state_root(override: str | pathlib.Path | None = None) -> pathlib.Path:
+def runpod_root(
+    override: str | pathlib.Path | None = None,
+) -> pathlib.Path:
+    """Portable authored Runpod configuration and evidence."""
+
     if override is not None:
-        return pathlib.Path(override).expanduser().resolve()
-    configured = os.environ.get("RUNPOD_HOME")
+        return pathlib.Path(override).expanduser().absolute()
+    configured = os.environ.get("RUNPOD_ROOT")
     if configured:
-        return pathlib.Path(configured).expanduser().resolve()
-    return pathlib.Path.home() / ".local" / "runpod"
+        return pathlib.Path(configured).expanduser().absolute()
+    return pathlib.Path("/mnt/dev/runpod")
+
+
+def runpod_config_file(
+    override: str | pathlib.Path | None = None,
+) -> pathlib.Path:
+    return runpod_root(override) / "runpod.toml"
+
+
+def profile_root(
+    override: str | pathlib.Path | None = None,
+) -> pathlib.Path:
+    return runpod_root(override) / "profiles"
+
+
+def volume_root(
+    override: str | pathlib.Path | None = None,
+) -> pathlib.Path:
+    return runpod_root(override) / "volumes"
+
+
+def state_root(override: str | pathlib.Path | None = None) -> pathlib.Path:
+    """Machine-local receipts and locks."""
+
+    if override is not None:
+        return pathlib.Path(override).expanduser().absolute()
+    configured = os.environ.get("RUNPOD_STATE_HOME")
+    if configured:
+        return pathlib.Path(configured).expanduser().absolute()
+    xdg_state = os.environ.get("XDG_STATE_HOME")
+    base = (
+        pathlib.Path(xdg_state).expanduser()
+        if xdg_state
+        else pathlib.Path.home() / ".local" / "state"
+    )
+    return base / "runpod"
+
+
+def runtime_root() -> pathlib.Path:
+    """Boot-local sockets, endpoint receipts, and transient coordination."""
+
+    xdg_runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if not xdg_runtime:
+        raise RunpodLocalError(
+            "XDG_RUNTIME_DIR is required for Runpod boot-local state",
+            code="runtime_directory_unavailable",
+        )
+    return pathlib.Path(xdg_runtime).expanduser().absolute() / "runpod"
 
 
 def config_root(override: str | pathlib.Path | None = None) -> pathlib.Path:

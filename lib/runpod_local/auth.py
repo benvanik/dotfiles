@@ -1,4 +1,4 @@
-"""Credential storage that never accepts API keys in process arguments."""
+"""Dedicated-file credentials that reject inherited secret authority."""
 
 from __future__ import annotations
 
@@ -60,13 +60,17 @@ class CredentialStore:
     def load(self, *, required: bool = True) -> ApiCredential | None:
         environment_value = self.environment.get("RUNPOD_API_KEY")
         if environment_value:
-            return ApiCredential(environment_value, source="environment")
+            raise RunpodLocalError(
+                "RUNPOD_API_KEY is inherited by this process; unset it and "
+                "use the dedicated mode-0600 credential file",
+                code="inherited_credential_forbidden",
+            )
         try:
             metadata = self.path.lstat()
         except FileNotFoundError:
             if required:
                 raise RunpodLocalError(
-                    "no Runpod credential configured; run `runpod-auth login` "
+                    "no Runpod credential configured; run `runpod auth login` "
                     "from a trusted terminal",
                     code="credential_missing",
                 )

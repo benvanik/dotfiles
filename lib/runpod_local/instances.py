@@ -14,10 +14,8 @@ from typing import Any
 from .api import validate_provider_pod_snapshot
 from .errors import RunpodLocalError
 from .profile import provider_effective_environment_summary, validate_profile
-from .runtime_catalog import validate_runtime_identity
-from .state import StateStore, validate_record_name
+from .state import StateRecordScan, StateStore, validate_record_name
 from .template import (
-    template_contract_violations,
     validate_image_digest,
     validate_private_template_contract,
 )
@@ -411,11 +409,16 @@ def validate_instance_record(record: dict[str, Any]) -> dict[str, Any]:
         )
     price_cap = expected.get("max_hourly_usd")
     gpu_count = expected.get("gpu_count")
+    gpu_memory_gb = expected.get("gpu_memory_gb")
     if (
         not isinstance(expected.get("gpu_id"), str)
         or not isinstance(gpu_count, int)
         or isinstance(gpu_count, bool)
         or gpu_count <= 0
+        or not isinstance(gpu_memory_gb, (int, float))
+        or isinstance(gpu_memory_gb, bool)
+        or not math.isfinite(gpu_memory_gb)
+        or gpu_memory_gb <= 0
         or not isinstance(price_cap, (int, float))
         or isinstance(price_cap, bool)
         or not math.isfinite(price_cap)
@@ -477,7 +480,6 @@ def validate_instance_record(record: dict[str, Any]) -> dict[str, Any]:
             code="invalid_instance_record",
         )
     template_contract = expected.get("template_contract")
-    runtime_identity = expected.get("runtime")
     if template_contract is not None:
         try:
             template_contract = validate_private_template_contract(
@@ -489,17 +491,6 @@ def validate_instance_record(record: dict[str, Any]) -> dict[str, Any]:
                 f"instance {name} has an invalid expected template contract",
                 code="invalid_instance_record",
             ) from error
-        try:
-            runtime = validate_runtime_identity(runtime_identity)
-        except RunpodLocalError as error:
-            raise RunpodLocalError(
-                f"instance {name} has an invalid reviewed runtime identity",
-                code="invalid_instance_record",
-            ) from error
-        expected_template = runtime.template_contract(
-            name=template_contract["name"],
-            template_id=template_contract["id"],
-        )
         if (
             template_contract["image"] != expected_image
             or template_contract["docker_entrypoint"]
@@ -513,22 +504,44 @@ def validate_instance_record(record: dict[str, Any]) -> dict[str, Any]:
             != expected_volume_mount_path
             or template_contract["volume_in_gb"]
             != expected_volume_in_gb
-            or template_contract_violations(
-                template_contract,
-                expected_template,
-            )
         ):
             raise RunpodLocalError(
-                f"instance {name} expected runtime disagrees with its template",
+                f"instance {name} expected host contract disagrees with its template",
                 code="invalid_instance_record",
             )
     elif (
         expected.get("docker_entrypoint") is not None
         or expected.get("docker_start_cmd") is not None
-        or runtime_identity is not None
     ):
         raise RunpodLocalError(
             f"instance {name} has Docker overrides without a template",
+            code="invalid_instance_record",
+        )
+    min_vcpu_count = expected.get("min_vcpu_count")
+    min_ram_gb = expected.get("min_ram_gb")
+    if (
+        not isinstance(min_vcpu_count, int)
+        or isinstance(min_vcpu_count, bool)
+        or min_vcpu_count <= 0
+        or not isinstance(min_ram_gb, int)
+        or isinstance(min_ram_gb, bool)
+        or min_ram_gb <= 0
+    ):
+        raise RunpodLocalError(
+            f"instance {name} has invalid generic host capacity floors",
+            code="invalid_instance_record",
+        )
+    retention = record.get("retention")
+    if (
+        not isinstance(retention, dict)
+        or retention.get("mode") not in {"manual", "while-claimed"}
+        or not isinstance(retention.get("empty_grace_seconds"), int)
+        or isinstance(retention.get("empty_grace_seconds"), bool)
+        or retention["empty_grace_seconds"] < 0
+        or retention["empty_grace_seconds"] > MAX_DURATION_SECONDS
+    ):
+        raise RunpodLocalError(
+            f"instance {name} has invalid host retention policy",
             code="invalid_instance_record",
         )
     lease_request = record.get("lease_request")
@@ -896,6 +909,37 @@ class InstanceStore:
             validate_instance_record(record)
             for record in self.state.list("instances")
         ]
+
+    def scan(self) -> list[StateRecordScan]:
+        records = []
+        for scanned in self.state.scan("instances"):
+            if scanned.error is not None:
+                records.append(scanned)
+                continue
+            try:
+                record = validate_instance_record(scanned.value)
+                if record["name"] != scanned.name:
+                    raise RunpodLocalError(
+                        "instance receipt is stored under another local name",
+                        code="invalid_instance_record",
+                    )
+            except RunpodLocalError as error:
+                records.append(
+                    StateRecordScan(
+                        name=scanned.name,
+                        value=None,
+                        error=error,
+                    )
+                )
+                continue
+            records.append(
+                StateRecordScan(
+                    name=scanned.name,
+                    value=record,
+                    error=None,
+                )
+            )
+        return records
 
     def set_ttl(
         self,

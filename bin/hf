@@ -12,8 +12,8 @@ import sys
 DOTFILES_ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(DOTFILES_ROOT / "lib"))
 
-from runpod_local.errors import RunpodLocalError  # noqa: E402
-from runpod_local.huggingface_credentials import (  # noqa: E402
+from model_lab.errors import ModelLabError  # noqa: E402
+from model_lab.huggingface_credentials import (  # noqa: E402
     HF_CLI_VERSION,
     ensure_huggingface_secret_directory,
     huggingface_token_path,
@@ -37,7 +37,7 @@ def _cache_home(environment: dict[str, str]) -> pathlib.Path:
         )
         path = base / "huggingface"
     if not path.is_absolute():
-        raise RunpodLocalError(
+        raise ModelLabError(
             "HF_HOME must be absolute or expand to an absolute path",
             code="unsafe_hf_cache_path",
         )
@@ -50,22 +50,22 @@ def _validate_optional_secret(path: pathlib.Path) -> None:
     except FileNotFoundError:
         return
     except OSError as error:
-        raise RunpodLocalError(
+        raise ModelLabError(
             f"cannot inspect Hugging Face secret file {path}: {error}",
             code="unsafe_hf_credential_file",
         ) from error
     if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
-        raise RunpodLocalError(
+        raise ModelLabError(
             f"Hugging Face secret path is not a regular file: {path}",
             code="unsafe_hf_credential_file",
         )
     if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
-        raise RunpodLocalError(
+        raise ModelLabError(
             f"Hugging Face secret file is not owned by this user: {path}",
             code="unsafe_hf_credential_file",
         )
     if metadata.st_mode & 0o077:
-        raise RunpodLocalError(
+        raise ModelLabError(
             f"Hugging Face secret permissions are broader than 0600: {path}",
             code="unsafe_hf_credential_permissions",
         )
@@ -80,7 +80,7 @@ def _managed_executable(environment: dict[str, str]) -> pathlib.Path:
     )
     executable = root / HF_CLI_VERSION / "bin" / "hf"
     if not executable.is_file() or not os.access(executable, os.X_OK):
-        raise RunpodLocalError(
+        raise ModelLabError(
             f"managed hf {HF_CLI_VERSION} is not installed; run "
             f"`{DOTFILES_ROOT}/tools/hf/install.sh {HF_CLI_VERSION}`",
             code="hf_cli_missing",
@@ -90,7 +90,7 @@ def _managed_executable(environment: dict[str, str]) -> pathlib.Path:
 
 def main(arguments: list[str]) -> int:
     if arguments and arguments[0] == "update":
-        raise RunpodLocalError(
+        raise ModelLabError(
             "the managed hf CLI cannot self-update; change the dotfiles pin "
             "and rerun tools/hf/install.sh",
             code="managed_update_rejected",
@@ -101,13 +101,13 @@ def main(arguments: list[str]) -> int:
         or argument == "--add-to-git-credential"
         for argument in arguments
     ):
-        raise RunpodLocalError(
+        raise ModelLabError(
             "token arguments and Git-credential copies are disabled; use "
             "interactive `hf auth login`",
             code="unsafe_hf_token_argument",
         )
     if len(arguments) >= 2 and arguments[:2] == ["auth", "token"]:
-        raise RunpodLocalError(
+        raise ModelLabError(
             "`hf auth token` prints the credential and is disabled",
             code="unsafe_hf_token_output",
         )
@@ -115,7 +115,7 @@ def main(arguments: list[str]) -> int:
     environment = dict(os.environ)
     for name in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
         if environment.get(name):
-            raise RunpodLocalError(
+            raise ModelLabError(
                 f"refusing inherited {name}; use `hf auth login` so the "
                 "credential remains in the private token file",
                 code="unsafe_hf_environment_token",
@@ -153,6 +153,6 @@ if __name__ == "__main__":
     os.umask(0o077)
     try:
         raise SystemExit(main(sys.argv[1:]))
-    except RunpodLocalError as error:
+    except ModelLabError as error:
         print(f"hf: error: {error}", file=sys.stderr)
         raise SystemExit(1) from None

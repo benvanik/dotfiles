@@ -14,8 +14,9 @@ from typing import Any
 from .api import RunpodApi, gpu_stock_is_available
 from .auth import ApiCredential, CredentialStore
 from .errors import RunpodLocalError
+from .host_template import build_generic_host_template
 from .output import print_json
-from .paths import credentials_file, state_root
+from .paths import credentials_file, runpod_root, state_root
 from .profile import (
     DEFAULT_PROFILE_HARD_TTL,
     MAX_IMPLICIT_HARD_TTL_SECONDS,
@@ -26,7 +27,6 @@ from .profile import (
     validate_ssh_identity_file,
     validate_ssh_key_pair,
 )
-from .runtime_catalog import available_runtime_ids, load_runtime
 from .state import StateStore
 from .template import (
     redact_docker_arguments,
@@ -47,14 +47,10 @@ STANDARD_VOLUME_PRICING = {
 
 def standard_volume_monthly_usd(size_gb: int) -> float:
     first_tier = min(size_gb, STANDARD_VOLUME_PRICING["first_tier_gb"])
-    additional = max(
-        0, size_gb - STANDARD_VOLUME_PRICING["first_tier_gb"]
-    )
+    additional = max(0, size_gb - STANDARD_VOLUME_PRICING["first_tier_gb"])
     return round(
-        first_tier
-        * STANDARD_VOLUME_PRICING["first_tier_usd_per_gb_month"]
-        + additional
-        * STANDARD_VOLUME_PRICING["additional_usd_per_gb_month"],
+        first_tier * STANDARD_VOLUME_PRICING["first_tier_usd_per_gb_month"]
+        + additional * STANDARD_VOLUME_PRICING["additional_usd_per_gb_month"],
         2,
     )
 
@@ -74,9 +70,8 @@ def created_volume_violations(
 ) -> list[str]:
     violations = []
     volume_id = volume.get("id")
-    if (
-        not isinstance(volume_id, str)
-        or not re.fullmatch(r"[A-Za-z0-9_-]{1,191}", volume_id)
+    if not isinstance(volume_id, str) or not re.fullmatch(
+        r"[A-Za-z0-9_-]{1,191}", volume_id
     ):
         violations.append("missing_or_invalid_volume_id")
     for field in ("name", "size_gb", "data_center_id"):
@@ -103,7 +98,12 @@ def _add_common_provider_arguments(
         parser.add_argument(
             "--state-root",
             metavar="PATH",
-            help="Override RUNPOD_HOME (default: ~/.local/runpod).",
+            help="Override RUNPOD_STATE_HOME for machine receipts and locks.",
+        )
+        parser.add_argument(
+            "--runpod-root",
+            metavar="PATH",
+            help="Override RUNPOD_ROOT (default: /mnt/dev/runpod).",
         )
     if credentials:
         parser.add_argument(
@@ -207,13 +207,9 @@ def add_provider_parsers(subparsers: Any) -> None:
     )
     _add_agents_argument(volume_parser)
     volume_subparsers = volume_parser.add_subparsers(dest="volume_action")
-    volume_list = volume_subparsers.add_parser(
-        "list", help="List network volumes."
-    )
+    volume_list = volume_subparsers.add_parser("list", help="List network volumes.")
     _add_common_provider_arguments(volume_list)
-    volume_get = volume_subparsers.add_parser(
-        "get", help="Get one network volume."
-    )
+    volume_get = volume_subparsers.add_parser("get", help="Get one network volume.")
     _add_common_provider_arguments(volume_get)
     volume_get.add_argument("volume_id")
     volume_create = volume_subparsers.add_parser(
@@ -261,13 +257,15 @@ def add_provider_parsers(subparsers: Any) -> None:
     _add_common_provider_arguments(template_create, state=True)
     template_create.add_argument("name")
     template_create.add_argument(
-        "--runtime",
+        "--image",
         required=True,
-        metavar="ID",
-        help=(
-            "Reviewed upstream runtime ID. Available: "
-            + ", ".join(available_runtime_ids())
-        ),
+        help="Immutable upstream NAME@sha256:DIGEST image reference.",
+    )
+    template_create.add_argument(
+        "--container-disk-gb",
+        type=int,
+        default=50,
+        help="Ephemeral container disk size (default: 50 GB).",
     )
     template_create.add_argument(
         "--execute",
@@ -281,13 +279,9 @@ def add_provider_parsers(subparsers: Any) -> None:
     _add_agents_argument(profile_parser)
     profile_subparsers = profile_parser.add_subparsers(dest="profile_action")
     profile_list = profile_subparsers.add_parser("list", help="List profiles.")
-    _add_common_provider_arguments(
-        profile_list, state=True, credentials=False
-    )
+    _add_common_provider_arguments(profile_list, state=True, credentials=False)
     profile_show = profile_subparsers.add_parser("show", help="Show a profile.")
-    _add_common_provider_arguments(
-        profile_show, state=True, credentials=False
-    )
+    _add_common_provider_arguments(profile_show, state=True, credentials=False)
     profile_show.add_argument("name")
     profile_create = profile_subparsers.add_parser(
         "create", help="Create a validated local launch profile."
@@ -295,21 +289,9 @@ def add_provider_parsers(subparsers: Any) -> None:
     _add_common_provider_arguments(profile_create, state=True)
     profile_create.add_argument("name")
     profile_create.add_argument(
-        "--image",
-        help=(
-            "Explicit immutable NAME@sha256:DIGEST for a direct-image profile."
-        ),
-    )
-    profile_create.add_argument(
-        "--runtime",
-        metavar="ID",
-        help=(
-            "Reviewed runtime required with --template-id. Available: "
-            + ", ".join(available_runtime_ids())
-        ),
-    )
-    profile_create.add_argument(
-        "--template-id", help="Exact account-visible Runpod template ID."
+        "--template-id",
+        required=True,
+        help="Exact account-visible generic SSH Pod-template ID.",
     )
     storage = profile_create.add_mutually_exclusive_group(required=True)
     storage.add_argument(
@@ -319,13 +301,13 @@ def add_provider_parsers(subparsers: Any) -> None:
     storage.add_argument(
         "--ephemeral",
         action="store_true",
-        help="Explicitly create a profile without persistent model storage.",
+        help="Explicitly create a profile without a network volume.",
     )
     profile_create.add_argument(
         "--gpu",
         action="append",
         required=True,
-        help="GPU catalog alias or exact ID; repeat in fallback order.",
+        help="Exact provider GPU ID; repeat in fallback order.",
     )
     profile_create.add_argument(
         "--gpu-count",
@@ -412,8 +394,11 @@ def _api(args: argparse.Namespace) -> RunpodApi:
 
 
 def _profile_store(args: argparse.Namespace) -> ProfileStore:
-    root = state_root(getattr(args, "state_root", None))
-    return ProfileStore(StateStore(root))
+    state = StateStore(state_root(getattr(args, "state_root", None)))
+    return ProfileStore(
+        runpod_root(getattr(args, "runpod_root", None)),
+        lock_state=state,
+    )
 
 
 def _print_result(value: Any, *, as_json: bool) -> None:
@@ -513,9 +498,7 @@ def _run_auth(args: argparse.Namespace) -> int:
             credential = store.load(required=True)
             if credential is None:
                 raise AssertionError("required credential unexpectedly absent")
-            result["visible_pod_count"] = len(
-                RunpodApi(credential).list_pods()
-            )
+            result["visible_pod_count"] = len(RunpodApi(credential).list_pods())
             result["validated"] = True
         _print_result(result, as_json=args.json)
         return 0
@@ -555,9 +538,7 @@ def _run_stock(args: argparse.Namespace) -> int:
     names = [name.casefold() for name in args.gpu]
     filtered = []
     for gpu in result["gpus"]:
-        searchable = (
-            f"{gpu.get('gpu_id', '')} {gpu.get('display_name', '')}".casefold()
-        )
+        searchable = f"{gpu.get('gpu_id', '')} {gpu.get('display_name', '')}".casefold()
         if names and not any(name in searchable for name in names):
             continue
         memory = gpu.get("memory_gb")
@@ -568,9 +549,8 @@ def _run_stock(args: argparse.Namespace) -> int:
         ):
             continue
         price = gpu.get("on_demand_price_per_gpu_hour")
-        if (
-            args.max_hourly is not None
-            and (price is None or price * args.gpu_count > args.max_hourly)
+        if args.max_hourly is not None and (
+            price is None or price * args.gpu_count > args.max_hourly
         ):
             continue
         filtered.append(gpu)
@@ -631,9 +611,7 @@ def _run_volume(args: argparse.Namespace) -> int:
         "data_center_id": args.data_center,
     }
     lock = (
-        StateStore(state_root(args.state_root)).locked(
-            volume_lock_scope(args.name)
-        )
+        StateStore(state_root(args.state_root)).locked(volume_lock_scope(args.name))
         if args.execute
         else contextlib.nullcontext()
     )
@@ -672,9 +650,7 @@ def _run_volume(args: argparse.Namespace) -> int:
                 "a different size/datacenter",
                 code="volume_name_conflict",
             )
-        if exact_matches and created_volume_violations(
-            exact_matches[0], request
-        ):
+        if exact_matches and created_volume_violations(exact_matches[0], request):
             raise RunpodLocalError(
                 f"network volume {args.name!r} has no valid durable ID",
                 code="invalid_provider_response",
@@ -682,9 +658,7 @@ def _run_volume(args: argparse.Namespace) -> int:
         result = {
             "schema_version": "runpod.plan.v1",
             "action": (
-                "reuse_network_volume"
-                if exact_matches
-                else "create_network_volume"
+                "reuse_network_volume" if exact_matches else "create_network_volume"
             ),
             "request": request,
             "data_center": center_matches[0],
@@ -708,11 +682,7 @@ def _run_volume(args: argparse.Namespace) -> int:
                 "violations": violations,
             }
     _print_result(result, as_json=args.json)
-    return (
-        1
-        if result.get("verification", {}).get("status") == "error"
-        else 0
-    )
+    return 1 if result.get("verification", {}).get("status") == "error" else 0
 
 
 def _run_template(args: argparse.Namespace) -> int:
@@ -752,12 +722,13 @@ def _run_template(args: argparse.Namespace) -> int:
         )
         return 0
 
-    runtime = load_runtime(args.runtime)
-    request = runtime.template_contract(name=args.name)
+    request = build_generic_host_template(
+        name=args.name,
+        image=args.image,
+        container_disk_gb=args.container_disk_gb,
+    )
     lock = (
-        StateStore(state_root(args.state_root)).locked(
-            template_lock_scope(args.name)
-        )
+        StateStore(state_root(args.state_root)).locked(template_lock_scope(args.name))
         if args.execute
         else contextlib.nullcontext()
     )
@@ -782,12 +753,9 @@ def _run_template(args: argparse.Namespace) -> int:
         result = {
             "schema_version": "runpod.plan.v1",
             "action": (
-                "reuse_private_template"
-                if exact_matches
-                else "create_private_template"
+                "reuse_private_template" if exact_matches else "create_private_template"
             ),
             "request": request,
-            "runtime": runtime.safe_summary(),
             "executed": False,
         }
         if exact_matches:
@@ -803,11 +771,7 @@ def _run_template(args: argparse.Namespace) -> int:
                 "violations": violations,
             }
     _print_result(result, as_json=args.json)
-    return (
-        1
-        if result.get("verification", {}).get("status") == "error"
-        else 0
-    )
+    return 1 if result.get("verification", {}).get("status") == "error" else 0
 
 
 def _run_profile(args: argparse.Namespace) -> int:
@@ -830,64 +794,80 @@ def _run_profile(args: argparse.Namespace) -> int:
             "require an explicit runpod-up --ttl override",
             code="profile_ttl_too_long",
         )
-    if args.template_id is not None:
-        if args.runtime is None or args.image is not None:
-            raise RunpodLocalError(
-                "template-backed profile requires --runtime and rejects "
-                "--image",
-                code="invalid_profile_source",
-            )
-    elif args.runtime is not None or args.image is None:
-        raise RunpodLocalError(
-            "direct-image profile requires --image and rejects --runtime",
-            code="invalid_profile_source",
-        )
     environment = _parse_environment(args.env)
     public_key_path, public_key = load_ssh_public_key_file(
         args.public_key_file or f"{args.identity_file}.pub"
     )
     validate_ssh_identity_file(args.identity_file)
     validate_ssh_key_pair(args.identity_file, public_key)
-    template_contract = None
-    runtime_id = None
-    image_name = args.image
-    if args.template_id is not None:
-        runtime = load_runtime(args.runtime)
-        template_contract = _api(args).get_template(args.template_id)
-        try:
-            template_contract = validate_private_template_contract(
-                template_contract,
-                require_id=True,
-            )
-        except RunpodLocalError as error:
-            raise RunpodLocalError(
-                "profile template is not an exact private Pod-template "
-                "overlay",
-                code="template_contract_drift",
-            ) from error
-        expected_template = runtime.template_contract(
-            name=template_contract["name"],
-            template_id=args.template_id,
-        )
-        if template_contract_violations(
+    template_contract = _api(args).get_template(args.template_id)
+    try:
+        template_contract = validate_private_template_contract(
             template_contract,
-            expected_template,
+            require_id=True,
+        )
+    except RunpodLocalError as error:
+        raise RunpodLocalError(
+            "profile template is not an exact private Pod-template overlay",
+            code="template_contract_drift",
+        ) from error
+    if template_contract["id"] != args.template_id:
+        raise RunpodLocalError(
+            "profile template response has the wrong provider identity",
+            code="template_contract_drift",
+        )
+    expected_template_contract = build_generic_host_template(
+        name=template_contract["name"],
+        image=template_contract["image"],
+        container_disk_gb=template_contract["container_disk_gb"],
+        template_id=template_contract["id"],
+    )
+    if template_contract_violations(
+        template_contract,
+        expected_template_contract,
+    ):
+        raise RunpodLocalError(
+            "profile template does not carry the reviewed generic SSH "
+            "overlay",
+            code="template_contract_drift",
+        )
+    image_name = template_contract["image"]
+    stock = _api(args).stock(
+        gpu_count=args.gpu_count,
+        secure_cloud=True,
+        include_data_centers=False,
+    )
+    gpu_memory_gb_by_type: dict[str, float] = {}
+    for requested_gpu_id in args.gpu:
+        matches = [
+            gpu for gpu in stock["gpus"] if gpu.get("gpu_id") == requested_gpu_id
+        ]
+        if len(matches) != 1:
+            raise RunpodLocalError(
+                f"profile GPU must be one exact provider GPU ID: {requested_gpu_id}",
+                code="invalid_profile_gpu",
+            )
+        memory_gb = matches[0].get("memory_gb")
+        if (
+            isinstance(memory_gb, bool)
+            or not isinstance(memory_gb, (int, float))
+            or not math.isfinite(memory_gb)
+            or memory_gb <= 0
         ):
             raise RunpodLocalError(
-                "profile template drifted from the selected reviewed runtime",
-                code="template_contract_drift",
+                f"provider GPU has no valid memory capacity: {requested_gpu_id}",
+                code="invalid_profile_gpu",
             )
-        runtime_id = runtime.runtime_id
-        image_name = runtime.image
+        gpu_memory_gb_by_type[requested_gpu_id] = float(memory_gb)
     profile = create_profile(
         name=args.name,
-        gpu_names=args.gpu,
+        gpu_type_ids=args.gpu,
+        gpu_memory_gb_by_type=gpu_memory_gb_by_type,
         max_hourly_usd=args.max_hourly,
         default_ttl_seconds=default_ttl_seconds,
         image_name=image_name,
         template_id=args.template_id,
         template_contract=template_contract,
-        runtime_id=runtime_id,
         network_volume_id=args.network_volume_id,
         ephemeral=args.ephemeral,
         container_disk_gb=args.container_disk_gb,

@@ -1,0 +1,449 @@
+"""Config-only model-service boundary tests."""
+
+from __future__ import annotations
+
+import json
+import pathlib
+import stat
+import tempfile
+import unittest
+
+from model_lab.runtime_catalog import load_runtime
+from model_lab.service_bundle import build_service_bundle_plan
+from model_lab.service_definition import (
+    ServiceDefinition,
+    load_service,
+    parse_service_toml,
+)
+from model_lab.service_huggingface import (
+    HuggingFaceClosure,
+    HuggingFaceClosureFile,
+)
+from model_lab.service_planner import (
+    build_service_deployment_plan,
+    build_service_validation,
+)
+from model_lab.service_vllm import build_vllm_argv
+from model_lab_service_test_fixture import (
+    SERVICE_FIXTURE,
+    SOURCE_SERVICE_FIXTURE,
+)
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+FIXTURE_ROOT = ROOT / "test" / "fixtures" / "model-lab-services"
+SECOND_SERVICE = SERVICE_FIXTURE
+SERVICE_ID = "fixture-dense-text"
+MODEL_REPOSITORY = "fixture-org/fixture-dense-text-7b"
+MODEL_REVISION = "2222222222222222222222222222222222222222"
+COMPARISON_SERVICE_ID = "fixture-dense-chat"
+COMPARISON_MODEL_REPOSITORY = "fixture-org/fixture-dense-chat-13b"
+COMPARISON_MODEL_REVISION = "3333333333333333333333333333333333333333"
+
+
+def flag_value(arguments: list[str], flag: str) -> str:
+    position = arguments.index(flag)
+    return arguments[position + 1]
+
+
+def comparison_payload(payload: bytes) -> bytes:
+    return (
+        payload.replace(
+            b'service_id = "fixture-dense-text"',
+            b'service_id = "fixture-dense-chat"',
+            1,
+        )
+        .replace(
+            b'repository = "fixture-org/fixture-dense-text-7b"',
+            b'repository = "fixture-org/fixture-dense-chat-13b"',
+            1,
+        )
+        .replace(
+            b'revision = "2222222222222222222222222222222222222222"',
+            b'revision = "3333333333333333333333333333333333333333"',
+            1,
+        )
+        .replace(
+            b"max_model_len = 8192",
+            b"max_model_len = 4096",
+            1,
+        )
+        .replace(
+            b"prefix_caching = true",
+            b"prefix_caching = false",
+            1,
+        )
+    )
+
+
+def closure_for_service(
+    definition: ServiceDefinition,
+    *,
+    identity_digit: str,
+) -> HuggingFaceClosure:
+    model = definition.normalized_plan()["model"]
+    checkpoint = model["checkpoint"]
+    if not isinstance(checkpoint, str):
+        raise TypeError("acceptance fixture requires a checkpoint")
+    return HuggingFaceClosure(
+        repository=model["repository"],
+        revision=model["revision"],
+        requested_selector=checkpoint,
+        resolved_index=None,
+        weight_files=(checkpoint,),
+        files=(
+            HuggingFaceClosureFile(
+                path="config.json",
+                bytes=128,
+                role="snapshot",
+                identity_algorithm="git-blob-sha1",
+                identity_digest=identity_digit * 40,
+            ),
+            HuggingFaceClosureFile(
+                path=checkpoint,
+                bytes=1024,
+                role="checkpoint-weight",
+                identity_algorithm="sha256",
+                identity_digest=identity_digit * 64,
+            ),
+        ),
+    )
+
+
+class ConfigOnlySecondServiceAcceptanceTest(unittest.TestCase):
+    def test_fixture_is_one_nonexecutable_configuration_file(self):
+        entries = list(FIXTURE_ROOT.iterdir())
+
+        self.assertEqual(entries, [SOURCE_SERVICE_FIXTURE])
+        metadata = SOURCE_SERVICE_FIXTURE.lstat()
+        self.assertTrue(stat.S_ISREG(metadata.st_mode))
+        self.assertFalse(stat.S_ISLNK(metadata.st_mode))
+        self.assertEqual(stat.S_IMODE(metadata.st_mode) & 0o111, 0)
+        self.assertEqual(SOURCE_SERVICE_FIXTURE.suffix, ".toml")
+
+    def test_config_alone_defines_a_distinct_vllm_launch(self):
+        fixture_root_before = FIXTURE_ROOT.lstat()
+        fixture_entries_before = {
+            path.name: path.lstat() for path in FIXTURE_ROOT.iterdir()
+        }
+        definition = load_service(SECOND_SERVICE)
+        plan = definition.normalized_plan()
+
+        self.assertEqual(plan["schema"], "model-lab.service-plan.v1")
+        self.assertEqual(plan["service_id"], SERVICE_ID)
+        self.assertEqual(plan["driver"], "vllm-openai.v1")
+        self.assertEqual(plan["runtime_id"], "vllm-cu129-v0.25.1")
+        self.assertEqual(plan["model"]["repository"], MODEL_REPOSITORY)
+        self.assertEqual(plan["model"]["revision"], MODEL_REVISION)
+        self.assertEqual(
+            plan["model"]["checkpoint"],
+            "model.safetensors",
+        )
+        self.assertNotIn("closure_sha256", plan["model"])
+        self.assertFalse(plan["endpoint"]["reasoning"])
+        self.assertEqual(
+            plan["compatibility"]["minimum_compute_capability"],
+            [8, 0],
+        )
+        self.assertIsNone(plan["vllm"]["quantization"])
+        self.assertIsNone(plan["vllm"]["reasoning_parser"])
+        self.assertIsNone(plan["vllm"]["tool_call_parser"])
+        self.assertIsNone(plan["vllm"]["speculative_config"])
+        self.assertIs(plan["vllm"]["auto_tool_choice"], False)
+        self.assertEqual(plan["vllm"]["model_implementation"], "vllm")
+        self.assertEqual(plan["vllm"]["load_format"], "safetensors")
+
+        model_path = "/root/runpod-session/models/resolved-fixture-snapshot"
+        arguments = list(
+            build_vllm_argv(
+                definition,
+                model_path=model_path,
+                remote_port=8123,
+            )
+        )
+        self.assertEqual(
+            arguments[:3],
+            ["/usr/local/bin/vllm", "serve", model_path],
+        )
+        self.assertNotIn("model.safetensors", arguments)
+        self.assertEqual(
+            flag_value(arguments, "--served-model-name"),
+            SERVICE_ID,
+        )
+        self.assertEqual(flag_value(arguments, "--host"), "127.0.0.1")
+        self.assertEqual(flag_value(arguments, "--port"), "8123")
+        self.assertEqual(
+            flag_value(arguments, "--api-key"),
+            "model-session-local-no-secret",
+        )
+        self.assertEqual(flag_value(arguments, "--max-model-len"), "8192")
+        self.assertEqual(flag_value(arguments, "--max-num-seqs"), "2")
+        self.assertEqual(flag_value(arguments, "--model-impl"), "vllm")
+        self.assertEqual(
+            flag_value(arguments, "--load-format"),
+            "safetensors",
+        )
+        self.assertIn("--enable-prefix-caching", arguments)
+        for omitted_flag in (
+            "--quantization",
+            "--reasoning-parser",
+            "--tool-call-parser",
+            "--enable-auto-tool-choice",
+            "--speculative-config",
+        ):
+            with self.subTest(omitted_flag=omitted_flag):
+                self.assertNotIn(omitted_flag, arguments)
+        self.assertFalse(
+            any(argument.endswith((".py", ".sh")) for argument in arguments)
+        )
+        fixture_entries_after = {
+            path.name: path.lstat() for path in FIXTURE_ROOT.iterdir()
+        }
+        fixture_root_after = FIXTURE_ROOT.lstat()
+        self.assertEqual(
+            (
+                fixture_root_after.st_dev,
+                fixture_root_after.st_ino,
+                fixture_root_after.st_mtime_ns,
+                fixture_root_after.st_ctime_ns,
+            ),
+            (
+                fixture_root_before.st_dev,
+                fixture_root_before.st_ino,
+                fixture_root_before.st_mtime_ns,
+                fixture_root_before.st_ctime_ns,
+            ),
+        )
+        self.assertEqual(
+            set(fixture_entries_after),
+            set(fixture_entries_before),
+        )
+        for name, before in fixture_entries_before.items():
+            after = fixture_entries_after[name]
+            self.assertEqual(
+                (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns),
+                (
+                    before.st_dev,
+                    before.st_ino,
+                    before.st_size,
+                    before.st_mtime_ns,
+                ),
+            )
+
+    def test_definition_identity_depends_on_config_not_its_path(self):
+        payload = SECOND_SERVICE.read_bytes()
+        from_file = load_service(SECOND_SERVICE)
+        from_memory = parse_service_toml(
+            payload,
+            source="<second-service-fixture>",
+        )
+        changed = parse_service_toml(
+            payload.replace(
+                b'service_id = "fixture-dense-text"',
+                b'service_id = "fixture-dense-chat"',
+                1,
+            ),
+            source="<changed-service-fixture>",
+        )
+
+        self.assertEqual(
+            from_file.normalized_plan(),
+            from_memory.normalized_plan(),
+        )
+        self.assertEqual(from_file.plan_sha256, from_memory.plan_sha256)
+        self.assertNotEqual(from_file.plan_sha256, changed.plan_sha256)
+
+    def test_two_configs_use_the_same_generic_planner(self):
+        runtime = load_runtime("vllm-cu129-v0.25.1")
+        second_definition = load_service(SECOND_SERVICE)
+        validation = build_service_validation(
+            second_definition,
+            source_path=SECOND_SERVICE,
+            runtime=runtime.safe_summary(),
+        )
+        self.assertEqual(
+            validation["schema_version"],
+            "model-lab.service-validation.v1",
+        )
+        self.assertIs(validation["valid"], True)
+        self.assertEqual(validation["service"]["service_id"], SERVICE_ID)
+
+        payload = SECOND_SERVICE.read_bytes()
+        with tempfile.TemporaryDirectory() as directory:
+            comparison_path = pathlib.Path(directory) / "comparison.toml"
+            comparison_path.write_bytes(comparison_payload(payload))
+            comparison_path.chmod(0o644)
+            comparison_definition = load_service(comparison_path)
+            second_plan = build_service_deployment_plan(
+                second_definition,
+                source_path=SECOND_SERVICE,
+                source_root=ROOT,
+                runtime=runtime.safe_summary(),
+                remote_port=8123,
+            )
+            comparison_plan = build_service_deployment_plan(
+                comparison_definition,
+                source_path=comparison_path,
+                source_root=ROOT,
+                runtime=runtime.safe_summary(),
+                remote_port=8123,
+            )
+
+        self.assertEqual(
+            second_plan["schema_version"],
+            "model-lab.service-deployment-plan.v1",
+        )
+        self.assertIs(second_plan["executed"], False)
+        self.assertEqual(
+            second_plan["planning_source_closure"]["schema_version"],
+            "model-lab.service-planning-source.v1",
+        )
+        self.assertEqual(
+            second_plan["deployment"]["schema_version"],
+            "model-lab.vllm-openai-deployment-plan.v1",
+        )
+        self.assertEqual(
+            second_plan["planning_source_closure"],
+            comparison_plan["planning_source_closure"],
+        )
+        self.assertNotIn("controller_bundle", second_plan)
+        self.assertEqual(
+            second_plan["remote_controller_requirement"]["status"],
+            "available-after-materialization",
+        )
+        self.assertIs(
+            second_plan["remote_controller_requirement"][
+                "generic_implementation_required"
+            ],
+            False,
+        )
+        self.assertEqual(
+            second_plan["remote_controller_requirement"]["authored_remote_input_count"],
+            0,
+        )
+        self.assertEqual(
+            second_plan["remote_controller_requirement"][
+                "generated_deployment_manifest_count"
+            ],
+            1,
+        )
+        self.assertEqual(second_plan["config_input"]["companion_inputs"], 0)
+        self.assertEqual(
+            second_plan["config_input"]["scope"],
+            "local-planning-only",
+        )
+        self.assertNotEqual(
+            second_plan["config_input"]["sha256"],
+            comparison_plan["config_input"]["sha256"],
+        )
+        self.assertEqual(
+            second_plan["config_input"]["remote_path"],
+            comparison_plan["config_input"]["remote_path"],
+        )
+        self.assertNotEqual(
+            second_plan["deployment"]["manifest_path_template"],
+            comparison_plan["deployment"]["manifest_path_template"],
+        )
+        self.assertNotEqual(
+            second_plan["deployment"]["service_root"],
+            comparison_plan["deployment"]["service_root"],
+        )
+        self.assertNotEqual(
+            second_plan["deployment"]["launch"]["compile_affecting_sha256"],
+            comparison_plan["deployment"]["launch"]["compile_affecting_sha256"],
+        )
+        self.assertEqual(
+            second_plan["deployment"]["launch"]["compile_affecting_sha256"],
+            second_plan["deployment"]["compile_cache_identity_inputs"][
+                "compile_affecting_launch_sha256"
+            ],
+        )
+        generic_planner = json.dumps(
+            second_plan["planning_source_closure"],
+            sort_keys=True,
+        )
+        for service_specific_value in (
+            SERVICE_ID,
+            MODEL_REPOSITORY,
+            MODEL_REVISION,
+            COMPARISON_SERVICE_ID,
+            COMPARISON_MODEL_REPOSITORY,
+            COMPARISON_MODEL_REVISION,
+        ):
+            with self.subTest(service_specific_value=service_specific_value):
+                self.assertNotIn(service_specific_value, generic_planner)
+
+    def test_two_configs_bundle_with_one_generic_implementation(self):
+        first_definition = load_service(SECOND_SERVICE)
+        runtime = load_runtime("vllm-cu129-v0.25.1")
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            second_config = root / "comparison.toml"
+            second_config.write_bytes(comparison_payload(SECOND_SERVICE.read_bytes()))
+            second_config.chmod(0o600)
+            second_definition = load_service(second_config)
+            first = build_service_bundle_plan(
+                first_definition,
+                source_root=ROOT,
+                runtime=runtime,
+                closure=closure_for_service(
+                    first_definition,
+                    identity_digit="8",
+                ),
+                remote_port=8123,
+            )
+            second = build_service_bundle_plan(
+                second_definition,
+                source_root=ROOT,
+                runtime=runtime,
+                closure=closure_for_service(
+                    second_definition,
+                    identity_digit="9",
+                ),
+                remote_port=8123,
+            )
+
+        self.assertEqual(
+            first["schema_version"],
+            "model-lab.service-bundle-plan.v1",
+        )
+        self.assertIs(first["executed"], False)
+        self.assertEqual(
+            first["implementation_bundle"],
+            second["implementation_bundle"],
+        )
+        self.assertNotEqual(
+            first["deployment_manifest"],
+            second["deployment_manifest"],
+        )
+        for result in (first, second):
+            with self.subTest(manifest=result["deployment_manifest"]["sha256"]):
+                self.assertEqual(
+                    result["deployment_manifest"]["mode"],
+                    "0600",
+                )
+                self.assertTrue(
+                    result["implementation_bundle"]["entrypoint"].endswith(
+                        "/bin/model-lab-service-runtime"
+                    )
+                )
+
+    def test_fixture_identity_is_absent_from_reusable_executable_sources(self):
+        production_sources = [
+            *sorted((ROOT / "lib" / "model_lab").glob("*.py")),
+            *sorted((ROOT / "bin").glob("model-lab*")),
+            *sorted((ROOT / "model-lab").rglob("*.py")),
+            *sorted((ROOT / "model-lab").rglob("*.sh")),
+        ]
+        needles = (SERVICE_ID, MODEL_REPOSITORY, MODEL_REVISION)
+
+        for path in production_sources:
+            if not path.is_file():
+                continue
+            source = path.read_text(encoding="utf-8")
+            for needle in needles:
+                with self.subTest(path=path, needle=needle):
+                    self.assertNotIn(needle, source)
+
+
+if __name__ == "__main__":
+    unittest.main()

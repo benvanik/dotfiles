@@ -13,6 +13,7 @@ from runpod_local.allocation import (
 )
 from runpod_local.api import normalize_pod
 from runpod_local.errors import HttpRequestError, RunpodLocalError
+from runpod_local.host_template import build_generic_host_template
 from runpod_local.instances import (
     InstanceStore,
     json_document_hash,
@@ -24,9 +25,10 @@ from runpod_local.profile import (
     create_profile,
     provider_effective_environment_summary,
 )
-from runpod_local.runtime_catalog import load_runtime
 from runpod_local.state import StateStore
-from runpod_local.template import environment_summary
+from runpod_local.template import (
+    environment_summary,
+)
 from runpod_local.timeutil import parse_utc_timestamp
 
 GPU_ID = "NVIDIA RTX PRO 6000 Blackwell Server Edition"
@@ -41,17 +43,29 @@ IMAGE = (
     "runpod/pytorch@sha256:"
     "1111111111111111111111111111111111111111111111111111111111111111"
 )
-RUNTIME_ID = "vllm-cu129-v0.25.1"
-RUNTIME = load_runtime(RUNTIME_ID)
+TEMPLATE_IMAGE = "runpod/pytorch@sha256:" + "2" * 64
+GPU_MEMORY_GB_BY_TYPE = {
+    GPU_ID: 96.0,
+    "NVIDIA H200": 141.0,
+}
 
 
 def profile(**overrides):
+    contract = build_generic_host_template(
+        name="generic-host",
+        image=IMAGE,
+        container_disk_gb=50,
+        template_id="template-default",
+    )
     arguments = {
         "name": "pro-dev",
-        "gpu_names": ["pro6000", "h200"],
+        "gpu_type_ids": [GPU_ID, "NVIDIA H200"],
+        "gpu_memory_gb_by_type": GPU_MEMORY_GB_BY_TYPE,
         "max_hourly_usd": 3.0,
         "default_ttl_seconds": 3600,
         "image_name": IMAGE,
+        "template_id": "template-default",
+        "template_contract": contract,
         "network_volume_id": "volume123",
         "ssh_public_key": SSH_PUBLIC_KEY,
     }
@@ -60,15 +74,16 @@ def profile(**overrides):
 
 
 def template_profile(**overrides):
-    contract = RUNTIME.template_contract(
+    contract = build_generic_host_template(
         name="upstream-runtime",
+        image=TEMPLATE_IMAGE,
+        container_disk_gb=50,
         template_id="template123",
     )
     arguments = {
-        "image_name": RUNTIME.image,
+        "image_name": TEMPLATE_IMAGE,
         "template_id": "template123",
         "template_contract": contract,
-        "runtime_id": RUNTIME_ID,
     }
     arguments.update(overrides)
     return profile(**arguments)
@@ -296,6 +311,8 @@ class LifecycleTest(unittest.TestCase):
         self.identity.chmod(0o600)
         self.launch_profile = profile(identity_file=str(self.identity))
         self.api = FakeApi()
+        template = self.launch_profile["pod"]["template_contract"]
+        self.api.templates[template["id"]] = template
         self.clock = MutableClock()
         self.manager = LifecycleManager(
             self.api,
@@ -380,6 +397,10 @@ class LifecycleTest(unittest.TestCase):
             self.assertEqual(
                 record["pod_payload"]["dataCenterId"],
                 "US-NC-2",
+            )
+            self.assertEqual(
+                record["expected"]["gpu_memory_gb"],
+                96.0,
             )
 
         self.api.before_attest = delay_account_attestation
@@ -508,6 +529,82 @@ class LifecycleTest(unittest.TestCase):
         )
         self.assertEqual(self.api.create_calls, 1)
         self.assertEqual(self.api.pods, [])
+
+    def test_expected_operation_guard_never_recreates_terminal_host(self):
+        launched = self.launch()
+        self.manager.terminate(
+            "compiler",
+            execute=True,
+            reason="operator",
+        )
+        self.manager.uuid_factory = lambda: uuid.UUID(
+            "87654321-4321-4321-8321-ba9876543210"
+        )
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            self.launch(expected_operation_id=launched["operation_id"])
+
+        self.assertEqual(caught.exception.code, "instance_operation_changed")
+        self.assertEqual(self.api.create_calls, 1)
+        self.assertEqual(self.api.pods, [])
+
+    def test_absence_guard_rejects_receipt_that_appeared_before_launch(self):
+        self.launch()
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            self.launch(require_absent=True)
+
+        self.assertEqual(caught.exception.code, "instance_operation_changed")
+        self.assertEqual(self.api.create_calls, 1)
+
+    def test_exact_target_operation_creates_or_resumes_only_that_identity(self):
+        target_operation_id = "87654321-4321-4321-8321-ba9876543210"
+
+        first = self.launch(target_operation_id=target_operation_id)
+        second = self.launch(target_operation_id=target_operation_id)
+
+        self.assertEqual(first["operation_id"], target_operation_id)
+        self.assertEqual(second["operation_id"], target_operation_id)
+        self.assertEqual(self.api.create_calls, 1)
+
+    def test_exact_target_rejects_host_name_reused_by_another_operation(self):
+        target_operation_id = "87654321-4321-4321-8321-ba9876543210"
+        launched = self.launch(target_operation_id=target_operation_id)
+        self.manager.terminate(
+            "compiler",
+            execute=True,
+            reason="operator",
+        )
+        replacement_operation_id = "22345678-1234-4234-8234-123456789abc"
+        self.manager.uuid_factory = lambda: uuid.UUID(
+            replacement_operation_id
+        )
+        self.launch()
+
+        with self.assertRaises(RunpodLocalError) as caught:
+            self.launch(
+                target_operation_id=launched["operation_id"],
+            )
+
+        self.assertEqual(caught.exception.code, "instance_operation_changed")
+        self.assertEqual(self.api.create_calls, 2)
+
+    def test_exact_target_can_replace_only_its_recorded_predecessor(self):
+        predecessor = self.launch()
+        self.manager.terminate(
+            "compiler",
+            execute=True,
+            reason="operator",
+        )
+        target_operation_id = "87654321-4321-4321-8321-ba9876543210"
+
+        replacement = self.launch(
+            target_operation_id=target_operation_id,
+            predecessor_operation_id=predecessor["operation_id"],
+        )
+
+        self.assertEqual(replacement["operation_id"], target_operation_id)
+        self.assertEqual(self.api.create_calls, 2)
 
     def test_terminal_reuse_rejects_distinct_id_with_retained_name_prefix(self):
         self.launch()
@@ -964,11 +1061,9 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual(
             record["expected"]["template_contract"], contract
         )
-        self.assertEqual(record["expected"]["image"], RUNTIME.image)
-        self.assertEqual(
-            record["expected"]["runtime"]["runtime_id"],
-            RUNTIME_ID,
-        )
+        self.assertEqual(record["expected"]["image"], TEMPLATE_IMAGE)
+        self.assertNotIn("runtime", record["expected"])
+        self.assertNotIn("model", record)
         self.assertEqual(record["expected"]["volume_in_gb"], 0)
         self.assertEqual(record["provider"]["volume_in_gb"], 0)
         self.assertNotIn("docker_entrypoint", record["provider"])
@@ -1936,6 +2031,53 @@ class LifecycleTest(unittest.TestCase):
 
         self.assertTrue(result["actions"][0]["executed"])
         self.assertEqual(self.api.delete_calls, ["pod123"])
+
+    def test_ttl_enforcement_isolates_malformed_instance_receipt(self):
+        record = self.launch()
+        self.state.write(
+            "instances",
+            "broken",
+            {"schema_version": "not-an-instance-receipt"},
+        )
+        self.clock.now = parse_utc_timestamp(record["lease"]["expires_at"])
+
+        result = self.manager.enforce_ttl(execute=True)
+
+        actions = {
+            action["instance_name"]: action
+            for action in result["actions"]
+        }
+        self.assertEqual(
+            actions["broken"]["reasons"],
+            ["invalid_instance_state"],
+        )
+        self.assertEqual(
+            actions["broken"]["error"]["code"],
+            "invalid_instance_record",
+        )
+        self.assertFalse(actions["broken"]["executed"])
+        self.assertTrue(actions["compiler"]["executed"])
+        self.assertEqual(self.api.delete_calls, ["pod123"])
+
+    def test_ttl_enforcement_cannot_terminate_a_claimed_host(self):
+        record = self.launch()
+        self.clock.now = parse_utc_timestamp(record["lease"]["expires_at"])
+
+        result = self.manager.enforce_ttl(
+            execute=True,
+            protected_instance_names={"compiler"},
+        )
+
+        self.assertEqual(len(result["actions"]), 1)
+        action = result["actions"][0]
+        self.assertTrue(action["blocked_by_active_claims"])
+        self.assertFalse(action["executed"])
+        self.assertEqual(action["error"]["code"], "host_has_active_claims")
+        self.assertEqual(self.api.delete_calls, [])
+        self.assertEqual(
+            InstanceStore(self.state).load("compiler")["phase"],
+            "active",
+        )
 
     def test_failed_ttl_delete_is_retried_until_receipt_is_terminal(self):
         record = self.launch()

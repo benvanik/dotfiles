@@ -25,6 +25,7 @@ from model_session.attachment import (
     publish_inference_attachment as _publish_inference_attachment,
 )
 from model_session.service_endpoint import (
+    inspect_service_publication,
     load_service_endpoint,
     parse_service_workload,
     publish_service_endpoint,
@@ -1491,6 +1492,52 @@ class ModelSessionServiceEndpointTest(unittest.TestCase):
 
             self.assertFalse(endpoint.receipt_path.exists())
             self.assertTrue(socket_path.exists())
+
+    def test_administrative_inspection_authenticates_stale_dead_publication(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime_root = pathlib.Path(directory) / "runtime"
+            runtime_root.mkdir(mode=0o700)
+            services = runtime_root / "services"
+            services.mkdir(mode=0o700)
+            socket_path = services / "shared-service.sock"
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+                listener.bind(os.fspath(socket_path))
+                listener.listen(1)
+                socket_path.chmod(0o600)
+                endpoint = publish_service_endpoint(
+                    "shared-service",
+                    service_sha256="b" * 64,
+                    workload=self.workload(),
+                    input_modalities=("text",),
+                    ttl_seconds=1,
+                    socket_path=socket_path,
+                    runtime_root=runtime_root,
+                    clock=lambda: NOW,
+                )
+            _rewrite_receipt(
+                endpoint.receipt_path,
+                lambda value: value.update(
+                    {"boot_id": "11111111-1111-4111-8111-111111111111"}
+                ),
+                recompute_payload_hash=True,
+            )
+
+            inspected = inspect_service_publication(
+                "shared-service",
+                runtime_root=runtime_root,
+            )
+
+            self.assertIsNotNone(inspected)
+            assert inspected is not None
+            self.assertEqual(inspected.publication_id, endpoint.publication_id)
+            revoke_service_endpoint(
+                "shared-service",
+                inspected.publication_id,
+                runtime_root=runtime_root,
+            )
+            self.assertFalse(endpoint.receipt_path.exists())
 
     def test_stale_revoke_cannot_remove_a_newer_publication(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

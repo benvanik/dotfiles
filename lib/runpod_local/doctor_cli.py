@@ -9,7 +9,8 @@ from typing import Any
 from .auth import CredentialStore
 from .doctor import run_doctor
 from .output import print_json
-from .paths import credentials_file, state_root
+from .paths import credentials_file, runpod_root, state_root
+from .profile import ProfileStore
 from .state import StateStore
 
 
@@ -23,7 +24,12 @@ def add_doctor_parser(subparsers: Any) -> None:
     parser.add_argument(
         "--state-root",
         metavar="PATH",
-        help="Override RUNPOD_HOME (default: ~/.local/runpod).",
+        help="Override RUNPOD_STATE_HOME for machine receipts and locks.",
+    )
+    parser.add_argument(
+        "--runpod-root",
+        metavar="PATH",
+        help="Override RUNPOD_ROOT for portable authored configuration.",
     )
     parser.add_argument(
         "--credentials-file",
@@ -51,6 +57,7 @@ def run_doctor_command(args: argparse.Namespace) -> int:
     )
     result = run_doctor(
         state=StateStore(state_root(args.state_root)),
+        profiles=ProfileStore(runpod_root(args.runpod_root)),
         credential_store=CredentialStore(credential_path),
         live=args.live,
     )

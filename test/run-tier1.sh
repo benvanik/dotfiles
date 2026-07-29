@@ -1,6 +1,6 @@
 #!/bin/bash
 # ~/.dotfiles/test/run-tier1.sh - Fast local validation tests
-# Runs in <5 seconds with no external dependencies (shellcheck optional).
+# Runs quickly with no external or provider dependencies (shellcheck optional).
 set -e
 
 DOTFILES="${DOTFILES:-$HOME/.dotfiles}"
@@ -105,9 +105,21 @@ section "python" "Python command validation"
 if command -v python3 &>/dev/null; then
     if PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$DOTFILES/lib" \
         python3 -m unittest discover -s test -p 'test_runpod_*.py'; then
-        pass "Runpod command tests"
+        pass "RunPod host-control tests"
     else
-        fail "Runpod command tests"
+        fail "RunPod host-control tests"
+    fi
+    if PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$DOTFILES/lib" \
+        python3 -m unittest discover -s test -p 'test_model_session_*.py'; then
+        pass "Model-session isolation tests"
+    else
+        fail "Model-session isolation tests"
+    fi
+    if PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$DOTFILES/lib" \
+        python3 -m unittest discover -s test -p 'test_model_lab_*.py'; then
+        pass "Model-lab orchestration tests"
+    else
+        fail "Model-lab orchestration tests"
     fi
 else
     fail "python3 required for Python commands"

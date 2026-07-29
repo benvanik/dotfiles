@@ -52,7 +52,7 @@ zsh
 The `dotfiles` command provides testing and maintenance:
 
 ```bash
-dotfiles test              # Fast local validation (<5s)
+dotfiles test              # Fast local validation
 dotfiles test --full       # Full Docker-based integration tests
 dotfiles doctor            # Health check (tools, symlinks, configs)
 dotfiles update            # Pull latest changes from git
@@ -67,15 +67,20 @@ Scripts in `bin/` prefixed with project names are optional and can be removed:
 | Prefix | Project | Purpose |
 |--------|---------|---------|
 | `iree-*` | [IREE](https://github.com/iree-org/iree) | Compiler worktree and build management |
-| `runpod-*` | [Runpod](https://www.runpod.io/) | Private GPU model planning and session lifecycle |
+| `runpod*` | [RunPod](https://www.runpod.io/) | Generic GPU hosts, claims, SSH, and billing lifetime |
+| `model-lab*` | Model lab | Private model services and isolated Pi sessions |
 | `therock-*` | [TheRock](https://github.com/ROCm/TheRock) | ROCm/HIP compiler development |
 | `vulkan-*` | Vulkan SDK | SDK installation and layer building |
 
 These scripts assume specific directory layouts (`~/src/iree/`, `~/src/rocm/`, etc.).
 If you don't work on these projects, delete the scripts or ignore them.
 
-The Runpod command suite has its own security, storage, lifecycle, and
-agent-operation guide in [`runpod/README.md`](runpod/README.md).
+The two GPU layers have separate ownership and operating guides:
+
+- [`runpod/README.md`](runpod/README.md) covers provider resources, generic
+  hosts, resource claims, SSH, and host retirement.
+- [`model-lab/README.md`](model-lab/README.md) covers Hugging Face models,
+  serving, caches, service idle lifetime, profiles, and isolated Pi sessions.
 
 ## Platform Support
 

@@ -5,21 +5,19 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import json
 import math
 import os
 import pathlib
 import re
 import stat
 import subprocess
+import tempfile
+import tomllib
 from typing import Any
 
 from .errors import RunpodLocalError
-from .huggingface_credentials import REMOTE_HF_TOKEN_PATH
-from .placement import load_hardware_catalog, select_hardware
-from .runtime_catalog import (
-    load_runtime,
-    validate_runtime_identity,
-)
+from .host_template import build_generic_host_template
 from .state import StateStore, validate_record_name
 from .template import (
     environment_summary,
@@ -29,7 +27,7 @@ from .template import (
 )
 from .timeutil import parse_duration, parse_utc_timestamp, utc_timestamp
 
-PROFILE_SCHEMA = "runpod.profile.v2"
+PROFILE_SCHEMA = "runpod.host-profile.v1"
 DEFAULT_PROFILE_HARD_TTL = "30m"
 MAX_IMPLICIT_HARD_TTL_SECONDS = parse_duration(DEFAULT_PROFILE_HARD_TTL)
 PROVIDER_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,191}$")
@@ -41,14 +39,7 @@ SENSITIVE_ENVIRONMENT_PATTERN = re.compile(
     r"(?:^|_)(?:TOKEN|KEY|SECRET|PASSWORD|CREDENTIALS?)(?:_|$)",
     re.IGNORECASE,
 )
-NONSECRET_SENSITIVE_ENVIRONMENT_NAMES = {
-    "HF_TOKEN_PATH",
-    "SSH_PUBLIC_KEY",
-}
-FORBIDDEN_HUGGING_FACE_CREDENTIAL_ENVIRONMENT_NAMES = {
-    "HF_TOKEN",
-    "HUGGING_FACE_HUB_TOKEN",
-}
+NONSECRET_SENSITIVE_ENVIRONMENT_NAMES = {"SSH_PUBLIC_KEY"}
 FORBIDDEN_REMOTE_SHELL_ENVIRONMENT_NAMES = {
     "BASHOPTS",
     "BASH_ENV",
@@ -65,19 +56,7 @@ FORBIDDEN_DYNAMIC_LOADER_ENVIRONMENT_NAMES = {
     "LOCPATH",
 }
 UNSAFE_RUNPOD_ENVIRONMENT_VALUE_CHARACTERS = frozenset('"$\\`')
-DEFAULT_CACHE_ENVIRONMENT = {
-    "HF_ASSETS_CACHE": "/workspace/.cache/huggingface/assets",
-    "HF_HOME": "/workspace/.cache/huggingface",
-    "HF_HUB_CACHE": "/workspace/.cache/huggingface/hub",
-    "HF_HUB_DISABLE_TELEMETRY": "1",
-    "HF_HUB_DISABLE_UPDATE_CHECK": "1",
-    "HF_TOKEN_PATH": REMOTE_HF_TOKEN_PATH,
-    "HF_XET_CACHE": "/workspace/.cache/huggingface/xet",
-    "HF_XET_HIGH_PERFORMANCE": "1",
-    "TORCH_HOME": "/root/runpod-session/cache/torch",
-    "VLLM_CACHE_ROOT": "/root/runpod-session/cache/vllm",
-    "XDG_CACHE_HOME": "/root/runpod-session/cache",
-}
+RETENTION_MODES = frozenset({"manual", "while-claimed"})
 SSH_PUBLIC_KEY_TYPES = {
     "ssh-ed25519",
     "ssh-rsa",
@@ -94,6 +73,20 @@ def _provider_id(value: str, *, label: str) -> str:
     if not isinstance(value, str) or not PROVIDER_ID_PATTERN.fullmatch(value):
         raise RunpodLocalError(
             f"invalid Runpod {label}: {value!r}",
+            code="invalid_profile",
+        )
+    return value
+
+
+def _gpu_type_id(value: Any) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 4096
+        or not value.isprintable()
+    ):
+        raise RunpodLocalError(
+            f"invalid Runpod GPU type ID: {value!r}",
             code="invalid_profile",
         )
     return value
@@ -195,20 +188,13 @@ def validate_environment(environment: dict[str, str]) -> dict[str, str]:
                 "the expanded value cannot be validated before image startup",
                 code="invalid_profile_environment",
             )
-        if name in FORBIDDEN_HUGGING_FACE_CREDENTIAL_ENVIRONMENT_NAMES:
-            raise RunpodLocalError(
-                f"{name} is reserved; Hugging Face credentials must use the "
-                "ephemeral SSH lease",
-                code="invalid_profile_environment",
-            )
         if (
             name in FORBIDDEN_REMOTE_SHELL_ENVIRONMENT_NAMES
             or name.startswith("LD_")
             or name in FORBIDDEN_DYNAMIC_LOADER_ENVIRONMENT_NAMES
         ):
             raise RunpodLocalError(
-                f"{name} is reserved by the reconciled SSH/runtime control "
-                "plane",
+                f"{name} is reserved by the reconciled SSH control plane",
                 code="invalid_profile_environment",
             )
         if (
@@ -219,11 +205,6 @@ def validate_environment(environment: dict[str, str]) -> dict[str, str]:
                 f"{name} looks sensitive and cannot be stored in a launch "
                 "profile",
                 code="literal_secret_rejected",
-            )
-        if name == "HF_TOKEN_PATH" and value != REMOTE_HF_TOKEN_PATH:
-            raise RunpodLocalError(
-                f"HF_TOKEN_PATH must use ephemeral {REMOTE_HF_TOKEN_PATH}",
-                code="invalid_profile_environment",
             )
         result[name] = value
     return {name: result[name] for name in sorted(result)}
@@ -535,13 +516,13 @@ def validate_ssh_key_pair(
 def create_profile(
     *,
     name: str,
-    gpu_names: list[str],
+    gpu_type_ids: list[str],
+    gpu_memory_gb_by_type: dict[str, float],
     max_hourly_usd: float,
     default_ttl_seconds: int,
     image_name: str | None = None,
     template_id: str | None = None,
     template_contract: dict[str, Any] | None = None,
-    runtime_id: str | None = None,
     network_volume_id: str | None = None,
     ephemeral: bool = False,
     container_disk_gb: int = 50,
@@ -553,59 +534,53 @@ def create_profile(
     public_key_file: str = "~/.ssh/id_ed25519_runpod.pub",
     ssh_public_key: str | None = None,
     environment: dict[str, str] | None = None,
+    retention_mode: str = "manual",
+    empty_grace_seconds: int = 5 * 60,
 ) -> dict[str, Any]:
     validate_record_name(name)
-    runtime = None
-    if template_id is not None:
-        if runtime_id is None:
-            raise RunpodLocalError(
-                "template-backed profile requires a reviewed runtime ID",
-                code="invalid_profile",
-            )
-        runtime = load_runtime(runtime_id)
-        if image_name is None:
-            image_name = runtime.image
-        elif image_name != runtime.image:
-            raise RunpodLocalError(
-                "profile image disagrees with its reviewed runtime",
-                code="invalid_profile",
-            )
-        _provider_id(template_id, label="template ID")
-        try:
-            template_contract = validate_private_template_contract(
-                template_contract,
-                require_id=True,
-            )
-        except RunpodLocalError as error:
-            raise RunpodLocalError(
-                "template-backed profile requires an exact private "
-                "Pod-template contract",
-                code="invalid_profile",
-            ) from error
-        expected_template = runtime.template_contract(
-            name=template_contract["name"],
-            template_id=template_id,
-        )
-        template_mismatches = template_contract_violations(
-            template_contract,
-            expected_template,
-        )
-        if template_contract["container_disk_gb"] != container_disk_gb:
-            template_mismatches.append("container_disk_gb: mismatch")
-        if template_mismatches:
-            raise RunpodLocalError(
-                "profile and template contract disagree on: "
-                + ", ".join(template_mismatches),
-                code="invalid_profile",
-            )
-    elif template_contract is not None or runtime_id is not None:
+    if template_id is None:
         raise RunpodLocalError(
-            "direct-image profile cannot carry a template or runtime contract",
+            "host profile requires a reviewed generic SSH Pod template",
             code="invalid_profile",
         )
-    if image_name is None:
+    _provider_id(template_id, label="template ID")
+    try:
+        template_contract = validate_private_template_contract(
+            template_contract,
+            require_id=True,
+        )
+    except RunpodLocalError as error:
         raise RunpodLocalError(
-            "profile requires an exact immutable image digest",
+            "template-backed profile requires an exact private "
+            "Pod-template contract",
+            code="invalid_profile",
+        ) from error
+    template_mismatches = []
+    if template_contract["id"] != template_id:
+        template_mismatches.append("id: mismatch")
+    if image_name is None:
+        image_name = template_contract["image"]
+    elif image_name != template_contract["image"]:
+        template_mismatches.append("image: mismatch")
+    if template_contract["container_disk_gb"] != container_disk_gb:
+        template_mismatches.append("container_disk_gb: mismatch")
+    expected_template_contract = build_generic_host_template(
+        name=template_contract["name"],
+        image=template_contract["image"],
+        container_disk_gb=template_contract["container_disk_gb"],
+        template_id=template_contract["id"],
+    )
+    if template_contract_violations(
+        template_contract,
+        expected_template_contract,
+    ):
+        template_mismatches.append(
+            "launch_overlay: not the reviewed generic SSH overlay"
+        )
+    if template_mismatches:
+        raise RunpodLocalError(
+            "profile and template contract disagree on: "
+            + ", ".join(template_mismatches),
             code="invalid_profile",
         )
     try:
@@ -625,23 +600,43 @@ def create_profile(
             "profile requires either a network volume ID or explicit ephemeral storage",
             code="invalid_profile",
         )
-    if template_id is not None and network_volume_id is None:
-        raise RunpodLocalError(
-            "template-backed profile requires a separate network volume",
-            code="invalid_profile",
-        )
     if network_volume_id is not None:
         _provider_id(network_volume_id, label="network volume ID")
-    if (
-        not isinstance(gpu_names, list)
-        or not gpu_names
-        or not all(isinstance(gpu_name, str) for gpu_name in gpu_names)
-    ):
+    if not isinstance(gpu_type_ids, list) or not gpu_type_ids:
         raise RunpodLocalError(
             "profile requires at least one GPU",
             code="invalid_profile",
         )
-    selected_gpus = select_hardware(load_hardware_catalog(), gpu_names)
+    normalized_gpu_type_ids = [
+        _gpu_type_id(gpu_type_id) for gpu_type_id in gpu_type_ids
+    ]
+    if len(set(normalized_gpu_type_ids)) != len(normalized_gpu_type_ids):
+        raise RunpodLocalError(
+            "profile GPU type IDs must be unique",
+            code="invalid_profile",
+        )
+    if (
+        not isinstance(gpu_memory_gb_by_type, dict)
+        or set(gpu_memory_gb_by_type) != set(normalized_gpu_type_ids)
+    ):
+        raise RunpodLocalError(
+            "profile requires one VRAM capacity for every GPU type ID",
+            code="invalid_profile",
+        )
+    normalized_gpu_memory = {}
+    for gpu_type_id in sorted(gpu_memory_gb_by_type):
+        memory_gb = gpu_memory_gb_by_type[gpu_type_id]
+        if (
+            not isinstance(memory_gb, (int, float))
+            or isinstance(memory_gb, bool)
+            or not math.isfinite(memory_gb)
+            or memory_gb <= 0
+        ):
+            raise RunpodLocalError(
+                f"profile GPU {gpu_type_id!r} has invalid VRAM capacity",
+                code="invalid_profile",
+            )
+        normalized_gpu_memory[gpu_type_id] = float(memory_gb)
     if not isinstance(gpu_count, int) or isinstance(gpu_count, bool) or gpu_count <= 0:
         raise RunpodLocalError(
             "profile GPU count must be positive",
@@ -687,6 +682,21 @@ def create_profile(
             "profile CPU and RAM floors must be positive",
             code="invalid_profile",
         )
+    if retention_mode not in RETENTION_MODES:
+        raise RunpodLocalError(
+            "profile retention must be manual or while-claimed",
+            code="invalid_profile",
+        )
+    if (
+        not isinstance(empty_grace_seconds, int)
+        or isinstance(empty_grace_seconds, bool)
+        or empty_grace_seconds < 0
+        or empty_grace_seconds > 30 * 24 * 60 * 60
+    ):
+        raise RunpodLocalError(
+            "profile empty-host grace must be from 0 seconds through 30 days",
+            code="invalid_profile",
+        )
     identity_file = _printable_path(identity_file, label="SSH identity")
     public_key_file = _printable_path(
         public_key_file, label="SSH public-key"
@@ -718,7 +728,7 @@ def create_profile(
             "profile environment must be an object",
             code="invalid_profile",
         )
-    merged_environment = dict(DEFAULT_CACHE_ENVIRONMENT)
+    merged_environment: dict[str, str] = {}
     if environment:
         merged_environment.update(environment)
     if "PUBLIC_KEY" in merged_environment:
@@ -745,9 +755,9 @@ def create_profile(
             "image_name": image_name,
             "template_id": template_id,
             "template_contract": template_contract,
-            "runtime": runtime.safe_summary() if runtime is not None else None,
             "cloud_type": "SECURE",
-            "gpu_type_ids": [gpu["id"] for gpu in selected_gpus],
+            "gpu_type_ids": normalized_gpu_type_ids,
+            "gpu_memory_gb_by_type": normalized_gpu_memory,
             "gpu_count": gpu_count,
             "gpu_type_priority": "custom",
             "network_volume_id": network_volume_id,
@@ -776,6 +786,10 @@ def create_profile(
             "default_ttl_seconds": default_ttl_seconds,
             "expiry_action": "terminate",
         },
+        "retention": {
+            "mode": retention_mode,
+            "empty_grace_seconds": empty_grace_seconds,
+        },
     }
 
 
@@ -801,8 +815,10 @@ def validate_profile(profile: dict[str, Any]) -> dict[str, Any]:
     ssh = profile.get("ssh")
     limits = profile.get("limits")
     lease = profile.get("lease")
+    retention = profile.get("retention")
     if not all(
-        isinstance(value, dict) for value in (pod, ssh, limits, lease)
+        isinstance(value, dict)
+        for value in (pod, ssh, limits, lease, retention)
     ):
         raise RunpodLocalError(
             "profile is missing a required object",
@@ -821,32 +837,15 @@ def validate_profile(profile: dict[str, Any]) -> dict[str, Any]:
             code="invalid_profile",
         )
     parse_utc_timestamp(created_at)
-    runtime_identity = pod.get("runtime")
-    runtime_id = None
-    if pod.get("template_id") is not None:
-        try:
-            runtime_id = validate_runtime_identity(
-                runtime_identity
-            ).runtime_id
-        except RunpodLocalError as error:
-            raise RunpodLocalError(
-                "template-backed profile has an invalid reviewed runtime",
-                code="invalid_profile",
-            ) from error
-    elif runtime_identity is not None:
-        raise RunpodLocalError(
-            "direct-image profile carries a reviewed runtime identity",
-            code="invalid_profile",
-        )
     reconstructed = create_profile(
         name=name,
-        gpu_names=pod.get("gpu_type_ids", []),
+        gpu_type_ids=pod.get("gpu_type_ids", []),
+        gpu_memory_gb_by_type=pod.get("gpu_memory_gb_by_type"),
         max_hourly_usd=limits.get("max_hourly_usd", 0),
         default_ttl_seconds=lease.get("default_ttl_seconds", 0),
         image_name=pod.get("image_name"),
         template_id=pod.get("template_id"),
         template_contract=pod.get("template_contract"),
-        runtime_id=runtime_id,
         network_volume_id=pod.get("network_volume_id"),
         ephemeral=pod.get("storage_mode") == "ephemeral",
         container_disk_gb=pod.get("container_disk_gb", 0),
@@ -858,16 +857,15 @@ def validate_profile(profile: dict[str, Any]) -> dict[str, Any]:
         public_key_file=ssh.get("public_key_file", ""),
         ssh_public_key=environment.get("SSH_PUBLIC_KEY"),
         environment=environment,
+        retention_mode=retention.get("mode"),
+        empty_grace_seconds=retention.get("empty_grace_seconds"),
     )
     reconstructed["created_at"] = created_at
-    for section_name in ("pod", "ssh", "limits", "lease"):
-        original_section = profile[section_name]
-        for key, value in reconstructed[section_name].items():
-            if original_section.get(key) != value:
-                raise RunpodLocalError(
-                    f"profile {section_name}.{key} violates its canonical policy",
-                    code="invalid_profile",
-                )
+    if profile != reconstructed:
+        raise RunpodLocalError(
+            "profile violates its canonical generic-host policy",
+            code="invalid_profile",
+        )
     return reconstructed
 
 
@@ -892,31 +890,232 @@ def validate_profile_ssh_files(
     return identity_path, public_key_path
 
 
+def _toml_key(value: str) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _toml_value(value: Any) -> str:
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if type(value) is bool:
+        return "true" if value else "false"
+    if type(value) is int:
+        return str(value)
+    if isinstance(value, float) and math.isfinite(value):
+        return repr(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_value(item) for item in value) + "]"
+    raise RunpodLocalError(
+        f"profile contains a value that TOML cannot represent: {value!r}",
+        code="invalid_profile",
+    )
+
+
+def _profile_toml(profile: dict[str, Any]) -> str:
+    """Serialize the canonical profile without inventing a second schema."""
+
+    profile = validate_profile(profile)
+    lines: list[str] = []
+
+    def append_table(path: tuple[str, ...], value: dict[str, Any]) -> None:
+        if path:
+            if lines and lines[-1] != "":
+                lines.append("")
+            lines.append(
+                "[" + ".".join(_toml_key(part) for part in path) + "]"
+            )
+        for key in sorted(value):
+            item = value[key]
+            if item is None or isinstance(item, dict):
+                continue
+            lines.append(f"{_toml_key(key)} = {_toml_value(item)}")
+        for key in sorted(value):
+            item = value[key]
+            if isinstance(item, dict):
+                append_table((*path, key), item)
+
+    append_table((), profile)
+    return "\n".join(lines) + "\n"
+
+
+def _authored_profile(document: Any) -> dict[str, Any]:
+    if not isinstance(document, dict):
+        raise RunpodLocalError(
+            "authored host profile is not a TOML table",
+            code="invalid_profile",
+        )
+    normalized = {
+        key: (
+            dict(value)
+            if isinstance(value, dict)
+            else value
+        )
+        for key, value in document.items()
+    }
+    pod = normalized.get("pod")
+    if isinstance(pod, dict):
+        pod.setdefault("template_id", None)
+        pod.setdefault("template_contract", None)
+        pod.setdefault("network_volume_id", None)
+    return validate_profile(normalized)
+
+
+def _ensure_authored_directory(path: pathlib.Path) -> None:
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise RunpodLocalError(
+            f"cannot inspect authored profile directory {path}: {error}",
+            code="profile_store_error",
+        ) from error
+    if path.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+        raise RunpodLocalError(
+            f"authored profile path is not a real directory: {path}",
+            code="profile_store_error",
+        )
+
+
+def _authored_directory_exists(path: pathlib.Path) -> bool:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise RunpodLocalError(
+            f"cannot inspect authored profile directory {path}: {error}",
+            code="profile_store_error",
+        ) from error
+    if path.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+        raise RunpodLocalError(
+            f"authored profile path is not a real directory: {path}",
+            code="profile_store_error",
+        )
+    return True
+
+
+def _write_profile_toml(path: pathlib.Path, content: str) -> None:
+    _ensure_authored_directory(path.parent)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    temporary_path = pathlib.Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary_path, path)
+        path.chmod(0o600)
+        directory_descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    except Exception:
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
 class ProfileStore:
-    def __init__(self, state: StateStore) -> None:
-        self.state = state
+    """Portable authored TOML profiles, separate from machine receipts."""
+
+    def __init__(
+        self,
+        root: pathlib.Path,
+        *,
+        lock_state: StateStore | None = None,
+    ) -> None:
+        if not isinstance(root, pathlib.Path) or not root.is_absolute():
+            raise RunpodLocalError(
+                "Runpod authored root must be an absolute path",
+                code="profile_store_error",
+            )
+        self.root = root
+        self.lock_state = lock_state
+
+    def _path(self, name: str) -> pathlib.Path:
+        validate_record_name(name)
+        return self.root / "profiles" / f"{name}.toml"
 
     def save(self, profile: dict[str, Any], *, replace: bool = False) -> None:
         profile = validate_profile(profile)
         name = profile["name"]
-        with self.state.locked("profiles"):
-            existing = self.state.read("profiles", name)
-            if existing is not None and not replace:
-                raise RunpodLocalError(
-                    f"profile already exists: {name}",
-                    code="profile_exists",
-                )
-            self.state.write("profiles", name, profile)
+        if self.lock_state is None:
+            raise RunpodLocalError(
+                "profile writes require an explicit machine lock store",
+                code="profile_store_read_only",
+            )
+        path = self._path(name)
+        with self.lock_state.locked("profiles"):
+            try:
+                existing_metadata = path.lstat()
+            except FileNotFoundError:
+                existing_metadata = None
+            if existing_metadata is not None:
+                if path.is_symlink() or not stat.S_ISREG(
+                    existing_metadata.st_mode
+                ):
+                    raise RunpodLocalError(
+                        f"authored profile is not a regular file: {path}",
+                        code="profile_store_error",
+                    )
+                if not replace:
+                    raise RunpodLocalError(
+                        f"profile already exists: {name}",
+                        code="profile_exists",
+                    )
+            _write_profile_toml(path, _profile_toml(profile))
 
     def load(self, name: str) -> dict[str, Any]:
-        validate_record_name(name)
-        profile = self.state.read("profiles", name)
-        if profile is None:
+        path = self._path(name)
+        if not _authored_directory_exists(path.parent):
             raise RunpodLocalError(
                 f"profile does not exist: {name}",
                 code="profile_not_found",
             )
-        return validate_profile(profile)
+        try:
+            metadata = path.lstat()
+            if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+                raise RunpodLocalError(
+                    f"authored profile is not a regular file: {path}",
+                    code="profile_store_error",
+                )
+            with path.open("rb") as profile_file:
+                document = tomllib.load(profile_file)
+        except FileNotFoundError:
+            raise RunpodLocalError(
+                f"profile does not exist: {name}",
+                code="profile_not_found",
+            )
+        except (OSError, tomllib.TOMLDecodeError) as error:
+            raise RunpodLocalError(
+                f"cannot read authored profile {path}: {error}",
+                code="profile_store_error",
+            ) from error
+        profile = _authored_profile(document)
+        if profile["name"] != name:
+            raise RunpodLocalError(
+                f"profile file {path} declares a different name",
+                code="invalid_profile",
+            )
+        return profile
 
     def list(self) -> list[dict[str, Any]]:
-        return [validate_profile(profile) for profile in self.state.list("profiles")]
+        directory = self.root / "profiles"
+        if not _authored_directory_exists(directory):
+            return []
+        try:
+            paths = sorted(directory.glob("*.toml"))
+        except OSError as error:
+            raise RunpodLocalError(
+                f"cannot list authored profiles {directory}: {error}",
+                code="profile_store_error",
+            ) from error
+        return [self.load(path.stem) for path in paths]

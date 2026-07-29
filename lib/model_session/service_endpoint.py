@@ -19,6 +19,7 @@ from .attachment import (
     ServiceEndpointBinding,
     ServiceWorkload,
     _AttachmentDirectories,
+    _BOOT_ID_PATTERN,
     _HASH_PATTERN,
     _PUBLICATION_ID_PATTERN,
     _SERVICE_BINDING_KEYS,
@@ -526,7 +527,7 @@ def _parse_service_endpoint_receipt(
     service_id: str,
     receipt_path: pathlib.Path,
     current_time: datetime.datetime | None,
-    boot_id: str,
+    boot_id: str | None,
     require_live_socket: bool = True,
 ) -> ServiceEndpoint:
     if set(value) != _SERVICE_RECEIPT_KEYS:
@@ -558,7 +559,16 @@ def _parse_service_endpoint_receipt(
             "service endpoint payload identity is invalid",
             code="service_endpoint_tampered",
         )
-    if value["boot_id"] != boot_id:
+    receipt_boot_id = value["boot_id"]
+    if (
+        not isinstance(receipt_boot_id, str)
+        or not _BOOT_ID_PATTERN.fullmatch(receipt_boot_id)
+    ):
+        _fail(
+            "service endpoint boot identity is invalid",
+            code="service_endpoint_tampered",
+        )
+    if boot_id is not None and receipt_boot_id != boot_id:
         _fail(
             "service endpoint belongs to a different machine boot",
             code="service_endpoint_wrong_boot",
@@ -789,7 +799,7 @@ def revoke_service_endpoint(
                 service_id=identifier,
                 receipt_path=receipt_path,
                 current_time=None,
-                boot_id=_read_boot_id(),
+                boot_id=None,
                 require_live_socket=False,
             )
             if endpoint.publication_id != expected_publication_id:
@@ -821,6 +831,78 @@ def revoke_service_endpoint(
                     f"durability is unknown for {receipt_path}: {error}",
                     code="service_endpoint_revoke_durability_unknown",
                 ) from error
+    finally:
+        directories.close()
+
+
+def inspect_service_publication(
+    service_id: str,
+    *,
+    runtime_root: os.PathLike[str] | str | None = None,
+) -> ServiceEndpoint | None:
+    """Authenticate one retained publication for administrative cleanup.
+
+    Unlike ``load_service_endpoint``, this does not admit a user session. It
+    intentionally ignores admission expiry, socket liveness, and machine boot
+    age so the service owner can revoke exact retained state after a crash or
+    reboot. The canonical receipt, payload hash, service identity, workload,
+    capabilities, socket path, and publication identity remain fully
+    validated under the service publication lock.
+    """
+
+    identifier = _validate_identifier(service_id, label="service_id")
+    resolved_runtime_root = _service_runtime_root_path(runtime_root)
+    directories = _service_directories(
+        resolved_runtime_root,
+        create=False,
+    )
+    if directories is None:
+        return None
+    receipt_name = f"{identifier}.json"
+    receipt_path = directories.attachments_path / receipt_name
+    lock_name = f"{identifier}.lock"
+    lock_path = directories.locks_path / lock_name
+    try:
+        receipt_metadata = _entry_metadata(
+            directories.attachments_descriptor,
+            receipt_name,
+            path=receipt_path,
+        )
+        if receipt_metadata is None:
+            return None
+        lock_metadata = (
+            _entry_metadata(
+                directories.locks_descriptor,
+                lock_name,
+                path=lock_path,
+            )
+            if directories.locks_descriptor is not None
+            else None
+        )
+        if lock_metadata is None:
+            _fail(
+                "service endpoint receipt exists without its persistent lock",
+                code="unsafe_service_endpoint_state",
+            )
+        with _attachment_lock(
+            directories,
+            identifier,
+            exclusive=False,
+            create=False,
+        ):
+            value, _ = _read_receipt(
+                directories.attachments_descriptor,
+                receipt_name,
+                receipt_path,
+            )
+            return _parse_service_endpoint_receipt(
+                value,
+                service_id=identifier,
+                receipt_path=receipt_path,
+                current_time=None,
+                boot_id=None,
+                require_live_socket=False,
+            )
     finally:
         directories.close()
 

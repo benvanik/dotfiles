@@ -31,6 +31,14 @@ SERVICE_ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
 REMOTE_SEGMENT_PATTERN = re.compile(r"^[A-Za-z0-9._+@%=-]+$")
 AT_FDCWD = -100
 AT_SYMLINK_FOLLOW = 0x400
+RENAME_NOREPLACE = 1
+PUBLICATION_STAGE_PREFIX = ".model-lab-publish-"
+ANONYMOUS_PUBLICATION_UNSUPPORTED = frozenset(
+    {
+        errno.EINVAL,
+        errno.EOPNOTSUPP,
+    }
+)
 ROLES = frozenset(
     {
         "implementation-member",
@@ -479,6 +487,36 @@ def incoming_transport_mode(final_mode: int) -> int:
     fail("install file mode has no incoming transport normalization")
 
 
+def publication_stage_name(
+    *,
+    destination_name: str,
+    mode: int,
+    byte_count: int,
+    digest: str,
+) -> str:
+    """Derive the one recoverable staging name for an immutable destination."""
+
+    identity = canonical_bytes(
+        {
+            "bytes": byte_count,
+            "destination_name": destination_name,
+            "mode": f"{mode:04o}",
+            "sha256": digest,
+        }
+    )
+    return PUBLICATION_STAGE_PREFIX + hashlib.sha256(identity).hexdigest()
+
+
+def publication_stage_path(record: dict[str, Any]) -> pathlib.Path:
+    destination = pathlib.Path(record["remote_path"])
+    return destination.parent / publication_stage_name(
+        destination_name=destination.name,
+        mode=int(record["mode"], 8),
+        byte_count=record["bytes"],
+        digest=record["sha256"],
+    )
+
+
 def verify_incoming(
     incoming: pathlib.Path,
     document: dict[str, Any],
@@ -574,6 +612,12 @@ def verify_existing_final_subset(
             for record in document["files"]
             if record["role"] in roles
         }
+        expected_stages = {
+            publication_stage_path(record)
+            for record in document["files"]
+            if record["role"] in roles
+        }
+        allowed_files = expected if complete else expected | expected_stages
         expected_directories = {root}
         for path in expected:
             expected_directories.update(
@@ -603,7 +647,7 @@ def verify_existing_final_subset(
                     fail(f"installed closure contains a non-regular file: {child}")
                 observed.add(child)
         if (
-            not observed.issubset(expected)
+            not observed.issubset(allowed_files)
             or not observed_directories.issubset(expected_directories)
             or (
                 complete
@@ -649,6 +693,12 @@ def verify_service_directory(
     allow_incomplete_target: bool,
 ) -> None:
     _, root, target_deployment_id = deployment_installation_paths(document)
+    target_record = next(
+        record
+        for record in document["files"]
+        if record["role"] == "deployment-manifest"
+    )
+    target_stage_name = publication_stage_path(target_record).name
     if not os.path.lexists(root):
         return
     require_private_directory(root, create=False)
@@ -686,8 +736,26 @@ def verify_service_directory(
                 if (
                     allow_incomplete_target
                     and version_entry.name == target_deployment_id
-                    and not version_entries
                 ):
+                    allowed_names = {"deployment.json", target_stage_name}
+                    if any(
+                        entry.name not in allowed_names for entry in version_entries
+                    ):
+                        fail(
+                            f"installed deployment version is incomplete: {version_root}"
+                        )
+                    for version_child in version_entries:
+                        metadata = version_child.stat(follow_symlinks=False)
+                        if (
+                            not stat.S_ISREG(metadata.st_mode)
+                            or stat.S_ISLNK(metadata.st_mode)
+                            or metadata.st_uid != os.getuid()
+                            or metadata.st_nlink != 1
+                        ):
+                            fail(
+                                "installed deployment version has an unsafe "
+                                f"entry: {version_child.path}"
+                            )
                     continue
                 if (
                     len(version_entries) != 1
@@ -845,6 +913,321 @@ def link_anonymous_file(
         )
 
 
+def rename_named_file_no_replace(
+    parent_descriptor: int,
+    *,
+    source_name: str,
+    destination_name: str,
+) -> None:
+    """Atomically publish a named stage without replacing any destination."""
+
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except AttributeError as error:
+        raise InstallError("this runtime has no no-replace rename primitive") from error
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        parent_descriptor,
+        os.fsencode(source_name),
+        parent_descriptor,
+        os.fsencode(destination_name),
+        RENAME_NOREPLACE,
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        if error_number == errno.EEXIST:
+            raise FileExistsError(
+                error_number,
+                os.strerror(error_number),
+                destination_name,
+            )
+        raise InstallError(
+            f"named no-replace publication failed: {os.strerror(error_number)}"
+        )
+
+
+def anonymous_publication_descriptor(
+    parent_descriptor: int,
+    *,
+    mode: int,
+) -> int | None:
+    """Open an anonymous publication inode, or report an unsupported filesystem."""
+
+    if not hasattr(os, "O_TMPFILE"):
+        return None
+    flags = (
+        os.O_RDWR
+        | os.O_TMPFILE
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        return os.open(".", flags, mode, dir_fd=parent_descriptor)
+    except OSError as error:
+        if error.errno in ANONYMOUS_PUBLICATION_UNSUPPORTED:
+            return None
+        raise InstallError(
+            "runtime filesystem cannot create an anonymous publication inode"
+        ) from error
+
+
+def child_exists_at(parent_descriptor: int, name: str) -> bool:
+    try:
+        os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def sync_publication_directory(parent_descriptor: int) -> None:
+    """Durably order a completed publication or exact stage cleanup."""
+
+    try:
+        os.fsync(parent_descriptor)
+    except OSError as error:
+        raise InstallError(
+            "cannot durably synchronize a publication directory"
+        ) from error
+
+
+def descriptor_payload(
+    descriptor: int,
+    *,
+    display_path: pathlib.Path,
+    allowed_modes: set[int],
+    maximum_bytes: int,
+    expected_link_count: int,
+) -> tuple[bytes, os.stat_result]:
+    """Read a staged descriptor while proving its inode identity is stable."""
+
+    before = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_uid != os.getuid()
+        or before.st_nlink != expected_link_count
+        or stat.S_IMODE(before.st_mode) not in allowed_modes
+        or not 0 <= before.st_size <= maximum_bytes
+    ):
+        fail(f"publication stage has an unsafe identity: {display_path}")
+    chunks: list[bytes] = []
+    offset = 0
+    while offset < before.st_size:
+        chunk = os.pread(
+            descriptor,
+            min(64 * 1024, before.st_size - offset),
+            offset,
+        )
+        if not chunk:
+            fail(f"publication stage read made no progress: {display_path}")
+        chunks.append(chunk)
+        offset += len(chunk)
+    payload = b"".join(chunks)
+    after = os.fstat(descriptor)
+    if (
+        len(payload) != before.st_size
+        or after.st_dev != before.st_dev
+        or after.st_ino != before.st_ino
+        or after.st_size != before.st_size
+        or after.st_mtime_ns != before.st_mtime_ns
+        or after.st_ctime_ns != before.st_ctime_ns
+        or not stat.S_ISREG(after.st_mode)
+        or after.st_uid != before.st_uid
+        or after.st_nlink != before.st_nlink
+        or stat.S_IMODE(after.st_mode) != stat.S_IMODE(before.st_mode)
+    ):
+        fail(f"publication stage changed while reading: {display_path}")
+    return payload, after
+
+
+def require_descriptor_name(
+    descriptor: int,
+    *,
+    parent_descriptor: int,
+    name: str,
+    display_path: pathlib.Path,
+) -> os.stat_result:
+    """Prove a fixed child still names the already-open staged inode."""
+
+    opened = os.fstat(descriptor)
+    try:
+        named = os.stat(
+            name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except OSError as error:
+        raise InstallError(
+            f"publication stage name changed while open: {display_path}"
+        ) from error
+    if (
+        named.st_dev != opened.st_dev
+        or named.st_ino != opened.st_ino
+        or not stat.S_ISREG(named.st_mode)
+        or named.st_uid != opened.st_uid
+        or named.st_nlink != opened.st_nlink
+        or stat.S_IMODE(named.st_mode) != stat.S_IMODE(opened.st_mode)
+        or named.st_size != opened.st_size
+    ):
+        fail(f"publication stage name changed while open: {display_path}")
+    return opened
+
+
+def write_all(descriptor: int, payload: bytes, *, offset: int) -> None:
+    os.lseek(descriptor, offset, os.SEEK_SET)
+    while offset < len(payload):
+        written = os.write(descriptor, payload[offset:])
+        if written <= 0:
+            fail("installed file write made no progress")
+        offset += written
+
+
+def open_named_publication_stage(
+    parent_descriptor: int,
+    *,
+    name: str,
+    display_path: pathlib.Path,
+) -> int:
+    flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        return os.open(name, flags, dir_fd=parent_descriptor)
+    except FileNotFoundError:
+        try:
+            descriptor = os.open(
+                name,
+                flags | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=parent_descriptor,
+            )
+        except FileExistsError:
+            try:
+                return os.open(name, flags, dir_fd=parent_descriptor)
+            except OSError as error:
+                raise InstallError(
+                    f"cannot safely open publication stage: {display_path}"
+                ) from error
+        except OSError as error:
+            raise InstallError(
+                f"cannot safely create publication stage: {display_path}"
+            ) from error
+        os.fchmod(descriptor, 0o600)
+        return descriptor
+    except OSError as error:
+        raise InstallError(
+            f"cannot safely open publication stage: {display_path}"
+        ) from error
+
+
+def install_with_named_stage(
+    *,
+    parent_descriptor: int,
+    destination: pathlib.Path,
+    source_payload: bytes,
+    mode: int,
+    digest: str,
+) -> None:
+    """Resume or publish one deterministic private stage on this filesystem."""
+
+    stage_name = publication_stage_name(
+        destination_name=destination.name,
+        mode=mode,
+        byte_count=len(source_payload),
+        digest=digest,
+    )
+    stage_path = destination.parent / stage_name
+    descriptor = open_named_publication_stage(
+        parent_descriptor,
+        name=stage_name,
+        display_path=stage_path,
+    )
+    try:
+        staged_payload, staged_metadata = descriptor_payload(
+            descriptor,
+            display_path=stage_path,
+            allowed_modes={0o600, mode},
+            maximum_bytes=len(source_payload),
+            expected_link_count=1,
+        )
+        if staged_payload != source_payload[: len(staged_payload)]:
+            fail(f"publication stage has another identity: {stage_path}")
+        staged_mode = stat.S_IMODE(staged_metadata.st_mode)
+        if (
+            staged_mode == mode
+            and mode != 0o600
+            and len(staged_payload) != len(source_payload)
+        ):
+            fail(f"publication stage has an impossible partial mode: {stage_path}")
+        if len(staged_payload) != len(source_payload):
+            write_all(
+                descriptor,
+                source_payload,
+                offset=len(staged_payload),
+            )
+        os.fsync(descriptor)
+        os.fchmod(descriptor, mode)
+        os.fsync(descriptor)
+        completed_payload, _ = descriptor_payload(
+            descriptor,
+            display_path=stage_path,
+            allowed_modes={mode},
+            maximum_bytes=len(source_payload),
+            expected_link_count=1,
+        )
+        if completed_payload != source_payload:
+            fail(f"publication stage has another identity: {stage_path}")
+        require_descriptor_name(
+            descriptor,
+            parent_descriptor=parent_descriptor,
+            name=stage_name,
+            display_path=stage_path,
+        )
+        try:
+            rename_named_file_no_replace(
+                parent_descriptor,
+                source_name=stage_name,
+                destination_name=destination.name,
+            )
+        except FileExistsError:
+            installed = safe_file_bytes_at(
+                parent_descriptor,
+                destination.name,
+                display_path=destination,
+                mode=mode,
+                maximum_bytes=MAX_MEMBER_BYTES,
+            )
+            if installed != source_payload:
+                fail(f"installed path raced with another identity: {destination}")
+            require_descriptor_name(
+                descriptor,
+                parent_descriptor=parent_descriptor,
+                name=stage_name,
+                display_path=stage_path,
+            )
+            os.unlink(stage_name, dir_fd=parent_descriptor)
+        else:
+            installed_metadata = os.stat(
+                destination.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            published_metadata = os.fstat(descriptor)
+            if (
+                installed_metadata.st_dev != published_metadata.st_dev
+                or installed_metadata.st_ino != published_metadata.st_ino
+                or published_metadata.st_nlink != 1
+            ):
+                fail(f"named publication changed while renaming: {destination}")
+        sync_publication_directory(parent_descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def install_file(
     *,
     source: pathlib.Path,
@@ -887,49 +1270,59 @@ def install_file(
         if existing is not None:
             if existing != source_payload:
                 fail(f"installed path has another identity: {destination}")
-            return
-        if not hasattr(os, "O_TMPFILE"):
-            fail("runtime filesystem has no anonymous publication support")
-        flags = (
-            os.O_WRONLY
-            | os.O_TMPFILE
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-        )
-        try:
-            descriptor = os.open(".", flags, mode, dir_fd=parent_descriptor)
-        except OSError as error:
-            raise InstallError(
-                "runtime filesystem cannot create an anonymous publication inode"
-            ) from error
-        try:
-            os.fchmod(descriptor, mode)
-            offset = 0
-            while offset < len(source_payload):
-                written = os.write(descriptor, source_payload[offset:])
-                if written <= 0:
-                    fail("installed file write made no progress")
-                offset += written
-            os.fsync(descriptor)
-            written_metadata = os.fstat(descriptor)
-            if (
-                not stat.S_ISREG(written_metadata.st_mode)
-                or written_metadata.st_uid != os.getuid()
-                or written_metadata.st_nlink != 0
-                or stat.S_IMODE(written_metadata.st_mode) != mode
-                or written_metadata.st_size != len(source_payload)
-            ):
-                fail("anonymous publication inode changed while writing")
-            try:
-                link_anonymous_file(
-                    descriptor,
+            stage_name = publication_stage_name(
+                destination_name=destination.name,
+                mode=mode,
+                byte_count=byte_count,
+                digest=digest,
+            )
+            if not child_exists_at(parent_descriptor, stage_name):
+                sync_publication_directory(parent_descriptor)
+                return
+            install_with_named_stage(
+                parent_descriptor=parent_descriptor,
+                destination=destination,
+                source_payload=source_payload,
+                mode=mode,
+                digest=digest,
+            )
+        else:
+            descriptor = anonymous_publication_descriptor(
+                parent_descriptor,
+                mode=mode,
+            )
+            if descriptor is None:
+                install_with_named_stage(
                     parent_descriptor=parent_descriptor,
-                    name=destination.name,
+                    destination=destination,
+                    source_payload=source_payload,
+                    mode=mode,
+                    digest=digest,
                 )
-            except FileExistsError:
-                pass
-        finally:
-            os.close(descriptor)
+            else:
+                try:
+                    os.fchmod(descriptor, mode)
+                    write_all(descriptor, source_payload, offset=0)
+                    os.fsync(descriptor)
+                    anonymous_payload, _ = descriptor_payload(
+                        descriptor,
+                        display_path=destination,
+                        allowed_modes={mode},
+                        maximum_bytes=len(source_payload),
+                        expected_link_count=0,
+                    )
+                    if anonymous_payload != source_payload:
+                        fail("anonymous publication inode changed while writing")
+                    try:
+                        link_anonymous_file(
+                            descriptor,
+                            parent_descriptor=parent_descriptor,
+                            name=destination.name,
+                        )
+                    except FileExistsError:
+                        pass
+                finally:
+                    os.close(descriptor)
         installed = safe_file_bytes_at(
             parent_descriptor,
             destination.name,
@@ -939,7 +1332,7 @@ def install_file(
         )
         if installed != source_payload:
             fail(f"installed path raced with another identity: {destination}")
-        os.fsync(parent_descriptor)
+        sync_publication_directory(parent_descriptor)
     finally:
         os.close(parent_descriptor)
 
@@ -975,6 +1368,14 @@ def installed_files_match(
         ):
             fail(f"installed path has another identity: {destination}")
     return complete
+
+
+def publication_stages_present(document: dict[str, Any]) -> bool:
+    """Report whether this exact closure retains a named publication stage."""
+
+    return any(
+        os.path.lexists(publication_stage_path(record)) for record in document["files"]
+    )
 
 
 def open_service_lock(path: pathlib.Path) -> int:
@@ -1056,7 +1457,7 @@ def install(identity: str, transfer_id: str) -> dict[str, Any]:
         fail("incoming install document has another identity")
     verify_incoming(incoming, document, allow_missing=False)
     deployment, service_root, _ = deployment_installation_paths(document)
-    if os.path.lexists(deployment):
+    if os.path.lexists(deployment) and not publication_stages_present(document):
         if not installed_files_match(incoming=incoming, document=document):
             fail(
                 "installed deployment manifest exists without its complete "
@@ -1103,20 +1504,20 @@ def install(identity: str, transfer_id: str) -> dict[str, Any]:
                     "cannot install a changed deployment while service process "
                     "state is retained"
                 )
-            for record in document["directories"]:
-                require_private_directory(
-                    pathlib.Path(record["path"]),
-                    create=True,
-                )
-            for record in document["files"]:
-                local = pathlib.PurePosixPath(record["local_path"])
-                install_file(
-                    source=incoming.joinpath(*local.parts),
-                    destination=pathlib.Path(record["remote_path"]),
-                    mode=int(record["mode"], 8),
-                    byte_count=record["bytes"],
-                    digest=record["sha256"],
-                )
+        for record in document["directories"]:
+            require_private_directory(
+                pathlib.Path(record["path"]),
+                create=True,
+            )
+        for record in document["files"]:
+            local = pathlib.PurePosixPath(record["local_path"])
+            install_file(
+                source=incoming.joinpath(*local.parts),
+                destination=pathlib.Path(record["remote_path"]),
+                mode=int(record["mode"], 8),
+                byte_count=record["bytes"],
+                digest=record["sha256"],
+            )
         verify_existing_final_subset(document, complete=True)
         verify_service_directory(
             document,

@@ -13,6 +13,7 @@ import stat
 import tempfile
 import unittest
 from types import ModuleType
+from unittest import mock
 
 from model_lab.runtime_catalog import load_runtime
 from model_lab.service_definition import load_service
@@ -170,6 +171,216 @@ def copy_incoming(
 
 
 class ServiceInstallerTest(unittest.TestCase):
+    def test_named_publication_fallback_installs_complete_closure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            module = load_installer()
+            configure_test_root(module, root)
+            materialized = materialized_fixture(root / "local")
+            document = relocated_document(
+                module,
+                materialized.install_document,
+            )
+            identity = document["materialization_sha256"]
+            module.prepare(identity, TRANSFER_ID)
+            copy_incoming(module, materialized, document)
+
+            with mock.patch.object(
+                module,
+                "anonymous_publication_descriptor",
+                return_value=None,
+            ):
+                installed = module.install(identity, TRANSFER_ID)
+
+            self.assertEqual(installed["status"], "installed")
+            for record in document["files"]:
+                destination = pathlib.Path(record["remote_path"])
+                stage = module.publication_stage_path(record)
+                with self.subTest(remote_path=str(destination)):
+                    self.assertTrue(destination.is_file())
+                    self.assertFalse(os.path.lexists(stage))
+                    self.assertEqual(destination.lstat().st_nlink, 1)
+                    self.assertEqual(
+                        stat.S_IMODE(destination.lstat().st_mode),
+                        int(record["mode"], 8),
+                    )
+
+    def test_named_publication_recovers_crash_before_rename(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            module = load_installer()
+            configure_test_root(module, root)
+            materialized = materialized_fixture(root / "local")
+            document = relocated_document(
+                module,
+                materialized.install_document,
+            )
+            identity = document["materialization_sha256"]
+            module.prepare(identity, TRANSFER_ID)
+            incoming = copy_incoming(module, materialized, document)
+            first = document["files"][0]
+            first_stage = module.publication_stage_path(first)
+            first_destination = pathlib.Path(first["remote_path"])
+
+            with (
+                mock.patch.object(
+                    module,
+                    "anonymous_publication_descriptor",
+                    return_value=None,
+                ),
+                mock.patch.object(
+                    module,
+                    "rename_named_file_no_replace",
+                    side_effect=RuntimeError("simulated crash before publication"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "before publication"),
+            ):
+                module.install(identity, TRANSFER_ID)
+
+            local = pathlib.PurePosixPath(first["local_path"])
+            self.assertFalse(os.path.lexists(first_destination))
+            self.assertTrue(first_stage.is_file())
+            self.assertEqual(first_stage.lstat().st_nlink, 1)
+            self.assertEqual(
+                first_stage.read_bytes(),
+                incoming.joinpath(*local.parts).read_bytes(),
+            )
+
+            with mock.patch.object(
+                module,
+                "anonymous_publication_descriptor",
+                return_value=None,
+            ):
+                installed = module.install(identity, TRANSFER_ID)
+
+            self.assertEqual(installed["status"], "installed")
+            self.assertFalse(os.path.lexists(first_stage))
+            self.assertTrue(first_destination.is_file())
+
+    def test_named_publication_recovers_crash_after_rename(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            module = load_installer()
+            configure_test_root(module, root)
+            materialized = materialized_fixture(root / "local")
+            document = relocated_document(
+                module,
+                materialized.install_document,
+            )
+            identity = document["materialization_sha256"]
+            module.prepare(identity, TRANSFER_ID)
+            incoming = copy_incoming(module, materialized, document)
+            first = document["files"][0]
+            first_stage = module.publication_stage_path(first)
+            first_destination = pathlib.Path(first["remote_path"])
+
+            with (
+                mock.patch.object(
+                    module,
+                    "anonymous_publication_descriptor",
+                    return_value=None,
+                ),
+                mock.patch.object(
+                    module,
+                    "sync_publication_directory",
+                    side_effect=RuntimeError("simulated crash after publication"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "after publication"),
+            ):
+                module.install(identity, TRANSFER_ID)
+
+            self.assertTrue(first_destination.is_file())
+            self.assertFalse(os.path.lexists(first_stage))
+            first_local = pathlib.PurePosixPath(first["local_path"])
+            with mock.patch.object(
+                module,
+                "sync_publication_directory",
+                wraps=module.sync_publication_directory,
+            ) as recovery_sync:
+                module.install_file(
+                    source=incoming.joinpath(*first_local.parts),
+                    destination=first_destination,
+                    mode=int(first["mode"], 8),
+                    byte_count=first["bytes"],
+                    digest=first["sha256"],
+                )
+            recovery_sync.assert_called_once()
+            with (
+                mock.patch.object(
+                    module.os,
+                    "fsync",
+                    side_effect=OSError("simulated directory sync failure"),
+                ),
+                self.assertRaisesRegex(
+                    module.InstallError,
+                    "durably synchronize",
+                ),
+            ):
+                module.install_file(
+                    source=incoming.joinpath(*first_local.parts),
+                    destination=first_destination,
+                    mode=int(first["mode"], 8),
+                    byte_count=first["bytes"],
+                    digest=first["sha256"],
+                )
+
+            with mock.patch.object(
+                module,
+                "anonymous_publication_descriptor",
+                return_value=None,
+            ):
+                installed = module.install(identity, TRANSFER_ID)
+
+            self.assertEqual(installed["status"], "installed")
+
+    def test_named_publication_rejects_unsafe_stage_conflicts(self):
+        for conflict_kind in ("overly-permissive", "symlink"):
+            with self.subTest(conflict_kind=conflict_kind):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = pathlib.Path(directory)
+                    module = load_installer()
+                    configure_test_root(module, root)
+                    module.SESSION_ROOT.mkdir(mode=0o700)
+                    destination_parent = module.SESSION_ROOT / "target"
+                    destination_parent.mkdir(mode=0o700)
+                    source = module.SESSION_ROOT / "source"
+                    source_payload = b"exact payload\n"
+                    source.write_bytes(source_payload)
+                    source.chmod(0o600)
+                    destination = destination_parent / "installed"
+                    digest = hashlib.sha256(source_payload).hexdigest()
+                    stage_name = module.publication_stage_name(
+                        destination_name=destination.name,
+                        mode=0o600,
+                        byte_count=len(source_payload),
+                        digest=digest,
+                    )
+                    stage = destination_parent / stage_name
+                    if conflict_kind == "overly-permissive":
+                        stage.write_bytes(source_payload)
+                        stage.chmod(0o644)
+                    else:
+                        stage.symlink_to(source)
+
+                    with (
+                        mock.patch.object(
+                            module,
+                            "anonymous_publication_descriptor",
+                            return_value=None,
+                        ),
+                        self.assertRaises(module.InstallError),
+                    ):
+                        module.install_file(
+                            source=source,
+                            destination=destination,
+                            mode=0o600,
+                            byte_count=len(source_payload),
+                            digest=digest,
+                        )
+
+                    self.assertFalse(os.path.lexists(destination))
+                    self.assertTrue(os.path.lexists(stage))
+
     def test_changed_stopped_deployment_is_versioned_and_lifecycle_guarded(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
@@ -314,9 +525,7 @@ class ServiceInstallerTest(unittest.TestCase):
                     with self.assertRaises(module.InstallError) as raised:
                         module.install(identity, TRANSFER_ID)
                     self.assertIn("unsafe identity", str(raised.exception))
-                    source.chmod(
-                        module.incoming_transport_mode(int(record["mode"], 8))
-                    )
+                    source.chmod(module.incoming_transport_mode(int(record["mode"], 8)))
 
     def test_partial_resume_validates_existing_bytes_and_rejects_extras(self):
         with tempfile.TemporaryDirectory() as directory:

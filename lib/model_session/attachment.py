@@ -179,6 +179,20 @@ class ServiceEndpoint:
     admission_expires_at: datetime.datetime
     receipt_path: pathlib.Path
 
+    def as_dict(self) -> dict[str, Any]:
+        """Return the JSON-safe administrative view of this live endpoint."""
+
+        return {
+            "publication_id": self.publication_id,
+            "binding": self.binding.as_dict(),
+            "socket_path": str(self.socket_path),
+            "socket_device": self.socket_device,
+            "socket_inode": self.socket_inode,
+            "published_at": _format_timestamp(self.published_at),
+            "admission_expires_at": _format_timestamp(self.admission_expires_at),
+            "receipt_path": str(self.receipt_path),
+        }
+
 
 @dataclass(frozen=True)
 class _SocketIdentity:

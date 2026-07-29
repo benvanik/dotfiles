@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import os
 import pathlib
 import socket
@@ -31,6 +32,11 @@ from model_lab.supervisor_protocol import (
     process_start_time,
     receive_document,
     send_document,
+)
+from model_session.attachment import (
+    ServiceEndpoint,
+    ServiceEndpointBinding,
+    ServiceWorkload,
 )
 from test_model_lab_core import (
     FakeProfile,
@@ -264,6 +270,85 @@ class SupervisorLeaseChannelTest(unittest.TestCase):
             self._admit(channel)
         for channel in channels:
             channel.close()
+
+    def test_up_serializes_a_real_service_endpoint(self) -> None:
+        published_at = datetime.datetime(
+            2026,
+            7,
+            28,
+            12,
+            0,
+            tzinfo=datetime.timezone.utc,
+        )
+        workload = ServiceWorkload(
+            repository="fixture/model",
+            revision="c" * 40,
+            provider="runpod-vllm",
+            model_id="fixture-chat",
+            context_tokens=32768,
+            max_output_tokens=4096,
+            weight_format="native",
+            kv_cache_dtype="bf16",
+            runtime_compatibility="fixture-runtime",
+            reasoning=False,
+        )
+        endpoint = ServiceEndpoint(
+            publication_id="d" * 32,
+            binding=ServiceEndpointBinding(
+                service_id="fixture-chat",
+                service_sha256="e" * 64,
+                workload=workload,
+                workload_sha256="f" * 64,
+                input_modalities=("image", "text"),
+            ),
+            socket_path=self.runtime / "services" / "fixture-chat.sock",
+            socket_device=31,
+            socket_inode=47,
+            published_at=published_at,
+            admission_expires_at=published_at + datetime.timedelta(seconds=120),
+            receipt_path=self.runtime / "services" / "fixture-chat.json",
+        )
+        deployment = SimpleNamespace(
+            normalized=lambda: {
+                "service_id": "fixture-chat",
+                "host_name": "host-one",
+                "idle_deadline": "2026-07-28T12:30:00Z",
+            }
+        )
+        self.controller.ensure_ready = lambda *_args, **_kwargs: (
+            deployment,
+            endpoint,
+        )
+        self.controller.down = lambda *_args, **_kwargs: deployment
+
+        result = self.client.request(
+            "up",
+            {
+                "service_id": "fixture-chat",
+                "host_name": None,
+            },
+        )
+
+        self.assertEqual(result["deployment"], deployment.normalized())
+        self.assertEqual(
+            result["endpoint"],
+            {
+                "publication_id": "d" * 32,
+                "binding": {
+                    "service_id": "fixture-chat",
+                    "service_sha256": "e" * 64,
+                    "workload": workload.as_dict(),
+                    "workload_sha256": "f" * 64,
+                    "input_modalities": ["image", "text"],
+                },
+                "socket_path": str(self.runtime / "services" / "fixture-chat.sock"),
+                "socket_device": 31,
+                "socket_inode": 47,
+                "published_at": "2026-07-28T12:00:00.000000Z",
+                "admission_expires_at": "2026-07-28T12:02:00.000000Z",
+                "receipt_path": str(self.runtime / "services" / "fixture-chat.json"),
+            },
+        )
 
     def test_hard_expiry_closes_active_pi_channel_before_claim_recovery(self):
         channel = self.client.acquire_pi(

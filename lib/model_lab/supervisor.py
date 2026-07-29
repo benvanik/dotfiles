@@ -458,7 +458,7 @@ class ModelLabSupervisor:
                 "operation": "up",
                 "result": {
                     "deployment": deployment.normalized(),
-                    "endpoint": endpoint.normalized(),
+                    "endpoint": endpoint.as_dict(),
                 },
             },
         )

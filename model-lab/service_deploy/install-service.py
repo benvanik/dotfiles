@@ -469,6 +469,16 @@ def expected_incoming_paths(
     return files, directories
 
 
+def incoming_transport_mode(final_mode: int) -> int:
+    """Return the owner-private mode produced by the SSH transport."""
+
+    if final_mode in {0o600, 0o644}:
+        return 0o600
+    if final_mode == 0o755:
+        return 0o700
+    fail("install file mode has no incoming transport normalization")
+
+
 def verify_incoming(
     incoming: pathlib.Path,
     document: dict[str, Any],
@@ -525,7 +535,7 @@ def verify_incoming(
         record = by_local[path]
         payload = safe_file_bytes(
             path,
-            mode=int(record["mode"], 8),
+            mode=incoming_transport_mode(int(record["mode"], 8)),
             maximum_bytes=MAX_MEMBER_BYTES,
         )
         if (
@@ -845,7 +855,7 @@ def install_file(
 ) -> None:
     source_payload = safe_file_bytes(
         source,
-        mode=mode,
+        mode=incoming_transport_mode(mode),
         maximum_bytes=MAX_MEMBER_BYTES,
     )
     if (
@@ -950,7 +960,7 @@ def installed_files_match(
         local = pathlib.PurePosixPath(record["local_path"])
         source_payload = safe_file_bytes(
             incoming.joinpath(*local.parts),
-            mode=int(record["mode"], 8),
+            mode=incoming_transport_mode(int(record["mode"], 8)),
             maximum_bytes=MAX_MEMBER_BYTES,
         )
         installed_payload = safe_file_bytes(

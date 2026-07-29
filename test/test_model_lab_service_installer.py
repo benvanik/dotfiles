@@ -153,6 +153,19 @@ def copy_incoming(
         pathlib.Path(directory).chmod(0o700)
         for name in directory_names:
             (pathlib.Path(directory) / name).chmod(0o700)
+    files = document["files"]
+    if not isinstance(files, list):
+        raise TypeError("invalid fixture")
+    for record in files:
+        if not isinstance(record, dict):
+            raise TypeError("invalid fixture")
+        local_path = record["local_path"]
+        mode = record["mode"]
+        if not isinstance(local_path, str) or not isinstance(mode, str):
+            raise TypeError("invalid fixture")
+        incoming.joinpath(*pathlib.PurePosixPath(local_path).parts).chmod(
+            module.incoming_transport_mode(int(mode, 8))
+        )
     return incoming
 
 
@@ -242,7 +255,15 @@ class ServiceInstallerTest(unittest.TestCase):
 
             prepared = module.prepare(identity, TRANSFER_ID)
             self.assertEqual(prepared["status"], "ready-for-copy")
-            copy_incoming(module, materialized, document)
+            incoming = copy_incoming(module, materialized, document)
+            for record in document["files"]:
+                local_path = pathlib.PurePosixPath(record["local_path"])
+                source = incoming.joinpath(*local_path.parts)
+                with self.subTest(incoming_path=str(local_path)):
+                    self.assertEqual(
+                        stat.S_IMODE(source.lstat().st_mode),
+                        module.incoming_transport_mode(int(record["mode"], 8)),
+                    )
             installed = module.install(identity, TRANSFER_ID)
             repeated = module.install(identity, TRANSFER_ID)
 
@@ -262,6 +283,40 @@ class ServiceInstallerTest(unittest.TestCase):
                         record["sha256"],
                     )
                     self.assertEqual(destination.lstat().st_nlink, 1)
+
+    def test_incoming_transport_rejects_overly_permissive_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            module = load_installer()
+            configure_test_root(module, root)
+            materialized = materialized_fixture(root / "local")
+            document = relocated_document(
+                module,
+                materialized.install_document,
+            )
+            identity = document["materialization_sha256"]
+            module.prepare(identity, TRANSFER_ID)
+            incoming = copy_incoming(module, materialized, document)
+            records = document["files"]
+            non_executable = next(
+                record for record in records if record["mode"] == "0644"
+            )
+            executable = next(record for record in records if record["mode"] == "0755")
+
+            for record, unsafe_mode in (
+                (non_executable, 0o644),
+                (executable, 0o755),
+            ):
+                local_path = pathlib.PurePosixPath(record["local_path"])
+                source = incoming.joinpath(*local_path.parts)
+                with self.subTest(local_path=str(local_path)):
+                    source.chmod(unsafe_mode)
+                    with self.assertRaises(module.InstallError) as raised:
+                        module.install(identity, TRANSFER_ID)
+                    self.assertIn("unsafe identity", str(raised.exception))
+                    source.chmod(
+                        module.incoming_transport_mode(int(record["mode"], 8))
+                    )
 
     def test_partial_resume_validates_existing_bytes_and_rejects_extras(self):
         with tempfile.TemporaryDirectory() as directory:

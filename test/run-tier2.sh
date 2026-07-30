@@ -9,12 +9,10 @@ cd "$DOTFILES"
 # Colors.
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
 BOLD='\033[1m'
 NC='\033[0m'
 
 info() { printf "${GREEN}[tier2]${NC} %s\n" "$1"; }
-warn() { printf "${YELLOW}[tier2]${NC} %s\n" "$1"; }
 error() { printf "${RED}[tier2]${NC} %s\n" "$1" >&2; }
 
 # Parse arguments.
@@ -36,15 +34,24 @@ if ! command -v docker &>/dev/null; then
     exit 1
 fi
 
-# Check Docker daemon is running.
-if ! docker info &>/dev/null; then
-    error "Docker daemon not running"
-    error "Start Docker and try again"
+# Check Docker daemon access and preserve the mechanism of any failure.
+DOCKER_INFO_ERROR=""
+if ! DOCKER_INFO_ERROR=$(docker info 2>&1); then
+    case "$DOCKER_INFO_ERROR" in
+        *[Pp]ermission*denied*)
+            error "Docker daemon is not accessible to this user"
+            error "Grant access to the Docker socket and try again"
+            ;;
+        *)
+            error "Docker daemon not running"
+            error "Start Docker and try again"
+            ;;
+    esac
     exit 1
 fi
 
 echo ""
-printf "${BOLD}[dotfiles]${NC} Running Tier 2 Docker tests...\n"
+printf "%b[dotfiles]%b Running Tier 2 Docker tests...\n" "$BOLD" "$NC"
 echo ""
 
 # ============================================================================
@@ -80,11 +87,11 @@ info "=== Ubuntu (full integration) ==="
 if run_ubuntu; then
     echo ""
     echo "========================================"
-    printf "${GREEN}All Tier 2 tests passed!${NC}\n"
+    printf "%bAll Tier 2 tests passed!%b\n" "$GREEN" "$NC"
     exit 0
 else
     echo ""
     echo "========================================"
-    printf "${RED}Tier 2 tests failed!${NC}\n"
+    printf "%bTier 2 tests failed!%b\n" "$RED" "$NC"
     exit 1
 fi

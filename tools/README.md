@@ -16,9 +16,12 @@ Tools are installed in `~/tools/<tool>/<version>/` with a `latest` symlink:
 ~/tools/llvm/
 ├── 21.1.6/         # Installed version
 ├── 20.1.0/         # Another version
-├── latest -> 21.1.6
-└── env.sh          # Common LLVM settings
+└── latest -> 21.1.6
 ```
+
+Environment definitions live in `~/.dotfiles/tools/<tool>/env.sh`. Keeping
+configuration in Git and payloads in `~/tools/` means a dotfiles pull updates
+tool behavior without reinstalling toolchains.
 
 ## Usage
 
@@ -53,7 +56,6 @@ use_cmake ">=3.28.0"
 
 # Use latest for tools without version requirements
 use_ninja
-use_mold
 
 # ROCm - silent skip on non-Linux
 use_rocm ">=6.0.0"
@@ -63,17 +65,6 @@ source_local_envrc
 ```
 
 Then run `direnv allow` to activate.
-
-### IREE Development
-
-For IREE development, use the convenience function:
-
-```bash
-# In .envrc
-use_iree_dev  # Uses sensible defaults
-# Or specify versions:
-use_iree_dev ">=21.0.0" ">=3.28.0"
-```
 
 ## Installing New Tool Versions
 
@@ -121,4 +112,4 @@ export MY_DEBUG_FLAG=1
 | platform.sh | ~/.dotfiles/tools/ | Platform detection |
 | versions.sh | ~/.dotfiles/tools/ | Version comparison |
 | project-init | ~/.dotfiles/bin/ | Project setup script |
-| env.sh | ~/tools/<tool>/ | Tool-specific settings |
+| `<tool>/env.sh` | ~/.dotfiles/tools/ | Tool-specific settings |

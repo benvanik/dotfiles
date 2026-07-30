@@ -36,12 +36,16 @@ _use_tool() {
     # Export root variable for env.sh to use.
     local root_var
     root_var="$(echo "${tool}" | tr '[:lower:]' '[:upper:]')_ROOT"
-    eval "export ${root_var}=\"${tool_path}\""
+    export "$root_var=$tool_path"
 
-    # Source tool-specific env.sh if exists.
-    # env.sh is responsible for adding to PATH.
-    local env_file="${tool_dir}/env.sh"
-    [ -f "$env_file" ] && source_env "$env_file"
+    # Environment definitions are tracked with the dotfiles so pulling an
+    # update changes behavior without reinstalling the tool payload.
+    local environment_file="${HOME}/.dotfiles/tools/${tool}/env.sh"
+    if [ ! -f "$environment_file" ]; then
+        log_error "Missing ${tool} environment definition: ${environment_file}"
+        return 1
+    fi
+    source_env "$environment_file"
 
     # Track for summary output.
     _track_tool "$tool" "$(_version_from_path "$tool_path")"
@@ -100,33 +104,6 @@ use_project_history() {
     mkdir -p "$HISTORY_BASE"
 }
 
-# Enable ccache with project-isolated cache directory.
-# Usage: use_ccache [cache_name]
-#
-# Cache stored at: ${CCACHE_BASE_DIR:-~/.cache/ccache}/<cache_name>
-# For worktrees sharing cache, use same cache_name.
-#
-# Examples:
-#   use_ccache             # Cache name from directory basename
-#   use_ccache "iree"      # All IREE worktrees share this cache
-#
-use_ccache() {
-    command -v ccache >/dev/null || {
-        log_error "ccache not found. Install with: sudo apt install ccache"
-        return 1
-    }
-
-    local cache_name="${1:-$(basename "$PWD")}"
-    local base_cache="${CCACHE_BASE_DIR:-$HOME/.cache/ccache}"
-
-    export CCACHE_DIR="${base_cache}/${cache_name}"
-    export CMAKE_C_COMPILER_LAUNCHER="ccache"
-    export CMAKE_CXX_COMPILER_LAUNCHER="ccache"
-
-    mkdir -p "$CCACHE_DIR"
-    _track_tool "ccache" "$cache_name"
-}
-
 # Activate Python virtual environment if present.
 # Usage: use_venv [path]
 #
@@ -159,7 +136,9 @@ use_venv() {
     fi
 
     # Activate venv using direnv's layout mechanism.
-    export VIRTUAL_ENV="$(cd "$venv_path" && pwd)"
+    local virtual_environment
+    virtual_environment=$(cd "$venv_path" && pwd) || return 1
+    export VIRTUAL_ENV="$virtual_environment"
     PATH_add "${VIRTUAL_ENV}/bin"
     export VIRTUAL_ENV_PROMPT="${venv_path##*/}"
 

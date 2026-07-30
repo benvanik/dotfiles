@@ -8,15 +8,15 @@
 | `rocm-install 7.9.0` | Install ROCm version to ~/tools/rocm/ |
 | `use_llvm ">=21.0.0"` | In .envrc: require LLVM 21+ |
 | `use_rocm "debug"` | In .envrc: use TheRock debug build |
-| `use_ccache "iree"` | In .envrc: enable ccache with named cache |
-| `use_iree_dev` | Convenience: llvm+cmake+ninja+rocm |
 
 ## Directory Layout
 
 ```
+~/.dotfiles/tools/<tool>/
+└── env.sh          # Synced settings (CC, CXX, PATH, etc.)
+
 ~/tools/<tool>/
-├── env.sh          # Common settings (CC, CXX, PATH, etc.)
-├── <version>/      # Installed version directory
+├── <version>/      # Machine-local installed version
 └── latest -> ver   # Default symlink
 ```
 
@@ -33,8 +33,6 @@ In .envrc files:
 - `use_cmake [version]` - Load CMake
 - `use_ninja [version]` - Load Ninja
 - `use_rocm [version]` - Load ROCm (Linux only, silent skip elsewhere)
-- `use_ccache [cache_name]` - Enable ccache with per-project isolation
-- `use_iree_dev [llvm_ver] [cmake_ver]` - Load IREE development tools
 - `source_local_envrc` - Load .envrc.local overrides
 
 ## Adding New Tool Version
@@ -57,51 +55,6 @@ LLVM:
 ROCm:
 - `ROCM_HOME`, `HIP_PATH` - ROCm paths
 - `CMAKE_PREFIX_PATH` - For TheRock builds
-
-## ccache Setup
-
-ccache speeds up recompilation by caching compiled objects (3-4x faster rebuilds).
-
-### Basic Usage
-
-In .envrc:
-```bash
-use_ccache              # Cache name from directory basename
-use_ccache "myproject"  # Named cache (for sharing across worktrees)
-```
-
-### Environment Variables Set
-
-- `CCACHE_DIR` - Cache directory: `${CCACHE_BASE_DIR:-~/.cache/ccache}/<cache_name>`
-- `CMAKE_C_COMPILER_LAUNCHER` - Set to `ccache`
-- `CMAKE_CXX_COMPILER_LAUNCHER` - Set to `ccache`
-
-### Shared Cache Across Worktrees
-
-For projects with multiple worktrees (like IREE), use a named cache:
-```bash
-# In all IREE worktrees:
-use_ccache "iree"  # All share ~/.cache/ccache/iree/
-```
-
-### Custom Cache Location
-
-Set `CCACHE_BASE_DIR` in `~/.shrc.local` to relocate all caches:
-```bash
-# Use fast SSD for cache (offload I/O from main drive).
-export CCACHE_BASE_DIR="/mnt/fastssd/cache/ccache"
-```
-
-### Requirements
-
-Install ccache via package manager:
-```bash
-# Debian/Ubuntu
-sudo apt install ccache
-
-# macOS
-brew install ccache
-```
 
 ## ROCm Setup
 

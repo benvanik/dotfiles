@@ -11,6 +11,10 @@
 
 set -e
 
+PROJECT_INIT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../tools/versions.sh
+source "$PROJECT_INIT_DIR/../tools/versions.sh"
+
 # Colors.
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -36,18 +40,17 @@ _PI_TOOLS=(
     "llvm:>=21.0.0:all:LLVM/Clang toolchain"
     "bazel:latest:all:Bazel build system"
     "nvm:latest:all:Node.js version manager"
-    "ccache:system:all:Compiler cache (3-4x faster rebuilds)"
     "rocm:>=6.0.0:linux:AMD ROCm/HIP"
     "vulkan:latest:linux:Vulkan SDK"
 )
 
 # Group definitions: id:name:tools (comma-separated tool names)
 _PI_TOOL_GROUPS=(
-    "build:Build Tools:cmake,ninja,llvm,bazel,nvm,ccache"
+    "build:Build Tools:cmake,ninja,llvm,bazel,nvm"
     "gpu:ML/GPU Tools:rocm,vulkan"
 )
 
-# Build preset tools (ccache is opt-in, not included in preset).
+# Build preset tools.
 _PI_BUILD_TOOLS=(cmake ninja llvm bazel)
 
 # GPU preset tools.
@@ -350,13 +353,6 @@ generate_envrc() {
             ninja)  echo "use_ninja" ;;
             bazel)  echo "use_bazel" ;;
             nvm)    echo "use_nvm" ;;
-            ccache)
-                if [ -n "$CACHE_NAME" ]; then
-                    echo "use_ccache \"$CACHE_NAME\""
-                else
-                    echo "use_ccache"
-                fi
-                ;;
             rocm)   echo "use_rocm \"$version\"  # Linux only" ;;
             vulkan) echo "use_vulkan" ;;
         esac
@@ -400,7 +396,6 @@ OPTIONS
     -y, --yes           Skip confirmation prompt
     --no-env            Skip .envrc generation (use with --vscode)
     --no-history        Disable per-project shell history
-    --cache-name NAME   Override ccache cache name (default: directory basename)
     --history-path PATH Override history directory path
 
 VS CODE WORKSPACE OPTIONS
@@ -455,7 +450,6 @@ parse_args() {
     PRESET_GPU=false
     PRESET_ALL=false
     TARGET_DIR="."
-    CACHE_NAME=""
     HISTORY_PATH=""
 
     # VS Code workspace options.
@@ -495,10 +489,6 @@ parse_args() {
                 ;;
             --no-history)
                 USE_HISTORY=false
-                ;;
-            --cache-name)
-                shift
-                CACHE_NAME="$1"
                 ;;
             --history-path)
                 shift
@@ -593,15 +583,9 @@ get_tool_root() {
     local tool="$1"
     local tool_dir="$HOME/tools/$tool"
 
-    if [ -L "$tool_dir/latest" ]; then
-        readlink -f "$tool_dir/latest"
-    elif [ -d "$tool_dir/latest" ]; then
-        echo "$tool_dir/latest"
-    else
-        # Find the first version directory.
-        local version_dir
-        version_dir=$(find "$tool_dir" -maxdepth 1 -type d ! -name "$tool" 2>/dev/null | head -1)
-        [ -n "$version_dir" ] && echo "$version_dir" || echo "$tool_dir"
+    if ! _find_version "$tool_dir" latest; then
+        error "No installed $tool version found in $tool_dir"
+        return 1
     fi
 }
 
@@ -809,7 +793,9 @@ main() {
     # Parse existing .envrc if present.
     local current_tools=()
     if [ -f ".envrc" ]; then
-        mapfile -t current_tools < <(parse_envrc ".envrc")
+        while IFS= read -r tool; do
+            [ -n "$tool" ] && current_tools+=("$tool")
+        done < <(parse_envrc ".envrc")
         if envrc_has_history ".envrc"; then
             USE_HISTORY=true
         else

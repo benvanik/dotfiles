@@ -17,11 +17,11 @@ PASSED=0
 FAILED=0
 
 pass() { printf "  ${GREEN}PASS${NC} %s\n" "$1"; ((++PASSED)); }
-fail() { printf "  ${RED}FAIL${NC} %s\n" "$1"; ((++FAILED)); LAST_FAIL="$1"; }
+fail() { printf "  ${RED}FAIL${NC} %s\n" "$1"; ((++FAILED)); }
 section() { printf "\n${BOLD}[%s]${NC} %s\n" "$1" "$2"; }
 
 echo ""
-printf "${BOLD}Dotfiles Docker Test${NC} (mode: $MODE)\n"
+printf "%bDotfiles Docker Test%b (mode: %s)\n" "$BOLD" "$NC" "$MODE"
 echo "========================================"
 
 # ============================================================================

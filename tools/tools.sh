@@ -8,8 +8,9 @@ TOOLS_DIR="$HOME/tools"
 
 # Source platform utilities.
 . "$HOME/.dotfiles/tools/platform.sh" 2>/dev/null || return 0
+. "$HOME/.dotfiles/tools/versions.sh" 2>/dev/null || return 0
 
-# Helper to load a tool by setting ROOT and sourcing env.sh.
+# Helper to load a tool by setting ROOT and sourcing its tracked environment.
 _load_tool() {
     local tool="$1"
     local tool_dir="$TOOLS_DIR/$tool"
@@ -26,11 +27,20 @@ _load_tool() {
     eval "current_root=\${${root_var}:-}"
     [ -n "$current_root" ] && return 0
 
-    # Export the global default and let env.sh configure the tool.
-    eval "export ${root_var}=\"\$(readlink -f \"$latest\")\""
+    local tool_root
+    if ! tool_root=$(_find_version "$tool_dir" latest); then
+        printf '\033[31m[tools]\033[0m Broken latest link: %s\n' "$latest" >&2
+        return 1
+    fi
+    export "$root_var=$tool_root"
 
-    local env_file="$tool_dir/env.sh"
-    [ -f "$env_file" ] && . "$env_file"
+    local environment_file="$HOME/.dotfiles/tools/$tool/env.sh"
+    if [ ! -f "$environment_file" ]; then
+        printf '\033[31m[tools]\033[0m Missing environment: %s\n' \
+            "$environment_file" >&2
+        return 1
+    fi
+    . "$environment_file"
 }
 
 # Load core development tools (latest versions).

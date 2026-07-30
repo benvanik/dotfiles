@@ -1,7 +1,7 @@
 #!/bin/bash
 # ~/.dotfiles/lib/packages.sh - Package definitions and verification.
 # Single source of truth for all system dependencies.
-# Requires bash 4+ for associative arrays.
+# Compatible with the Bash 3.2 shipped by macOS.
 
 # ============================================================================
 # Package Categories
@@ -11,41 +11,19 @@
 REQUIRED_PACKAGES=(zsh git curl fzf rg jq direnv)
 
 # Recommended packages - warnings only, install proceeds.
-RECOMMENDED_PACKAGES=(fd bat eza shellcheck ccache)
+RECOMMENDED_PACKAGES=(fd bat eza shellcheck)
 
 # ============================================================================
 # Package Manager Name Mappings
 # ============================================================================
-# Format: PKG_NAMES[pm:canonical]=actual_package_name
-# Only specify if different from canonical name.
-
-declare -A PKG_NAMES=(
-    # apt uses different names.
-    [apt:rg]="ripgrep"
-    [apt:fd]="fd-find"
-
-    # dnf differences.
-    [dnf:rg]="ripgrep"
-    [dnf:fd]="fd-find"
-    [dnf:shellcheck]="ShellCheck"
-
-    # pacman differences.
-    [pacman:rg]="ripgrep"
-
-    # brew differences.
-    [brew:rg]="ripgrep"
-)
+# Only manager-specific names that differ from the canonical name are listed.
 
 # ============================================================================
 # Binary Name Mappings
 # ============================================================================
 # Some packages install binaries with different names.
-# Format: BIN_NAMES[pm:canonical]=actual_binary
-
-declare -A BIN_NAMES=(
-    [apt:fd]="fdfind"
-    [apt:bat]="batcat"
-)
+# Only manager-specific binary names that differ from the canonical name are
+# listed.
 
 # ============================================================================
 # Package Manager Detection
@@ -77,15 +55,12 @@ _pkg_detect_pm() {
 # Returns: actual package name for that manager.
 _pkg_resolve_name() {
     local pm="$1" canonical="$2"
-    local key="${pm}:${canonical}"
-
-    # Check for manager-specific override.
-    if [[ -v "PKG_NAMES[$key]" ]]; then
-        echo "${PKG_NAMES[$key]}"
-    else
-        # Default to canonical name.
-        echo "$canonical"
-    fi
+    case "$pm:$canonical" in
+        apt:rg|dnf:rg|pacman:rg|brew:rg) echo "ripgrep" ;;
+        apt:fd|dnf:fd) echo "fd-find" ;;
+        dnf:shellcheck) echo "ShellCheck" ;;
+        *) echo "$canonical" ;;
+    esac
 }
 
 # Get the binary name to check for a package.
@@ -93,15 +68,11 @@ _pkg_resolve_name() {
 # Returns: binary name to look for in PATH.
 _pkg_resolve_bin() {
     local canonical="$1" pm="$2"
-    local key="${pm}:${canonical}"
-
-    # Check for manager-specific binary name.
-    if [[ -v "BIN_NAMES[$key]" ]]; then
-        echo "${BIN_NAMES[$key]}"
-    else
-        # Binary name same as canonical name.
-        echo "$canonical"
-    fi
+    case "$pm:$canonical" in
+        apt:fd) echo "fdfind" ;;
+        apt:bat) echo "batcat" ;;
+        *) echo "$canonical" ;;
+    esac
 }
 
 # ============================================================================

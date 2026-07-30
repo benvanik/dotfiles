@@ -119,18 +119,6 @@ chmod +x "$VERSION/bin/buildozer"
 # Update latest symlink.
 update_latest "$BAZEL_DIR" "$VERSION"
 
-# Create env.sh if it doesn't exist.
-if [ ! -f "env.sh" ]; then
-    cat > env.sh << 'EOF'
-# Bazel tools environment.
-# Sourced by direnvrc when using use_bazel.
-if [ -n "$BAZEL_ROOT" ]; then
-    export PATH="$BAZEL_ROOT/bin:$PATH"
-fi
-EOF
-    info "Created env.sh"
-fi
-
 info "Bazel tools installed successfully!"
 echo "  bazel (bazelisk $BAZELISK_VER)"
 echo "  buildifier $VERSION"

@@ -23,11 +23,11 @@ fail() { printf "  ${RED}FAIL${NC} %s\n" "$1"; ((++FAILED)); }
 skip() { printf "  ${YELLOW}SKIP${NC} %s\n" "$1"; ((++SKIPPED)); }
 section() { printf "\n${BOLD}[%s]${NC} %s\n" "$1" "$2"; }
 
-# Track start time.
-START_TIME=$(date +%s.%N)
+# Track start time with the Bash timer available on Linux and macOS.
+START_TIME=$SECONDS
 
 echo ""
-printf "${BOLD}[dotfiles]${NC} Running Tier 1 tests...\n"
+printf "%b[dotfiles]%b Running Tier 1 tests...\n" "$BOLD" "$NC"
 
 # ============================================================================
 # Syntax Validation
@@ -66,6 +66,10 @@ bash_files=(
     "install-deps.sh"
     "shell/bashrc"
 )
+# Add all test scripts.
+for f in test/*.sh; do
+    [ -f "$f" ] && bash_files+=("$f")
+done
 # Add bin scripts with bash shebang.
 for f in bin/*; do
     if [ -f "$f" ] && head -1 "$f" 2>/dev/null | grep -q "^#!/bin/bash"; then
@@ -76,8 +80,8 @@ done
 for f in lib/*.sh; do
     [ -f "$f" ] && bash_files+=("$f")
 done
-# Add tools files (use 'local' which requires bash-mode checking).
-for f in tools/*.sh; do
+# Add tool support and installer files.
+for f in tools/*.sh tools/*/*.sh; do
     [ -f "$f" ] && bash_files+=("$f")
 done
 
@@ -85,7 +89,7 @@ bash_pass=0
 bash_fail=0
 for f in "${bash_files[@]}"; do
     if [ -f "$f" ]; then
-        if bash -n "$f" 2>/dev/null; then
+        if "$BASH" -n "$f" 2>/dev/null; then
             ((++bash_pass))
         else
             fail "bash syntax: $f"
@@ -127,9 +131,10 @@ section "links" "Symlink target verification"
 # Extract '_link X Y' calls from bin/dotfiles and verify X exists.
 link_pass=0
 link_fail=0
+link_pattern='^[[:space:]]*_link[[:space:]]+([^[:space:]]+)'
 while IFS= read -r line; do
     # Parse: _link <source> <dest>
-    if [[ "$line" =~ ^[[:space:]]*_link[[:space:]]+([^[:space:]]+) ]]; then
+    if [[ "$line" =~ $link_pattern ]]; then
         src="${BASH_REMATCH[1]}"
         if [ -e "$DOTFILES/$src" ]; then
             ((++link_pass))
@@ -142,6 +147,39 @@ done < bin/dotfiles
 
 if [ $link_fail -eq 0 ]; then
     pass "symlink targets: $link_pass verified"
+fi
+
+# ============================================================================
+# Project Worktree Lifecycle
+# ============================================================================
+section "worktrees" "Project worktree lifecycle"
+
+if "$BASH" "$DOTFILES/test/project-worktree-test.sh"; then
+    pass "project worktree lifecycle"
+else
+    fail "project worktree lifecycle"
+fi
+
+# ============================================================================
+# Tool Environments
+# ============================================================================
+section "tool-env" "Portable tracked tool environments"
+
+if "$BASH" "$DOTFILES/test/tool-environment-test.sh"; then
+    pass "tool environment portability"
+else
+    fail "tool environment portability"
+fi
+
+# ============================================================================
+# Package Resolution
+# ============================================================================
+section "packages" "Portable package resolution"
+
+if "$BASH" "$DOTFILES/test/packages-test.sh"; then
+    pass "package resolution"
+else
+    fail "package resolution"
 fi
 
 # ============================================================================
@@ -378,6 +416,8 @@ TOOLS_DIR="$HOME/tools"
 smoketest_pass=0
 smoketest_fail=0
 smoketest_skip=0
+# shellcheck source=../tools/versions.sh
+. "$DOTFILES/tools/versions.sh"
 
 for tool_dir in "$DOTFILES"/tools/*/; do
     tool=$(basename "$tool_dir")
@@ -406,19 +446,32 @@ for tool_dir in "$DOTFILES"/tools/*/; do
 
     # Set up tool environment (skip for nvm - uses shrc PATH setup).
     if [ "$tool" != "nvm" ]; then
-        # Source the tool's env.sh if it exists.
-        if [ -f "$TOOLS_DIR/$tool/env.sh" ]; then
-            # Set up the ROOT variable the env.sh expects.
-            root_var="$(echo "$tool" | tr '[:lower:]' '[:upper:]')_ROOT"
-            eval "export ${root_var}=\"\$(readlink -f \"$TOOLS_DIR/$tool/latest\")\""
-            . "$TOOLS_DIR/$tool/env.sh" 2>/dev/null || true
+        environment_file="$DOTFILES/tools/$tool/env.sh"
+        if [ ! -f "$environment_file" ]; then
+            fail "missing tool environment: $tool"
+            ((++smoketest_fail))
+            continue
+        fi
+        if ! tool_root=$(_find_version "$TOOLS_DIR/$tool" latest); then
+            fail "broken latest link: $tool"
+            ((++smoketest_fail))
+            continue
+        fi
+
+        # Set up the ROOT variable the tracked environment expects.
+        root_var="$(echo "$tool" | tr '[:lower:]' '[:upper:]')_ROOT"
+        export "$root_var=$tool_root"
+        if ! . "$environment_file"; then
+            fail "environment setup: $tool"
+            ((++smoketest_fail))
+            continue
         fi
         # Add tool to PATH.
         export PATH="$TOOLS_DIR/$tool/latest/bin:$PATH"
     fi
 
     # Run smoketest.
-    if bash "$smoketest" 2>/dev/null; then
+    if "$BASH" "$smoketest" 2>/dev/null; then
         ((++smoketest_pass))
     else
         fail "smoketest: $tool"
@@ -438,15 +491,16 @@ fi
 # ============================================================================
 # Summary
 # ============================================================================
-END_TIME=$(date +%s.%N)
-DURATION=$(echo "$END_TIME - $START_TIME" | bc 2>/dev/null || echo "?")
+DURATION=$((SECONDS - START_TIME))
 
 echo ""
 echo "========================================"
 if [ $FAILED -eq 0 ]; then
-    printf "${GREEN}All tests passed!${NC} (%s passed, %s skipped) [%ss]\n" "$PASSED" "$SKIPPED" "${DURATION%.*}"
+    printf "%bAll tests passed!%b (%s passed, %s skipped) [%ss]\n" \
+        "$GREEN" "$NC" "$PASSED" "$SKIPPED" "$DURATION"
     exit 0
 else
-    printf "${RED}Tests failed!${NC} (%s passed, %s failed, %s skipped) [%ss]\n" "$PASSED" "$FAILED" "$SKIPPED" "${DURATION%.*}"
+    printf "%bTests failed!%b (%s passed, %s failed, %s skipped) [%ss]\n" \
+        "$RED" "$NC" "$PASSED" "$FAILED" "$SKIPPED" "$DURATION"
     exit 1
 fi

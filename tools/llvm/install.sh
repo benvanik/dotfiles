@@ -94,7 +94,12 @@ tar xf "$TARBALL"
 
 # Rename extracted directory to version.
 # New naming: LLVM-$VERSION-* (e.g., LLVM-21.1.6-Linux-X64).
-EXTRACTED=$(ls -d LLVM-$VERSION* 2>/dev/null | head -1)
+EXTRACTED=""
+for candidate in LLVM-"$VERSION"*; do
+    [ -d "$candidate" ] || continue
+    EXTRACTED="$candidate"
+    break
+done
 if [ -n "$EXTRACTED" ] && [ "$EXTRACTED" != "$VERSION" ]; then
     mv "$EXTRACTED" "$VERSION"
 fi
@@ -111,23 +116,5 @@ update_latest "$LLVM_DIR" "$VERSION"
 
 # Cleanup tarball.
 rm -f "$TARBALL"
-
-# Create env.sh if it doesn't exist.
-if [ ! -f "env.sh" ]; then
-    cat > env.sh << 'EOF'
-# LLVM/Clang environment.
-# Sourced by direnvrc when using use_llvm.
-if [ -n "$LLVM_ROOT" ]; then
-    export PATH="$LLVM_ROOT/bin:$PATH"
-    export CC="$LLVM_ROOT/bin/clang"
-    export CXX="$LLVM_ROOT/bin/clang++"
-    export LLVM_DIR="$LLVM_ROOT/lib/cmake/llvm"
-    export CLANG_DIR="$LLVM_ROOT/lib/cmake/clang"
-    export MLIR_DIR="$LLVM_ROOT/lib/cmake/mlir"
-    export LD_LIBRARY_PATH="$LLVM_ROOT/lib:${LD_LIBRARY_PATH:-}"
-fi
-EOF
-    info "Created env.sh"
-fi
 
 info "LLVM $VERSION installed successfully!"

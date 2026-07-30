@@ -62,13 +62,17 @@ use_ninja              # Latest
 source_local_envrc     # Must be last - prints env summary
 ```
 
-The `tools/direnvrc` provides `use_*` functions. Tool environment is configured in `~/tools/<tool>/env.sh`.
+The `tools/direnvrc` provides `use_*` functions. Version payloads remain
+machine-local under `~/tools/`, while environment definitions are tracked in
+`tools/<tool>/env.sh` so a dotfiles update applies them on every machine.
 
 ### Testing Infrastructure
 
 **Tier 1** (`test/run-tier1.sh`): Fast local checks
 - Shell syntax validation (POSIX, bash, zsh)
 - Symlink target verification
+- Generic worktree lifecycle integration
+- Portable tool environment integration
 - POSIX compliance (no bash-isms in POSIX files)
 - Secret detection
 - shellcheck analysis

@@ -3,6 +3,10 @@
 
 set -e
 
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../lib/project-worktrees.sh
+. "$SCRIPT_DIR/../lib/project-worktrees.sh"
+
 show_help() {
     cat << 'EOF'
 project-deinit - Cleanup project directory configuration
@@ -12,7 +16,7 @@ USAGE
 
 OPTIONS
     -h, --help       Show this help
-    --session NAME   Override tmux session name (default: directory basename)
+    --session NAME   Override tmux session name (default: repository/worktree name)
     --tmux-only      Only kill tmux session, skip file cleanup
     -y, --yes        Skip confirmation prompts
 
@@ -97,9 +101,9 @@ if [ ! -d "$TARGET_DIR" ]; then
 fi
 cd "$TARGET_DIR"
 
-# Session name defaults to directory basename.
+# Session name defaults to the repository-qualified worktree name.
 if [ -z "$SESSION_NAME" ]; then
-    SESSION_NAME=$(basename "$PWD")
+    SESSION_NAME=$(project_default_session_name "$PWD")
 fi
 
 # Helper to confirm action.

@@ -292,16 +292,8 @@ _show_summary() {
     info "  project-dev       Create/attach to project tmux session"
     info "  project-code      Launch VS Code for project"
     info "  project-deinit    Remove project .envrc"
-    echo ""
-
-    info "IREE development:"
-    info "  iree-worktree-init <branch>   Create IREE worktree with shared config"
-    info "  iree-dev <name>               Create/attach to IREE tmux session"
-    info "  iree-code <name>              Launch VS Code for IREE worktree"
-    info "  iree-cmake-configure          Configure CMake build"
-    info "  iree-cmake-build              Build with ninja"
-    info "  iree-cmake-test               Run tests"
-    info "  iree-worktree-deinit <name>   Remove worktree and build directory"
+    info "  project-worktree-init <branch>  Create sibling Git worktree"
+    info "  project-worktree-deinit <name>  Safely remove sibling worktree"
     echo ""
 
     if [ -d "$BACKUP_DIR" ]; then

@@ -1,0 +1,144 @@
+#!/bin/bash
+# Create a sibling Git worktree using the <project>/main layout.
+
+set -euo pipefail
+
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../lib/project-worktrees.sh
+. "$SCRIPT_DIR/../lib/project-worktrees.sh"
+
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+info() { printf "${GREEN}[project-worktree]${NC} %s\n" "$1"; }
+error() { printf "${RED}[project-worktree]${NC} %s\n" "$1" >&2; }
+
+show_help() {
+    cat << 'EOF'
+project-worktree-init - Create a sibling Git worktree
+
+USAGE
+    project-worktree-init <branch> [name]
+
+ARGUMENTS
+    branch    Local or origin branch to check out. A missing branch is
+              created from main.
+    name      Sibling directory name (default: basename of branch)
+
+LAYOUT
+    The repository's main branch must be checked out as <project>/main.
+    New worktrees are created at <project>/<name>.
+
+    If main/AGENTS.override.md exists, the new worktree receives a relative
+    AGENTS.override.md symlink to that shared file.
+
+EXAMPLES
+    project-worktree-init users/me/feature
+    project-worktree-init users/me/feature experiment
+EOF
+}
+
+case "${1:-}" in
+    -h|--help)
+        show_help
+        exit 0
+        ;;
+esac
+
+if [ $# -lt 1 ] || [ $# -gt 2 ]; then
+    show_help >&2
+    exit 1
+fi
+
+BRANCH="$1"
+WORKTREE_NAME="${2:-$(basename "$BRANCH")}"
+
+if ! git check-ref-format --branch "$BRANCH" >/dev/null 2>&1; then
+    error "Invalid branch name: $BRANCH"
+    exit 1
+fi
+
+if [[ ! "$WORKTREE_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || \
+        [ "$WORKTREE_NAME" = "." ] || [ "$WORKTREE_NAME" = ".." ]; then
+    error "Invalid worktree name: $WORKTREE_NAME"
+    error "Use letters, numbers, periods, underscores, and hyphens."
+    exit 1
+fi
+
+if [ "$WORKTREE_NAME" = "main" ]; then
+    error "The worktree name 'main' is reserved for the primary checkout."
+    exit 1
+fi
+
+if ! CURRENT_WORKTREE=$(git rev-parse --show-toplevel 2>/dev/null); then
+    error "Run this command from inside an existing Git worktree."
+    exit 1
+fi
+
+if ! MAIN_WORKTREE=$(project_main_worktree "$CURRENT_WORKTREE"); then
+    error "The local main branch is not checked out in any worktree."
+    exit 1
+fi
+
+if [ "$(basename "$MAIN_WORKTREE")" != "main" ]; then
+    error "The main worktree must be named 'main': $MAIN_WORKTREE"
+    exit 1
+fi
+
+PROJECT_ROOT=$(dirname "$MAIN_WORKTREE")
+WORKTREE_PATH="$PROJECT_ROOT/$WORKTREE_NAME"
+OVERRIDE_SOURCE="$MAIN_WORKTREE/AGENTS.override.md"
+
+if [ -e "$WORKTREE_PATH" ] || [ -L "$WORKTREE_PATH" ]; then
+    error "Destination already exists: $WORKTREE_PATH"
+    exit 1
+fi
+
+START_POINT="main"
+BRANCH_MODE="new"
+if git -C "$MAIN_WORKTREE" show-ref --verify --quiet "refs/heads/$BRANCH"; then
+    START_POINT="$BRANCH"
+    BRANCH_MODE="local"
+elif git -C "$MAIN_WORKTREE" show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
+    START_POINT="origin/$BRANCH"
+    BRANCH_MODE="remote"
+fi
+
+if [ -L "$OVERRIDE_SOURCE" ] && [ ! -e "$OVERRIDE_SOURCE" ]; then
+    error "The main worktree has a broken AGENTS.override.md symlink."
+    exit 1
+fi
+if [ -e "$OVERRIDE_SOURCE" ] && [ ! -f "$OVERRIDE_SOURCE" ]; then
+    error "The main worktree's AGENTS.override.md is not a regular file."
+    exit 1
+fi
+
+if [ -e "$OVERRIDE_SOURCE" ] && \
+        git -C "$MAIN_WORKTREE" cat-file -e "$START_POINT:AGENTS.override.md" 2>/dev/null; then
+    error "AGENTS.override.md is tracked on $START_POINT and cannot be replaced by a shared symlink."
+    exit 1
+fi
+
+info "Creating $WORKTREE_PATH from $START_POINT"
+case "$BRANCH_MODE" in
+    local)
+        git -C "$MAIN_WORKTREE" worktree add "$WORKTREE_PATH" "$BRANCH"
+        ;;
+    remote)
+        git -C "$MAIN_WORKTREE" worktree add --track -b "$BRANCH" \
+            "$WORKTREE_PATH" "$START_POINT"
+        ;;
+    new)
+        git -C "$MAIN_WORKTREE" worktree add -b "$BRANCH" \
+            "$WORKTREE_PATH" "$START_POINT"
+        ;;
+esac
+
+if [ -e "$OVERRIDE_SOURCE" ]; then
+    ln -s "../main/AGENTS.override.md" "$WORKTREE_PATH/AGENTS.override.md"
+    info "Linked AGENTS.override.md -> ../main/AGENTS.override.md"
+fi
+
+info "Created worktree: $WORKTREE_PATH"
+printf '  cd %q\n' "$WORKTREE_PATH"

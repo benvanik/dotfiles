@@ -1,0 +1,115 @@
+#!/bin/bash
+# Safely remove a sibling Git worktree using the <project>/main layout.
+
+set -euo pipefail
+
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../lib/project-worktrees.sh
+. "$SCRIPT_DIR/../lib/project-worktrees.sh"
+
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+info() { printf "${GREEN}[project-worktree]${NC} %s\n" "$1"; }
+error() { printf "${RED}[project-worktree]${NC} %s\n" "$1" >&2; }
+
+show_help() {
+    cat << 'EOF'
+project-worktree-deinit - Remove a sibling Git worktree
+
+USAGE
+    project-worktree-deinit <name>
+
+The command must be run from another worktree in the same repository. Git
+refuses to remove a worktree containing modified or untracked files.
+No build directories or project configuration are removed separately.
+EOF
+}
+
+case "${1:-}" in
+    -h|--help)
+        show_help
+        exit 0
+        ;;
+esac
+
+if [ $# -ne 1 ]; then
+    show_help >&2
+    exit 1
+fi
+
+WORKTREE_NAME="$1"
+if [[ ! "$WORKTREE_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || \
+        [ "$WORKTREE_NAME" = "." ] || [ "$WORKTREE_NAME" = ".." ]; then
+    error "Invalid worktree name: $WORKTREE_NAME"
+    exit 1
+fi
+
+if [ "$WORKTREE_NAME" = "main" ]; then
+    error "The primary main worktree cannot be removed."
+    exit 1
+fi
+
+if ! CURRENT_WORKTREE=$(git rev-parse --show-toplevel 2>/dev/null); then
+    error "Run this command from inside another Git worktree."
+    exit 1
+fi
+
+if ! MAIN_WORKTREE=$(project_main_worktree "$CURRENT_WORKTREE"); then
+    error "The local main branch is not checked out in any worktree."
+    exit 1
+fi
+
+if [ "$(basename "$MAIN_WORKTREE")" != "main" ]; then
+    error "The main worktree must be named 'main': $MAIN_WORKTREE"
+    exit 1
+fi
+
+PROJECT_ROOT=$(dirname "$MAIN_WORKTREE")
+WORKTREE_PATH="$PROJECT_ROOT/$WORKTREE_NAME"
+CURRENT_DIRECTORY=$(pwd -P)
+
+case "$CURRENT_DIRECTORY/" in
+    "$WORKTREE_PATH/"*)
+        error "Cannot remove the worktree containing the current directory."
+        error "Run this command from $MAIN_WORKTREE or another worktree."
+        exit 1
+        ;;
+esac
+
+REGISTERED=false
+while IFS= read -r line; do
+    if [ "$line" = "worktree $WORKTREE_PATH" ]; then
+        REGISTERED=true
+        break
+    fi
+done < <(git -C "$MAIN_WORKTREE" worktree list --porcelain)
+
+if [ "$REGISTERED" != "true" ]; then
+    error "Not a registered worktree: $WORKTREE_PATH"
+    exit 1
+fi
+
+SESSION_NAME=$(project_default_session_name "$WORKTREE_PATH")
+info "Removing worktree: $WORKTREE_PATH"
+
+# The initializer owns this exact symlink. Remove it before asking Git to
+# evaluate cleanliness, restoring it if any other state blocks removal.
+MANAGED_OVERRIDE=false
+if [ -L "$WORKTREE_PATH/AGENTS.override.md" ] && \
+        [ "$(readlink "$WORKTREE_PATH/AGENTS.override.md")" = "../main/AGENTS.override.md" ]; then
+    rm "$WORKTREE_PATH/AGENTS.override.md"
+    MANAGED_OVERRIDE=true
+fi
+
+if ! git -C "$MAIN_WORKTREE" worktree remove "$WORKTREE_PATH"; then
+    if [ "$MANAGED_OVERRIDE" = "true" ]; then
+        ln -s "../main/AGENTS.override.md" "$WORKTREE_PATH/AGENTS.override.md"
+    fi
+    error "Worktree removal failed; modified and untracked files were preserved."
+    exit 1
+fi
+
+"$SCRIPT_DIR/project-deinit" --session "$SESSION_NAME" --tmux-only --yes "$MAIN_WORKTREE"
+info "Removed worktree: $WORKTREE_PATH"

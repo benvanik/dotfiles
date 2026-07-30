@@ -18,7 +18,6 @@
       "WebFetch(domain:llvm.org)",
       "WebFetch(domain:mlir.llvm.org)",
       "WebFetch(domain:releases.llvm.org)",
-      "WebFetch(domain:iree.dev)",
       "WebFetch(domain:openxla.org)",
       "WebFetch(domain:vulkan.lunarg.com)",
       "WebFetch(domain:registry.khronos.org)",

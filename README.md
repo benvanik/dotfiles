@@ -5,7 +5,7 @@ Personal shell configuration.
 ## About
 
 This is an opinionated dotfiles setup optimized for:
-- Compiler development (MLIR/IREE/ROCm workflows)
+- Compiler development (HRX/ROCm workflows)
 - Multi-version tool management via direnv
 
 Feel free to fork and adapt. Project-specific scripts can be removed if you
@@ -60,17 +60,35 @@ dotfiles install           # Set up symlinks and configuration
 dotfiles deps              # Run install-deps.sh (install packages)
 ```
 
+## Project Tools
+
+The generic `project-*` commands initialize development environments, launch
+editor and tmux sessions, and manage sibling Git worktrees. The worktree
+commands use a `<project>/main` primary checkout and create feature worktrees
+at `<project>/<name>`:
+
+```bash
+cd ~/src/my-project/main
+project-worktree-init users/me/feature feature
+project-dev
+project-code .
+project-worktree-deinit feature
+```
+
+When `main/AGENTS.override.md` exists, `project-worktree-init` links it into
+each new worktree. Git rejects deinitialization while a worktree contains any
+other modified or untracked files.
+
 ## Project-Specific Tools (Optional)
 
 Scripts in `bin/` prefixed with project names are optional and can be removed:
 
 | Prefix | Project | Purpose |
 |--------|---------|---------|
-| `iree-*` | [IREE](https://github.com/iree-org/iree) | Compiler worktree and build management |
 | `therock-*` | [TheRock](https://github.com/ROCm/TheRock) | ROCm/HIP compiler development |
 | `vulkan-*` | Vulkan SDK | SDK installation and layer building |
 
-These scripts assume specific directory layouts (`~/src/iree/`, `~/src/rocm/`, etc.).
+These scripts assume specific directory layouts (`~/src/rocm/`, etc.).
 If you don't work on these projects, delete the scripts or ignore them.
 
 ## Platform Support
@@ -162,7 +180,7 @@ A pre-commit hook runs `dotfiles test` automatically.
 - shellcheck (if installed)
 
 **Tier 2 (Docker)** - on-demand with `--full`:
-- Full install on pristine Alpine/Ubuntu containers
+- Full install on a pristine Ubuntu container
 - Package installation validation
 - Interactive shell startup tests
 

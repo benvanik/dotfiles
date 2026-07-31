@@ -11,6 +11,14 @@
 
 set -e
 
+PROJECT_INIT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../tools/versions.sh
+source "$PROJECT_INIT_DIR/../tools/versions.sh"
+# shellcheck source=../tools/platform.sh
+source "$PROJECT_INIT_DIR/../tools/platform.sh"
+# shellcheck source=../tools/rocm/root.sh
+source "$PROJECT_INIT_DIR/../tools/rocm/root.sh"
+
 # Colors.
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -26,47 +34,40 @@ error() { printf "${RED}[project-init]${NC} %s\n" "$1" >&2; }
 # Tool Definitions
 # ============================================================================
 
-# Tool metadata: name:version_spec:platform:description
-# Platform: all, linux, darwin
+# Tool metadata: name:version_spec:description
 # version_spec: "system" means check command -v instead of ~/tools/
+# Host support is owned exclusively by tools/platform.sh.
 # Prefix with _PI_ to avoid environment variable conflicts.
 _PI_TOOLS=(
-    "cmake:>=3.28.0:all:CMake build system"
-    "ninja:latest:all:Ninja build tool"
-    "llvm:>=21.0.0:all:LLVM/Clang toolchain"
-    "mold:latest:linux:Fast linker"
-    "bazel:latest:all:Bazel build system"
-    "nvm:latest:all:Node.js version manager"
-    "python:system:all:Python venv (creates .venv)"
-    "ccache:system:all:Compiler cache (3-4x faster rebuilds)"
-    "rocm:>=6.0.0:linux:AMD ROCm/HIP"
-    "vulkan:latest:linux:Vulkan SDK"
+    "cmake:>=3.28.0:CMake build system"
+    "ninja:latest:Ninja build tool"
+    "llvm:>=21.0.0:LLVM/Clang toolchain"
+    "bazel:latest:Bazel build system"
+    "mold:latest:Mold linker (explicit opt-in)"
+    "cuda:latest:NVIDIA CUDA toolkit"
+    "rocm:>=6.0.0:AMD ROCm/HIP"
+    "vulkan:latest:Vulkan SDK"
 )
 
 # Group definitions: id:name:tools (comma-separated tool names)
 _PI_TOOL_GROUPS=(
-    "build:Build Tools:cmake,ninja,llvm,mold,bazel,nvm,python,ccache"
-    "gpu:ML/GPU Tools:rocm,vulkan"
+    "build:Build Tools:cmake,ninja,llvm,bazel"
+    "gpu:ML/GPU Tools:cuda,rocm,vulkan"
 )
 
-# Build preset tools (ccache is opt-in, not included in preset).
-_PI_BUILD_TOOLS=(cmake ninja llvm mold bazel)
+# Build preset tools.
+_PI_BUILD_TOOLS=(cmake ninja llvm bazel)
 
 # GPU preset tools.
-_PI_GPU_TOOLS=(rocm vulkan)
+_PI_GPU_TOOLS=(cuda rocm vulkan)
+
+# These tools are supported and round-tripped, but never selected by --all or
+# an interactive/preset group. Their effects are intentionally project-local.
+_PI_EXPLICIT_ONLY_TOOLS=(mold venv)
 
 # ============================================================================
 # Helper Functions
 # ============================================================================
-
-# Get platform (linux/darwin).
-get_platform() {
-    case "$(uname -s)" in
-        Linux*)  echo "linux" ;;
-        Darwin*) echo "darwin" ;;
-        *)       echo "unknown" ;;
-    esac
-}
 
 # Check if tool is available (installed in ~/tools/ OR system command).
 tool_installed() {
@@ -80,23 +81,12 @@ tool_installed() {
 
     if [ "$version" = "system" ]; then
         # System tool: check via command -v.
-        # Special case: "python" tool checks for python3.
-        local cmd="$tool"
-        [ "$tool" = "python" ] && cmd="python3"
-        command -v "$cmd" &>/dev/null
+        command -v "$tool" &>/dev/null
     else
-        # Versioned tool: check ~/tools/.
-        [ -d "$HOME/tools/$tool/latest" ] || \
-            { [ -d "$HOME/tools/$tool" ] && [ "$(ls -A "$HOME/tools/$tool" 2>/dev/null)" ]; }
+        # Versioned tool: require a resolvable published version. Installer
+        # guards, journals, and crash-recovery staging are not installations.
+        _find_version "$HOME/tools/$tool" latest >/dev/null 2>&1
     fi
-}
-
-# Check if tool is available on current platform.
-tool_available_on_platform() {
-    local platform="$1"
-    local current
-    current=$(get_platform)
-    [ "$platform" = "all" ] || [ "$platform" = "$current" ]
 }
 
 # Get tool metadata by name.
@@ -111,22 +101,100 @@ get_tool_info() {
     return 1
 }
 
-# Parse existing .envrc to find selected tools.
-# Maps direnv function names back to tool names (e.g., venv -> python).
-parse_envrc() {
-    local envrc="$1"
-    [ -f "$envrc" ] || return
-    # Match use_<tool> but not use_project_history or source_local_envrc.
-    grep -oE 'use_[a-z_]+' "$envrc" 2>/dev/null | \
-        grep -v 'use_project_history' | \
-        sed 's/use_//' | \
-        sed 's/^venv$/python/' || true
+tool_is_explicit_only() {
+    array_contains "$1" "${_PI_EXPLICIT_ONLY_TOOLS[@]}"
 }
 
-# Check if history is enabled in existing .envrc.
-envrc_has_history() {
+# Exact existing directives are retained so project-specific version edits are
+# stable across convergence. Unknown content fails before replacement instead
+# of being silently discarded.
+CURRENT_ENVRC_TOOLS=()
+CURRENT_ENVRC_DIRECTIVES=()
+CURRENT_HISTORY_DIRECTIVE=""
+
+load_existing_envrc() {
     local envrc="$1"
-    [ -f "$envrc" ] && grep -q 'use_project_history' "$envrc" 2>/dev/null
+    local line=""
+    local line_number=0
+    local tool=""
+    local strict_line_count=0
+    local local_source_count=0
+
+    CURRENT_ENVRC_TOOLS=()
+    CURRENT_ENVRC_DIRECTIVES=()
+    CURRENT_HISTORY_DIRECTIVE=""
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        line_number=$((line_number + 1))
+        if [[ "$line" =~ ^[[:space:]]*$ ]]; then
+            continue
+        fi
+        case "$line" in
+            "# Project environment - managed by direnv."|\
+            "# Edit tool versions as needed. Run 'direnv allow' after changes."|\
+            "# A failed import must abort direnv before its source cleanup can"|\
+            "# replace the failure status."|\
+            "# Per-project shell history (shared across subdirectories)."|\
+            "# Load machine-specific overrides if present.")
+                continue
+                ;;
+            "set -o errexit -o pipefail")
+                strict_line_count=$((strict_line_count + 1))
+                continue
+                ;;
+            "source_local_envrc")
+                local_source_count=$((local_source_count + 1))
+                continue
+                ;;
+        esac
+        if [[ "$line" =~ ^[[:space:]]*use_project_history([[:space:]]|$) ]]; then
+            if [ -n "$CURRENT_HISTORY_DIRECTIVE" ]; then
+                error "Duplicate history directive in $envrc"
+                return 1
+            fi
+            CURRENT_HISTORY_DIRECTIVE="$line"
+            continue
+        fi
+        if [[ "$line" =~ ^[[:space:]]*use_([a-z_]+)([[:space:]]|$) ]]; then
+            tool="${BASH_REMATCH[1]}"
+            if [ "$tool" != "venv" ] &&
+                    ! get_tool_info "$tool" >/dev/null; then
+                error "Unsupported tool directive in $envrc:$line_number: $line"
+                return 1
+            fi
+            if array_contains "$tool" "${CURRENT_ENVRC_TOOLS[@]}"; then
+                error "Duplicate $tool directive in $envrc"
+                return 1
+            fi
+            CURRENT_ENVRC_TOOLS+=("$tool")
+            CURRENT_ENVRC_DIRECTIVES+=("$line")
+            continue
+        fi
+        error "Refusing to discard unmanaged content in $envrc:$line_number"
+        error "Move machine-only values to .envrc.local before convergence."
+        return 1
+    done < "$envrc"
+
+    # Files produced by both merge parents predate the strict line. Their exact
+    # generated shape is accepted once and converges to the current form.
+    if [ "$strict_line_count" -gt 1 ] ||
+            [ "$local_source_count" -ne 1 ]; then
+        error "$envrc is not a complete project-init environment"
+        return 1
+    fi
+}
+
+existing_tool_directive() {
+    local requested_tool="$1"
+    local index=0
+
+    for ((index=0; index<${#CURRENT_ENVRC_TOOLS[@]}; index++)); do
+        if [ "${CURRENT_ENVRC_TOOLS[$index]}" = "$requested_tool" ]; then
+            printf '%s\n' "${CURRENT_ENVRC_DIRECTIVES[$index]}"
+            return 0
+        fi
+    done
+    return 1
 }
 
 # Get list of available (installed + platform-compatible) tools.
@@ -134,12 +202,10 @@ get_available_tools() {
     local available=()
     for spec in "${_PI_TOOLS[@]}"; do
         local name="${spec%%:*}"
-        local rest="${spec#*:}"
-        local version="${rest%%:*}"
-        rest="${rest#*:}"
-        local platform="${rest%%:*}"
 
-        if tool_installed "$name" && tool_available_on_platform "$platform"; then
+        if ! tool_is_explicit_only "$name" &&
+                _platform_supports "$name" &&
+                tool_installed "$name"; then
             available+=("$name")
         fi
     done
@@ -162,14 +228,11 @@ build_fzf_items() {
 
         local name="${spec%%:*}"
         local rest="${spec#*:}"
-        local version="${rest%%:*}"
-        rest="${rest#*:}"
-        local platform="${rest%%:*}"
         local desc="${rest#*:}"
 
         # Skip if not installed or not available on platform.
+        _platform_supports "$name" || continue
         tool_installed "$name" || continue
-        tool_available_on_platform "$platform" || continue
 
         printf '%s\t%s\n' "$name" "$desc"
     done
@@ -182,16 +245,19 @@ build_fzf_items() {
 run_fzf() {
     local outfile
     outfile=$(mktemp)
+    local fzf_status=0
 
-    # Run fzf with stdout to file. Stdin is inherited from caller.
-    fzf "$@" > "$outfile" 2>/dev/null || true
+    # Run fzf with stdout to file.
+    fzf "$@" > "$outfile" 2>/dev/null </dev/stdin ||
+        fzf_status=$?
 
-    # Output results if non-empty.
-    if [ -s "$outfile" ]; then
-        cat "$outfile"
+    # Filter out numeric-only terminal responses emitted by some fzf builds.
+    if [ "$fzf_status" -eq 0 ] && [ -s "$outfile" ]; then
+        grep -v '^[0-9][0-9]*$' "$outfile" 2>/dev/null || true
     fi
 
-    rm -f "$outfile"
+    unlink "$outfile"
+    return "$fzf_status"
 }
 
 # Multi-select tools using fzf.
@@ -208,18 +274,17 @@ select_tools_fzf() {
     # No tools available in this group.
     [ -z "$items" ] && return 0
 
-    # Count items for height calculation.
+    # Need room for items, border, header, prompt, and a small buffer.
     local count
     count=$(echo "$items" | wc -l)
     local height=$((count + 6))
     [ "$height" -lt 8 ] && height=8
 
-    # Write items to temp file for position-based pre-selection.
     local infile
     infile=$(mktemp)
     echo "$items" > "$infile"
 
-    # Build pre-selection bind command using pos(N)+toggle for each preselected item.
+    # fzf preselection uses one-indexed cursor positions.
     local bind_cmd=""
     if [ -n "$preselected" ]; then
         local idx=1
@@ -236,15 +301,15 @@ select_tools_fzf() {
         [ -n "$bind_cmd" ] && bind_cmd="$bind_cmd+first"
     fi
 
-    # Run fzf with pre-selection if needed.
-    # accept-non-empty prevents Enter from outputting highlighted item when nothing Tab-selected.
+    # Require an explicit Tab selection rather than accepting the highlighted
+    # item when Enter is pressed.
     local result
     if [ -n "$bind_cmd" ]; then
-        result=$(run_fzf --multi \
+        if ! result=$(run_fzf --multi \
             --height "$height" \
             --border \
             --prompt "Select $group_name: " \
-            --header "Tab: toggle, Enter: confirm, Esc: none" \
+            --header "Tab: toggle, Enter: confirm" \
             --marker "✓" \
             --pointer "▶" \
             --delimiter $'\t' \
@@ -252,24 +317,30 @@ select_tools_fzf() {
             --tabstop 12 \
             --sync \
             --bind "load:$bind_cmd" \
-            --bind 'enter:accept-non-empty' \
-            < "$infile")
+            --bind 'enter:transform:test -n "{+}" && echo accept || echo abort' \
+            < "$infile"); then
+            unlink "$infile"
+            return 1
+        fi
     else
-        result=$(run_fzf --multi \
+        if ! result=$(run_fzf --multi \
             --height "$height" \
             --border \
             --prompt "Select $group_name: " \
-            --header "Tab: toggle, Enter: confirm, Esc: none" \
+            --header "Tab: toggle, Enter: confirm" \
             --marker "✓" \
             --pointer "▶" \
             --delimiter $'\t' \
             --with-nth "1,2" \
             --tabstop 12 \
-            --bind 'enter:accept-non-empty' \
-            < "$infile")
+            --bind 'enter:transform:test -n "{+}" && echo accept || echo abort' \
+            < "$infile"); then
+            unlink "$infile"
+            return 1
+        fi
     fi
 
-    rm -f "$infile"
+    unlink "$infile"
 
     # Extract just the tool names (first column).
     if [ -n "$result" ]; then
@@ -289,21 +360,42 @@ select_history_fzf() {
         items=$'yes\tEnable per-project shell history\nno\tDisable per-project shell history (current)'
     fi
 
-    local choice
-    choice=$(echo "$items" | run_fzf --height 8 \
+    local infile
+    infile=$(mktemp)
+    echo "$items" > "$infile"
+
+    local bind_cmd
+    if [ "$current" = "true" ]; then
+        bind_cmd="pos(1)+toggle+first"
+    else
+        bind_cmd="pos(2)+toggle+first"
+    fi
+
+    local result
+    if ! result=$(run_fzf --height 8 \
         --border \
         --prompt "Per-project history: " \
         --header "Enter to select" \
         --delimiter $'\t' \
-        --with-nth "1,2" | cut -f1)
+        --with-nth "1,2" \
+        --sync \
+        --bind "load:$bind_cmd" \
+        < "$infile"); then
+        unlink "$infile"
+        return 1
+    fi
+    unlink "$infile"
 
-    # Default to current value if nothing selected.
+    local choice
+    choice=$(printf '%s\n' "$result" | cut -f1)
     if [ -z "$choice" ]; then
-        echo "$current"
+        return 1
     elif [ "$choice" = "yes" ]; then
         echo "true"
-    else
+    elif [ "$choice" = "no" ]; then
         echo "false"
+    else
+        return 1
     fi
 }
 
@@ -320,12 +412,20 @@ generate_envrc() {
 
     echo "# Project environment - managed by direnv."
     echo "# Edit tool versions as needed. Run 'direnv allow' after changes."
+    echo "# A failed import must abort direnv before its source cleanup can"
+    echo "# replace the failure status."
+    echo "set -o errexit -o pipefail"
     echo ""
 
     if [ "$use_history" = "true" ]; then
         echo "# Per-project shell history (shared across subdirectories)."
-        if [ -n "$HISTORY_PATH" ]; then
-            echo "use_project_history \"$HISTORY_PATH\""
+        if [ "$HISTORY_SELECTION_EXPLICIT" != "true" ] &&
+                [ -n "$CURRENT_HISTORY_DIRECTIVE" ]; then
+            printf '%s\n' "$CURRENT_HISTORY_DIRECTIVE"
+        elif [ -n "$HISTORY_PATH" ]; then
+            printf 'use_project_history '
+            printf '%q' "$HISTORY_PATH"
+            printf '\n'
         else
             echo "use_project_history"
         fi
@@ -333,8 +433,16 @@ generate_envrc() {
     fi
 
     for tool in "${tools[@]}"; do
+        local retained_directive=""
+        if retained_directive=$(existing_tool_directive "$tool"); then
+            printf '%s\n' "$retained_directive"
+            continue
+        fi
         local spec
-        spec=$(get_tool_info "$tool") || continue
+        spec=$(get_tool_info "$tool") || {
+            [ "$tool" = "venv" ] && echo "use_venv"
+            continue
+        }
 
         local version="${spec#*:}"
         version="${version%%:*}"
@@ -343,17 +451,9 @@ generate_envrc() {
             llvm)   echo "use_llvm \"$version\"" ;;
             cmake)  echo "use_cmake \"$version\"" ;;
             ninja)  echo "use_ninja" ;;
-            mold)   echo "use_mold" ;;
             bazel)  echo "use_bazel" ;;
-            nvm)    echo "use_nvm" ;;
-            python) echo "use_venv" ;;
-            ccache)
-                if [ -n "$CACHE_NAME" ]; then
-                    echo "use_ccache \"$CACHE_NAME\""
-                else
-                    echo "use_ccache"
-                fi
-                ;;
+            mold)   echo "use_mold" ;;
+            cuda)   echo "use_cuda \"$version\"  # Linux only" ;;
             rocm)   echo "use_rocm \"$version\"  # Linux only" ;;
             vulkan) echo "use_vulkan" ;;
         esac
@@ -394,16 +494,19 @@ OPTIONS
     -b, --build         Select build tools preset (non-interactive)
     -g, --gpu           Also include GPU/ML tools
     -a, --all           Select all available tools
+    --none              Select no tools (non-interactive)
+    --mold              Explicitly select the mold linker
     -y, --yes           Skip confirmation prompt
-    --no-env            Skip .envrc generation (workspace only)
-    --no-beads          Skip beads issue tracking initialization
+    --no-env            Generate only a VS Code workspace; environment and
+                        Claude settings options are rejected
     --no-history        Disable per-project shell history
-    --cache-name NAME   Override ccache cache name (default: directory basename)
-    --history-path PATH Override history directory path
+    --history-path PATH Create and use a custom history directory
 
-VS CODE WORKSPACE OPTIONS (workspace generated by default)
-    --no-vscode         Skip workspace file generation
-    --cmake [DIR]       Enable CMake settings (default: ./build/)
+VS CODE WORKSPACE OPTIONS
+    --vscode            Generate <basename>.code-workspace file
+    --cmake             Enable CMake settings (default: ./build/)
+    --cmake-build-dir DIR
+                        Enable CMake settings with a specific build directory
     --llvm              Enable LLVM settings (clangd, clang-format, lldb)
     --bazel             Enable Bazel settings (bazel, buildifier)
     --no-colors         Disable workspace color scheme generation
@@ -411,36 +514,37 @@ VS CODE WORKSPACE OPTIONS (workspace generated by default)
     --vscode-name NAME  Override workspace name (default: directory basename)
 
 CLAUDE CODE OPTIONS
-    --claude [DIR]      Generate .claude/settings.local.json for sandbox
-                        DIR is the build directory for Edit permissions
-                        (default: uses --cmake dir if specified)
+    --claude            Generate .claude/settings.local.json for sandbox
+    --claude-build-dir DIR
+                        Generate Claude settings with Edit permission for DIR
+                        (default: uses --cmake-build-dir if specified)
 
 INTERACTIVE MODE
     By default, project-init uses fzf for interactive tool selection.
     Tools are grouped by category (Build Tools, ML/GPU Tools).
     Only installed tools (present in ~/tools/<tool>/) are shown.
 
-    If .envrc already exists, current selection is shown in the header.
+    If .envrc already exists, current tools are pre-selected.
 
 NON-INTERACTIVE PRESETS
-    --build         cmake, ninja, llvm, mold, bazel
-    --build --gpu   Above + rocm, vulkan
-    --all           All available tools
+    --build         cmake, ninja, llvm, bazel
+    --build --gpu   Above + cuda, rocm, vulkan
+    --all           All available ambient tools (mold remains explicit)
+    --none          No tools; history remains independently configurable
 
 EXAMPLES
     project-init                  # Interactive selection
     project-init --build          # Build tools only
     project-init --build --gpu    # Build + GPU tools
+    project-init --build --mold   # Build tools with mold linker
     project-init -by              # Build tools, no confirm
     project-init ~/new-project    # Init specific directory
 
 FILES CREATED
     .envrc              Project tool configuration (commit this)
     .envrc.local        Machine overrides template (gitignored)
-    .beads/             Beads issue tracking (if bd installed)
-    .history/           Per-project shell history (if enabled)
-    .venv/              Python virtual environment (if python selected)
-    <name>.code-workspace  VS Code workspace file (unless --no-vscode)
+    .history/           Default per-project shell history (if enabled)
+    <name>.code-workspace  VS Code workspace file (if --vscode)
 
 SEE ALSO
     direnv, use_llvm, use_cmake, use_rocm (in ~/.direnvrc)
@@ -454,12 +558,15 @@ parse_args() {
     PRESET_BUILD=false
     PRESET_GPU=false
     PRESET_ALL=false
+    SELECT_NONE=false
+    SELECT_MOLD=false
     TARGET_DIR="."
-    CACHE_NAME=""
+    TARGET_DIR_SET=false
     HISTORY_PATH=""
+    HISTORY_SELECTION_EXPLICIT=false
 
-    # VS Code workspace options (enabled by default).
-    VSCODE_ENABLED=true
+    # VS Code workspace options.
+    VSCODE_ENABLED=false
     NO_ENV=false
     VSCODE_CMAKE=false
     VSCODE_LLVM=false
@@ -472,9 +579,6 @@ parse_args() {
     # Claude Code options.
     CLAUDE_ENABLED=false
     CLAUDE_BUILD_DIR=""
-
-    # Beads issue tracking (enabled by default).
-    BEADS_ENABLED=true
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -493,32 +597,55 @@ parse_args() {
                 INTERACTIVE=false
                 PRESET_ALL=true
                 ;;
+            --none)
+                INTERACTIVE=false
+                SELECT_NONE=true
+                ;;
+            --mold)
+                INTERACTIVE=false
+                SELECT_MOLD=true
+                ;;
             -y|--yes)
                 AUTO_CONFIRM=true
                 ;;
             --no-history)
                 USE_HISTORY=false
-                ;;
-            --cache-name)
-                shift
-                CACHE_NAME="$1"
+                HISTORY_SELECTION_EXPLICIT=true
                 ;;
             --history-path)
+                if [ $# -lt 2 ]; then
+                    error "--history-path requires PATH"
+                    exit 1
+                fi
                 shift
                 HISTORY_PATH="$1"
+                if [ -z "$HISTORY_PATH" ]; then
+                    error "--history-path requires a non-empty path"
+                    exit 1
+                fi
+                USE_HISTORY=true
+                HISTORY_SELECTION_EXPLICIT=true
                 ;;
-            --no-vscode)
-                VSCODE_ENABLED=false
+            --vscode)
+                VSCODE_ENABLED=true
                 ;;
             --no-env)
                 NO_ENV=true
                 ;;
             --cmake)
                 VSCODE_CMAKE=true
-                # Check if next arg is a directory (not another flag).
-                if [ $# -gt 1 ] && [[ ! "$2" =~ ^- ]]; then
-                    shift
-                    BUILD_DIR="$1"
+                ;;
+            --cmake-build-dir)
+                if [ $# -lt 2 ]; then
+                    error "--cmake-build-dir requires DIR"
+                    exit 1
+                fi
+                VSCODE_CMAKE=true
+                shift
+                BUILD_DIR="$1"
+                if [ -z "$BUILD_DIR" ]; then
+                    error "--cmake-build-dir requires a non-empty directory"
+                    exit 1
                 fi
                 ;;
             --llvm)
@@ -531,23 +658,60 @@ parse_args() {
                 VSCODE_COLORS=false
                 ;;
             --vscode-settings)
+                if [ $# -lt 2 ]; then
+                    error "--vscode-settings requires FILE"
+                    exit 1
+                fi
                 shift
                 VSCODE_EXTRA_SETTINGS="$1"
+                if [ -z "$VSCODE_EXTRA_SETTINGS" ]; then
+                    error "--vscode-settings requires a non-empty file"
+                    exit 1
+                fi
                 ;;
             --vscode-name)
+                if [ $# -lt 2 ]; then
+                    error "--vscode-name requires NAME"
+                    exit 1
+                fi
                 shift
                 VSCODE_NAME="$1"
-                ;;
-            --no-beads)
-                BEADS_ENABLED=false
+                if [ -z "$VSCODE_NAME" ]; then
+                    error "--vscode-name requires a non-empty name"
+                    exit 1
+                fi
                 ;;
             --claude)
                 CLAUDE_ENABLED=true
-                # Check if next arg is a directory (not another flag).
-                if [ $# -gt 1 ] && [[ ! "$2" =~ ^- ]]; then
-                    shift
-                    CLAUDE_BUILD_DIR="$1"
+                ;;
+            --claude-build-dir)
+                if [ $# -lt 2 ]; then
+                    error "--claude-build-dir requires DIR"
+                    exit 1
                 fi
+                CLAUDE_ENABLED=true
+                shift
+                CLAUDE_BUILD_DIR="$1"
+                if [ -z "$CLAUDE_BUILD_DIR" ]; then
+                    error "--claude-build-dir requires a non-empty directory"
+                    exit 1
+                fi
+                ;;
+            --)
+                shift
+                if [ $# -gt 1 ]; then
+                    error "Unexpected extra directory: $2"
+                    exit 1
+                fi
+                if [ $# -eq 1 ]; then
+                    if [ "$TARGET_DIR_SET" = "true" ]; then
+                        error "Unexpected extra directory: $1"
+                        exit 1
+                    fi
+                    TARGET_DIR="$1"
+                    TARGET_DIR_SET=true
+                fi
+                break
                 ;;
             -*)
                 # Handle combined short flags like -by.
@@ -569,11 +733,47 @@ parse_args() {
                 fi
                 ;;
             *)
+                if [ "$TARGET_DIR_SET" = "true" ]; then
+                    error "Unexpected extra directory: $1"
+                    exit 1
+                fi
                 TARGET_DIR="$1"
+                TARGET_DIR_SET=true
                 ;;
         esac
         shift
     done
+
+    if [ "$NO_ENV" = "true" ] && [ "$VSCODE_ENABLED" != "true" ]; then
+        error "--no-env requires --vscode"
+        exit 1
+    fi
+    if [ "$SELECT_NONE" = "true" ] &&
+            { [ "$PRESET_BUILD" = "true" ] ||
+                [ "$PRESET_GPU" = "true" ] ||
+                [ "$PRESET_ALL" = "true" ] ||
+                [ "$SELECT_MOLD" = "true" ]; }; then
+        error "--none cannot be combined with a tool-selection option"
+        exit 1
+    fi
+    if [ "$NO_ENV" = "true" ]; then
+        if [ "$CLAUDE_ENABLED" = "true" ]; then
+            error "--no-env cannot be combined with Claude settings options"
+            exit 1
+        fi
+        if [ "$PRESET_BUILD" = "true" ] ||
+                [ "$PRESET_GPU" = "true" ] ||
+                [ "$PRESET_ALL" = "true" ] ||
+                [ "$SELECT_NONE" = "true" ] ||
+                [ "$SELECT_MOLD" = "true" ] ||
+                [ "$HISTORY_SELECTION_EXPLICIT" = "true" ]; then
+            error "--no-env cannot be combined with environment-selection options"
+            exit 1
+        fi
+    fi
+    if [ -n "$VSCODE_NAME" ]; then
+        validate_vscode_name "$VSCODE_NAME" || exit 1
+    fi
 }
 
 # ============================================================================
@@ -599,23 +799,121 @@ get_tool_root() {
     local tool="$1"
     local tool_dir="$HOME/tools/$tool"
 
-    if [ -L "$tool_dir/latest" ]; then
-        readlink -f "$tool_dir/latest"
-    elif [ -d "$tool_dir/latest" ]; then
-        echo "$tool_dir/latest"
-    else
-        # Find the first version directory.
-        local version_dir
-        version_dir=$(find "$tool_dir" -maxdepth 1 -type d ! -name "$tool" 2>/dev/null | head -1)
-        [ -n "$version_dir" ] && echo "$version_dir" || echo "$tool_dir"
+    if ! _find_version "$tool_dir" latest; then
+        error "No installed $tool version found in $tool_dir"
+        return 1
     fi
+}
+
+# Returns whether the expected value is present in the remaining arguments.
+array_contains() {
+    local expected="$1"
+    shift
+    local value
+    for value in "$@"; do
+        [ "$value" != "$expected" ] || return 0
+    done
+    return 1
+}
+
+# Returns whether an existing .envrc activates a specific tool.
+envrc_uses_tool() {
+    local envrc="$1"
+    local tool="$2"
+    [ -f "$envrc" ] &&
+        grep -Eq "^[[:space:]]*use_${tool}([[:space:]]|$)" "$envrc"
+}
+
+# Resolves the selected version root into the SDK root consumed by CMake.
+get_rocm_sdk_root() {
+    local configured_root
+    configured_root=$(get_tool_root "rocm") || return 1
+    rocm_resolve_selected_root "$configured_root" || return 1
+    printf '%s\n' "$ROCM_RESOLVED_SDK_ROOT"
+}
+
+# Returns the generated filename and display name selected by the CLI.
+effective_vscode_name() {
+    local project_name="$1"
+    if [ -n "$VSCODE_NAME" ]; then
+        printf '%s\n' "$VSCODE_NAME"
+    else
+        printf '%s\n' "$project_name"
+    fi
+}
+
+# A workspace name is both display text and one filename component.
+validate_vscode_name() {
+    local name="$1"
+    case "$name" in
+        ""|"."|".."|*/*|*$'\n'*|*$'\r'*)
+            error "VS Code workspace name must be one non-empty filename component"
+            return 1
+            ;;
+    esac
+}
+
+# Load a JSON template and replace literal string tokens without routing paths
+# through sed replacement syntax.
+render_json_template() {
+    local template_path="$1"
+    shift
+
+    python3 - "$template_path" "$@" << 'PY'
+import json
+import re
+import sys
+
+template_path = sys.argv[1]
+replacement_arguments = sys.argv[2:]
+if len(replacement_arguments) % 2:
+    raise SystemExit("JSON template replacements must be token/value pairs")
+replacements = list(
+    zip(replacement_arguments[0::2], replacement_arguments[1::2])
+)
+replacement_map = dict(replacements)
+if (
+    not replacements
+    or len(replacement_map) != len(replacements)
+    or "" in replacement_map
+):
+    raise SystemExit("JSON template replacement tokens must be unique and non-empty")
+replacement_pattern = re.compile(
+    "|".join(
+        re.escape(token)
+        for token in sorted(replacement_map, key=len, reverse=True)
+    )
+)
+
+with open(template_path, encoding="utf-8") as template_file:
+    value = json.load(template_file)
+
+
+def replace_strings(current):
+    if isinstance(current, str):
+        return replacement_pattern.sub(
+            lambda match: replacement_map[match.group(0)],
+            current,
+        )
+    if isinstance(current, list):
+        return [replace_strings(item) for item in current]
+    if isinstance(current, dict):
+        return {
+            key: replace_strings(item)
+            for key, item in current.items()
+        }
+    return current
+
+
+json.dump(replace_strings(value), sys.stdout, separators=(",", ":"))
+PY
 }
 
 # Generate color scheme based on project name hash.
 generate_color_scheme() {
     local name="$1"
     local hash
-    hash=$(echo -n "$name" | cksum | cut -d' ' -f1)
+    hash=$(printf '%s' "$name" | cksum | cut -d' ' -f1)
     local idx=$((hash % ${#_PI_COLORS[@]}))
     local base="${_PI_COLORS[$idx]}"
 
@@ -636,12 +934,12 @@ generate_color_scheme() {
     echo "$base $inactive $dark"
 }
 
-# Generate VS Code workspace file.
-generate_vscode_workspace() {
+# Render VS Code workspace content.
+# Args: project_name, include_rocm
+render_vscode_workspace() {
     local project_name="$1"
-    # Use VSCODE_NAME override if set.
-    [ -n "$VSCODE_NAME" ] && project_name="$VSCODE_NAME"
-    local workspace_file="$project_name.code-workspace"
+    local include_rocm="$2"
+    project_name=$(effective_vscode_name "$project_name")
 
     # Start with base settings.
     local settings='{
@@ -688,50 +986,70 @@ COLOREOF
     fi
 
     # Merge tool-specific settings.
-    local tools_dir="$HOME/.dotfiles/tools"
+    local tools_dir="$PROJECT_INIT_DIR/../tools"
 
-    if [ "$VSCODE_CMAKE" = "true" ] && [ -f "$tools_dir/cmake/vscode-settings.json" ]; then
+    if [ "$VSCODE_CMAKE" = "true" ]; then
+        if [ ! -f "$tools_dir/cmake/vscode-settings.json" ]; then
+            error "CMake VS Code settings template is missing"
+            return 1
+        fi
         local cmake_settings
-        cmake_settings=$(sed "s|\\\$BUILD_DIR|$abs_build_dir|g" "$tools_dir/cmake/vscode-settings.json")
+        cmake_settings=$(render_json_template \
+            "$tools_dir/cmake/vscode-settings.json" \
+            "\$BUILD_DIR" "$abs_build_dir")
         settings=$(echo "$settings" "$cmake_settings" | jq -s '.[0] * .[1]')
     fi
 
-    if [ "$VSCODE_LLVM" = "true" ] && [ -f "$tools_dir/llvm/vscode-settings.json" ]; then
+    if [ "$VSCODE_LLVM" = "true" ]; then
+        if [ ! -f "$tools_dir/llvm/vscode-settings.json" ]; then
+            error "LLVM VS Code settings template is missing"
+            return 1
+        fi
         local llvm_root
         llvm_root=$(get_tool_root "llvm")
         local llvm_settings
-        llvm_settings=$(sed "s|\\\$TOOL_ROOT|$llvm_root|g; s|\\\$BUILD_DIR|$abs_build_dir|g" "$tools_dir/llvm/vscode-settings.json")
+        llvm_settings=$(render_json_template \
+            "$tools_dir/llvm/vscode-settings.json" \
+            "\$TOOL_ROOT" "$llvm_root" \
+            "\$BUILD_DIR" "$abs_build_dir")
         settings=$(echo "$settings" "$llvm_settings" | jq -s '.[0] * .[1]')
     fi
 
-    if [ "$VSCODE_BAZEL" = "true" ] && [ -f "$tools_dir/bazel/vscode-settings.json" ]; then
+    if [ "$VSCODE_BAZEL" = "true" ]; then
+        if [ ! -f "$tools_dir/bazel/vscode-settings.json" ]; then
+            error "Bazel VS Code settings template is missing"
+            return 1
+        fi
         local bazel_root
         bazel_root=$(get_tool_root "bazel")
         local bazel_settings
-        bazel_settings=$(sed "s|\\\$TOOL_ROOT|$bazel_root|g" "$tools_dir/bazel/vscode-settings.json")
+        bazel_settings=$(render_json_template \
+            "$tools_dir/bazel/vscode-settings.json" \
+            "\$TOOL_ROOT" "$bazel_root")
         settings=$(echo "$settings" "$bazel_settings" | jq -s '.[0] * .[1]')
     fi
 
-    # Check for rocm in selected tools and merge its settings.
-    if [ -f "$tools_dir/rocm/vscode-settings.json" ]; then
-        # Check if rocm is in the envrc.
-        if [ -f ".envrc" ] && grep -q "use_rocm" ".envrc"; then
-            local rocm_root
-            rocm_root=$(get_tool_root "rocm")
-            local rocm_settings
-            rocm_settings=$(sed "s|\\\$TOOL_ROOT|$rocm_root|g" "$tools_dir/rocm/vscode-settings.json")
-            settings=$(echo "$settings" "$rocm_settings" | jq -s '.[0] * .[1]')
+    if [ "$include_rocm" = "true" ]; then
+        if [ ! -f "$tools_dir/rocm/vscode-settings.json" ]; then
+            error "ROCm VS Code settings template is missing"
+            return 1
         fi
+        local rocm_root
+        rocm_root=$(get_rocm_sdk_root)
+        local rocm_settings
+        rocm_settings=$(render_json_template \
+            "$tools_dir/rocm/vscode-settings.json" \
+            "\$TOOL_ROOT" "$rocm_root")
+        settings=$(echo "$settings" "$rocm_settings" | jq -s '.[0] * .[1]')
     fi
 
     # Merge extra settings if provided.
-    if [ -n "$VSCODE_EXTRA_SETTINGS" ] && [ -f "$VSCODE_EXTRA_SETTINGS" ]; then
+    if [ -n "$VSCODE_EXTRA_SETTINGS" ]; then
         local extra_settings
-        extra_settings=$(cat "$VSCODE_EXTRA_SETTINGS")
+        extra_settings=$(cat -- "$VSCODE_EXTRA_SETTINGS")
         settings=$(echo "$settings" "$extra_settings" | jq -s '.[0] * .[1]')
     fi
 
-    # Write the workspace file.
     jq -n \
         --arg name "$project_name" \
         --argjson settings "$settings" \
@@ -739,41 +1057,314 @@ COLOREOF
             name: $name,
             folders: [{ path: ".", name: $name }],
             settings: $settings
-        }' > "$workspace_file"
-
-    info "Created VS Code workspace: $workspace_file"
+        }'
 }
 
 # ============================================================================
 # Claude Code Settings Generation
 # ============================================================================
 
-# Generate Claude Code settings.local.json for sandbox write access.
+# Resolve the Claude Code build directory selected by the CLI.
+resolve_claude_build_directory() {
+    local build_dir=""
+    if [ -n "$CLAUDE_BUILD_DIR" ]; then
+        build_dir="$CLAUDE_BUILD_DIR"
+    elif [ -n "$BUILD_DIR" ] && [ "$BUILD_DIR" != "./build" ]; then
+        build_dir="$BUILD_DIR"
+    fi
+    if [ -n "$build_dir" ] && [[ "$build_dir" != /* ]]; then
+        build_dir="$(pwd)/${build_dir#./}"
+    fi
+    printf '%s\n' "$build_dir"
+}
+
+# Render Claude Code settings.local.json for sandbox write access.
 # Args: build_dir (absolute path to build directory)
-generate_claude_settings() {
+render_claude_settings() {
     local build_dir="$1"
 
-    mkdir -p .claude
-
-    # Build the Edit rules array.
     # Linux sandbox only supports literal paths (no globs).
-    local edit_rules='["Edit(/tmp)"'
-    if [ -n "$build_dir" ]; then
-        edit_rules="$edit_rules, \"Edit($build_dir)\""
+    jq -n --arg build_dir "$build_dir" '
+        {
+            permissions: {
+                allow: (
+                    ["Edit(/tmp)"] +
+                    if $build_dir == "" then
+                        []
+                    else
+                        ["Edit(\($build_dir))"]
+                    end
+                )
+            }
+        }
+    '
+}
+
+# Returns whether a generated file already has the requested content.
+generated_file_matches() {
+    local path="$1"
+    local expected_content="$2"
+    [ -f "$path" ] &&
+        [ ! -L "$path" ] &&
+        [ "$(cat -- "$path")" = "$expected_content" ]
+}
+
+# Capture the exact absent/regular generation observed before user interaction.
+# The inode identity detects editor-style atomic replacement; the digest detects
+# in-place edits.
+capture_generated_file_generation() {
+    local path="$1"
+
+    python3 - "$path" << 'PY'
+import hashlib
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+flags = os.O_RDONLY
+if hasattr(os, "O_CLOEXEC"):
+    flags |= os.O_CLOEXEC
+if hasattr(os, "O_NOFOLLOW"):
+    flags |= os.O_NOFOLLOW
+
+try:
+    descriptor = os.open(path, flags)
+except FileNotFoundError:
+    print("absent")
+    raise SystemExit
+
+with os.fdopen(descriptor, "rb", closefd=True) as input_file:
+    before = os.fstat(input_file.fileno())
+    if not stat.S_ISREG(before.st_mode):
+        raise SystemExit(f"destination is not an ordinary file: {path}")
+    digest = hashlib.sha256()
+    while chunk := input_file.read(1024 * 1024):
+        digest.update(chunk)
+    after_descriptor = os.fstat(input_file.fileno())
+
+after_path = os.stat(path, follow_symlinks=False)
+stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+if any(
+    getattr(before, field) != getattr(after_descriptor, field)
+    or getattr(before, field) != getattr(after_path, field)
+    for field in stable_fields
+):
+    raise SystemExit(f"destination changed while it was inspected: {path}")
+
+print(
+    f"regular:{before.st_dev}:{before.st_ino}:{digest.hexdigest()}"
+)
+PY
+}
+
+require_generated_file_generation() {
+    local path="$1"
+    local expected_generation="$2"
+    local label="$3"
+    local current_generation=""
+
+    if ! current_generation=$(capture_generated_file_generation "$path"); then
+        error "$label changed after it was inspected: $path"
+        return 1
     fi
-    edit_rules="$edit_rules]"
-
-    # Generate settings.local.json.
-    cat > .claude/settings.local.json << EOF
-{
-  "permissions": {
-    "allow": $edit_rules
-  }
+    if [ "$current_generation" != "$expected_generation" ]; then
+        error "$label changed after it was inspected: $path"
+        return 1
+    fi
 }
-EOF
 
-    info "Created Claude Code settings: .claude/settings.local.json"
+# Refuse path-type changes before publishing generated project state.
+validate_generated_file_destination() {
+    local path="$1"
+    local label="$2"
+    if [ -L "$path" ] ||
+            { [ -e "$path" ] && [ ! -f "$path" ]; }; then
+        error "$label destination is not an ordinary file: $path"
+        return 1
+    fi
 }
+
+# Validate every existing component and the first writable creation boundary
+# before any generated project file changes.
+validate_directory_destination() {
+    local path="$1"
+    local label="$2"
+
+    if ! python3 - "$path" << 'PY'
+import os
+import stat
+import sys
+
+path = os.path.abspath(sys.argv[1])
+components = path.split(os.sep)
+current = os.sep
+for component in components:
+    if not component:
+        continue
+    candidate = os.path.join(current, component)
+    if not os.path.lexists(candidate):
+        if not os.access(current, os.W_OK | os.X_OK):
+            raise SystemExit(f"creation parent is not writable: {current}")
+        break
+    mode = os.lstat(candidate).st_mode
+    if not stat.S_ISDIR(mode):
+        raise SystemExit(f"path component is not an ordinary directory: {candidate}")
+    current = candidate
+else:
+    if not os.access(current, os.W_OK | os.X_OK):
+        raise SystemExit(f"directory is not writable: {current}")
+PY
+    then
+        error "$label cannot be created as an ordinary directory: $path"
+        return 1
+    fi
+}
+
+# Publish generated text from a same-directory staging file. Existing regular
+# content remains live until the atomic replacement succeeds.
+publish_generated_file() (
+    local path="$1"
+    local content="$2"
+    local publication_mode="${3:-replace}"
+    local expected_generation="${4:-}"
+    local parent
+    local staging_path=""
+
+    # shellcheck disable=SC2317  # Invoked by the EXIT trap below.
+    cleanup_generated_file() {
+        local final_status=$?
+        trap - EXIT HUP INT TERM
+        if [ -n "$staging_path" ] &&
+                { [ -e "$staging_path" ] || [ -L "$staging_path" ]; }; then
+            if ! unlink "$staging_path"; then
+                error "Generated-file staging requires inspection: $staging_path"
+                final_status=1
+            fi
+        fi
+        exit "$final_status"
+    }
+    trap cleanup_generated_file EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    case "$publication_mode" in
+        replace|create) ;;
+        *)
+            error "Unknown generated-file publication mode: $publication_mode"
+            return 1
+            ;;
+    esac
+    if [ "$publication_mode" = "replace" ] &&
+            [ -z "$expected_generation" ]; then
+        error "Replace publication requires an expected generation: $path"
+        return 1
+    fi
+    parent=$(dirname -- "$path")
+    if [ ! -d "$parent" ] || [ -L "$parent" ]; then
+        error "Generated-file parent is not an ordinary directory: $parent"
+        return 1
+    fi
+    validate_generated_file_destination "$path" "Generated file" || return 1
+    if ! staging_path=$(mktemp "$parent/.project-init.XXXXXX"); then
+        error "Could not reserve generated-file staging in: $parent"
+        return 1
+    fi
+    if ! printf '%s\n' "$content" > "$staging_path"; then
+        error "Could not write generated-file staging: $staging_path"
+        return 1
+    fi
+    if ! chmod 0644 "$staging_path"; then
+        error "Could not set generated-file permissions: $staging_path"
+        return 1
+    fi
+    if [ "$publication_mode" = "create" ]; then
+        if ! python3 - "$staging_path" "$path" << 'PY'
+import os
+import sys
+
+os.link(sys.argv[1], sys.argv[2], follow_symlinks=False)
+PY
+        then
+            error "Generated file appeared before initial publication: $path"
+            return 1
+        fi
+        if ! unlink "$staging_path"; then
+            error "Could not clean committed generated-file staging: $staging_path"
+            return 1
+        fi
+        staging_path=""
+        return 0
+    fi
+    if ! python3 - "$staging_path" "$path" "$expected_generation" << 'PY'
+import hashlib
+import os
+import stat
+import sys
+
+staging_path, destination_path, expected_generation = sys.argv[1:]
+
+
+def capture_generation(path):
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return "absent"
+
+    with os.fdopen(descriptor, "rb", closefd=True) as input_file:
+        before = os.fstat(input_file.fileno())
+        if not stat.S_ISREG(before.st_mode):
+            raise SystemExit(
+                f"destination is not an ordinary file: {path}"
+            )
+        digest = hashlib.sha256()
+        while chunk := input_file.read(1024 * 1024):
+            digest.update(chunk)
+        after_descriptor = os.fstat(input_file.fileno())
+
+    after_path = os.stat(path, follow_symlinks=False)
+    stable_fields = (
+        "st_dev",
+        "st_ino",
+        "st_size",
+        "st_mtime_ns",
+        "st_ctime_ns",
+    )
+    if any(
+        getattr(before, field) != getattr(after_descriptor, field)
+        or getattr(before, field) != getattr(after_path, field)
+        for field in stable_fields
+    ):
+        raise SystemExit(
+            f"destination changed while it was inspected: {path}"
+        )
+    return (
+        f"regular:{before.st_dev}:{before.st_ino}:{digest.hexdigest()}"
+    )
+
+
+if capture_generation(destination_path) != expected_generation:
+    raise SystemExit(
+        f"destination changed after it was inspected: {destination_path}"
+    )
+if expected_generation == "absent":
+    os.link(staging_path, destination_path, follow_symlinks=False)
+    os.unlink(staging_path)
+else:
+    os.replace(staging_path, destination_path)
+PY
+    then
+        error "Could not publish unchanged generated-file destination: $path"
+        return 1
+    fi
+    staging_path=""
+)
 
 # ============================================================================
 # Main
@@ -782,28 +1373,39 @@ EOF
 main() {
     parse_args "$@"
 
+    if [ "$VSCODE_ENABLED" = "true" ]; then
+        local workspace_tool=""
+        for workspace_tool in cmake llvm bazel; do
+            local workspace_tool_requested=false
+            case "$workspace_tool" in
+                cmake) workspace_tool_requested="$VSCODE_CMAKE" ;;
+                llvm) workspace_tool_requested="$VSCODE_LLVM" ;;
+                bazel) workspace_tool_requested="$VSCODE_BAZEL" ;;
+            esac
+            if [ "$workspace_tool_requested" = "true" ] &&
+                    ! _platform_supports "$workspace_tool"; then
+                error "VS Code $workspace_tool integration is not supported on $(_detect_os)/$(_detect_arch)"
+                exit 1
+            fi
+        done
+    fi
+
     # Create and enter target directory.
     if [ ! -d "$TARGET_DIR" ]; then
-        mkdir -p "$TARGET_DIR"
+        mkdir -p -- "$TARGET_DIR"
         info "Created directory: $TARGET_DIR"
     fi
-    cd "$TARGET_DIR"
+    cd -- "$TARGET_DIR"
 
-    # Initialize beads issue tracking (runs in all modes including --no-env).
-    if [ "$BEADS_ENABLED" = "true" ] && command -v bd &>/dev/null && [ ! -d ".beads" ]; then
-        bd init -q
-        bd config set id.prefix=bd -q
-        # Add .beads/ to git local exclude if in a git repo.
-        if git rev-parse --git-dir &>/dev/null 2>&1; then
-            local git_dir
-            git_dir=$(git rev-parse --git-dir)
-            local exclude_file="$git_dir/info/exclude"
-            mkdir -p "$(dirname "$exclude_file")"
-            if [ ! -f "$exclude_file" ] || ! grep -q '\.beads/' "$exclude_file"; then
-                echo '.beads/' >> "$exclude_file"
-            fi
+    if [ -n "$VSCODE_EXTRA_SETTINGS" ]; then
+        if [ ! -f "$VSCODE_EXTRA_SETTINGS" ]; then
+            error "VS Code settings file is not a regular file: $VSCODE_EXTRA_SETTINGS"
+            exit 1
         fi
-        info "Initialized beads: .beads/ (prefix: bd-*)"
+        if ! jq empty -- "$VSCODE_EXTRA_SETTINGS" >/dev/null 2>&1; then
+            error "VS Code settings file is not valid JSON: $VSCODE_EXTRA_SETTINGS"
+            exit 1
+        fi
     fi
 
     # Handle --no-env mode: generate workspace only and exit.
@@ -811,9 +1413,71 @@ main() {
         if [ "$VSCODE_ENABLED" = "true" ]; then
             local project_name
             project_name=$(basename "$(pwd)")
-            generate_vscode_workspace "$project_name"
+            local workspace_name
+            workspace_name=$(effective_vscode_name "$project_name")
+            validate_vscode_name "$workspace_name" || exit 1
+            local workspace_file="$workspace_name.code-workspace"
+            validate_generated_file_destination \
+                "$workspace_file" "VS Code workspace" || exit 1
+            local workspace_generation
+            workspace_generation=$(
+                capture_generated_file_generation "$workspace_file"
+            ) || exit 1
+            local include_rocm=false
+            if _platform_supports rocm &&
+                    envrc_uses_tool ".envrc" "rocm"; then
+                include_rocm=true
+            fi
+            local workspace_content
+            workspace_content=$(render_vscode_workspace \
+                "$project_name" "$include_rocm")
+            if ! generated_file_matches \
+                "$workspace_file" "$workspace_content"; then
+                publish_generated_file \
+                    "$workspace_file" "$workspace_content" replace \
+                    "$workspace_generation"
+                info "Wrote VS Code workspace: $workspace_file"
+            else
+                info "VS Code workspace is up to date: $workspace_file"
+            fi
         fi
         exit 0
+    fi
+
+    validate_generated_file_destination ".envrc" ".envrc" || exit 1
+    local envrc_generation
+    envrc_generation=$(capture_generated_file_generation ".envrc") || exit 1
+
+    # Destination generations are captured before interactive selection. A
+    # user or editor update made while project-init is waiting must win.
+    local project_name
+    project_name=$(basename "$(pwd)")
+    local workspace_name
+    workspace_name=$(effective_vscode_name "$project_name")
+    validate_vscode_name "$workspace_name" || exit 1
+    local workspace_file="$workspace_name.code-workspace"
+    local workspace_generation=""
+    if [ "$VSCODE_ENABLED" = "true" ]; then
+        validate_generated_file_destination \
+            "$workspace_file" "VS Code workspace" || exit 1
+        workspace_generation=$(
+            capture_generated_file_generation "$workspace_file"
+        ) || exit 1
+    fi
+    local claude_generation=""
+    if [ "$CLAUDE_ENABLED" = "true" ]; then
+        if [ -L ".claude" ] ||
+                { [ -e ".claude" ] && [ ! -d ".claude" ]; }; then
+            error "Claude settings parent is not an ordinary directory: .claude"
+            exit 1
+        fi
+        validate_directory_destination \
+            ".claude" "Claude settings parent" || exit 1
+        validate_generated_file_destination \
+            ".claude/settings.local.json" "Claude settings" || exit 1
+        claude_generation=$(
+            capture_generated_file_generation ".claude/settings.local.json"
+        ) || exit 1
     fi
 
     echo -e "${BLUE}Project initialization${NC}"
@@ -832,11 +1496,16 @@ main() {
     # Parse existing .envrc if present.
     local current_tools=()
     if [ -f ".envrc" ]; then
-        mapfile -t current_tools < <(parse_envrc ".envrc")
-        if envrc_has_history ".envrc"; then
-            USE_HISTORY=true
-        else
-            USE_HISTORY=false
+        if ! load_existing_envrc ".envrc"; then
+            exit 1
+        fi
+        current_tools=("${CURRENT_ENVRC_TOOLS[@]}")
+        if [ "$HISTORY_SELECTION_EXPLICIT" != "true" ]; then
+            if [ -n "$CURRENT_HISTORY_DIRECTIVE" ]; then
+                USE_HISTORY=true
+            else
+                USE_HISTORY=false
+            fi
         fi
         info "Existing .envrc detected. Current tools: ${current_tools[*]:-none}"
         echo ""
@@ -861,7 +1530,12 @@ main() {
             done
 
             local chosen
-            chosen=$(select_tools_fzf "$group_name" "$group_tools" "$preselected")
+            if ! chosen=$(
+                select_tools_fzf "$group_name" "$group_tools" "$preselected"
+            ); then
+                error "Tool selection canceled; project files were not changed."
+                exit 1
+            fi
             if [ -n "$chosen" ]; then
                 while IFS= read -r tool; do
                     [ -n "$tool" ] && selected_tools+=("$tool")
@@ -870,7 +1544,10 @@ main() {
         done
 
         # History selection.
-        USE_HISTORY=$(select_history_fzf "$USE_HISTORY")
+        if ! USE_HISTORY=$(select_history_fzf "$USE_HISTORY"); then
+            error "History selection canceled; project files were not changed."
+            exit 1
+        fi
     else
         # Non-interactive: use presets.
         if [ "$PRESET_ALL" = "true" ]; then
@@ -882,13 +1559,9 @@ main() {
             # Build preset.
             if [ "$PRESET_BUILD" = "true" ]; then
                 for tool in "${_PI_BUILD_TOOLS[@]}"; do
-                    if tool_installed "$tool"; then
-                        local spec
-                        spec=$(get_tool_info "$tool") || continue
-                        local platform="${spec#*:}"
-                        platform="${platform#*:}"
-                        platform="${platform%%:*}"
-                        tool_available_on_platform "$platform" && selected_tools+=("$tool")
+                    if _platform_supports "$tool" &&
+                            tool_installed "$tool"; then
+                        selected_tools+=("$tool")
                     fi
                 done
             fi
@@ -896,17 +1569,60 @@ main() {
             # GPU preset.
             if [ "$PRESET_GPU" = "true" ]; then
                 for tool in "${_PI_GPU_TOOLS[@]}"; do
-                    if tool_installed "$tool"; then
-                        local spec
-                        spec=$(get_tool_info "$tool") || continue
-                        local platform="${spec#*:}"
-                        platform="${platform#*:}"
-                        platform="${platform%%:*}"
-                        tool_available_on_platform "$platform" && selected_tools+=("$tool")
+                    if _platform_supports "$tool" &&
+                            tool_installed "$tool"; then
+                        selected_tools+=("$tool")
                     fi
                 done
             fi
         fi
+    fi
+
+    # An explicit-only tool is never pulled in by --all or a preset, but an
+    # existing project choice is durable across every convergence. The option
+    # provides the corresponding first-use path.
+    if [ "$SELECT_NONE" != "true" ]; then
+        if [ "$SELECT_MOLD" = "true" ]; then
+            if ! _platform_supports mold; then
+                error "--mold is not supported on $(_detect_os)/$(_detect_arch)"
+                exit 1
+            fi
+            if ! tool_installed mold; then
+                error "--mold requested, but no published mold version is installed"
+                exit 1
+            fi
+            if ! array_contains mold "${selected_tools[@]}"; then
+                selected_tools+=(mold)
+            fi
+        fi
+        for tool in "${current_tools[@]}"; do
+            if tool_is_explicit_only "$tool" &&
+                    ! array_contains "$tool" "${selected_tools[@]}"; then
+                selected_tools+=("$tool")
+            fi
+        done
+
+        # A project requirement can be checked out on a machine where its
+        # payload is absent. Preserve current directives that belong to the
+        # requested preset instead of mutating committed configuration to
+        # match this host.
+        for tool in "${current_tools[@]}"; do
+            if array_contains "$tool" "${selected_tools[@]}" ||
+                    tool_is_explicit_only "$tool"; then
+                continue
+            fi
+            if { [ "$INTERACTIVE" = "true" ] &&
+                    { ! _platform_supports "$tool" ||
+                        ! tool_installed "$tool"; }; } ||
+                    { [ "$PRESET_ALL" = "true" ] &&
+                        ! tool_is_explicit_only "$tool"; } ||
+                    { [ "$PRESET_BUILD" = "true" ] &&
+                        array_contains "$tool" "${_PI_BUILD_TOOLS[@]}"; } ||
+                    { [ "$PRESET_GPU" = "true" ] &&
+                        array_contains "$tool" "${_PI_GPU_TOOLS[@]}"; }; then
+                selected_tools+=("$tool")
+            fi
+        done
     fi
 
     # Check for empty selection.
@@ -933,23 +1649,86 @@ main() {
         fi
     fi
 
-    local project_name
-    project_name=$(basename "$(pwd)")
-    local workspace_file="$project_name.code-workspace"
-    [ -n "$VSCODE_NAME" ] && workspace_file="$VSCODE_NAME.code-workspace"
+    local needs_envrc_local=false
+    if [ -L ".envrc.local" ] && [ ! -e ".envrc.local" ]; then
+        error ".envrc.local is a broken symlink; refusing to replace it."
+        exit 1
+    elif [ -e ".envrc.local" ] && [ ! -f ".envrc.local" ]; then
+        error ".envrc.local exists but is not a regular file."
+        exit 1
+    elif [ ! -e ".envrc.local" ]; then
+        needs_envrc_local=true
+    fi
+
+    local history_directory=""
+    local needs_history=false
+    if [ "$USE_HISTORY" = "true" ]; then
+        if [ -n "$HISTORY_PATH" ]; then
+            history_directory="$HISTORY_PATH"
+        elif [ -z "$CURRENT_HISTORY_DIRECTIVE" ] ||
+                [ "$CURRENT_HISTORY_DIRECTIVE" = "use_project_history" ]; then
+            history_directory=".history"
+        fi
+        if [ -n "$history_directory" ]; then
+            if [ -L "$history_directory" ] ||
+                    { [ -e "$history_directory" ] &&
+                        [ ! -d "$history_directory" ]; }; then
+                error "History destination is not an ordinary directory: $history_directory"
+                exit 1
+            fi
+            if [ ! -d "$history_directory" ]; then
+                needs_history=true
+            fi
+            validate_directory_destination \
+                "$history_directory" "History destination" || exit 1
+        fi
+    fi
 
     local needs_workspace=false
-    if [ "$VSCODE_ENABLED" = "true" ] && [ ! -f "$workspace_file" ]; then
-        needs_workspace=true
+    local workspace_content=""
+    if [ "$VSCODE_ENABLED" = "true" ]; then
+        validate_generated_file_destination \
+            "$workspace_file" "VS Code workspace" || exit 1
+        local include_rocm=false
+        if _platform_supports rocm &&
+                array_contains "rocm" "${selected_tools[@]}"; then
+            include_rocm=true
+        fi
+        workspace_content=$(render_vscode_workspace \
+            "$project_name" "$include_rocm")
+        if ! generated_file_matches \
+            "$workspace_file" "$workspace_content"; then
+            needs_workspace=true
+        fi
     fi
 
     local needs_claude=false
-    if [ "$CLAUDE_ENABLED" = "true" ] && [ ! -f ".claude/settings.local.json" ]; then
-        needs_claude=true
+    local claude_content=""
+    if [ "$CLAUDE_ENABLED" = "true" ]; then
+        if [ -L ".claude" ] ||
+                { [ -e ".claude" ] && [ ! -d ".claude" ]; }; then
+            error "Claude settings parent is not an ordinary directory: .claude"
+            exit 1
+        fi
+        validate_directory_destination \
+            ".claude" "Claude settings parent" || exit 1
+        validate_generated_file_destination \
+            ".claude/settings.local.json" "Claude settings" || exit 1
+        local claude_build
+        claude_build=$(resolve_claude_build_directory)
+        claude_content=$(render_claude_settings "$claude_build")
+        if ! generated_file_matches \
+            ".claude/settings.local.json" "$claude_content"; then
+            needs_claude=true
+        fi
     fi
 
     # Exit early only if nothing needs to be done.
-    if [ "$envrc_changed" = "false" ] && [ "$needs_workspace" = "false" ] && [ "$needs_claude" = "false" ]; then
+    if [ "$envrc_changed" = "false" ] &&
+       [ "$needs_envrc_local" = "false" ] &&
+       [ "$needs_history" = "false" ] &&
+       [ "$needs_workspace" = "false" ] &&
+       [ "$needs_claude" = "false" ]; then
         info "No changes needed. All files are up to date."
         exit 0
     fi
@@ -964,6 +1743,14 @@ main() {
     else
         info ".envrc unchanged"
     fi
+    [ "$needs_envrc_local" != "true" ] ||
+        info "Will create missing .envrc.local"
+    [ "$needs_history" != "true" ] ||
+        info "Will create missing history directory: $history_directory"
+    [ "$needs_workspace" != "true" ] ||
+        info "Will write VS Code workspace: $workspace_file"
+    [ "$needs_claude" != "true" ] ||
+        info "Will write Claude Code settings: .claude/settings.local.json"
 
     # Confirm unless -y.
     if [ "$AUTO_CONFIRM" != "true" ]; then
@@ -972,57 +1759,89 @@ main() {
         [[ $REPLY =~ ^[Nn]$ ]] && { echo "Aborted."; exit 1; }
     fi
 
+    # Preflight every replaceable destination as one generation before the
+    # first directory or file mutation. Publication repeats the check at the
+    # replacement boundary.
+    require_generated_file_generation \
+        ".envrc" "$envrc_generation" ".envrc" || exit 1
+    if [ "$VSCODE_ENABLED" = "true" ]; then
+        require_generated_file_generation \
+            "$workspace_file" "$workspace_generation" \
+            "VS Code workspace" || exit 1
+    fi
+    if [ "$CLAUDE_ENABLED" = "true" ]; then
+        require_generated_file_generation \
+            ".claude/settings.local.json" "$claude_generation" \
+            "Claude settings" || exit 1
+    fi
+
+    # Materialize every requested directory boundary before publishing any
+    # generated file. The preflight above has already rejected obstructed or
+    # symlinked components.
+    if [ "$needs_history" = "true" ]; then
+        if ! mkdir -p -- "$history_directory"; then
+            error "Could not create history directory: $history_directory"
+            exit 1
+        fi
+        if [ ! -d "$history_directory" ] || [ -L "$history_directory" ]; then
+            error "History destination changed during creation: $history_directory"
+            exit 1
+        fi
+    fi
+    if [ "$needs_claude" = "true" ] && [ ! -d ".claude" ]; then
+        if ! mkdir -p -- ".claude"; then
+            error "Could not create Claude settings directory: .claude"
+            exit 1
+        fi
+    fi
+    if [ "$needs_claude" = "true" ] &&
+            { [ ! -d ".claude" ] || [ -L ".claude" ]; }; then
+        error "Claude settings parent changed during creation: .claude"
+        exit 1
+    fi
+
+    # .envrc.local is user-owned after its initial creation, so its no-replace
+    # publication happens before any replaceable generated file.
+    if [ "$needs_envrc_local" = "true" ]; then
+        local envrc_local_content
+        envrc_local_content=$(create_envrc_local)
+        publish_generated_file \
+            ".envrc.local" "$envrc_local_content" create
+    fi
+
     # Write .envrc if changed.
     if [ "$envrc_changed" = "true" ]; then
-        echo "$new_envrc" > .envrc
-    fi
-
-    # Create .envrc.local if doesn't exist.
-    if [ ! -f ".envrc.local" ]; then
-        create_envrc_local > .envrc.local
-    fi
-
-    # Create history directory if enabled.
-    if [ "$USE_HISTORY" = "true" ]; then
-        mkdir -p .history
-    fi
-
-    # Create Python venv if python is selected and .venv doesn't exist.
-    if [[ " ${selected_tools[*]} " == *" python "* ]] && [ ! -d ".venv" ]; then
-        info "Creating Python virtual environment..."
-        python3 -m venv .venv
+        publish_generated_file \
+            ".envrc" "$new_envrc" replace "$envrc_generation"
     fi
 
     # Generate VS Code workspace if enabled.
-    if [ "$VSCODE_ENABLED" = "true" ]; then
-        generate_vscode_workspace "$project_name"
+    if [ "$needs_workspace" = "true" ]; then
+        publish_generated_file \
+            "$workspace_file" "$workspace_content" replace \
+            "$workspace_generation"
+        info "Wrote VS Code workspace: $workspace_file"
     fi
 
     # Generate Claude Code settings if requested.
-    if [ "$CLAUDE_ENABLED" = "true" ]; then
-        # Resolve build dir to absolute path.
-        local claude_build=""
-        if [ -n "$CLAUDE_BUILD_DIR" ]; then
-            claude_build="$CLAUDE_BUILD_DIR"
-        elif [ -n "$BUILD_DIR" ] && [ "$BUILD_DIR" != "./build" ]; then
-            # Use cmake build dir if specified.
-            claude_build="$BUILD_DIR"
+    if [ "$needs_claude" = "true" ]; then
+        if [ ! -d ".claude" ] || [ -L ".claude" ]; then
+            error "Claude settings parent is not an ordinary directory: .claude"
+            exit 1
         fi
-        # Make absolute if relative.
-        if [ -n "$claude_build" ] && [[ "$claude_build" != /* ]]; then
-            claude_build="$(pwd)/${claude_build#./}"
-        fi
-        generate_claude_settings "$claude_build"
+        publish_generated_file \
+            ".claude/settings.local.json" "$claude_content" replace \
+            "$claude_generation"
+        info "Wrote Claude Code settings: .claude/settings.local.json"
     fi
 
     echo ""
     echo -e "${GREEN}Created:${NC}"
     echo "  .envrc       - Project tool configuration (commit this)"
     [ ! -f ".envrc.local" ] || echo "  .envrc.local - Machine overrides (gitignored)"
-    [ -d ".beads" ] && echo "  .beads/      - Beads issue tracking (gitignored)"
-    [ "$USE_HISTORY" = "true" ] && echo "  .history/    - Per-project shell history (gitignored)"
-    [ -d ".venv" ] && echo "  .venv/       - Python virtual environment (gitignored)"
-    [ "$VSCODE_ENABLED" = "true" ] && echo "  $project_name.code-workspace - VS Code workspace"
+    [ "$USE_HISTORY" != "true" ] || [ -z "$history_directory" ] ||
+        echo "  $history_directory - Per-project shell history"
+    [ "$VSCODE_ENABLED" = "true" ] && echo "  $workspace_file - VS Code workspace"
     [ "$CLAUDE_ENABLED" = "true" ] && echo "  .claude/settings.local.json - Claude Code sandbox settings"
     echo ""
 

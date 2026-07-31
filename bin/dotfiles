@@ -16,6 +16,50 @@ info() { printf "${GREEN}[dotfiles]${NC} %s\n" "$1"; }
 warn() { printf "${YELLOW}[dotfiles]${NC} %s\n" "$1"; }
 error() { printf "${RED}[dotfiles]${NC} %s\n" "$1" >&2; }
 
+_resolve_dotfiles_implementation_root() {
+    local entrypoint="${BASH_SOURCE[0]}"
+    local entrypoint_directory=""
+    local entrypoint_target=""
+    local link_count=0
+
+    while [ -L "$entrypoint" ]; do
+        link_count=$((link_count + 1))
+        if [ "$link_count" -gt 40 ]; then
+            error "Too many symlinks while resolving dotfiles entrypoint"
+            return 1
+        fi
+        if ! entrypoint_directory=$(
+                CDPATH='' cd -- "$(dirname -- "$entrypoint")" && pwd -P
+            ) ||
+                ! entrypoint_target=$(readlink "$entrypoint"); then
+            error "Could not resolve dotfiles entrypoint: $entrypoint"
+            return 1
+        fi
+        case "$entrypoint_target" in
+            /*) entrypoint="$entrypoint_target" ;;
+            *) entrypoint="$entrypoint_directory/$entrypoint_target" ;;
+        esac
+    done
+
+    if ! entrypoint_directory=$(
+            CDPATH='' cd -- "$(dirname -- "$entrypoint")" && pwd -P
+        ); then
+        error "Could not resolve dotfiles implementation directory"
+        return 1
+    fi
+    (
+        CDPATH=''
+        cd -- "$entrypoint_directory/.." && pwd -P
+    )
+}
+
+if ! DOTFILES_IMPLEMENTATION_ROOT=$(
+        _resolve_dotfiles_implementation_root
+    ); then
+    exit 1
+fi
+unset -f _resolve_dotfiles_implementation_root
+
 # ============================================================================
 # Help
 # ============================================================================
@@ -31,7 +75,7 @@ ${BOLD}COMMANDS${NC}
     ${BOLD}test --full${NC}       Run Tier 1 + Tier 2 Docker tests
     ${BOLD}doctor${NC}            Health check (tools, symlinks, configs)
     ${BOLD}fixup${NC}             Integrate installer changes to shell configs
-    ${BOLD}update${NC}            Pull latest changes from git
+    ${BOLD}update${NC}            Pull changes and publish agent contracts
     ${BOLD}install${NC}           Set up dotfiles (deps check, symlinks, identity)
     ${BOLD}deps${NC}              Run install-deps.sh (install packages)
     ${BOLD}multiplexer${NC}       Update official tmux, Byobu, TPM, and plugins
@@ -51,7 +95,7 @@ ${BOLD}TESTING${NC}
       - shellcheck (if installed)
 
     Tier 2 (Docker, comprehensive):
-      - Full install on pristine Alpine/Ubuntu
+      - Full install on pristine Ubuntu
       - Package installation validation
       - Interactive shell startup tests
 EOF
@@ -98,7 +142,7 @@ cmd_install() {
         echo ""
         error "Missing required packages. Install them first:"
         echo ""
-        echo "    sudo ~/.dotfiles/install-deps.sh"
+        echo "    ~/.dotfiles/install-deps.sh"
         echo ""
         exit 1
     fi
@@ -132,54 +176,33 @@ cmd_install() {
     _show_summary
 }
 
-# Backup directory for existing files (XDG-compliant location).
-# Only non-symlink files are backed up (first install only).
-BACKUP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/dotfiles/backups/$(date +%Y%m%d-%H%M%S)"
+# Publication implementation follows the loaded command, not the independently
+# selectable DOTFILES content root. Tests and recovery tools intentionally pair
+# one implementation checkout with another managed source generation.
+# shellcheck source=../lib/home-publication-transaction.sh
+source "$DOTFILES_IMPLEMENTATION_ROOT/lib/home-publication-transaction.sh"
+# shellcheck source=../lib/managed-link-publication.sh
+source "$DOTFILES_IMPLEMENTATION_ROOT/lib/managed-link-publication.sh"
+# shellcheck source=../lib/managed-copy-publication.sh
+source "$DOTFILES_IMPLEMENTATION_ROOT/lib/managed-copy-publication.sh"
+# shellcheck source=../lib/agent-contract-publication.sh
+source "$DOTFILES_IMPLEMENTATION_ROOT/lib/agent-contract-publication.sh"
+# shellcheck source=../lib/local-config-publication.sh
+source "$DOTFILES_IMPLEMENTATION_ROOT/lib/local-config-publication.sh"
 
-# Create symlink, backing up existing files.
 _link() {
-    local src="$DOTFILES/$1"
-    local dst="$HOME/$2"
-
-    # Backup existing non-symlink files.
-    if [ -e "$dst" ] && [ ! -L "$dst" ]; then
-        mkdir -p "$BACKUP_DIR"
-        mv "$dst" "$BACKUP_DIR/"
-        warn "Backed up $dst"
-    fi
-
-    # Remove existing symlink.
-    [ -L "$dst" ] && rm "$dst"
-
-    # Create parent directory if needed.
-    mkdir -p "$(dirname "$dst")"
-
-    ln -sf "$src" "$dst"
-    info "Linked $dst -> $src"
+    _link_path "$DOTFILES/$1" "$HOME/$2"
 }
 
-# Copy a managed file for tools that do not reliably follow symlinks.
-_copy() {
-    local src="$DOTFILES/$1"
-    local dst="$HOME/$2"
-
-    mkdir -p "$(dirname "$dst")"
-
-    # Replace symlinks so the destination is always a regular file.
-    if [ -L "$dst" ]; then
-        rm "$dst"
-    elif [ -e "$dst" ]; then
-        if cmp -s "$src" "$dst"; then
-            info "Already copied $dst"
-            return
-        fi
-        mkdir -p "$BACKUP_DIR"
-        mv "$dst" "$BACKUP_DIR/"
-        warn "Backed up $dst"
+_install_pre_commit_hook() {
+    if [ ! -d "$DOTFILES/.git" ]; then
+        return 0
     fi
 
-    cp -p "$src" "$dst"
-    info "Copied $dst from $src"
+    info "Setting up pre-commit hook..."
+    _link_path \
+        "$DOTFILES/git/hooks/pre-commit" \
+        "$DOTFILES/.git/hooks/pre-commit"
 }
 
 # Create all symlinks.
@@ -202,69 +225,55 @@ _create_symlinks() {
     _link git/config .gitconfig
     _link git/ignore_global .gitignore_global
 
-    # Set up pre-commit hook if this is a git repo.
-    if [ -d "$DOTFILES/.git" ]; then
-        info "Setting up pre-commit hook..."
-        ln -sf ../../git/hooks/pre-commit "$DOTFILES/.git/hooks/pre-commit"
-    fi
+    # Set up the repository-local pre-commit hook through the same preserving
+    # publisher as HOME links.
+    _install_pre_commit_hook
 
     info "Setting up Claude configuration..."
-    mkdir -p "$HOME/.claude"
+    _mkdir_p_durable "$HOME/.claude"
     _link claude/settings.json .claude/settings.json
     _link claude/settings-admin.json .claude/settings-admin.json
     _link claude/statusline.sh .claude/statusline.sh
     _link claude/claude-powerline.json .claude/claude-powerline.json
-    _link claude/CLAUDE.md .claude/CLAUDE.md
 
     # GPU passthrough wrapper for Claude Code sandbox (Linux only).
     if [ "$(uname -s)" = "Linux" ] && command -v bwrap &>/dev/null; then
         info "Setting up Claude sandbox GPU passthrough..."
-        mkdir -p "$HOME/.local/bin"
-        ln -sf "$DOTFILES/claude/bwrap-gpu-wrapper" "$HOME/.local/bin/bwrap"
+        _link claude/bwrap-gpu-wrapper .local/bin/bwrap
     fi
 
     info "Setting up Codex configuration..."
-    mkdir -p "$HOME/.codex"
-    _copy codex/AGENTS.md .codex/AGENTS.md
+    _publish_agent_contracts
 
     info "Setting up tmux configuration..."
     _link tmux.conf .tmux.conf
 
     info "Setting up versioned tools..."
-    mkdir -p "$HOME/tools"
-    ln -sf "$DOTFILES/tools/CLAUDE.md" "$HOME/tools/CLAUDE.md"
-    ln -sf "$DOTFILES/tools/README.md" "$HOME/tools/README.md"
-    ln -sf "$DOTFILES/tools/direnvrc" "$HOME/.direnvrc"
-    info "Linked ~/.direnvrc -> $DOTFILES/tools/direnvrc"
+    _link tools/CLAUDE.md tools/CLAUDE.md
+    _link tools/README.md tools/README.md
+    _link tools/direnvrc .direnvrc
 }
 
-# Generate ~/.gitconfig.local from identity in ~/.shrc.local.
-_generate_gitconfig_local() {
-    if [ -f "$HOME/.gitconfig.local" ]; then
-        return  # Already exists.
-    fi
+_render_gitconfig_local() {
+    local output_path="$1"
+    local user_name="$2"
+    local user_email="$3"
 
-    # Source .shrc.local to get user identity if it exists.
-    if [ -f "$HOME/.shrc.local" ]; then
-        # shellcheck source=/dev/null
-        . "$HOME/.shrc.local"
-    fi
-
-    # Generate .gitconfig.local with user identity.
-    if [ -n "$USER_NAME" ] && [ "$USER_NAME" != "Your Name" ]; then
-        info "Creating ~/.gitconfig.local with user identity..."
-        cat > "$HOME/.gitconfig.local" << EOF
+    cat > "$output_path" << 'EOF'
 # ~/.gitconfig.local - Machine-specific git configuration (NOT synced)
 # Generated from USER_NAME and USER_EMAIL in ~/.shrc.local
 
-[user]
-    name = $USER_NAME
-    email = $USER_EMAIL
 EOF
-    else
-        # No identity configured yet - create placeholder.
-        info "Creating ~/.gitconfig.local template..."
-        cat > "$HOME/.gitconfig.local" << 'EOF'
+    if ! git config --file "$output_path" --add user.name "$user_name" ||
+            ! git config --file "$output_path" --add user.email "$user_email"; then
+        return 1
+    fi
+}
+
+_render_gitconfig_local_placeholder() {
+    local output_path="$1"
+
+    cat > "$output_path" << 'EOF'
 # ~/.gitconfig.local - Machine-specific git configuration (NOT synced)
 # Edit ~/.shrc.local with your identity, then re-run 'dotfiles install'.
 
@@ -272,30 +281,112 @@ EOF
     name = Your Name
     email = you@example.com
 EOF
+}
+
+# Generate ~/.gitconfig.local from identity in ~/.shrc.local.
+_generate_gitconfig_local_locked() {
+    local destination="$HOME/.gitconfig.local"
+    local shrc_local="$HOME/.shrc.local"
+    local USER_NAME=""
+    local USER_EMAIL=""
+
+    if [ -L "$destination" ]; then
+        error "Refusing symlinked local configuration: $destination"
+        return 1
+    fi
+    if [ -e "$destination" ]; then
+        if [ ! -f "$destination" ]; then
+            error "Local configuration is not a regular file: $destination"
+            return 1
+        fi
+        return 0
+    fi
+
+    if [ -L "$shrc_local" ]; then
+        error "Refusing symlinked local configuration: $shrc_local"
+        return 1
+    fi
+    if [ -e "$shrc_local" ] && [ ! -f "$shrc_local" ]; then
+        error "Local configuration is not a regular file: $shrc_local"
+        return 1
+    fi
+    if [ -f "$shrc_local" ]; then
+        # shellcheck source=/dev/null
+        . "$shrc_local"
+    fi
+
+    if [ -n "$USER_NAME" ] && [ "$USER_NAME" != "Your Name" ] &&
+            [ -n "$USER_EMAIL" ] && [ "$USER_EMAIL" != "you@example.com" ]; then
+        info "Creating ~/.gitconfig.local with user identity..."
+        _create_local_file_locked \
+            "$destination" 644 _render_gitconfig_local \
+            "$USER_NAME" "$USER_EMAIL"
+    else
+        info "Creating ~/.gitconfig.local template..."
+        _create_local_file_locked \
+            "$destination" 644 _render_gitconfig_local_placeholder
         warn "Set USER_NAME/USER_EMAIL in ~/.shrc.local, then re-run 'dotfiles install'"
     fi
 }
 
-# Set up git SSH signing if not already configured.
+_generate_gitconfig_local() {
+    _with_home_transaction_lock _generate_gitconfig_local_locked
+}
+
+# Set up git SSH signing and ensure local verification is configured.
 _setup_git_signing() {
-    if ! git config --global user.signingkey &>/dev/null; then
-        if [ -d "$HOME/.ssh" ] && ls "$HOME/.ssh"/*.pub &>/dev/null; then
-            info "Setting up git SSH signing..."
-            "$DOTFILES/bin/git-setup-signing"
-        else
-            warn "No SSH keys found - run 'dotfiles setup' after creating keys"
-        fi
+    local configured_signing_key=""
+    configured_signing_key=$(
+        git config --global --includes user.signingkey 2>/dev/null
+    ) || configured_signing_key=""
+
+    if [ -n "$configured_signing_key" ] ||
+            { [ -d "$HOME/.ssh" ] &&
+                compgen -G "$HOME/.ssh/*.pub" >/dev/null; }; then
+        info "Setting up git SSH signing..."
+        "$DOTFILES/bin/git-setup-signing"
+    else
+        warn "No SSH keys found - run 'dotfiles setup' after creating keys"
     fi
 }
 
-# Create ~/.secrets template if it doesn't exist.
-_ensure_secrets() {
-    if [ ! -f "$HOME/.secrets" ]; then
-        info "Creating ~/.secrets template..."
-        cp "$DOTFILES/secrets.template" "$HOME/.secrets"
-        chmod 600 "$HOME/.secrets"
-        warn "Created ~/.secrets - edit with your API keys"
+# Copy a repository template into a staged local file.
+_render_local_file_from_source() {
+    local output_path="$1"
+    local source_path="$2"
+
+    if [ ! -f "$source_path" ] || [ -L "$source_path" ]; then
+        error "Local configuration template is not a real regular file: $source_path"
+        return 1
     fi
+    cp "$source_path" "$output_path"
+}
+
+# Create ~/.secrets template if it doesn't exist.
+_ensure_secrets_locked() {
+    local destination="$HOME/.secrets"
+
+    if [ -L "$destination" ]; then
+        error "Refusing symlinked local configuration: $destination"
+        return 1
+    fi
+    if [ -e "$destination" ]; then
+        if [ ! -f "$destination" ]; then
+            error "Local configuration is not a regular file: $destination"
+            return 1
+        fi
+        return 0
+    fi
+
+    info "Creating ~/.secrets template..."
+    _create_local_file_locked \
+        "$destination" 600 _render_local_file_from_source \
+        "$DOTFILES/secrets.template"
+    warn "Created ~/.secrets - edit with your API keys"
+}
+
+_ensure_secrets() {
+    _with_home_transaction_lock _ensure_secrets_locked
 }
 
 # Show install summary.
@@ -325,16 +416,8 @@ _show_summary() {
     info "  project-dev       Create/attach to project tmux session"
     info "  project-code      Launch VS Code for project"
     info "  project-deinit    Remove project .envrc"
-    echo ""
-
-    info "IREE development:"
-    info "  iree-worktree-init <branch>   Create IREE worktree with shared config"
-    info "  iree-dev <name>               Create/attach to IREE tmux session"
-    info "  iree-code <name>              Launch VS Code for IREE worktree"
-    info "  iree-cmake-configure          Configure CMake build"
-    info "  iree-cmake-build              Build with ninja"
-    info "  iree-cmake-test               Run tests"
-    info "  iree-worktree-deinit <name>   Remove worktree and build directory"
+    info "  project-worktree-init <branch>  Create sibling Git worktree"
+    info "  project-worktree-deinit <name>  Safely remove sibling worktree"
     echo ""
 
     if [ -d "$BACKUP_DIR" ]; then
@@ -357,16 +440,15 @@ _check_shell_components() {
             echo "  - $component"
         done
         echo ""
-        warn "Run: sudo ~/.dotfiles/install-deps.sh"
+        warn "Run: ~/.dotfiles/install-deps.sh"
         echo ""
     fi
 }
 
-# Ensure ~/.shrc.local exists (create template if missing).
-_ensure_shrc_local() {
-    if [ ! -f "$HOME/.shrc.local" ]; then
-        info "Creating ~/.shrc.local template..."
-        cat > "$HOME/.shrc.local" << 'EOF'
+_render_shrc_local_template() {
+    local output_path="$1"
+
+    cat > "$output_path" << 'EOF'
 # ~/.shrc.local - Machine-specific shell configuration (NOT synced)
 #
 # ============================================================================
@@ -387,7 +469,31 @@ export USER_GITHUB_ID="yourusername"
 # ============================================================================
 # export ROCM_GPU_TARGET=gfx1100  # RDNA3
 EOF
+}
+
+# Ensure ~/.shrc.local exists (create template if missing).
+_ensure_shrc_local_locked() {
+    local destination="$HOME/.shrc.local"
+
+    if [ -L "$destination" ]; then
+        error "Refusing symlinked local configuration: $destination"
+        return 1
     fi
+    if [ -e "$destination" ]; then
+        if [ ! -f "$destination" ]; then
+            error "Local configuration is not a regular file: $destination"
+            return 1
+        fi
+        return 0
+    fi
+
+    info "Creating ~/.shrc.local template..."
+    _create_local_file_locked \
+        "$destination" 644 _render_shrc_local_template
+}
+
+_ensure_shrc_local() {
+    _with_home_transaction_lock _ensure_shrc_local_locked
 }
 
 # Check if identity needs to be configured.
@@ -405,6 +511,60 @@ _is_interactive() {
 }
 
 # Prompt for user identity.
+_render_shrc_local_identity() {
+    local output_path="$1"
+    local name="$2"
+    local email="$3"
+    local github_id="$4"
+
+    python3 -c '
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+values = {
+    "USER_NAME": ("Your Name", sys.argv[2]),
+    "USER_EMAIL": ("you@example.com", sys.argv[3]),
+    "USER_GITHUB_ID": ("yourusername", sys.argv[4]),
+}
+text = path.read_text(encoding="utf-8")
+
+def shell_quote(value):
+    quote = chr(39)
+    replacement = quote + chr(34) + quote + chr(34) + quote
+    return quote + value.replace(quote, replacement) + quote
+
+for variable, (placeholder, value) in values.items():
+    pattern = re.compile(
+        r"^export " + re.escape(variable) + r"=" +
+        re.escape("\"" + placeholder + "\"") + r"$",
+        re.MULTILINE,
+    )
+    if len(pattern.findall(text)) != 1:
+        raise SystemExit(
+            f"expected exactly one placeholder declaration for {variable}"
+        )
+    text = pattern.sub(
+        "export " + variable + "=" + shell_quote(value),
+        text,
+        count=1,
+    )
+
+path.write_text(text, encoding="utf-8")
+' "$output_path" "$name" "$email" "$github_id"
+}
+
+_update_shrc_local_identity_locked() {
+    local name="$1"
+    local email="$2"
+    local github_id="$3"
+
+    _replace_local_file_locked \
+        "$HOME/.shrc.local" _render_shrc_local_identity \
+        "$name" "$email" "$github_id"
+}
+
 _prompt_identity() {
     info "Setting up user identity..."
     echo ""
@@ -424,13 +584,12 @@ _prompt_identity() {
         return
     fi
 
-    # Update ~/.shrc.local with sed.
-    sed -i.bak \
-        -e "s/USER_NAME=\"Your Name\"/USER_NAME=\"$name\"/" \
-        -e "s/USER_EMAIL=\"you@example.com\"/USER_EMAIL=\"$email\"/" \
-        -e "s/USER_GITHUB_ID=\"yourusername\"/USER_GITHUB_ID=\"${github_id:-$USER}\"/" \
-        "$HOME/.shrc.local"
-    rm -f "$HOME/.shrc.local.bak"
+    if ! _with_home_transaction_lock \
+            _update_shrc_local_identity_locked \
+            "$name" "$email" "${github_id:-${USER:-}}"; then
+        error "Could not update ~/.shrc.local with user identity"
+        return 1
+    fi
 
     info "Updated ~/.shrc.local with your identity"
     echo ""
@@ -505,6 +664,33 @@ cmd_doctor() {
     done
     echo ""
 
+    # Agent clients need regular, current copies because neither client
+    # reliably follows the old provider-specific symlink layout.
+    printf "%bAgent working contracts:%b\n" "$BOLD" "$NC"
+    local managed_contract
+    for managed_contract in \
+            "$HOME/.claude/CLAUDE.md" \
+            "$HOME/.codex/AGENTS.md"; do
+        if [ -L "$managed_contract" ]; then
+            printf "  %b[DRIFT]%b %s is a symlink; run 'dotfiles install'\n" \
+                "$RED" "$NC" "$managed_contract"
+            all_ok=false
+        elif [ ! -f "$managed_contract" ]; then
+            printf "  %b[MISSING]%b %s; run 'dotfiles install'\n" \
+                "$RED" "$NC" "$managed_contract"
+            all_ok=false
+        elif cmp -s \
+                "$DOTFILES/agents/WORKING_CONTRACT.md" \
+                "$managed_contract"; then
+            printf "  %b[OK]%b %s\n" "$GREEN" "$NC" "$managed_contract"
+        else
+            printf "  %b[DRIFT]%b %s differs from the canonical contract\n" \
+                "$RED" "$NC" "$managed_contract"
+            all_ok=false
+        fi
+    done
+    echo ""
+
     # Check for broken symlinks.
     printf "%bBroken symlinks:%b\n" "$BOLD" "$NC"
     local broken_count=0
@@ -525,7 +711,7 @@ cmd_doctor() {
     printf "%bVersioned tools (~/tools/):%b\n" "$BOLD" "$NC"
     if [ -d "$HOME/tools" ]; then
         local found_tools=false
-        for tool in llvm cmake ninja mold bazel rocm vulkan; do
+        for tool in llvm cmake ninja bazel cuda rocm vulkan hf; do
             if [ -L "$HOME/tools/$tool/latest" ]; then
                 local version
                 version=$(basename "$(readlink "$HOME/tools/$tool/latest")")
@@ -650,34 +836,179 @@ cmd_fixup() {
     fi
 }
 
-# Move git diff additions to ~/.shrc.local.
-_fixup_move_to_shrc_local() {
+_render_shrc_local_append() {
+    local output_path="$1"
+    local source_file="$2"
+    local move_date="$3"
+    local additions_path="$4"
+
+    {
+        printf '\n'
+        printf '%s\n' \
+            "# ============================================================================"
+        printf '# Added by installer (moved from %s on %s)\n' \
+            "$source_file" "$move_date"
+        printf '%s\n' \
+            "# ============================================================================"
+        cat "$additions_path"
+    } >> "$output_path"
+}
+
+_append_shrc_local_locked() {
+    local source_file="$1"
+    local move_date="$2"
+    local additions_path="$3"
+
+    _replace_local_file_locked \
+        "$HOME/.shrc.local" _render_shrc_local_append \
+        "$source_file" "$move_date" "$additions_path"
+}
+
+# Move one exact byte suffix appended to a tracked shell file into
+# ~/.shrc.local. Insertions and replacements are left for manual review.
+_fixup_move_to_shrc_local() (
     local file="$1"
+    local base_path=""
+    local current_generation=""
+    local current_snapshot_path=""
+    local move_date=""
+    local suffix_path=""
 
-    # Extract only added lines (excluding diff metadata).
-    local additions
-    additions=$(git diff -- "$file" | grep '^+[^+]' | sed 's/^+//')
+    # Invoked indirectly by the EXIT trap below.
+    # shellcheck disable=SC2317
+    cleanup_fixup_snapshots() {
+        local exit_status=$?
+        local snapshot_path=""
+        trap - EXIT
+        trap '' HUP INT TERM
+        for snapshot_path in \
+                "$suffix_path" \
+                "$current_snapshot_path" \
+                "$base_path"; do
+            if [ -n "$snapshot_path" ] &&
+                    { [ -e "$snapshot_path" ] || [ -L "$snapshot_path" ]; } &&
+                    ! unlink "$snapshot_path"; then
+                error "Could not clean shell fixup snapshot: $snapshot_path"
+                exit_status=1
+            fi
+        done
+        exit "$exit_status"
+    }
+    trap cleanup_fixup_snapshots EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
 
-    if [ -z "$additions" ]; then
-        warn "No additions found to move"
-        return
+    if ! base_path=$(mktemp) ||
+            ! current_snapshot_path=$(mktemp) ||
+            ! suffix_path=$(mktemp); then
+        error "Could not reserve tracked shell snapshots: $file"
+        return 1
+    fi
+    if ! git show ":$file" > "$base_path"; then
+        error "Could not snapshot indexed shell configuration: $file"
+        return 1
+    fi
+    if ! current_generation=$(_local_file_generation "$file"); then
+        error "Tracked shell configuration is not a real regular file: $file"
+        return 1
+    fi
+    if ! python3 - "$base_path" "$file" \
+            "$current_snapshot_path" "$suffix_path" << 'PY'
+import os
+import stat
+import sys
+
+base_path, source_path, snapshot_path, suffix_path = sys.argv[1:]
+source_stat = os.lstat(source_path)
+if not stat.S_ISREG(source_stat.st_mode):
+    raise SystemExit(1)
+
+flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+flags |= getattr(os, "O_NOFOLLOW", 0)
+descriptor = os.open(source_path, flags)
+try:
+    opened_stat = os.fstat(descriptor)
+    if (opened_stat.st_dev, opened_stat.st_ino) != (
+            source_stat.st_dev, source_stat.st_ino):
+        raise SystemExit(1)
+    chunks = []
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    final_stat = os.fstat(descriptor)
+finally:
+    os.close(descriptor)
+
+if (
+    final_stat.st_dev,
+    final_stat.st_ino,
+    final_stat.st_mtime_ns,
+    final_stat.st_size,
+) != (
+    opened_stat.st_dev,
+    opened_stat.st_ino,
+    opened_stat.st_mtime_ns,
+    opened_stat.st_size,
+):
+    raise SystemExit(1)
+
+with open(base_path, "rb") as base_file:
+    base = base_file.read()
+current = b"".join(chunks)
+if len(current) <= len(base) or not current.startswith(base):
+    raise SystemExit(1)
+
+suffix = current[len(base):]
+if b"\0" in suffix:
+    raise SystemExit(1)
+if base and not base.endswith(b"\n") and not suffix.startswith(b"\n"):
+    raise SystemExit(1)
+
+with open(snapshot_path, "wb") as snapshot_file:
+    snapshot_file.write(current)
+with open(suffix_path, "wb") as suffix_file:
+    suffix_file.write(suffix)
+PY
+    then
+        error "Fixup only moves an exact appended suffix; leaving $file untouched"
+        return 1
     fi
 
-    # Append to ~/.shrc.local with a header.
-    {
-        echo ""
-        echo "# ============================================================================"
-        echo "# Added by installer (moved from $file on $(date +%Y-%m-%d))"
-        echo "# ============================================================================"
-        echo "$additions"
-    } >> "$HOME/.shrc.local"
+    if ! _ensure_shrc_local; then
+        return 1
+    fi
+    if ! move_date=$(date +%Y-%m-%d); then
+        error "Could not determine fixup date"
+        return 1
+    fi
+    if ! _with_home_transaction_lock \
+            _append_shrc_local_locked \
+            "$file" "$move_date" "$suffix_path"; then
+        return 1
+    fi
 
-    # Revert the original file.
-    git checkout -- "$file"
+    # Refuse the restore if either the index or worktree changed after the
+    # suffix snapshot. This detects cooperating edits before Git replaces the
+    # worktree path; Git does not provide a filesystem CAS against a writer
+    # that ignores this operation.
+    if ! git show ":$file" | cmp -s - "$base_path" ||
+            [ "$(_local_file_generation "$file" 2>/dev/null || true)" != \
+                "$current_generation" ] ||
+            ! cmp -s "$file" "$current_snapshot_path"; then
+        error "Tracked shell changes changed during fixup; leaving $file untouched"
+        return 1
+    fi
+    if ! git checkout -- "$file"; then
+        error "Could not restore tracked shell configuration: $file"
+        return 1
+    fi
 
     info "Moved additions to ~/.shrc.local and reverted $file"
     info "Review ~/.shrc.local to ensure correctness"
-}
+)
 
 # ============================================================================
 # Update Command
@@ -693,32 +1024,38 @@ cmd_update() {
     fi
 
     # Check if we're on a branch that tracks a remote.
-    local branch
-    branch=$(git symbolic-ref --short HEAD 2>/dev/null)
+    local branch=""
+    branch=$(git symbolic-ref --short HEAD 2>/dev/null) || branch=""
     if [ -z "$branch" ]; then
         error "Not on a branch - cannot update"
         return 1
     fi
 
-    local upstream
-    upstream=$(git rev-parse --abbrev-ref "$branch@{upstream}" 2>/dev/null)
+    local upstream=""
+    upstream=$(git rev-parse --abbrev-ref "$branch@{upstream}" 2>/dev/null) ||
+        upstream=""
     if [ -z "$upstream" ]; then
-        warn "Branch '$branch' has no upstream - skipping pull"
-        return 0
+        warn "Branch '$branch' has no upstream - publishing local configuration only"
+    else
+        info "Updating dotfiles from $upstream..."
+        if ! git pull --ff-only; then
+            error "Update failed - merge conflict or non-fast-forward"
+            error "Resolve manually with: cd $DOTFILES && git pull"
+            return 1
+        fi
     fi
 
-    info "Updating dotfiles from $upstream..."
-    if git pull --ff-only; then
-        echo ""
-        info "Update complete!"
-        echo ""
-        echo "To apply changes, run:"
-        echo "  source ~/.zshrc"
-    else
-        error "Update failed - merge conflict or non-fast-forward"
-        error "Resolve manually with: cd $DOTFILES && git pull"
+    if ! _publish_agent_contracts; then
+        error "Repository updated, but agent contracts were not applied"
+        error "Repair with: dotfiles install"
         return 1
     fi
+
+    echo ""
+    info "Update complete!"
+    echo ""
+    echo "To apply shell changes, run:"
+    echo "  source ~/.zshrc"
 }
 
 # ============================================================================

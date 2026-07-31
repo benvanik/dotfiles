@@ -92,7 +92,7 @@ awk -v cmd="$entry" '
 if [ -s "$histfile.tmp" ]; then
     mv "$histfile.tmp" "$histfile"
 else
-    rm -f "$histfile.tmp"
+    [ ! -e "$histfile.tmp" ] || unlink "$histfile.tmp"
 fi
 SCRIPT
     chmod +x /tmp/fzf-delete-history.sh

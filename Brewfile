@@ -17,7 +17,6 @@ brew "bat"
 brew "jq"
 brew "shellcheck"
 brew "direnv"
-brew "ccache"
 
 # Recommended tools.
 brew "fd"

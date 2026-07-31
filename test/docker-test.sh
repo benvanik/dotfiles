@@ -1,9 +1,7 @@
 #!/bin/bash
 # ~/.dotfiles/test/docker-test.sh - Test runner for inside Docker containers
-# Usage: docker-test.sh <alpine|ubuntu>
 set -e
 
-MODE="${1:-alpine}"
 DOTFILES="$HOME/.dotfiles"
 
 # Colors.
@@ -17,57 +15,61 @@ PASSED=0
 FAILED=0
 
 pass() { printf "  ${GREEN}PASS${NC} %s\n" "$1"; ((++PASSED)); }
-fail() { printf "  ${RED}FAIL${NC} %s\n" "$1"; ((++FAILED)); LAST_FAIL="$1"; }
+fail() { printf "  ${RED}FAIL${NC} %s\n" "$1"; ((++FAILED)); }
 section() { printf "\n${BOLD}[%s]${NC} %s\n" "$1" "$2"; }
 
 echo ""
-printf "${BOLD}Dotfiles Docker Test${NC} (mode: $MODE)\n"
+printf "%bDotfiles Docker Test%b (Ubuntu)\n" "$BOLD" "$NC"
 echo "========================================"
 
 # ============================================================================
-# Phase 1: Dependency Installation (Ubuntu only)
+# Phase 1: Dependency Installation
 # ============================================================================
-if [ "$MODE" = "ubuntu" ]; then
-    section "deps" "Installing dependencies (install-deps.sh)"
+section "deps" "Installing dependencies (install-deps.sh)"
 
-    if "$DOTFILES/install-deps.sh"; then
-        pass "install-deps.sh completed"
+if "$DOTFILES/install-deps.sh"; then
+    pass "install-deps.sh completed"
+else
+    fail "install-deps.sh failed"
+fi
+
+# Verify core tools installed.
+section "tools" "Verifying installed tools"
+
+for tool in zsh git fzf rg jq python3; do
+    if command -v "$tool" &>/dev/null; then
+        pass "$tool installed"
     else
-        fail "install-deps.sh failed"
+        fail "$tool not found"
     fi
+done
 
-    # Verify core tools installed.
-    section "tools" "Verifying installed tools"
-
-    for tool in zsh git fzf rg jq python3; do
-        if command -v "$tool" &>/dev/null; then
-            pass "$tool installed"
-        else
-            fail "$tool not found"
-        fi
-    done
-
-    # Check optional tools (don't fail, just report).
-    for tool in fd bat eza; do
-        if command -v "$tool" &>/dev/null || command -v "${tool}find" &>/dev/null || command -v "${tool}cat" &>/dev/null; then
-            pass "$tool available"
-        else
-            printf "  ${YELLOW}INFO${NC} %s not available (optional)\n" "$tool"
-        fi
-    done
-
-    # Check p10k installed.
-    if [ -d "$HOME/.local/p10k" ]; then
-        pass "Powerlevel10k installed"
+# Check optional tools (don't fail, just report).
+for tool in fd bat eza; do
+    if command -v "$tool" &>/dev/null || command -v "${tool}find" &>/dev/null || command -v "${tool}cat" &>/dev/null; then
+        pass "$tool available"
     else
-        fail "Powerlevel10k not found"
+        printf "  ${YELLOW}INFO${NC} %s not available (optional)\n" "$tool"
     fi
+done
+
+# Check p10k installed.
+if [ -d "$HOME/.local/p10k" ]; then
+    pass "Powerlevel10k installed"
+else
+    fail "Powerlevel10k not found"
 fi
 
 # ============================================================================
 # Phase 2: Symlink Installation
 # ============================================================================
 section "install" "Running dotfiles install"
+
+# Reproduce the real migration state: Claude has a dangling link to its retired
+# provider-specific contract while Codex has a differing user-owned copy.
+mkdir -p "$HOME/.claude" "$HOME/.codex"
+ln -s "$DOTFILES/claude/CLAUDE.md" "$HOME/.claude/CLAUDE.md"
+printf '%s\n' "contract state before migration" > "$HOME/.codex/AGENTS.md"
 
 if "$DOTFILES/bin/dotfiles" install; then
     pass "dotfiles install completed"
@@ -112,6 +114,37 @@ for tmpl in "${templates[@]}"; do
     fi
 done
 
+# Both agent clients receive byte-identical regular-file copies of the one
+# provider-neutral contract.
+if [ -f "$HOME/.codex/AGENTS.md" ] &&
+        [ ! -L "$HOME/.codex/AGENTS.md" ] &&
+        [ -f "$HOME/.claude/CLAUDE.md" ] &&
+        [ ! -L "$HOME/.claude/CLAUDE.md" ]; then
+    pass "agent contracts installed as regular files"
+else
+    fail "agent contracts were not installed as regular files"
+fi
+if cmp -s "$HOME/.codex/AGENTS.md" "$HOME/.claude/CLAUDE.md"; then
+    pass "agent contracts share one canonical payload"
+else
+    fail "agent contracts differ"
+fi
+if cmp -s "$DOTFILES/agents/WORKING_CONTRACT.md" \
+        "$HOME/.codex/AGENTS.md" &&
+        cmp -s "$DOTFILES/agents/WORKING_CONTRACT.md" \
+            "$HOME/.claude/CLAUDE.md"; then
+    pass "agent contracts match the canonical payload"
+else
+    fail "agent contracts do not match the canonical payload"
+fi
+if find "$HOME/.local/share/dotfiles/backups" -type f \
+        -exec grep -qxF "contract state before migration" {} \; \
+        -print -quit | grep -q .; then
+    pass "differing agent contract was backed up"
+else
+    fail "differing agent contract backup is missing"
+fi
+
 # ============================================================================
 # Phase 3: Shell Startup
 # ============================================================================
@@ -152,31 +185,29 @@ else
 fi
 
 # ============================================================================
-# Phase 4: Integration (Ubuntu only)
+# Phase 4: Integration
 # ============================================================================
-if [ "$MODE" = "ubuntu" ]; then
-    section "integration" "Testing tool integration"
+section "integration" "Testing tool integration"
 
-    # Test fzf is available in shell.
-    if TERM=dumb zsh -i -c 'command -v fzf' &>/dev/null; then
-        pass "fzf available in zsh"
-    else
-        fail "fzf not available in zsh"
-    fi
+# Test fzf is available in shell.
+if TERM=dumb zsh -i -c 'command -v fzf' &>/dev/null; then
+    pass "fzf available in zsh"
+else
+    fail "fzf not available in zsh"
+fi
 
-    # Test aliases loaded.
-    if TERM=dumb zsh -i -c 'alias' 2>&1 | grep -q "ls="; then
-        pass "aliases loaded"
-    else
-        fail "aliases not loaded"
-    fi
+# Test aliases loaded.
+if TERM=dumb zsh -i -c 'alias' 2>&1 | grep -q "ls="; then
+    pass "aliases loaded"
+else
+    fail "aliases not loaded"
+fi
 
-    # Test PATH includes dotfiles bin.
-    if TERM=dumb zsh -i -c 'echo $PATH' 2>&1 | grep -q ".dotfiles/bin"; then
-        pass "PATH includes ~/.dotfiles/bin"
-    else
-        fail "PATH missing ~/.dotfiles/bin"
-    fi
+# Test PATH includes dotfiles bin.
+if TERM=dumb zsh -i -c 'echo $PATH' 2>&1 | grep -q ".dotfiles/bin"; then
+    pass "PATH includes ~/.dotfiles/bin"
+else
+    fail "PATH missing ~/.dotfiles/bin"
 fi
 
 # ============================================================================

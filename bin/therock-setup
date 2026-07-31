@@ -72,8 +72,8 @@ configure_therock() {
 
     # Clear environment variables that can contaminate the build.
     # TheRock builds its own LLVM and cross-compiles to amdgcn - it must
-    # control its own toolchain. Our mold linker doesn't support LTO flags
-    # that LLD (required for amdgcn) uses.
+    # control its own toolchain. Host linker flags can conflict with LLD,
+    # which is required for AMDGPU targets.
     unset LDFLAGS
     unset LLVM_ROOT LLVM_DIR CLANG_DIR MLIR_DIR
 

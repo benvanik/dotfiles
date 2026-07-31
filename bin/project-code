@@ -11,6 +11,7 @@ set -e
 
 # Parse arguments.
 TARGET_DIR="."
+TARGET_DIR_SET=false
 CODE_ARGS=()
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -26,34 +27,55 @@ while [ $# -gt 0 ]; do
             CODE_ARGS=("$@")
             break
             ;;
+        -*)
+            printf 'project-code: unknown option before --: %s\n' "$1" >&2
+            exit 1
+            ;;
         *)
+            if [ "$TARGET_DIR_SET" = "true" ]; then
+                printf 'project-code: unexpected extra directory: %s\n' "$1" >&2
+                exit 1
+            fi
             TARGET_DIR="$1"
+            TARGET_DIR_SET=true
             ;;
     esac
     shift
 done
 
+if [ ! -d "$TARGET_DIR" ]; then
+    printf 'project-code: directory does not exist: %s\n' "$TARGET_DIR" >&2
+    exit 1
+fi
+
 # Find workspace file.
 find_workspace() {
     local dir="$1"
-    local basename
-    basename=$(basename "$(realpath "$dir")")
+    local directory
+    directory=$(CDPATH='' cd -- "$dir" 2>/dev/null && pwd -P) || return 1
+    local directory_name
+    directory_name=$(basename "$directory")
 
-    # Try <basename>.code-workspace first, then any *.code-workspace.
-    if [ -f "$dir/$basename.code-workspace" ]; then
-        echo "$dir/$basename.code-workspace"
+    # Try <directory>.code-workspace first, then any workspace file.
+    if [ -f "$directory/$directory_name.code-workspace" ]; then
+        echo "$directory/$directory_name.code-workspace"
     else
-        # Find first *.code-workspace file.
-        local ws
-        ws=$(find "$dir" -maxdepth 1 -name "*.code-workspace" -type f 2>/dev/null | head -1)
-        [ -n "$ws" ] && echo "$ws"
+        local workspace
+        for workspace in "$directory"/*.code-workspace; do
+            [ -f "$workspace" ] || continue
+            echo "$workspace"
+            break
+        done
     fi
 }
 
-WORKSPACE=$(find_workspace "$TARGET_DIR")
+WORKSPACE=$(find_workspace "$TARGET_DIR") || {
+    printf 'project-code: could not resolve directory: %s\n' "$TARGET_DIR" >&2
+    exit 1
+}
 
 if [ -n "$WORKSPACE" ]; then
-    exec code --file-uri "file://$(realpath "$WORKSPACE")" "${CODE_ARGS[@]}"
+    exec code "$WORKSPACE" "${CODE_ARGS[@]}"
 else
     exec code "$TARGET_DIR" "${CODE_ARGS[@]}"
 fi

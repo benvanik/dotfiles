@@ -6,7 +6,6 @@
 |------|---------|
 | `settings.json` | Global Claude Code settings (sandbox, permissions) |
 | `settings-admin.json` | Admin/managed settings |
-| `CLAUDE.md` | Global instructions for all projects |
 | `statusline.sh` | Status line script |
 | `bwrap-gpu-wrapper` | GPU passthrough wrapper for Linux sandbox |
 

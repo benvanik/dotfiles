@@ -16,9 +16,28 @@ Tools are installed in `~/tools/<tool>/<version>/` with a `latest` symlink:
 ~/tools/llvm/
 ├── 21.1.6/         # Installed version
 ├── 20.1.0/         # Another version
-├── latest -> 21.1.6
-└── env.sh          # Common LLVM settings
+└── latest -> 21.1.6
 ```
+
+Environment definitions live in `~/.dotfiles/tools/<tool>/env.sh`. Keeping
+configuration in Git and payloads in `~/tools/` means a dotfiles pull updates
+tool behavior without reinstalling toolchains.
+
+Installers treat each version as one published generation. Native release
+archives are checksum-attested before extraction. The Hugging Face and ROCm
+Python closures instead pin their requested package identity and validate the
+installed command/module surface; their resolver-selected wheel bytes are not
+independently attested here. Every closure is prepared in private sibling
+staging, checked through its real tool surface, and then renamed into place as a
+transaction. Each producer holds a kernel-released child guard from staging
+allocation through publication, and staging uses the exact
+`.dotfiles-stage-<child>.<uuid>` namespace. A restart therefore reclaims a
+pre-journal download only after excluding a live producer. The publication
+journal is durable before either rename: recovery restores a displaced prior
+generation or accepts a payload whose rename committed before reuse checks or
+network work begin. Mounted, cross-filesystem, symlinked, foreign-hidden, and
+ambiguous roots fail closed. `--force` never grants an in-place overlay and an
+ambient `FORCE` variable has no authority.
 
 ## Usage
 
@@ -26,6 +45,7 @@ Tools are installed in `~/tools/<tool>/<version>/` with a `latest` symlink:
 
 The shell automatically loads latest versions from ~/tools/ for interactive shells.
 This is handled by `~/.dotfiles/tools/tools.sh` (sourced from ~/.shrc).
+`mold` is intentionally excluded from those ambient defaults.
 
 ### Per-Project Versions
 
@@ -34,17 +54,29 @@ Use `project-init` to set up a new project:
 ```bash
 cd my-project
 project-init
+project-init --build --mold
 ```
 
 This creates:
+
 - `.envrc` - Tool configuration (commit this)
 - `.envrc.local` - Machine-specific overrides (gitignored)
+- `.history/` - Per-project shell history (gitignored)
+
+On rerun, `project-init` preserves supported directive arguments, including
+exact tool versions and history choices. It refuses to rewrite an `.envrc`
+containing unmanaged content; machine-only additions belong in `.envrc.local`.
+Use `--none` for an explicit empty tool selection. Canceling the interactive
+selector leaves the existing environment untouched.
 
 ### Manual .envrc
 
 Create `.envrc` in your project directory:
 
 ```bash
+# Abort the complete direnv evaluation if any selected environment is invalid.
+set -o errexit -o pipefail
+
 # Use specific LLVM version
 use_llvm "21.1.6"
 
@@ -53,9 +85,12 @@ use_cmake ">=3.28.0"
 
 # Use latest for tools without version requirements
 use_ninja
+
+# Link with mold only in a project that explicitly requests it
 use_mold
 
-# ROCm - silent skip on non-Linux
+# GPU SDKs - silent skip on non-Linux
+use_cuda ">=12.9.0"
 use_rocm ">=6.0.0"
 
 # Load machine-specific overrides
@@ -63,17 +98,6 @@ source_local_envrc
 ```
 
 Then run `direnv allow` to activate.
-
-### IREE Development
-
-For IREE development, use the convenience function:
-
-```bash
-# In .envrc
-use_iree_dev  # Uses sensible defaults
-# Or specify versions:
-use_iree_dev ">=21.0.0" ">=3.28.0"
-```
 
 ## Installing New Tool Versions
 
@@ -95,28 +119,16 @@ permissions. The wrapper rejects environment tokens, Git credential
 duplication, token-printing commands, and `hf update` so the dotfiles pin and
 private file remain authoritative.
 
-### LLVM Example
+### Managed release examples
 
 ```bash
-# Download and extract
-cd ~/tools/llvm
-wget https://github.com/llvm/llvm-project/releases/download/llvmorg-21.1.6/clang+llvm-21.1.6-x86_64-linux-gnu.tar.xz
-tar xf clang+llvm-21.1.6-x86_64-linux-gnu.tar.xz
-mv clang+llvm-21.1.6-x86_64-linux-gnu 21.1.6
-
-# Update latest symlink
-ln -sfn 21.1.6 latest
+~/.dotfiles/tools/llvm/install.sh 21.1.6
+~/.dotfiles/tools/cmake/install.sh 3.31.7
+~/.dotfiles/tools/mold/install.sh 2.41.0
 ```
 
-### CMake Example
-
-```bash
-cd ~/tools/cmake
-wget https://github.com/Kitware/CMake/releases/download/v3.31.7/cmake-3.31.7-linux-x86_64.tar.gz
-tar xf cmake-3.31.7-linux-x86_64.tar.gz
-mv cmake-3.31.7-linux-x86_64 3.31.7
-ln -sfn 3.31.7 latest
-```
+The dispatcher accepts only exact supported names. `tools/install.sh mold`
+works, while `tools/install.sh --all` deliberately leaves mold uninstalled.
 
 ## Machine-Specific Overrides
 
@@ -138,5 +150,5 @@ export MY_DEBUG_FLAG=1
 | direnvrc | ~/.dotfiles/tools/ | use_* functions for direnv |
 | platform.sh | ~/.dotfiles/tools/ | Platform detection |
 | versions.sh | ~/.dotfiles/tools/ | Version comparison |
-| project-init | ~/.dotfiles/bin/ | Project setup script |
-| env.sh | ~/tools/<tool>/ | Tool-specific settings |
+| project-init | ~/.dotfiles/bin/ | `.envrc`, local overrides, and default history |
+| `<tool>/env.sh` | ~/.dotfiles/tools/ | Tool-specific settings |

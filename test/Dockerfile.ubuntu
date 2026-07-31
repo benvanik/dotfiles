@@ -12,7 +12,7 @@ RUN apt-get update \
         curl \
         git \
         locales \
-    && rm -rf /var/lib/apt/lists/* \
+    && find /var/lib/apt/lists -mindepth 1 -depth -delete \
     && locale-gen en_US.UTF-8
 
 ENV LANG=en_US.UTF-8 \
@@ -31,4 +31,4 @@ WORKDIR /home/testuser
 COPY --chown=testuser:testuser . .dotfiles/
 
 # Entry point.
-ENTRYPOINT ["/home/testuser/.dotfiles/test/docker-test.sh", "ubuntu"]
+ENTRYPOINT ["/home/testuser/.dotfiles/test/docker-test.sh"]

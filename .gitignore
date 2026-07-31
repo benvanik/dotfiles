@@ -27,7 +27,6 @@ history.jsonl
 # Local env/config files
 .env
 .env.*
-.envrc
 .direnv/
 .npmrc
 .yarnrc

@@ -1,24 +1,25 @@
-# Tools Management - Claude Code Reference
+# Tools Management Reference
 
 ## Quick Reference
 
 | Command | Purpose |
 |---------|---------|
 | `project-init` | Initialize project with .envrc |
-| `cuda/install.sh 12.9.1` | Install CUDA SDK to ~/tools/cuda/ |
-| `rocm-install 7.9.0` | Install ROCm version to ~/tools/rocm/ |
-| `use_cuda [version]` | In .envrc: load CUDA SDK (sets IREE_CUDA_TOOLKIT_ROOT) |
+| `~/.dotfiles/tools/cuda/install.sh 12.9.1` | Install CUDA SDK to ~/tools/cuda/ |
+| `~/.dotfiles/tools/rocm/install.sh 7.14.0a20260612` | Install ROCm to ~/tools/rocm/ |
+| `use_cuda [version]` | In .envrc: load the CUDA SDK |
 | `use_llvm ">=21.0.0"` | In .envrc: require LLVM 21+ |
 | `use_rocm "debug"` | In .envrc: use TheRock debug build |
-| `use_ccache "iree"` | In .envrc: enable ccache with named cache |
-| `use_iree_dev` | Convenience: llvm+cmake+ninja+mold+rocm |
+| `use_mold [version]` | In .envrc: explicitly select the mold linker |
 
 ## Directory Layout
 
 ```
+~/.dotfiles/tools/<tool>/
+└── env.sh          # Synced settings (CC, CXX, PATH, etc.)
+
 ~/tools/<tool>/
-├── env.sh          # Common settings (CC, CXX, PATH, etc.)
-├── <version>/      # Installed version directory
+├── <version>/      # Machine-local installed version
 └── latest -> ver   # Default symlink
 ```
 
@@ -34,94 +35,54 @@ In .envrc files:
 - `use_llvm [version]` - Load LLVM/Clang
 - `use_cmake [version]` - Load CMake
 - `use_ninja [version]` - Load Ninja
-- `use_mold [version]` - Load Mold linker
-- `use_cuda [version]` - Load CUDA SDK (Linux only, sets IREE_CUDA_TOOLKIT_ROOT)
+- `use_mold [version]` - Load mold for an explicitly opted-in project
+- `use_cuda [version]` - Load CUDA SDK (Linux only)
 - `use_rocm [version]` - Load ROCm (Linux only, silent skip elsewhere)
-- `use_ccache [cache_name]` - Enable ccache with per-project isolation
-- `use_iree_dev [llvm_ver] [cmake_ver]` - Load IREE development tools
 - `source_local_envrc` - Load .envrc.local overrides
 
 ## Adding New Tool Version
 
-1. Download/extract to ~/tools/<tool>/<version>/
-2. Update latest symlink: `ln -sfn <version> ~/tools/<tool>/latest`
-3. Verify: `ls -la ~/tools/<tool>/`
+1. Update the reviewed release identity in `tools/<tool>/install.sh`.
+2. Run `tools/<tool>/install.sh <version>`.
+3. Run `tools/<tool>/smoketest.sh` when the tool provides one.
 
 ## Platform Behavior
 
-- CUDA: Linux only, silent skip on macOS/WSL
-- ROCm: Linux only, silent skip on macOS/WSL
-- Other tools: Error if requested but not found
+- CUDA and mold: Linux x86-64 or ARM64
+- ROCm and the LunarG Vulkan SDK: Linux x86-64
+- LLVM: Linux/WSL x86-64 or ARM64, and Apple Silicon macOS
+
+An exact installer request fails on an unsupported target. A committed
+`.envrc` silently skips a selected tool whose native artifact is unavailable on
+the current machine. CUDA, ROCm, and mold activation also remain disabled by
+policy on WSL; the Linux Vulkan and LLVM artifacts remain available there.
 
 ## Environment Variables Set
 
 CUDA:
-- `IREE_CUDA_TOOLKIT_ROOT` - CUDA toolkit path (used by IREE Bazel build)
-- `CUDA_TOOLKIT_ROOT_DIR` - Standard CMake CUDA path
+- `CUDA_ROOT`, `CUDA_HOME`, `CUDA_PATH` - CUDA toolkit root
+- `CUDA_TOOLKIT_ROOT_DIR` - CMake CUDA toolkit path
+- `CUDACXX` - CUDA compiler
 
 LLVM:
 - `CC`, `CXX` - Compiler paths
 - `LLVM_ROOT`, `LLVM_DIR`, `CLANG_DIR`, `MLIR_DIR` - CMake paths
 
-Mold:
-- `LDFLAGS` - Adds -fuse-ld=mold
-
 ROCm:
 - `ROCM_HOME`, `HIP_PATH` - ROCm paths
 - `CMAKE_PREFIX_PATH` - For TheRock builds
 
-## ccache Setup
-
-ccache speeds up recompilation by caching compiled objects (3-4x faster rebuilds).
-
-### Basic Usage
-
-In .envrc:
-```bash
-use_ccache              # Cache name from directory basename
-use_ccache "myproject"  # Named cache (for sharing across worktrees)
-```
-
-### Environment Variables Set
-
-- `CCACHE_DIR` - Cache directory: `${CCACHE_BASE_DIR:-~/.cache/ccache}/<cache_name>`
-- `CMAKE_C_COMPILER_LAUNCHER` - Set to `ccache`
-- `CMAKE_CXX_COMPILER_LAUNCHER` - Set to `ccache`
-
-### Shared Cache Across Worktrees
-
-For projects with multiple worktrees (like IREE), use a named cache:
-```bash
-# In all IREE worktrees:
-use_ccache "iree"  # All share ~/.cache/ccache/iree/
-```
-
-### Custom Cache Location
-
-Set `CCACHE_BASE_DIR` in `~/.shrc.local` to relocate all caches:
-```bash
-# Use fast SSD for cache (offload I/O from main drive).
-export CCACHE_BASE_DIR="/mnt/fastssd/cache/ccache"
-```
-
-### Requirements
-
-Install ccache via package manager:
-```bash
-# Debian/Ubuntu
-sudo apt install ccache
-
-# macOS
-brew install ccache
-```
+Mold (explicit projects only):
+- `MOLD_ROOT` - Selected mold installation
+- `LDFLAGS` - Adds `-fuse-ld=mold` once
 
 ## ROCm Setup
 
 ### Installing Release Versions
 
 ```bash
-rocm-install 7.9.0            # Uses ROCM_GPU_TARGET from .shrc.local
-rocm-install 7.9.0 gfx90a     # Override GPU target
+~/.dotfiles/tools/rocm/install.sh 7.14.0a20260612
+~/.dotfiles/tools/rocm/install.sh 7.14.0a20260612 gfx90a
 ```
 
 Set default GPU target in `~/.shrc.local`:
@@ -131,21 +92,21 @@ export ROCM_GPU_TARGET=gfx1100  # RDNA3
 
 ### Development Builds
 
-Set up symlinks to your TheRock checkout:
+`therock-setup` owns the direct development selectors:
 
 ```bash
-# Debug build (build/ directory)
-ln -sfn ~/src/rocm/TheRock/build ~/tools/rocm/debug
+therock-setup --symlinks-only
 
-# Release build (install/ directory)
-ln -sfn ~/src/rocm/TheRock/install ~/tools/rocm/release
+# Equivalent selector targets:
+# ~/tools/rocm/debug   -> ~/src/rocm/TheRock/build-debug
+# ~/tools/rocm/release -> ~/src/rocm/TheRock/install
 ```
 
 ### Version Selection in .envrc
 
 ```bash
 use_rocm                 # Latest release
-use_rocm "7.9.0"         # Specific version
+use_rocm "7.14.0a20260612" # Specific version
 use_rocm "debug"         # TheRock debug build
 use_rocm "release"       # TheRock release build
 ```
@@ -171,11 +132,10 @@ therock-setup --build-only # Just build (if already cloned)
 ### Rebuilding
 
 ```bash
-cd ~/src/rocm/TheRock
-source .venv/bin/activate
-cmake --build build-debug -j$(nproc)    # Rebuild debug
-cmake --build build-release -j$(nproc)  # Rebuild release
-cmake --install build-release           # Re-install
+therock-build debug
+therock-build release
+cmake --install ~/src/rocm/TheRock/build-release
+therock-setup --symlinks-only
 ```
 
 ### Using in Projects

@@ -10,35 +10,62 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export TOOL_NAME="tools"
 source "$SCRIPT_DIR/install-utils.sh"
 
-# List of tools with platform support.
-# Format: tool:platforms (linux, darwin, all)
+# List of tools with exact supported host targets. This is the authoritative
+# filter for help, exact dispatch, and --all; it must match each installer's
+# artifact matrix.
+ALL_HOST_TARGETS="linux/x86_64,linux/aarch64,darwin/x86_64,darwin/aarch64"
 TOOLS=(
-    "bazel:all"
-    "beads:all"
-    "cmake:all"
-    "hf:all"
-    "llvm:all"
-    "mold:linux"
-    "ninja:all"
-    "nix:all"
-    "nvm:all"
-    "rocm:linux"
-    "vulkan:linux"
+    "bazel:$ALL_HOST_TARGETS"
+    "beads:$ALL_HOST_TARGETS"
+    "cmake:$ALL_HOST_TARGETS"
+    "cuda:linux/x86_64,linux/aarch64"
+    "hf:$ALL_HOST_TARGETS"
+    "llvm:linux/x86_64,linux/aarch64,darwin/aarch64"
+    "mold:linux/x86_64,linux/aarch64"
+    "ninja:$ALL_HOST_TARGETS"
+    "nix:linux/x86_64,linux/aarch64,darwin/aarch64"
+    "nvm:$ALL_HOST_TARGETS"
+    "rocm:linux/x86_64"
+    "vulkan:linux/x86_64"
 )
 
-# Check if tool is supported on current platform.
+# Tools in this list remain available by exact name but are never ambient
+# defaults and are not included in --all.
+EXPLICIT_ONLY_TOOLS=(
+    "mold"
+)
+
+# Check if a metadata target set includes the current platform and architecture.
 tool_supported() {
-    local tool="$1"
-    local platforms="$2"
-    [ "$platforms" = "all" ] || [[ "$platforms" == *"$PLATFORM"* ]]
+    local supported_targets="$1"
+    local target
+
+    for target in ${supported_targets//,/ }; do
+        [ "$target" != "$PLATFORM/$ARCH" ] || return 0
+    done
+    return 1
 }
 
 # Get list of supported tools for current platform.
+tool_is_explicit_only() {
+    local requested_tool="$1"
+    local explicit_tool
+    for explicit_tool in "${EXPLICIT_ONLY_TOOLS[@]}"; do
+        [ "$requested_tool" != "$explicit_tool" ] || return 0
+    done
+    return 1
+}
+
 get_supported_tools() {
+    local include_explicit="${1:-true}"
     for entry in "${TOOLS[@]}"; do
         local tool="${entry%%:*}"
-        local platforms="${entry##*:}"
-        if tool_supported "$tool" "$platforms"; then
+        local supported_targets="${entry##*:}"
+        if [ "$include_explicit" != "true" ] &&
+                tool_is_explicit_only "$tool"; then
+            continue
+        fi
+        if tool_supported "$supported_targets"; then
             echo "$tool"
         fi
     done
@@ -54,13 +81,17 @@ USAGE
     tools/install.sh <tool> [args...]   Install specific tool
     tools/install.sh --all              Install all supported tools
 
-AVAILABLE TOOLS (on $PLATFORM)
+AVAILABLE TOOLS (on $PLATFORM/$ARCH)
 EOF
     for entry in "${TOOLS[@]}"; do
         local tool="${entry%%:*}"
-        local platforms="${entry##*:}"
-        if tool_supported "$tool" "$platforms"; then
-            printf "    %-12s\n" "$tool"
+        local supported_targets="${entry##*:}"
+        if tool_supported "$supported_targets"; then
+            if tool_is_explicit_only "$tool"; then
+                printf "    %-12s %s\n" "$tool" "(explicit only)"
+            else
+                printf "    %-12s\n" "$tool"
+            fi
         fi
     done
     cat << EOF
@@ -79,11 +110,11 @@ EOF
 
 # Install all supported tools.
 install_all() {
-    info "Installing all supported tools for $PLATFORM..."
+    info "Installing all supported tools for $PLATFORM/$ARCH..."
     echo ""
 
     local failed_tools=()
-    for tool in $(get_supported_tools); do
+    for tool in $(get_supported_tools false); do
         info "Installing $tool..."
         if ! "$SCRIPT_DIR/$tool/install.sh"; then
             warn "Failed to install $tool"
@@ -101,46 +132,60 @@ install_all() {
 }
 
 # Main.
-case "${1:-}" in
-    -h|--help)
-        show_help
-        exit 0
-        ;;
-    --all)
-        install_all
-        exit 0
-        ;;
-    "")
-        show_help
-        exit 0
-        ;;
-    *)
-        TOOL="$1"
-        shift
+main() {
+    local entry
+    local registered_tool
+    local requested_tool
+    local supported_targets=""
 
-        # Check if tool exists.
-        if [ ! -f "$SCRIPT_DIR/$TOOL/install.sh" ]; then
-            error "Unknown tool: $TOOL"
-            echo ""
-            echo "Available tools:"
-            get_supported_tools | sed 's/^/  /'
-            exit 1
-        fi
+    case "${1:-}" in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        --all)
+            install_all
+            exit 0
+            ;;
+        "")
+            show_help
+            exit 0
+            ;;
+        *)
+            requested_tool="$1"
+            shift
 
-        # Check platform support.
-        for entry in "${TOOLS[@]}"; do
-            local_tool="${entry%%:*}"
-            local_platforms="${entry##*:}"
-            if [ "$local_tool" = "$TOOL" ]; then
-                if ! tool_supported "$TOOL" "$local_platforms"; then
-                    error "$TOOL is not supported on $PLATFORM"
-                    exit 1
+            for entry in "${TOOLS[@]}"; do
+                registered_tool="${entry%%:*}"
+                if [ "$registered_tool" = "$requested_tool" ]; then
+                    supported_targets="${entry##*:}"
+                    break
                 fi
-                break
+            done
+            if [ -z "$supported_targets" ]; then
+                error "Unknown tool: $requested_tool"
+                echo ""
+                echo "Available tools:"
+                get_supported_tools | sed 's/^/  /'
+                exit 1
             fi
-        done
 
-        # Run tool installer.
-        exec "$SCRIPT_DIR/$TOOL/install.sh" "$@"
-        ;;
-esac
+            if ! tool_supported "$supported_targets"; then
+                error "$requested_tool is not supported on $PLATFORM/$ARCH"
+                exit 1
+            fi
+            if [ ! -f "$SCRIPT_DIR/$requested_tool/install.sh" ] ||
+                    [ -L "$SCRIPT_DIR/$requested_tool/install.sh" ]; then
+                error "Supported installer is missing or not a regular file: $requested_tool"
+                exit 1
+            fi
+
+            # Run tool installer.
+            exec "$SCRIPT_DIR/$requested_tool/install.sh" "$@"
+            ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

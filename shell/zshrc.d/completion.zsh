@@ -83,18 +83,14 @@ _generic_flags_completion() {
     _describe 'flags' flags
 }
 
-# Enable generic flag completion for common patterns.
-# This will fallback to flag parsing when no specific completion exists.
-# Add your custom binaries here:
-compdef _generic_flags_completion iree-opt
-compdef _generic_flags_completion iree-compile
-compdef _generic_flags_completion iree-run-module
+# Project-specific binaries can opt into `_generic_flags_completion` from
+# their repository-local completion files.
 
 # Note: For system commands, zsh already has good completions.
 # This is mainly for custom/project binaries in your build directories.
 #
 # Performance note: The first tab completion will parse --help output, which
-# may take a moment for tools with thousands of flags (like IREE tools).
+# may take a moment for tools with thousands of flags.
 # Subsequent completions in the same shell session are cached by zsh.
 
 # ============================================================================

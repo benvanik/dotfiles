@@ -23,8 +23,8 @@ fail() { printf "  ${RED}FAIL${NC} %s\n" "$1"; ((++FAILED)); }
 skip() { printf "  ${YELLOW}SKIP${NC} %s\n" "$1"; ((++SKIPPED)); }
 section() { printf "\n${BOLD}[%s]${NC} %s\n" "$1" "$2"; }
 
-# Track start time.
-START_TIME=$(date +%s.%N)
+# Track start time with the Bash timer available on Linux and macOS.
+START_TIME=$SECONDS
 
 echo ""
 printf "%b[dotfiles]%b Running Tier 1 tests...\n" "$BOLD" "$NC"
@@ -34,16 +34,48 @@ printf "%b[dotfiles]%b Running Tier 1 tests...\n" "$BOLD" "$NC"
 # ============================================================================
 section "syntax" "Shell syntax validation"
 
-# POSIX files (must work with sh/dash).
-posix_files=(
-    "shell/shrc"
-    "shell/profile"
-)
-# Add platform files if they exist.
-for f in shell/platform/*.sh; do
-    [ -f "$f" ] && posix_files+=("$f")
-done
-# Note: tools/*.sh use 'local' (bash-ism), checked as bash below.
+# Classify every tracked shell source once. Files with an explicit shell
+# contract take precedence over their extension; extension-only .sh files use
+# Bash because the tool environment sources intentionally use Bash-compatible
+# local variables without shebangs.
+posix_files=()
+bash_files=()
+zsh_files=()
+while IFS= read -r f; do
+    [ -f "$f" ] || continue
+    case "$f" in
+        shell/shrc|shell/profile|shell/platform/*.sh)
+            posix_files+=("$f")
+            continue
+            ;;
+        shell/bashrc)
+            bash_files+=("$f")
+            continue
+            ;;
+        shell/zshrc|*.zsh)
+            zsh_files+=("$f")
+            continue
+            ;;
+    esac
+
+    first_line=$(head -n 1 "$f" 2>/dev/null || true)
+    case "$first_line" in
+        '#!'*bash*)
+            bash_files+=("$f")
+            ;;
+        '#!'*zsh*)
+            zsh_files+=("$f")
+            ;;
+        '#!'*sh*)
+            posix_files+=("$f")
+            ;;
+        *)
+            case "$f" in
+                *.sh) bash_files+=("$f") ;;
+            esac
+            ;;
+    esac
+done < <(git ls-files)
 
 posix_pass=0
 posix_fail=0
@@ -61,31 +93,11 @@ if [ $posix_fail -eq 0 ]; then
     pass "POSIX syntax: $posix_pass files"
 fi
 
-# Bash files.
-bash_files=(
-    "install-deps.sh"
-    "shell/bashrc"
-)
-# Add bin scripts with bash shebang.
-for f in bin/*; do
-    if [ -f "$f" ] && head -1 "$f" 2>/dev/null | grep -q "^#!/bin/bash"; then
-        bash_files+=("$f")
-    fi
-done
-# Add lib files (require bash 4+ for associative arrays).
-for f in lib/*.sh; do
-    [ -f "$f" ] && bash_files+=("$f")
-done
-# Add tools files (use 'local' which requires bash-mode checking).
-for f in tools/*.sh; do
-    [ -f "$f" ] && bash_files+=("$f")
-done
-
 bash_pass=0
 bash_fail=0
 for f in "${bash_files[@]}"; do
     if [ -f "$f" ]; then
-        if bash -n "$f" 2>/dev/null; then
+        if "$BASH" -n "$f" 2>/dev/null; then
             ((++bash_pass))
         else
             fail "bash syntax: $f"
@@ -125,12 +137,6 @@ else
     fail "python3 required for Python commands"
 fi
 
-# Zsh files.
-zsh_files=("shell/zshrc")
-for f in shell/zshrc.d/*.zsh themes/*.zsh; do
-    [ -f "$f" ] && zsh_files+=("$f")
-done
-
 zsh_pass=0
 zsh_fail=0
 for f in "${zsh_files[@]}"; do
@@ -147,6 +153,43 @@ if [ $zsh_fail -eq 0 ]; then
     pass "zsh syntax: $zsh_pass files"
 fi
 
+# Agent-driven commands must never enter the direct shell file-removal path;
+# the Codex UI can block for hours before the subprocess starts. Use exact
+# unlink or bounded find-delete operations instead.
+deletion_command_name=$(printf '\162\155')
+deletion_command_pattern="(^|[;&|[:space:]\\\\/\"'])${deletion_command_name}([;&|[:space:]\"']|$)"
+deletion_command_fail=0
+
+# Keep the safety detector honest without spelling the forbidden command in a
+# tracked shell source (which would correctly make that source fail the scan).
+for specimen in \
+    "${deletion_command_name} -f target" \
+    "sudo ${deletion_command_name} -f target" \
+    "/bin/${deletion_command_name} -f target" \
+    "/usr/bin/${deletion_command_name} -f target" \
+    "\\${deletion_command_name} -f target" \
+    "\"/bin/${deletion_command_name}\" -f target"; do
+    if ! printf '%s\n' "$specimen" | rg -q "$deletion_command_pattern"; then
+        fail "shell deletion detector missed a command form"
+        deletion_command_fail=$((deletion_command_fail + 1))
+    fi
+done
+
+for f in \
+    "${posix_files[@]}" \
+    "${bash_files[@]}" \
+    "${zsh_files[@]}" \
+    test/Dockerfile.ubuntu; do
+    [ -f "$f" ] || continue
+    if rg -n "$deletion_command_pattern" "$f" >/dev/null; then
+        fail "forbidden shell file-removal command: $f"
+        deletion_command_fail=$((deletion_command_fail + 1))
+    fi
+done
+if [ $deletion_command_fail -eq 0 ]; then
+    pass "shell deletion paths use bounded operations"
+fi
+
 # ============================================================================
 # Symlink Target Verification
 # ============================================================================
@@ -155,9 +198,10 @@ section "links" "Symlink target verification"
 # Extract managed source paths from bin/dotfiles and verify they exist.
 link_pass=0
 link_fail=0
+link_pattern='^[[:space:]]*_(link|copy)[[:space:]]+([^[:space:]]+)'
 while IFS= read -r line; do
     # Parse: _link/_copy <source> <dest>
-    if [[ "$line" =~ ^[[:space:]]*_(link|copy)[[:space:]]+([^[:space:]]+) ]]; then
+    if [[ "$line" =~ $link_pattern ]]; then
         src="${BASH_REMATCH[2]}"
         if [ -e "$DOTFILES/$src" ]; then
             ((++link_pass))
@@ -170,6 +214,150 @@ done < bin/dotfiles
 
 if [ $link_fail -eq 0 ]; then
     pass "symlink targets: $link_pass verified"
+fi
+
+# ============================================================================
+# Project Worktree Lifecycle
+# ============================================================================
+section "worktrees" "Project worktree lifecycle"
+
+if "$BASH" "$DOTFILES/test/project-worktree-test.sh"; then
+    pass "project worktree lifecycle"
+else
+    fail "project worktree lifecycle"
+fi
+
+# ============================================================================
+# Project Initialization
+# ============================================================================
+section "project-init" "Project initialization"
+
+if "$BASH" "$DOTFILES/test/project-init-test.sh"; then
+    pass "project initialization"
+else
+    fail "project initialization"
+fi
+
+# ============================================================================
+# Benchmark Lock Recovery
+# ============================================================================
+section "benchmark-unlock" "Benchmark lock legacy-state recovery"
+
+if "$BASH" "$DOTFILES/test/benchmark-unlock-test.sh"; then
+    pass "benchmark legacy-state recovery"
+else
+    fail "benchmark legacy-state recovery"
+fi
+
+# ============================================================================
+# Git Signing Setup
+# ============================================================================
+section "git-signing" "Machine-local SSH signing setup"
+
+if "$BASH" "$DOTFILES/test/git-signing-test.sh"; then
+    pass "git signing setup"
+else
+    fail "git signing setup"
+fi
+
+# ============================================================================
+# Agent Contract Lifecycle
+# ============================================================================
+section "agent-contract" "Canonical agent-contract publication"
+
+if "$BASH" "$DOTFILES/test/agent-contract-test.sh"; then
+    pass "canonical agent-contract publication"
+else
+    fail "canonical agent-contract publication"
+fi
+
+# ============================================================================
+# Machine-local Configuration Publication
+# ============================================================================
+section "local-config" "Atomic machine-local configuration"
+
+if "$BASH" "$DOTFILES/test/local-config-publication-test.sh"; then
+    pass "atomic machine-local configuration"
+else
+    fail "atomic machine-local configuration"
+fi
+
+# ============================================================================
+# Tool Environments
+# ============================================================================
+section "tool-env" "Portable tracked tool environments"
+
+if "$BASH" "$DOTFILES/test/tool-environment-test.sh"; then
+    pass "tool environment portability"
+else
+    fail "tool environment portability"
+fi
+
+# ============================================================================
+# Tool Installer Safety
+# ============================================================================
+section "tool-install" "Tool installer path and checksum safety"
+
+if "$BASH" "$DOTFILES/test/tool-installer-test.sh"; then
+    pass "tool installer path and checksum safety"
+else
+    fail "tool installer path and checksum safety"
+fi
+
+section "installer-transactions" "Managed installer publication safety"
+
+if "$BASH" "$DOTFILES/test/installer-transaction-test.sh"; then
+    pass "managed installer publication safety"
+else
+    fail "managed installer publication safety"
+fi
+
+section "installer-production" "Offline managed installer production paths"
+
+if "$BASH" "$DOTFILES/test/installer-production-test.sh"; then
+    pass "offline managed installer production paths"
+else
+    fail "offline managed installer production paths"
+fi
+
+section "bootstrap-installers" "Pinned shell-component bootstrap"
+
+if "$BASH" "$DOTFILES/test/bootstrap-installer-test.sh"; then
+    pass "pinned shell-component bootstrap"
+else
+    fail "pinned shell-component bootstrap"
+fi
+
+section "multiplexer-publish" "Atomic multiplexer stack activation"
+
+if "$BASH" "$DOTFILES/test/multiplexer-publication-test.sh"; then
+    pass "atomic multiplexer stack activation"
+else
+    fail "atomic multiplexer stack activation"
+fi
+if "$BASH" "$DOTFILES/test/multiplexer-update-test.sh"; then
+    pass "offline multiplexer update production path"
+else
+    fail "offline multiplexer update production path"
+fi
+
+section "platform-installers" "Offline platform-installer production paths"
+
+if "$BASH" "$DOTFILES/test/platform-installer-test.sh"; then
+    pass "offline platform-installer production paths"
+else
+    fail "offline platform-installer production paths"
+fi
+
+# ============================================================================
+# Package Resolution
+# ============================================================================
+section "packages" "Portable package resolution"
+
+if "$BASH" "$DOTFILES/test/packages-test.sh"; then
+    pass "package resolution"
+else
+    fail "package resolution"
 fi
 
 # ============================================================================
@@ -233,16 +421,44 @@ secret_patterns=(
 secrets_found=0
 for pattern in "${secret_patterns[@]}"; do
     # Search all files except .git, deps/*/* (submodules), templates, and this test file.
-    if grep -rE "$pattern" --include="*" --exclude-dir=".git" --exclude-dir="deps" --exclude="*.template" --exclude="run-tier1.sh" . 2>/dev/null | head -1 > /tmp/secret_check; then
-        if [ -s /tmp/secret_check ]; then
-            fail "Potential secret found matching: $pattern"
-            ((++secrets_found))
-        fi
+    if grep -rEq \
+        --include="*" \
+        --exclude-dir=".git" \
+        --exclude-dir="deps" \
+        --exclude="*.template" \
+        --exclude="run-tier1.sh" \
+        "$pattern" . 2>/dev/null; then
+        fail "Potential secret found matching: $pattern"
+        ((++secrets_found))
     fi
 done
 
 if [ $secrets_found -eq 0 ]; then
     pass "No secrets detected"
+fi
+
+# Docker receives the repository root as its build context during Tier 2.
+# Every ignored credential class must remain outside that external boundary.
+docker_context_exclusions=(
+    ".git"
+    ".secrets"
+    "secrets"
+    "credentials.json"
+    ".credentials.json"
+    "*.pem"
+    "*.key"
+    ".env"
+    ".env.*"
+)
+docker_context_fail=0
+for exclusion in "${docker_context_exclusions[@]}"; do
+    if ! grep -qxF "$exclusion" .dockerignore; then
+        fail "Docker context permits ignored private path: $exclusion"
+        ((++docker_context_fail))
+    fi
+done
+if [ $docker_context_fail -eq 0 ]; then
+    pass "Docker context excludes private repository state"
 fi
 
 # ============================================================================
@@ -255,6 +471,8 @@ required_files=(
     "install-deps.sh"
     "README.md"
     "CLAUDE.md"
+    ".dockerignore"
+    "agents/WORKING_CONTRACT.md"
     "secrets.template"
     "shell/shrc"
     "shell/zshrc"
@@ -427,6 +645,10 @@ TOOLS_DIR="$HOME/tools"
 smoketest_pass=0
 smoketest_fail=0
 smoketest_skip=0
+# shellcheck source=../tools/versions.sh
+. "$DOTFILES/tools/versions.sh"
+# shellcheck source=../tools/platform.sh
+. "$DOTFILES/tools/platform.sh"
 
 for tool_dir in "$DOTFILES"/tools/*/; do
     tool=$(basename "$tool_dir")
@@ -455,25 +677,30 @@ for tool_dir in "$DOTFILES"/tools/*/; do
 
     # Set up tool environment (skip for nvm - uses shrc PATH setup).
     if [ "$tool" != "nvm" ]; then
-        # Source the tool's env.sh if it exists.
-        if [ -f "$TOOLS_DIR/$tool/env.sh" ]; then
-            # Set up the ROOT variable the env.sh expects.
-            root_var="$(echo "$tool" | tr '[:lower:]' '[:upper:]')_ROOT"
-            eval "export ${root_var}=\"\$(readlink -f \"$TOOLS_DIR/$tool/latest\")\""
-            if ! . "$TOOLS_DIR/$tool/env.sh"; then
-                fail "environment: $tool"
-                ((++smoketest_fail))
-                continue
-            fi
-        else
-            # Tools without environment configuration use the conventional
-            # version-root bin directory.
-            export PATH="$TOOLS_DIR/$tool/latest/bin:$PATH"
+        environment_file="$DOTFILES/tools/$tool/env.sh"
+        if [ ! -f "$environment_file" ]; then
+            fail "missing tool environment: $tool"
+            ((++smoketest_fail))
+            continue
+        fi
+        if ! tool_root=$(_find_version "$TOOLS_DIR/$tool" latest); then
+            fail "broken latest link: $tool"
+            ((++smoketest_fail))
+            continue
+        fi
+
+        # Set up the ROOT variable the tracked environment expects.
+        root_var="$(echo "$tool" | tr '[:lower:]' '[:upper:]')_ROOT"
+        export "$root_var=$tool_root"
+        if ! . "$environment_file"; then
+            fail "environment setup: $tool"
+            ((++smoketest_fail))
+            continue
         fi
     fi
 
     # Run smoketest.
-    if bash "$smoketest" 2>/dev/null; then
+    if "$BASH" "$smoketest" 2>/dev/null; then
         ((++smoketest_pass))
     else
         fail "smoketest: $tool"
@@ -493,15 +720,16 @@ fi
 # ============================================================================
 # Summary
 # ============================================================================
-END_TIME=$(date +%s.%N)
-DURATION=$(echo "$END_TIME - $START_TIME" | bc 2>/dev/null || echo "?")
+DURATION=$((SECONDS - START_TIME))
 
 echo ""
 echo "========================================"
 if [ $FAILED -eq 0 ]; then
-    printf "${GREEN}All tests passed!${NC} (%s passed, %s skipped) [%ss]\n" "$PASSED" "$SKIPPED" "${DURATION%.*}"
+    printf "%bAll tests passed!%b (%s passed, %s skipped) [%ss]\n" \
+        "$GREEN" "$NC" "$PASSED" "$SKIPPED" "$DURATION"
     exit 0
 else
-    printf "${RED}Tests failed!${NC} (%s passed, %s failed, %s skipped) [%ss]\n" "$PASSED" "$FAILED" "$SKIPPED" "${DURATION%.*}"
+    printf "%bTests failed!%b (%s passed, %s failed, %s skipped) [%ss]\n" \
+        "$RED" "$NC" "$PASSED" "$FAILED" "$SKIPPED" "$DURATION"
     exit 1
 fi

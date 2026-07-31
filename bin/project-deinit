@@ -3,6 +3,10 @@
 
 set -e
 
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../lib/project-worktrees.sh
+. "$SCRIPT_DIR/../lib/project-worktrees.sh"
+
 show_help() {
     cat << 'EOF'
 project-deinit - Cleanup project directory configuration
@@ -12,12 +16,13 @@ USAGE
 
 OPTIONS
     -h, --help       Show this help
-    --session NAME   Override tmux session name (default: directory basename)
+    --session NAME   Override tmux session name; ':' is not accepted
     --tmux-only      Only kill tmux session, skip file cleanup
     -y, --yes        Skip confirmation prompts
 
 ARGUMENTS
-    directory        Project directory to cleanup (default: current directory)
+    directory        Project directory to cleanup (default: current directory).
+                     Its default session has a path-qualified identity.
 
 WHAT IT REMOVES
     - Associated tmux session (if any)
@@ -63,11 +68,16 @@ SESSION_NAME=""
 TMUX_ONLY=false
 YES=false
 TARGET_DIR=""
+TARGET_DIR_SET=false
 
 # Parse arguments.
 while [ $# -gt 0 ]; do
     case "$1" in
         --session)
+            if [ $# -lt 2 ] || [ -z "$2" ] || [[ "$2" == -* ]]; then
+                error "--session requires a non-empty name"
+                exit 1
+            fi
             SESSION_NAME="$2"
             shift 2
             ;;
@@ -79,12 +89,21 @@ while [ $# -gt 0 ]; do
             YES=true
             shift
             ;;
+        -h|--help)
+            show_help
+            exit 0
+            ;;
         -*)
             error "Unknown option: $1"
             exit 1
             ;;
         *)
+            if [ "$TARGET_DIR_SET" = "true" ]; then
+                error "Unexpected extra directory: $1"
+                exit 1
+            fi
             TARGET_DIR="$1"
+            TARGET_DIR_SET=true
             shift
             ;;
     esac
@@ -96,11 +115,15 @@ if [ ! -d "$TARGET_DIR" ]; then
     error "Directory not found: $TARGET_DIR"
     exit 1
 fi
-cd "$TARGET_DIR"
+cd -P -- "$TARGET_DIR"
 
-# Session name defaults to directory basename.
+# Session name defaults to the repository-qualified worktree name.
 if [ -z "$SESSION_NAME" ]; then
-    SESSION_NAME=$(basename "$PWD")
+    SESSION_NAME=$(project_default_session_name "$PWD")
+fi
+if ! project_session_name_is_target_safe "$SESSION_NAME"; then
+    error "Session names cannot contain ':' because tmux treats it as a target delimiter."
+    exit 1
 fi
 
 # Helper to confirm action.
@@ -114,12 +137,23 @@ confirm() {
 }
 
 directory_has_entries() {
-    [ -d "$1" ] && [ -n "$(find "$1" -mindepth 1 -print -quit)" ]
+    [ -d "$1" ] &&
+        [ -n "$(find "$1" -xdev -mindepth 1 -print -quit)" ]
 }
 
 make_attic_dir() {
     local base_dir="$1"
-    if { [ ! -e "$base_dir" ] || [ -d "$base_dir" ]; } && [ ! -e "$base_dir/.beads" ]; then
+    if [ -L "$base_dir" ]; then
+        error "Archive destination is a symlink: $base_dir"
+        return 1
+    fi
+    if [ -L "$base_dir/.beads" ]; then
+        error "Archive destination contains a symlinked .beads path: $base_dir/.beads"
+        return 1
+    fi
+    if { [ ! -e "$base_dir" ] || [ -d "$base_dir" ]; } &&
+            [ ! -e "$base_dir/.beads" ] &&
+            [ ! -L "$base_dir/.beads" ]; then
         echo "$base_dir"
         return 0
     fi
@@ -128,14 +162,53 @@ make_attic_dir() {
     timestamp=$(date "+%Y%m%d-%H%M%S")
     local candidate="${base_dir}-${timestamp}"
     local counter=1
-    while [ -e "$candidate" ]; do
+    while [ -e "$candidate" ] || [ -L "$candidate" ]; do
         candidate="${base_dir}-${timestamp}-${counter}"
         counter=$((counter + 1))
     done
     echo "$candidate"
 }
 
+resolve_beads_archive_destination() {
+    local project_parent
+    project_parent=$(dirname "$PWD")
+    local project_name
+    project_name=$(basename "$PWD")
+    BEADS_ATTIC_ROOT="$project_parent/attic"
+    if [ -L "$BEADS_ATTIC_ROOT" ]; then
+        error "Archive root is a symlink: $BEADS_ATTIC_ROOT"
+        return 1
+    fi
+    if [ -e "$BEADS_ATTIC_ROOT" ] && [ ! -d "$BEADS_ATTIC_ROOT" ]; then
+        error "Archive root is not a directory: $BEADS_ATTIC_ROOT"
+        return 1
+    fi
+    if ! BEADS_ARCHIVE_DIR=$(
+        make_attic_dir "$BEADS_ATTIC_ROOT/$project_name"
+    ); then
+        return 1
+    fi
+}
+
+preflight_cleanup_paths() {
+    if [ -L ".beads" ]; then
+        error "Refusing to archive a symlinked .beads path."
+        return 1
+    fi
+    if [ -L ".history" ]; then
+        error "Refusing to remove a symlinked .history path."
+        return 1
+    fi
+    if [ -d ".beads" ] && directory_has_entries ".beads"; then
+        resolve_beads_archive_destination || return 1
+    fi
+}
+
 archive_beads() {
+    if [ -L ".beads" ]; then
+        error "Refusing to archive a symlinked .beads path."
+        return 1
+    fi
     if [ ! -d ".beads" ]; then
         return 0
     fi
@@ -148,25 +221,53 @@ archive_beads() {
         return 0
     fi
 
-    local project_parent
-    project_parent=$(dirname "$PWD")
-    local project_name
-    project_name=$(basename "$PWD")
-    local archive_dir
-    archive_dir=$(make_attic_dir "$project_parent/attic/$project_name")
+    resolve_beads_archive_destination || return 1
+    local attic_root="$BEADS_ATTIC_ROOT"
+    local archive_dir="$BEADS_ARCHIVE_DIR"
 
     if confirm "Move .beads to $archive_dir/.beads?"; then
-        mkdir -p "$archive_dir"
-        mv .beads "$archive_dir/.beads"
+        # Revalidate every archive component after confirmation so a changed
+        # path cannot redirect local issue state through a symlink.
+        if [ -L ".beads" ] || [ ! -d ".beads" ]; then
+            error "The .beads source changed before archival."
+            return 1
+        fi
+        if [ -L "$attic_root" ] ||
+                { [ -e "$attic_root" ] && [ ! -d "$attic_root" ]; }; then
+            error "Archive root changed before publication: $attic_root"
+            return 1
+        fi
+        if [ ! -e "$attic_root" ]; then
+            mkdir -- "$attic_root"
+        fi
+        if [ -L "$archive_dir" ] ||
+                { [ -e "$archive_dir" ] && [ ! -d "$archive_dir" ]; }; then
+            error "Archive destination is not an ordinary directory: $archive_dir"
+            return 1
+        fi
+        if [ ! -e "$archive_dir" ]; then
+            mkdir -- "$archive_dir"
+        fi
+        if [ -e "$archive_dir/.beads" ] ||
+                [ -L "$archive_dir/.beads" ]; then
+            error "Archive destination became occupied: $archive_dir/.beads"
+            return 1
+        fi
+        mv -- .beads "$archive_dir/.beads"
         info "Moved .beads/ to $archive_dir/.beads"
     fi
 }
 
+if [ "$TMUX_ONLY" != "true" ]; then
+    preflight_cleanup_paths
+fi
+
 # Kill associated tmux session if exists.
 if command -v tmux &>/dev/null; then
-    if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    SESSION_TARGET=$(project_exact_session_target "$SESSION_NAME")
+    if tmux has-session -t "$SESSION_TARGET" 2>/dev/null; then
         if confirm "Kill tmux session '$SESSION_NAME'?"; then
-            tmux kill-session -t "$SESSION_NAME"
+            tmux kill-session -t "$SESSION_TARGET"
             info "Killed tmux session: $SESSION_NAME"
         fi
     fi
@@ -188,14 +289,14 @@ if [ -f ".envrc" ]; then
         if command -v direnv &>/dev/null; then
             direnv deny 2>/dev/null || true
         fi
-        rm -f .envrc
+        unlink .envrc
         info "Removed .envrc"
     fi
 fi
 
 if [ -f ".envrc.local" ]; then
     if confirm "Remove .envrc.local?"; then
-        rm -f .envrc.local
+        unlink .envrc.local
         info "Removed .envrc.local"
     fi
 fi
@@ -206,7 +307,7 @@ archive_beads
 # Remove history directory.
 if [ -d ".history" ]; then
     if confirm "Remove .history directory?"; then
-        rm -rf .history
+        find .history -xdev -depth -delete
         info "Removed .history/"
     fi
 fi

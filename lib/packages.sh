@@ -1,7 +1,8 @@
 #!/bin/bash
 # ~/.dotfiles/lib/packages.sh - Package definitions and verification.
-# Single source of truth for all system dependencies.
-# Requires bash 4+ for associative arrays.
+# Canonical package names, manager mappings, and verification categories for
+# the core shell environment.
+# Compatible with the Bash 3.2 shipped by macOS.
 
 # ============================================================================
 # Package Categories
@@ -11,43 +12,19 @@
 REQUIRED_PACKAGES=(zsh git curl fzf rg jq direnv python3)
 
 # Recommended packages - warnings only, install proceeds.
-RECOMMENDED_PACKAGES=(fd bat eza shellcheck ccache)
+RECOMMENDED_PACKAGES=(fd bat eza shellcheck)
 
 # ============================================================================
 # Package Manager Name Mappings
 # ============================================================================
-# Format: PKG_NAMES[pm:canonical]=actual_package_name
-# Only specify if different from canonical name.
-
-declare -A PKG_NAMES=(
-    # apt uses different names.
-    [apt:rg]="ripgrep"
-    [apt:fd]="fd-find"
-
-    # dnf differences.
-    [dnf:rg]="ripgrep"
-    [dnf:fd]="fd-find"
-    [dnf:shellcheck]="ShellCheck"
-
-    # pacman differences.
-    [pacman:rg]="ripgrep"
-    [pacman:python3]="python"
-
-    # brew differences.
-    [brew:rg]="ripgrep"
-    [brew:python3]="python"
-)
+# Only manager-specific names that differ from the canonical name are listed.
 
 # ============================================================================
 # Binary Name Mappings
 # ============================================================================
 # Some packages install binaries with different names.
-# Format: BIN_NAMES[pm:canonical]=actual_binary
-
-declare -A BIN_NAMES=(
-    [apt:fd]="fdfind"
-    [apt:bat]="batcat"
-)
+# Only manager-specific binary names that differ from the canonical name are
+# listed.
 
 # ============================================================================
 # Package Manager Detection
@@ -59,7 +36,7 @@ _pkg_detect_pm() {
     if [[ "$OSTYPE" == "darwin"* ]]; then
         command -v brew &>/dev/null && echo "brew" && return
         return 1
-    elif command -v apt &>/dev/null; then
+    elif command -v apt-get &>/dev/null; then
         echo "apt"
     elif command -v dnf &>/dev/null; then
         echo "dnf"
@@ -79,15 +56,13 @@ _pkg_detect_pm() {
 # Returns: actual package name for that manager.
 _pkg_resolve_name() {
     local pm="$1" canonical="$2"
-    local key="${pm}:${canonical}"
-
-    # Check for manager-specific override.
-    if [[ -v "PKG_NAMES[$key]" ]]; then
-        echo "${PKG_NAMES[$key]}"
-    else
-        # Default to canonical name.
-        echo "$canonical"
-    fi
+    case "$pm:$canonical" in
+        apt:rg|dnf:rg|pacman:rg|brew:rg) echo "ripgrep" ;;
+        apt:fd|dnf:fd) echo "fd-find" ;;
+        dnf:shellcheck) echo "ShellCheck" ;;
+        pacman:python3|brew:python3) echo "python" ;;
+        *) echo "$canonical" ;;
+    esac
 }
 
 # Get the binary name to check for a package.
@@ -95,15 +70,11 @@ _pkg_resolve_name() {
 # Returns: binary name to look for in PATH.
 _pkg_resolve_bin() {
     local canonical="$1" pm="$2"
-    local key="${pm}:${canonical}"
-
-    # Check for manager-specific binary name.
-    if [[ -v "BIN_NAMES[$key]" ]]; then
-        echo "${BIN_NAMES[$key]}"
-    else
-        # Binary name same as canonical name.
-        echo "$canonical"
-    fi
+    case "$pm:$canonical" in
+        apt:fd) echo "fdfind" ;;
+        apt:bat) echo "batcat" ;;
+        *) echo "$canonical" ;;
+    esac
 }
 
 # ============================================================================
@@ -227,6 +198,14 @@ _pkg_get_install_list() {
     local pm="$1" category="${2:-all}"
     local packages=()
 
+    case "$pm" in
+        apt|dnf|pacman|brew) ;;
+        *)
+            echo "Unsupported package manager: $pm" >&2
+            return 1
+            ;;
+    esac
+
     case "$category" in
         required)
             for pkg in "${REQUIRED_PACKAGES[@]}"; do
@@ -238,10 +217,14 @@ _pkg_get_install_list() {
                 packages+=("$(_pkg_resolve_name "$pm" "$pkg")")
             done
             ;;
-        all|*)
+        all)
             for pkg in "${REQUIRED_PACKAGES[@]}" "${RECOMMENDED_PACKAGES[@]}"; do
                 packages+=("$(_pkg_resolve_name "$pm" "$pkg")")
             done
+            ;;
+        *)
+            echo "Unsupported package category: $category" >&2
+            return 1
             ;;
     esac
 

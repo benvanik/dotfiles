@@ -21,6 +21,9 @@ TMP_STATE="$STATE_FILE.tmp.$$"
 LEGACY_ROOT_STATE_DIR="/tmp/benchmark-lock-root"
 STATE_OWNER_UID="${SUDO_UID:-$(id -u)}"
 STATE_OWNER_GID="${SUDO_GID:-$(id -g)}"
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/benchmark-transaction.sh
+source "$SCRIPT_DIR/../lib/benchmark-transaction.sh"
 
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -30,6 +33,9 @@ NC='\033[0m'
 info() { printf "${GREEN}[benchmark-lock]${NC} %s\n" "$1"; }
 warn() { printf "${YELLOW}[benchmark-lock]${NC} %s\n" "$1"; }
 error() { printf "${RED}[benchmark-lock]${NC} %s\n" "$1" >&2; }
+
+benchmark_acquire_transaction_guard \
+    "$STATE_DIR" "$STATE_OWNER_UID" "$STATE_OWNER_GID"
 
 record_state() {
     local kind="$1"
@@ -224,7 +230,7 @@ set_state_owner_and_mode "$STATE_DIR"
 set_state_owner_and_mode "$TMP_STATE"
 
 cleanup_tmp_state() {
-    rm -f "$TMP_STATE"
+    [ ! -e "$TMP_STATE" ] || unlink "$TMP_STATE"
 }
 trap cleanup_tmp_state EXIT
 

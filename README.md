@@ -5,7 +5,7 @@ Personal shell configuration.
 ## About
 
 This is an opinionated dotfiles setup optimized for:
-- Compiler development (MLIR/IREE/ROCm workflows)
+- Compiler development (HRX/ROCm workflows)
 - Multi-version tool management via direnv
 
 Feel free to fork and adapt. Project-specific scripts can be removed if you
@@ -17,8 +17,8 @@ don't work on those projects.
 # 1. Clone dotfiles
 git clone https://github.com/USER/dotfiles ~/.dotfiles
 
-# 2. Install dependencies (requires sudo)
-sudo ~/.dotfiles/install-deps.sh
+# 2. Install dependencies (prompts for sudo when installing system packages)
+~/.dotfiles/install-deps.sh
 
 # 3. Set up symlinks and configuration
 ~/.dotfiles/bin/dotfiles install
@@ -33,10 +33,19 @@ zsh
 ```
 
 `dotfiles install` will:
-- Create all symlinks (~/.zshrc, ~/.gitconfig, etc.)
+- Install managed configuration files (using symlinks where appropriate)
 - Prompt for your identity (name, email, GitHub username)
 - Configure git SSH signing automatically
 - Create templates for machine-specific files
+
+`install-deps.sh` treats user-level bootstrap code as reviewed software:
+Oh My Zsh, Powerlevel10k, and TPM are clean detached checkouts of pinned
+commits; Meslo fonts are pinned and checksummed; and the hardened NVM installer
+selects exact Node `24.11.1`. The multiplexer updater likewise starts from
+reviewed tmux, Byobu, and TPM identities, publishes tmux + Byobu through one
+atomic generation selector, and updates plugins in an off-path whole-root
+snapshot. A dirty checkout, foreign origin, or unverified existing font fails
+without being overwritten.
 
 ## Shell Features
 
@@ -54,26 +63,59 @@ The `dotfiles` command provides testing and maintenance:
 ```bash
 dotfiles test              # Fast local validation
 dotfiles test --full       # Full Docker-based integration tests
-dotfiles doctor            # Health check (tools, symlinks, configs)
-dotfiles update            # Pull latest changes from git
+dotfiles doctor            # Health check, including managed agent contracts
+dotfiles update            # Pull changes and publish agent contracts
 dotfiles install           # Set up symlinks and configuration
 dotfiles deps              # Run install-deps.sh (install packages)
 ```
 
-## Project-Specific Tools (Optional)
+## Project Tools
 
-Scripts in `bin/` prefixed with project names are optional and can be removed:
+The generic `project-*` commands initialize development environments, launch
+editor and tmux sessions, and manage sibling Git worktrees. The worktree
+commands use a `<project>/main` primary checkout and create feature worktrees
+at `<project>/<name>`:
 
-| Prefix | Project | Purpose |
-|--------|---------|---------|
-| `iree-*` | [IREE](https://github.com/iree-org/iree) | Compiler worktree and build management |
+```bash
+cd ~/src/my-project/main
+project-worktree-init users/me/feature feature
+cd ../feature
+project-init --build --vscode
+project-dev
+project-code .
+cd ../main
+project-worktree-deinit feature
+```
+
+When `main/AGENTS.override.md` exists, `project-worktree-init` links it into
+each new worktree. Deinitialization refuses a worktree containing any other
+modified, untracked, or ignored files, stops its exact tmux session, and
+rechecks the complete worktree before removal. Default tmux names carry a
+readable project/worktree prefix plus a digest of the physical project path,
+so identically named repositories cannot attach to each other's sessions.
+Worktree lifetime and project configuration are separate: initialize each new
+worktree explicitly.
+
+`agents/WORKING_CONTRACT.md` is the canonical global agent contract.
+`dotfiles install` and `dotfiles update` publish byte-identical regular-file
+copies for Codex and Claude; `dotfiles doctor` reports missing, linked, or
+drifted copies.
+
+## Optional Infrastructure and Specialized Tools
+
+Some command families are useful only on machines doing GPU or compiler work:
+
+| Prefix | Layer | Purpose |
+|--------|-------|---------|
 | `runpod*` | [RunPod](https://www.runpod.io/) | Generic GPU hosts, claims, SSH, and billing lifetime |
-| `model-lab*` | Model lab | Private model services and isolated Pi sessions |
+| `model-lab*`, `model-session` | Model lab | Private model services and isolated Pi sessions |
 | `therock-*` | [TheRock](https://github.com/ROCm/TheRock) | ROCm/HIP compiler development |
 | `vulkan-*` | Vulkan SDK | SDK installation and layer building |
 
-These scripts assume specific directory layouts (`~/src/iree/`, `~/src/rocm/`, etc.).
-If you don't work on these projects, delete the scripts or ignore them.
+RunPod and model-lab keep machine-local state outside this repository and do
+not own any project checkout or project instance. TheRock and Vulkan commands
+are specialized development helpers and may assume their corresponding source
+layouts.
 
 The two GPU layers have separate ownership and operating guides:
 
@@ -171,7 +213,7 @@ A pre-commit hook runs `dotfiles test` automatically.
 - shellcheck (if installed)
 
 **Tier 2 (Docker)** - on-demand with `--full`:
-- Full install on pristine Alpine/Ubuntu containers
+- Full install on a pristine Ubuntu container
 - Package installation validation
 - Interactive shell startup tests
 
@@ -205,10 +247,11 @@ If you accidentally commit secrets:
 ├── themes/          # Powerlevel10k themes
 ├── git/             # Git configuration
 │   └── hooks/       # Git hooks (pre-commit)
+├── agents/          # Provider-neutral global working contract
 ├── bin/             # User scripts (on PATH)
 │   └── dotfiles     # Main CLI for testing/maintenance
 ├── test/            # Testing infrastructure
-├── claude/          # Claude Code settings
+├── claude/          # Claude Code provider settings
 ├── install-deps.sh  # Package installation
 └── secrets.template # API keys template
 ```
@@ -224,6 +267,8 @@ Installed automatically by `install-deps.sh`:
 | ripgrep | Fast grep | `apt install ripgrep` | `brew install ripgrep` |
 | jq | JSON processor | `apt install jq` | `brew install jq` |
 | git | Version control | `apt install git` | `brew install git` |
+| curl | HTTP transfers | `apt install curl` | `brew install curl` |
+| direnv | Per-project environments | `apt install direnv` | `brew install direnv` |
 | Python 3 | Standard-library command tools | `apt install python3` | `brew install python` |
 
 ## Recommended Packages
@@ -233,6 +278,7 @@ Installed automatically by `install-deps.sh`:
 | fd-find | Fast find | `apt install fd-find` | `brew install fd` |
 | bat | Syntax highlighting | `apt install bat` | `brew install bat` |
 | eza | Modern ls | `apt install eza` | `brew install eza` |
+| shellcheck | Shell static analysis | `apt install shellcheck` | `brew install shellcheck` |
 | zsh-autosuggestions | Fish-style suggestions | `apt install zsh-autosuggestions` | `brew install zsh-autosuggestions` |
 
 ## License

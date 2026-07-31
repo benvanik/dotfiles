@@ -35,6 +35,10 @@ EOF
 case "${1:-}" in
     -h|--help) show_help; exit 0 ;;
 esac
+if [ $# -ne 0 ]; then
+    printf 'git-setup-signing: unexpected argument: %s\n' "$1" >&2
+    exit 1
+fi
 
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -45,71 +49,785 @@ info() { printf "${GREEN}[git-signing]${NC} %s\n" "$1"; }
 warn() { printf "${YELLOW}[git-signing]${NC} %s\n" "$1"; }
 error() { printf "${RED}[git-signing]${NC} %s\n" "$1" >&2; }
 
-# Get email from git config.
-EMAIL=$(git config --global user.email 2>/dev/null)
-if [ -z "$EMAIL" ]; then
-    error "git user.email not configured"
-    error "Run: git config --global user.email your@email.com"
-    exit 1
-fi
+# Attempt a non-blocking advisory lock on file descriptor 9. This is the same
+# HOME-scoped lock used by `dotfiles install`, so its local-config creation and
+# signing setup cannot observe one another halfway through publication.
+try_home_transaction_lock() {
+    python3 -c '
+import errno
+import fcntl
+import sys
 
-# Find SSH public key.
-SSH_DIR="$HOME/.ssh"
-KEY_FILE=""
+try:
+    fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError as error:
+    if error.errno in (errno.EACCES, errno.EAGAIN):
+        sys.exit(75)
+    raise
+'
+}
 
-# Check common key names in order of preference.
-for key in id_ed25519.pub id_rsa.pub id_ecdsa.pub; do
-    if [ -f "$SSH_DIR/$key" ]; then
-        KEY_FILE="$SSH_DIR/$key"
-        break
-    fi
-done
+acquire_home_transaction_lock() {
+    local lock_status=0
 
-# Also check for *_github.pub keys.
-if [ -z "$KEY_FILE" ]; then
-    for key in "$SSH_DIR"/*_github.pub; do
-        if [ -f "$key" ]; then
-            KEY_FILE="$key"
-            break
+    while :; do
+        if try_home_transaction_lock; then
+            return 0
+        else
+            lock_status=$?
+        fi
+        if [ "$lock_status" -ne 75 ]; then
+            error "Could not acquire dotfiles HOME transaction lock"
+            return 1
+        fi
+        if ! sleep 0.05; then
+            error "Interrupted while waiting for dotfiles HOME transaction lock"
+            return 1
         fi
     done
-fi
+}
 
-if [ -z "$KEY_FILE" ]; then
-    error "No SSH public key found in $SSH_DIR"
-    error "Generate one with: ssh-keygen -t ed25519 -C \"$EMAIL\""
-    exit 1
-fi
+# Create every missing component and persist each directory entry before the
+# shared lock file is opened. This matches the HOME transaction boundary used
+# by `dotfiles install`.
+mkdir_p_durable() {
+    python3 -c '
+import os
+import sys
 
-info "Found SSH key: $KEY_FILE"
+path = os.path.abspath(sys.argv[1])
+missing = []
+cursor = path
+while not os.path.lexists(cursor):
+    missing.append(cursor)
+    parent = os.path.dirname(cursor)
+    if parent == cursor:
+        break
+    cursor = parent
 
-# Set signing key in git config.
-# Use ~ prefix so it's portable across machines.
-# shellcheck disable=SC2088  # Intentional: literal ~ for portable gitconfig.
-KEY_PATH="~/.ssh/$(basename "$KEY_FILE")"
-git config --global user.signingkey "$KEY_PATH"
-info "Set user.signingkey = $KEY_PATH"
+if not os.path.isdir(cursor):
+    raise SystemExit(f"directory ancestor is not a directory: {cursor}")
 
-# Create allowed_signers file.
-ALLOWED_SIGNERS="$SSH_DIR/allowed_signers"
-KEY_CONTENT=$(cat "$KEY_FILE")
 
-# Check if already in allowed_signers.
-if [ -f "$ALLOWED_SIGNERS" ] && grep -q "$EMAIL" "$ALLOWED_SIGNERS"; then
-    info "Email already in $ALLOWED_SIGNERS"
-else
-    echo "$EMAIL $KEY_CONTENT" >> "$ALLOWED_SIGNERS"
-    info "Added to $ALLOWED_SIGNERS"
-fi
+def fsync_directory(directory):
+    descriptor = os.open(
+        directory,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
-# Verify settings.
-echo ""
-info "Git signing configured!"
-echo ""
-echo "Current settings:"
-echo "  user.signingkey = $(git config --global user.signingkey)"
-echo "  gpg.format = $(git config --global gpg.format)"
-echo "  commit.gpgsign = $(git config --global commit.gpgsign)"
-echo ""
-echo "To test: git commit --allow-empty -m 'test signed commit'"
-echo "To verify: git log --show-signature -1"
+
+for directory in reversed(missing):
+    parent = os.path.dirname(directory)
+    try:
+        os.mkdir(directory)
+    except FileExistsError:
+        if not os.path.isdir(directory):
+            raise
+    fsync_directory(directory)
+    fsync_directory(parent)
+
+if not os.path.isdir(path):
+    raise SystemExit(f"path is not a directory: {path}")
+fsync_directory(path)
+fsync_directory(os.path.dirname(path))
+' "$1"
+}
+
+with_home_transaction_lock() (
+    local state_root="$HOME/.local/state/dotfiles"
+    local lock_path="$state_root/home-transaction.lock"
+    local lock_open=false
+
+    # Invoked indirectly by the EXIT trap below.
+    # shellcheck disable=SC2317
+    close_home_transaction_lock() {
+        local exit_status=$?
+        trap - EXIT
+        trap '' HUP INT TERM
+        if [ "$lock_open" = true ] && ! exec 9>&-; then
+            error "Could not close dotfiles HOME transaction lock"
+            exit_status=1
+        fi
+        exit "$exit_status"
+    }
+    trap close_home_transaction_lock EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    if [ -L "$state_root" ] ||
+            { [ -e "$state_root" ] && [ ! -d "$state_root" ]; }; then
+        error "Dotfiles state root is not a real directory: $state_root"
+        return 1
+    fi
+    if ! mkdir_p_durable "$state_root"; then
+        error "Could not create dotfiles state root: $state_root"
+        return 1
+    fi
+    if [ -L "$lock_path" ] ||
+            { [ -e "$lock_path" ] && [ ! -f "$lock_path" ]; }; then
+        error "Dotfiles HOME lock is not a regular file: $lock_path"
+        return 1
+    fi
+    if ! exec 9>>"$lock_path"; then
+        error "Could not open dotfiles HOME transaction lock: $lock_path"
+        return 1
+    fi
+    lock_open=true
+    if ! acquire_home_transaction_lock; then
+        return 1
+    fi
+
+    "$@"
+)
+
+validate_publication_destination() {
+    local path="$1"
+    local label="$2"
+
+    if [ -L "$path" ] ||
+            { [ -e "$path" ] && [ ! -f "$path" ]; }; then
+        error "$label is not a real regular file: $path"
+        return 1
+    fi
+}
+
+# A generation includes the opened inode identity, mutation metadata, mode, and
+# exact bytes. Participating dotfiles writers serialize on the HOME lock. The
+# repeated check catches changes visible before rename; it is not a filesystem
+# compare-and-swap against a writer that ignores that lock.
+file_generation() {
+    python3 - "$1" << 'PY'
+import hashlib
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+
+try:
+    path_stat = os.lstat(path)
+except FileNotFoundError:
+    print("absent")
+    raise SystemExit(0)
+
+if not stat.S_ISREG(path_stat.st_mode):
+    raise SystemExit(f"not a regular file: {path}")
+
+descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+try:
+    opened_before = os.fstat(descriptor)
+    if not stat.S_ISREG(opened_before.st_mode):
+        raise SystemExit(f"not a regular file: {path}")
+    digest = hashlib.sha256()
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            break
+        digest.update(chunk)
+    opened_after = os.fstat(descriptor)
+finally:
+    os.close(descriptor)
+
+identity_before = (
+    opened_before.st_dev,
+    opened_before.st_ino,
+    opened_before.st_size,
+    opened_before.st_mtime_ns,
+    opened_before.st_ctime_ns,
+    stat.S_IMODE(opened_before.st_mode),
+)
+identity_after = (
+    opened_after.st_dev,
+    opened_after.st_ino,
+    opened_after.st_size,
+    opened_after.st_mtime_ns,
+    opened_after.st_ctime_ns,
+    stat.S_IMODE(opened_after.st_mode),
+)
+if identity_before != identity_after:
+    raise SystemExit(f"file changed while reading: {path}")
+print(
+    "file:"
+    + ":".join(str(value) for value in identity_after)
+    + ":"
+    + digest.hexdigest()
+)
+PY
+}
+
+require_file_generation() {
+    local path="$1"
+    local expected_generation="$2"
+    local actual_generation=""
+
+    if ! actual_generation=$(file_generation "$path"); then
+        error "Could not inspect publication generation: $path"
+        return 1
+    fi
+    if [ "$actual_generation" != "$expected_generation" ]; then
+        error "Publication destination changed during signing setup: $path"
+        return 1
+    fi
+}
+
+sync_regular_file_and_parent() {
+    python3 - "$1" << 'PY'
+import os
+import stat
+import sys
+
+path = os.path.abspath(sys.argv[1])
+path_stat = os.lstat(path)
+if not stat.S_ISREG(path_stat.st_mode):
+    raise SystemExit(f"not a regular file: {path}")
+
+descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+try:
+    opened = os.fstat(descriptor)
+    if not stat.S_ISREG(opened.st_mode):
+        raise SystemExit(f"not a regular file: {path}")
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+
+parent_descriptor = os.open(
+    os.path.dirname(path),
+    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+)
+try:
+    os.fsync(parent_descriptor)
+finally:
+    os.close(parent_descriptor)
+PY
+}
+
+sync_parent_directory() {
+    python3 - "$1" << 'PY'
+import os
+import stat
+import sys
+
+parent = os.path.dirname(os.path.abspath(sys.argv[1]))
+parent_stat = os.lstat(parent)
+if not stat.S_ISDIR(parent_stat.st_mode):
+    raise SystemExit(f"not a real directory: {parent}")
+descriptor = os.open(
+    parent,
+    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+)
+try:
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+PY
+}
+
+atomic_publish_file() {
+    local staging_path="$1"
+    local destination="$2"
+    local expected_generation="$3"
+
+    python3 - "$staging_path" "$destination" "$expected_generation" << 'PY'
+import hashlib
+import os
+import stat
+import sys
+
+staging_path = os.path.abspath(sys.argv[1])
+destination = os.path.abspath(sys.argv[2])
+expected_generation = sys.argv[3]
+
+
+def generation(path: str) -> str:
+    try:
+        path_stat = os.lstat(path)
+    except FileNotFoundError:
+        return "absent"
+    if not stat.S_ISREG(path_stat.st_mode):
+        raise SystemExit(f"not a regular file: {path}")
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        opened_before = os.fstat(descriptor)
+        if not stat.S_ISREG(opened_before.st_mode):
+            raise SystemExit(f"not a regular file: {path}")
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        opened_after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    identity_before = (
+        opened_before.st_dev,
+        opened_before.st_ino,
+        opened_before.st_size,
+        opened_before.st_mtime_ns,
+        opened_before.st_ctime_ns,
+        stat.S_IMODE(opened_before.st_mode),
+    )
+    identity_after = (
+        opened_after.st_dev,
+        opened_after.st_ino,
+        opened_after.st_size,
+        opened_after.st_mtime_ns,
+        opened_after.st_ctime_ns,
+        stat.S_IMODE(opened_after.st_mode),
+    )
+    if identity_before != identity_after:
+        raise SystemExit(f"file changed while reading: {path}")
+    return (
+        "file:"
+        + ":".join(str(value) for value in identity_after)
+        + ":"
+        + digest.hexdigest()
+    )
+
+
+if os.path.dirname(staging_path) != os.path.dirname(destination):
+    raise SystemExit("staging and destination do not share a directory")
+staging_stat = os.lstat(staging_path)
+if not stat.S_ISREG(staging_stat.st_mode):
+    raise SystemExit(f"staging is not a regular file: {staging_path}")
+if generation(destination) != expected_generation:
+    raise SystemExit(f"publication generation changed: {destination}")
+
+os.replace(staging_path, destination)
+descriptor = os.open(
+    destination,
+    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+)
+try:
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+parent_descriptor = os.open(
+    os.path.dirname(destination),
+    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+)
+try:
+    os.fsync(parent_descriptor)
+finally:
+    os.close(parent_descriptor)
+PY
+}
+
+prepare_allowed_signers() {
+    local source_path="$1"
+    local staging_path="$2"
+    local email="$3"
+    local key_content="$4"
+
+    python3 - \
+        "$source_path" "$staging_path" "$email" "$key_content" << 'PY'
+import os
+import stat
+import sys
+
+source_path, staging_path, email, key_content = sys.argv[1:]
+entry = f"{email} {key_content}".encode()
+
+try:
+    source_stat = os.lstat(source_path)
+except FileNotFoundError:
+    source_stat = None
+
+if source_stat is None:
+    content = b""
+    mode = 0o600
+else:
+    if not stat.S_ISREG(source_stat.st_mode):
+        raise SystemExit(f"not a regular file: {source_path}")
+    descriptor = os.open(
+        source_path,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise SystemExit(f"not a regular file: {source_path}")
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        content = b"".join(chunks)
+        mode = stat.S_IMODE(opened.st_mode)
+    finally:
+        os.close(descriptor)
+
+changed = entry not in content.split(b"\n")
+if changed:
+    if content and not content.endswith(b"\n"):
+        content += b"\n"
+    content += entry + b"\n"
+
+descriptor = os.open(
+    staging_path,
+    os.O_WRONLY | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0),
+)
+try:
+    os.fchmod(descriptor, mode)
+    view = memoryview(content)
+    while view:
+        written = os.write(descriptor, view)
+        view = view[written:]
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+print("changed" if changed else "unchanged")
+PY
+}
+
+prepare_config_copy() {
+    local source_path="$1"
+    local staging_path="$2"
+
+    python3 - "$source_path" "$staging_path" << 'PY'
+import os
+import stat
+import sys
+
+source_path, staging_path = sys.argv[1:]
+try:
+    source_stat = os.lstat(source_path)
+except FileNotFoundError:
+    source_stat = None
+
+if source_stat is None:
+    content = b""
+    mode = 0o644
+else:
+    if not stat.S_ISREG(source_stat.st_mode):
+        raise SystemExit(f"not a regular file: {source_path}")
+    descriptor = os.open(
+        source_path,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise SystemExit(f"not a regular file: {source_path}")
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        content = b"".join(chunks)
+        mode = stat.S_IMODE(opened.st_mode)
+    finally:
+        os.close(descriptor)
+
+descriptor = os.open(
+    staging_path,
+    os.O_WRONLY | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0),
+)
+try:
+    os.fchmod(descriptor, mode)
+    view = memoryview(content)
+    while view:
+        written = os.write(descriptor, view)
+        view = view[written:]
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+print(format(mode, "o"))
+PY
+}
+
+# Validate one OpenSSH public-key line and expose its exact content without
+# ever reading private-key bytes into shell output.
+KEY_CONTENT=""
+validate_public_key_content() {
+    local public_key_content="$1"
+    local key_type=""
+    local key_blob=""
+
+    case "$public_key_content" in
+        *$'\n'*) return 1 ;;
+    esac
+    read -r key_type key_blob _ <<< "$public_key_content"
+    case "$key_type" in
+        ssh-*|ecdsa-*|sk-*) ;;
+        *) return 1 ;;
+    esac
+    [ -n "$key_blob" ]
+}
+
+load_public_key_file() {
+    local public_key_file="$1"
+    local line_count=""
+    local public_key_content=""
+
+    [ -f "$public_key_file" ] || return 1
+    line_count=$(awk 'END { print NR }' "$public_key_file") || return 1
+    [ "$line_count" -eq 1 ] || return 1
+    IFS= read -r public_key_content < "$public_key_file" ||
+        [ -n "$public_key_content" ] || return 1
+    validate_public_key_content "$public_key_content" || return 1
+    ssh-keygen -l -f "$public_key_file" >/dev/null 2>&1 || return 1
+    KEY_CONTENT="$public_key_content"
+}
+
+load_signing_public_key() {
+    local signing_key_file="$1"
+    local derived_public_key=""
+
+    if load_public_key_file "$signing_key_file"; then
+        return 0
+    fi
+    if [ -f "$signing_key_file.pub" ]; then
+        load_public_key_file "$signing_key_file.pub"
+        return
+    fi
+    if ! derived_public_key=$(
+        ssh-keygen -y -P '' -f "$signing_key_file" 2>/dev/null
+    ); then
+        return 1
+    fi
+    validate_public_key_content "$derived_public_key" || return 1
+    KEY_CONTENT="$derived_public_key"
+}
+
+configure_signing_locked() (
+    local email=""
+    local ssh_directory="$HOME/.ssh"
+    local config_path="$HOME/.gitconfig.local"
+    local allowed_signers="$ssh_directory/allowed_signers"
+    local configured_key=""
+    local key_file=""
+    local key_path=""
+    local key=""
+    local config_generation=""
+    local signer_generation=""
+    local config_staging=""
+    local signer_staging=""
+    local signer_change=""
+    local config_mode=""
+    local config_change=true
+
+    # Invoked indirectly by the EXIT trap below.
+    # shellcheck disable=SC2317
+    cleanup_signing_staging() {
+        local exit_status=$?
+        local cleanup_path=""
+        trap - EXIT
+        trap '' HUP INT TERM
+        for cleanup_path in \
+                "$config_staging" \
+                "$signer_staging"; do
+            [ -n "$cleanup_path" ] || continue
+            if [ -e "$cleanup_path" ] || [ -L "$cleanup_path" ]; then
+                if [ -d "$cleanup_path" ] && [ ! -L "$cleanup_path" ]; then
+                    error "Refusing non-file signing staging: $cleanup_path"
+                    exit_status=1
+                elif ! unlink "$cleanup_path"; then
+                    error "Could not clean signing staging: $cleanup_path"
+                    exit_status=1
+                elif ! sync_parent_directory "$cleanup_path"; then
+                    error "Could not persist signing staging cleanup: $cleanup_path"
+                    exit_status=1
+                fi
+            fi
+        done
+        exit "$exit_status"
+    }
+    trap cleanup_signing_staging EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    if [ ! -d "$ssh_directory" ] || [ -L "$ssh_directory" ]; then
+        error "SSH directory is not a real directory: $ssh_directory"
+        return 1
+    fi
+    validate_publication_destination \
+        "$config_path" "Git local config destination" || return 1
+    validate_publication_destination \
+        "$allowed_signers" "Allowed signers destination" || return 1
+
+    if ! email=$(git config --global --includes user.email 2>/dev/null); then
+        email=""
+    fi
+    if [ -z "$email" ]; then
+        error "git user.email not configured"
+        error "Run: git config --global user.email your@email.com"
+        return 1
+    fi
+    if [[ "$email" == *[[:space:],]* ]]; then
+        error "git user.email cannot contain whitespace or commas"
+        return 1
+    fi
+
+    # Preserve an existing machine-local choice when its public key still
+    # exists. A configured private key remains valid for Git while its public
+    # counterpart alone is admitted to allowed_signers.
+    if ! configured_key=$(
+        git config --global --includes --path user.signingkey 2>/dev/null
+    ); then
+        configured_key=""
+    fi
+    if [ -n "$configured_key" ] && [ -f "$configured_key" ]; then
+        key_file="$configured_key"
+    fi
+
+    if [ -z "$key_file" ]; then
+        for key in id_ed25519.pub id_rsa.pub id_ecdsa.pub; do
+            if [ -f "$ssh_directory/$key" ]; then
+                key_file="$ssh_directory/$key"
+                break
+            fi
+        done
+    fi
+    if [ -z "$key_file" ]; then
+        for key in "$ssh_directory"/*_github.pub; do
+            if [ -f "$key" ]; then
+                key_file="$key"
+                break
+            fi
+        done
+    fi
+    if [ -z "$key_file" ]; then
+        error "No SSH public key found in $ssh_directory"
+        error "Generate one with: ssh-keygen -t ed25519 -C \"$email\""
+        return 1
+    fi
+    if ! load_signing_public_key "$key_file"; then
+        error "Could not resolve one valid public key from: $key_file"
+        error "Private keys with passphrases require a matching .pub file"
+        return 1
+    fi
+    info "Found SSH signing key: $key_file"
+
+    case "$key_file" in
+        "$ssh_directory"/*)
+            # shellcheck disable=SC2088  # Intentional literal ~ in git config.
+            key_path="~/.ssh/${key_file#"$ssh_directory"/}"
+            ;;
+        *)
+            key_path="$key_file"
+            ;;
+    esac
+
+    if ! config_generation=$(file_generation "$config_path") ||
+            ! signer_generation=$(file_generation "$allowed_signers"); then
+        error "Could not capture signing publication generations"
+        return 1
+    fi
+    if ! config_staging=$(mktemp \
+            "$HOME/.git-setup-signing.config.XXXXXX") ||
+            ! signer_staging=$(mktemp \
+                "$ssh_directory/.git-setup-signing.signers.XXXXXX"); then
+        error "Could not reserve signing publication staging"
+        return 1
+    fi
+    if ! signer_change=$(prepare_allowed_signers \
+            "$allowed_signers" "$signer_staging" \
+            "$email" "$KEY_CONTENT"); then
+        error "Could not stage allowed signers"
+        return 1
+    fi
+    if ! config_mode=$(prepare_config_copy \
+            "$config_path" "$config_staging"); then
+        error "Could not stage Git local config"
+        return 1
+    fi
+    if ! git config --file "$config_staging" \
+            user.signingkey "$key_path"; then
+        error "Could not stage user.signingkey"
+        return 1
+    fi
+    if ! chmod "$config_mode" "$config_staging" ||
+            ! sync_regular_file_and_parent "$config_staging"; then
+        error "Could not persist staged Git local config"
+        return 1
+    fi
+    if [ -f "$config_path" ] &&
+            cmp -s "$config_staging" "$config_path"; then
+        config_change=false
+    fi
+
+    # Both snapshots must still be current before the first live mutation.
+    require_file_generation \
+        "$allowed_signers" "$signer_generation" || return 1
+    require_file_generation \
+        "$config_path" "$config_generation" || return 1
+
+    if [ "$signer_change" = "changed" ]; then
+        if ! atomic_publish_file \
+                "$signer_staging" "$allowed_signers" \
+                "$signer_generation"; then
+            error "Could not publish allowed signers"
+            return 1
+        fi
+        signer_staging=""
+        info "Added to $allowed_signers"
+    else
+        if ! sync_regular_file_and_parent "$allowed_signers"; then
+            error "Could not confirm durable allowed signers"
+            return 1
+        fi
+        if ! unlink "$signer_staging" ||
+                ! sync_parent_directory "$signer_staging"; then
+            error "Could not clean unchanged allowed-signers staging"
+            return 1
+        fi
+        signer_staging=""
+        info "Selected key already in $allowed_signers"
+    fi
+
+    # Test-only fault point at the intentional transaction boundary. The
+    # authorized key may safely exist before Git selects it; the reverse order
+    # would leave signing configured with no verification authorization.
+    if [ "${DOTFILES_GIT_SIGNING_TEST_FAULT:-}" = \
+            "after-signer-publication" ]; then
+        error "Injected failure after allowed-signers publication"
+        return 73
+    fi
+
+    if [ "$config_change" = true ]; then
+        if ! atomic_publish_file \
+                "$config_staging" "$config_path" \
+                "$config_generation"; then
+            error "Could not publish Git local config"
+            return 1
+        fi
+        config_staging=""
+        info "Set user.signingkey = $key_path"
+    else
+        require_file_generation \
+            "$config_path" "$config_generation" || return 1
+        if ! unlink "$config_staging" ||
+                ! sync_parent_directory "$config_staging"; then
+            error "Could not clean unchanged Git-config staging"
+            return 1
+        fi
+        config_staging=""
+        info "user.signingkey already set to $key_path"
+    fi
+
+    printf '\n'
+    info "Git signing configured!"
+    printf '\nCurrent settings:\n'
+    printf '  user.signingkey = %s\n' \
+        "$(git config --global --includes user.signingkey)"
+    printf '  gpg.format = %s\n' \
+        "$(git config --global --includes gpg.format)"
+    printf '  commit.gpgsign = %s\n' \
+        "$(git config --global --includes commit.gpgsign)"
+    printf "\nTo test: git commit --allow-empty -m 'test signed commit'\n"
+    printf "To verify: git log --show-signature -1\n"
+)
+
+with_home_transaction_lock configure_signing_locked

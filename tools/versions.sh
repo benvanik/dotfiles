@@ -38,6 +38,25 @@ _version_gte() {
     return 1
 }
 
+# Resolves a symlink to a physical directory without GNU readlink extensions.
+_resolve_linked_directory() {
+    local link_path="$1"
+    local link_target
+
+    link_target=$(readlink "$link_path") || return 1
+    case "$link_target" in
+        /*) ;;
+        *) link_target="$(dirname "$link_path")/$link_target" ;;
+    esac
+
+    [ -d "$link_target" ] || return 1
+    (
+        CDPATH=''
+        cd -- "$link_target" 2>/dev/null || exit 1
+        pwd -P
+    )
+}
+
 # Find best version matching requirement.
 # Args: tool_dir, requirement (>=X.Y.Z, X.Y.Z, or "latest").
 # Returns: full path to version directory.
@@ -47,8 +66,13 @@ _find_version() {
     # Handle "latest" symlink.
     if [ "$requirement" = "latest" ]; then
         if [ -L "$tool_dir/latest" ]; then
-            readlink -f "$tool_dir/latest"
-            return 0
+            _resolve_linked_directory "$tool_dir/latest"
+            return
+        elif [ -e "$tool_dir/latest" ]; then
+            # A copied or otherwise obstructed selector is not equivalent to
+            # an absent selector. Publication cannot replace it safely, so
+            # selection must not silently fall through to a numeric sibling.
+            return 1
         else
             # No latest symlink; fall through to find highest version.
             requirement=">="

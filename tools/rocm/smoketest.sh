@@ -51,14 +51,40 @@ if command -v hipconfig &>/dev/null; then
 fi
 
 if command -v cmake &>/dev/null; then
-    cmake_tmp="${TMPDIR:-/tmp}/rocm-smoketest.$$"
-    mkdir -p "$cmake_tmp"
-    trap 'rm -rf "$cmake_tmp"' EXIT
-    cat > "$cmake_tmp/CMakeLists.txt" << 'EOF'
+    cmake_scratch_parent="${TMPDIR:-/tmp}"
+    if [ ! -d "$cmake_scratch_parent" ]; then
+        echo "  CMake scratch parent is not a directory: $cmake_scratch_parent" >&2
+        exit 1
+    fi
+    cmake_scratch_parent="$(
+        CDPATH=''
+        cd -- "$cmake_scratch_parent" || exit 1
+        pwd -P
+    )"
+    cmake_scratch_directory=$(
+        mktemp -d "$cmake_scratch_parent/rocm-smoketest.XXXXXX"
+    )
+    cleanup_cmake_scratch() {
+        case "$cmake_scratch_directory" in
+            "$cmake_scratch_parent"/rocm-smoketest.*) ;;
+            *)
+                echo "  refusing unexpected CMake scratch cleanup path: $cmake_scratch_directory" >&2
+                return 1
+                ;;
+        esac
+        [ ! -e "$cmake_scratch_directory" ] ||
+            find "$cmake_scratch_directory" -depth -delete
+    }
+    trap cleanup_cmake_scratch EXIT
+    cat > "$cmake_scratch_directory/CMakeLists.txt" << 'EOF'
 cmake_minimum_required(VERSION 3.16)
 project(rocm_smoketest LANGUAGES CXX)
 find_package(hip CONFIG REQUIRED)
 EOF
-    cmake -S "$cmake_tmp" -B "$cmake_tmp/build" -DCMAKE_PREFIX_PATH="$rocm_root" >/dev/null
+    cmake \
+        -S "$cmake_scratch_directory" \
+        -B "$cmake_scratch_directory/build" \
+        -DCMAKE_PREFIX_PATH="$rocm_root" \
+        >/dev/null
     echo "  cmake: find_package(hip CONFIG) ok"
 fi

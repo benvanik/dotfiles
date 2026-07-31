@@ -4,8 +4,7 @@
 **/.claude/settings.local.json
 **/CLAUDE.local.md
 
-# direnv project environments (machine-specific, managed by project-init).
-.envrc
+# direnv local state (machine-specific, managed by project-init).
 .envrc.local
 .history/
 

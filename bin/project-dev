@@ -3,6 +3,10 @@
 
 set -e
 
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../lib/project-worktrees.sh
+. "$SCRIPT_DIR/../lib/project-worktrees.sh"
+
 # Use user's shell (typically zsh) for new sessions.
 USER_SHELL="${SHELL:-/bin/zsh}"
 
@@ -14,17 +18,19 @@ USAGE
     project-dev [session_name] [directory]
 
 ARGUMENTS
-    session_name    Name for the tmux session (default: current directory name)
+    session_name    Name for the tmux session; ':' is not accepted
+                    (default: path-qualified repository/worktree identity)
     directory       Working directory for the session (default: current directory)
 
 BEHAVIOR
     - If not in a tmux session: creates or attaches to the named session
     - If already in a tmux session: switches to the named session
+    - Existing sessions are always selected by exact name
     - Prefers byobu if installed, falls back to tmux
 
 EXAMPLES
     project-dev
-        Create session named after current directory
+        Create a repository-qualified session for the current worktree
 
     project-dev myproject
         Create or attach to session named 'myproject'
@@ -41,6 +47,11 @@ EOF
 case "${1:-}" in
     -h|--help) show_help; exit 0 ;;
 esac
+
+if [ $# -gt 2 ]; then
+    printf 'project-dev: expected at most a session name and directory\n' >&2
+    exit 1
+fi
 
 # Colors.
 GREEN='\033[0;32m'
@@ -64,7 +75,7 @@ fi
 info "Using $MUX"
 
 # Parse arguments.
-session_name="${1:-$(basename "$PWD")}"
+session_name="${1:-}"
 target_dir="${2:-$PWD}"
 
 # Ensure target directory exists.
@@ -76,6 +87,16 @@ fi
 # Convert to absolute path.
 target_dir=$(cd "$target_dir" && pwd)
 
+# Qualify default names with the repository when using sibling worktrees.
+if [ -z "$session_name" ]; then
+    session_name=$(project_default_session_name "$target_dir")
+fi
+if ! project_session_name_is_target_safe "$session_name"; then
+    error "Session names cannot contain ':' because tmux treats it as a target delimiter."
+    exit 1
+fi
+session_target=$(project_exact_session_target "$session_name")
+
 # Check if we're already in a session.
 if [ -n "$TMUX" ]; then
     # Already in tmux/byobu - check if session has this directory.
@@ -86,20 +107,20 @@ if [ -n "$TMUX" ]; then
     fi
 
     # Switch to existing session or create new window.
-    if $MUX has-session -t "$session_name" 2>/dev/null; then
+    if $MUX has-session -t "$session_target" 2>/dev/null; then
         info "Switching to existing session: $session_name"
-        $MUX switch-client -t "$session_name"
+        $MUX switch-client -t "$session_target"
     else
         info "Creating new session: $session_name (shell: $USER_SHELL)"
         $MUX set-option -g default-shell "$USER_SHELL"
         $MUX new-session -d -s "$session_name" -c "$target_dir"
-        $MUX switch-client -t "$session_name"
+        $MUX switch-client -t "$session_target"
     fi
 else
     # Not in tmux/byobu - attach or create.
-    if $MUX has-session -t "$session_name" 2>/dev/null; then
+    if $MUX has-session -t "$session_target" 2>/dev/null; then
         info "Attaching to existing session: $session_name"
-        exec $MUX attach-session -t "$session_name"
+        exec $MUX attach-session -t "$session_target"
     else
         info "Creating new session: $session_name (shell: $USER_SHELL)"
         # Pass shell directly to new-session to avoid needing server for set-option.

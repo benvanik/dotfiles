@@ -23,9 +23,6 @@ if git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1; then
     git_branch=$(git -C "$cwd" branch --show-current 2>/dev/null || echo "detached")
 fi
 
-# Calculate approximate context usage based on transcript size
-transcript_path=$(echo "$input" | jq -r '.transcript_path')
-
 # Build status line matching PS1 format: ${debian_chroot:+($debian_chroot)}\u@\h:\w plus extras
 # Using printf with ANSI colors (will be dimmed by terminal)
 

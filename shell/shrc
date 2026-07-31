@@ -8,7 +8,11 @@
 
 # Add directory to PATH if it exists.
 _add_path() {
-    [ -d "$1" ] && PATH="$1:$PATH"
+    [ -d "$1" ] || return 0
+    case ":$PATH:" in
+        *":$1:"*) ;;
+        *) PATH="$1:$PATH" ;;
+    esac
 }
 
 # Warn about missing tool (called once per session).
@@ -92,15 +96,6 @@ if [ -d "$HOME/.nvm/versions/node" ] && [ -f "$HOME/.nvm/alias/default" ]; then
 fi
 
 # ============================================================================
-# Versioned Tools
-# ============================================================================
-# Load default tool versions from ~/tools/ (latest symlinks).
-# Per-project overrides use direnv - see tools.sh and direnvrc.
-if [ -f "$HOME/.dotfiles/tools/tools.sh" ]; then
-    . "$HOME/.dotfiles/tools/tools.sh"
-fi
-
-# ============================================================================
 # Machine-Specific Configuration (not synced)
 # ============================================================================
 # Source machine-specific config from ~/.shrc.local.
@@ -119,6 +114,16 @@ if [ -f "$HOME/.shrc.local" ]; then
     . "$HOME/.shrc.local"
 fi
 
+# ============================================================================
+# Versioned Tools
+# ============================================================================
+# Load tracked environments after machine-local root selections are visible.
+# Unselected tools use ~/tools/<tool>/latest; projects may override both through
+# direnv after shell initialization.
+if [ -f "$HOME/.dotfiles/tools/tools.sh" ]; then
+    . "$HOME/.dotfiles/tools/tools.sh"
+fi
+
 # Export PATH after all modifications.
 export PATH
 
@@ -133,7 +138,7 @@ fi
 # ============================================================================
 # Warn about missing tools once per session.
 
-if [ -n "$PS1" ] && [ -z "$_DOTFILES_TOOLS_CHECKED" ]; then
+if [ -n "${PS1:-}" ] && [ -z "${_DOTFILES_TOOLS_CHECKED:-}" ]; then
     export _DOTFILES_TOOLS_CHECKED=1
 
     # Required tools - warn if missing.
@@ -178,8 +183,9 @@ export RUST_LOG="${RUST_LOG:-beads_rust=warn}"
 if _has_tool direnv; then
     # Silence verbose direnv logging; our direnvrc prints a clean summary.
     export DIRENV_LOG_FORMAT=""
-    eval "$(direnv hook bash 2>/dev/null)" || true
 fi
+# Interactive hook syntax is shell-specific. bashrc and zshrc.d/direnv.zsh own
+# their respective hooks; this shared POSIX environment must not evaluate one.
 
 # ============================================================================
 # End of ~/.shrc

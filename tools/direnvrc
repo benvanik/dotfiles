@@ -1,8 +1,40 @@
 # Versioned tools for direnv.
 # Link to ~/.direnvrc or source from ~/.config/direnv/direnvrc.
 
-source_env "${HOME}/.dotfiles/tools/platform.sh"
-source_env "${HOME}/.dotfiles/tools/versions.sh"
+# direnv does not automatically watch its global rc file. Track the canonical
+# repository source so a pull that changes loader semantics invalidates every
+# project environment that uses it.
+if ! watch_file "${HOME}/.dotfiles/tools/direnvrc"; then
+    log_error "Could not watch the dotfiles direnv loader"
+    return 1
+fi
+
+# direnv's source_env performs directory cleanup after sourcing a file. That
+# cleanup can turn a rejected environment file into a successful source. These
+# files do not need source_env's directory switching, so source them directly
+# and leave the source operation as the function's terminal status.
+_source_checked_environment() {
+    local environment_file="$1"
+    case "$environment_file" in
+        /*|./*|../*) ;;
+        *) environment_file="./$environment_file" ;;
+    esac
+    watch_file "$environment_file" || return 1
+    # shellcheck disable=SC1090
+    . "$environment_file"
+}
+_DIRENV_CHECKED_ENVIRONMENT_IMPORTS=1
+
+if ! _source_checked_environment \
+        "${HOME}/.dotfiles/tools/platform.sh"; then
+    log_error "Could not load dotfiles platform helpers"
+    return 1
+fi
+if ! _source_checked_environment \
+        "${HOME}/.dotfiles/tools/versions.sh"; then
+    log_error "Could not load dotfiles version helpers"
+    return 1
+fi
 
 # Track active tools for summary output.
 _DIRENV_TOOLS=""
@@ -10,11 +42,17 @@ _DIRENV_TOOLS=""
 # Add tool to active list (called by _use_tool).
 _track_tool() {
     local tool="$1" version="$2"
-    if [ -n "$_DIRENV_TOOLS" ]; then
-        _DIRENV_TOOLS="$_DIRENV_TOOLS $tool:$version"
-    else
-        _DIRENV_TOOLS="$tool:$version"
-    fi
+    local tracked_tool=""
+    local retained_tools=""
+
+    # shellcheck disable=SC2086
+    for tracked_tool in $_DIRENV_TOOLS; do
+        case "$tracked_tool" in
+            "$tool":*) continue ;;
+        esac
+        retained_tools="${retained_tools:+$retained_tools }$tracked_tool"
+    done
+    _DIRENV_TOOLS="${retained_tools:+$retained_tools }$tool:$version"
 }
 
 # Generic tool loader.
@@ -33,15 +71,38 @@ _use_tool() {
         return 1
     fi
 
+    # Environment definitions are tracked with the dotfiles so pulling an
+    # update changes behavior without reinstalling the tool payload.
+    local environment_file="${HOME}/.dotfiles/tools/${tool}/env.sh"
+    if [ ! -f "$environment_file" ]; then
+        log_error "Missing ${tool} environment definition: ${environment_file}"
+        return 1
+    fi
+
     # Export root variable for env.sh to use.
     local root_var
+    local previous_root=""
+    local previous_root_set=""
     root_var="$(echo "${tool}" | tr '[:lower:]' '[:upper:]')_ROOT"
-    eval "export ${root_var}=\"${tool_path}\""
+    eval "previous_root=\${$root_var-}"
+    eval "previous_root_set=\${$root_var+x}"
+    export "$root_var=$tool_path"
 
-    # Source tool-specific env.sh if exists.
-    # env.sh is responsible for adding to PATH.
-    local env_file="${tool_dir}/env.sh"
-    [ -f "$env_file" ] && source_env "$env_file"
+    # Keep this source as a bare command. Generated project environments enable
+    # errexit, and placing the source in a conditional would disable strict
+    # evaluation throughout the imported file.
+    local activation_status=0
+    _source_checked_environment "$environment_file"
+    activation_status=$?
+    if [ "$activation_status" -ne 0 ]; then
+        if [ "$previous_root_set" = "x" ]; then
+            export "$root_var=$previous_root"
+        else
+            unset "$root_var"
+        fi
+        log_error "Could not activate ${tool} from ${tool_path}"
+        return 1
+    fi
 
     # Track for summary output.
     _track_tool "$tool" "$(_version_from_path "$tool_path")"
@@ -91,14 +152,19 @@ use_flake() {
 
     # Cache directory keyed by project path.
     local project_hash
-    project_hash="$(echo -n "$PWD" | sha256sum | cut -d' ' -f1)"
+    project_hash="$(printf '%s' "$PWD" | git hash-object --stdin)"
     local cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/direnv/flake/${project_hash}"
     mkdir -p "$cache_dir"
 
     # Cache key from flake input content. If flake.lock doesn't exist yet
     # (fresh flake), hash flake.nix alone.
     local input_hash
-    input_hash="$(cat flake.nix flake.lock 2>/dev/null | sha256sum | cut -d' ' -f1)"
+    input_hash="$(
+        {
+            cat flake.nix
+            [ ! -f flake.lock ] || cat flake.lock
+        } | git hash-object --stdin
+    )"
     local cache_file="${cache_dir}/${input_hash}.env"
 
     if [ ! -f "$cache_file" ]; then
@@ -106,7 +172,7 @@ use_flake() {
         # since this operation takes several seconds and silence is confusing.
         printf '\033[0;33m[nix]\033[0m evaluating flake devshell (cached after first run)...\n' >&2
         if ! "$nix" print-dev-env --accept-flake-config 2>/dev/null > "${cache_file}.tmp"; then
-            rm -f "${cache_file}.tmp"
+            [ ! -e "${cache_file}.tmp" ] || unlink "${cache_file}.tmp"
             log_error "nix print-dev-env failed"
             return 1
         fi
@@ -167,7 +233,8 @@ use_vulkan_layers() {
             ;;
     esac
 
-    if [ ! -d "$layers_path" ]; then
+    if [ ! -d "$layers_path/share/vulkan/explicit_layer.d" ] ||
+       [ ! -d "$layers_path/lib" ]; then
         log_error "Vulkan layers '$variant' not found at $layers_path"
         log_error "Build with: vulkan-build-layers"
         return 1
@@ -175,7 +242,10 @@ use_vulkan_layers() {
 
     # VK_LAYER_PATH replaces default layer search path.
     export VK_LAYER_PATH="$layers_path/share/vulkan/explicit_layer.d"
-    export LD_LIBRARY_PATH="${layers_path}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    _replace_managed_path_entry \
+        LD_LIBRARY_PATH \
+        "${layers_path}/lib" \
+        DOTFILES_VULKAN_LAYERS_LIBRARY_ENTRY || return 1
 
     _track_tool "vk-layers" "$variant"
 }
@@ -191,35 +261,11 @@ use_vulkan_layers() {
 #   use_project_history "$PWD/../.history" # Share across worktrees
 use_project_history() {
     local history_dir="${1:-$PWD/.history}"
-    export HISTORY_BASE="$history_dir"
-    mkdir -p "$HISTORY_BASE"
-}
+    local history_base
 
-# Enable ccache with project-isolated cache directory.
-# Usage: use_ccache [cache_name]
-#
-# Cache stored at: ${CCACHE_BASE_DIR:-~/.cache/ccache}/<cache_name>
-# For worktrees sharing cache, use same cache_name.
-#
-# Examples:
-#   use_ccache             # Cache name from directory basename
-#   use_ccache "iree"      # All IREE worktrees share this cache
-#
-use_ccache() {
-    command -v ccache >/dev/null || {
-        log_error "ccache not found. Install with: sudo apt install ccache"
-        return 1
-    }
-
-    local cache_name="${1:-$(basename "$PWD")}"
-    local base_cache="${CCACHE_BASE_DIR:-$HOME/.cache/ccache}"
-
-    export CCACHE_DIR="${base_cache}/${cache_name}"
-    export CMAKE_C_COMPILER_LAUNCHER="ccache"
-    export CMAKE_CXX_COMPILER_LAUNCHER="ccache"
-
-    mkdir -p "$CCACHE_DIR"
-    _track_tool "ccache" "$cache_name"
+    mkdir -p -- "$history_dir" || return 1
+    history_base=$(CDPATH='' cd -- "$history_dir" && pwd -P) || return 1
+    export HISTORY_BASE="$history_base"
 }
 
 # Activate Python virtual environment if present.
@@ -254,7 +300,9 @@ use_venv() {
     fi
 
     # Activate venv using direnv's layout mechanism.
-    export VIRTUAL_ENV="$(cd "$venv_path" && pwd)"
+    local virtual_environment
+    virtual_environment=$(cd "$venv_path" && pwd) || return 1
+    export VIRTUAL_ENV="$virtual_environment"
     PATH_add "${VIRTUAL_ENV}/bin"
     export VIRTUAL_ENV_PROMPT="${venv_path##*/}"
 
@@ -264,7 +312,21 @@ use_venv() {
 # Source .envrc.local if exists (for machine-specific overrides).
 # Also prints the environment summary.
 source_local_envrc() {
-    [ -f ".envrc.local" ] && source_env ".envrc.local"
+    local source_status=0
+
+    if [ ! -f ".envrc.local" ]; then
+        _print_env_summary
+        return
+    fi
+
+    # Keep this source outside a conditional so a nonterminal failure in the
+    # user-owned override aborts a strict direnv evaluation immediately.
+    _source_checked_environment ".envrc.local"
+    source_status=$?
+    if [ "$source_status" -ne 0 ]; then
+        log_error "Could not load .envrc.local"
+        return 1
+    fi
     _print_env_summary
 }
 

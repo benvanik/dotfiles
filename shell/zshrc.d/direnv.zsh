@@ -1,3 +1,3 @@
 # Optimized direnv hook for zsh.
-# This overrides the bash hook in shrc with the native zsh hook.
+# The common shrc deliberately installs no shell-specific hook.
 (( $+commands[direnv] )) && eval "$(direnv hook zsh)"

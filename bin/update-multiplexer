@@ -1,58 +1,78 @@
 #!/bin/bash
-# Install official tmux and Byobu releases, then update TPM and its plugins.
+# Build, publish, and activate one attested tmux + Byobu generation.
 set -euo pipefail
 
 DOTFILES="${DOTFILES:-$HOME/.dotfiles}"
 INSTALL_PREFIX="${MULTIPLEXER_INSTALL_PREFIX:-$HOME/.local}"
 PLUGIN_ROOT="${TMUX_PLUGIN_MANAGER_PATH:-$HOME/.tmux/plugins}"
+MULTIPLEXER_STATE_ROOT="${MULTIPLEXER_STATE_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/dotfiles/multiplexer}"
+GENERATION_ROOT="$MULTIPLEXER_STATE_ROOT/generations"
+TOOL_NAME="multiplexer"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-NC='\033[0m'
-
-info() { printf "${GREEN}[multiplexer]${NC} %s\n" "$1"; }
-warn() { printf "${YELLOW}[multiplexer]${NC} %s\n" "$1"; }
-error() { printf "${RED}[multiplexer]${NC} %s\n" "$1" >&2; }
+# shellcheck source=../lib/bootstrap-pins.sh
+source "$DOTFILES/lib/bootstrap-pins.sh"
+# shellcheck source=../tools/install-utils.sh
+source "$DOTFILES/tools/install-utils.sh"
+# shellcheck source=../lib/multiplexer-plugins.sh
+source "$DOTFILES/lib/multiplexer-plugins.sh"
 
 FORCE=false
 ENABLE_TRUSTMUX=false
 TMUX_VERSION=""
 BYOBU_VERSION=""
+TMUX_VERSION_EXPLICIT=false
+BYOBU_VERSION_EXPLICIT=false
 
 show_help() {
-    cat << 'EOF'
-update-multiplexer - Install the current official terminal multiplexer stack
+    cat << EOF
+update-multiplexer - Publish an attested terminal multiplexer stack
 
 USAGE
     update-multiplexer [options]
 
 OPTIONS
-    --tmux-version VERSION    Install a specific official tmux release
-    --byobu-version VERSION   Install a specific official Byobu release
+    --tmux-version VERSION    Select another official tmux release
+    --byobu-version VERSION   Select another official Byobu release
     --enable-trustmux         Include Byobu's mobile companion daemon
-    --force                   Rebuild even when both versions are current
+    --force                   Rebuild a managed generation and authorize a
+                              preserved migration of legacy prefix paths
     -h, --help                Show this help
 
-The default installation contains the latest non-prerelease tmux and Byobu
-releases under ~/.local. Ubuntu packages remain available under /usr/bin as
-fallbacks. Trustmux is excluded unless explicitly enabled.
+The reviewed defaults are tmux $DOTFILES_TMUX_VERSION and Byobu
+$DOTFILES_BYOBU_VERSION. Their source identities live in
+lib/bootstrap-pins.sh. Explicit versions resolve one exact release digest and
+tag commit for this generation.
 
-The updater refuses to replace tmux while this user has a server running.
-Detach, save any needed state, and stop the server before upgrading.
+Each complete stack is published below:
+    $MULTIPLEXER_STATE_ROOT/generations/
+
+Stable command and Byobu resource links pass through one atomic current
+selector. Existing in-place prefix paths are never guessed to be ours:
+--force preserves them in a journaled backup before the first migration.
+
+The updater refuses a stack activation while this user has a tmux server
+running. Detach, save any needed state, and stop the server before upgrading.
 EOF
 }
 
-while [[ $# -gt 0 ]]; do
+while [ $# -gt 0 ]; do
     case "$1" in
         --tmux-version)
-            [[ $# -ge 2 ]] || { error "--tmux-version requires a value"; exit 1; }
+            [ $# -ge 2 ] || {
+                error "--tmux-version requires a value"
+                exit 1
+            }
             TMUX_VERSION="$2"
+            TMUX_VERSION_EXPLICIT=true
             shift 2
             ;;
         --byobu-version)
-            [[ $# -ge 2 ]] || { error "--byobu-version requires a value"; exit 1; }
+            [ $# -ge 2 ] || {
+                error "--byobu-version requires a value"
+                exit 1
+            }
             BYOBU_VERSION="$2"
+            BYOBU_VERSION_EXPLICIT=true
             shift 2
             ;;
         --enable-trustmux)
@@ -74,13 +94,13 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ "$(uname -s)" != "Linux" ]]; then
+if [ "$(uname -s)" != "Linux" ]; then
     error "Source installation is currently supported on Linux only"
     exit 1
 fi
 
 required_commands=(
-    autoconf automake bison cc curl git jq make nproc pkg-config sha256sum stat tar
+    autoconf automake bison cc curl git make nproc pkg-config python3 stat tar
 )
 for required_command in "${required_commands[@]}"; do
     if ! command -v "$required_command" >/dev/null 2>&1; then
@@ -88,357 +108,567 @@ for required_command in "${required_commands[@]}"; do
         exit 1
     fi
 done
-
 for required_module in libevent ncurses; do
     if ! pkg-config --exists "$required_module"; then
         error "Missing pkg-config module: $required_module"
         exit 1
     fi
 done
+if [ ! -f "$DOTFILES/tmux.conf" ] || [ -L "$DOTFILES/tmux.conf" ]; then
+    error "tmux configuration is not an ordinary file: $DOTFILES/tmux.conf"
+    exit 1
+fi
+case "$INSTALL_PREFIX" in
+    /*) ;;
+    *)
+        error "Multiplexer installation prefix must be absolute: $INSTALL_PREFIX"
+        exit 1
+        ;;
+esac
+case "$MULTIPLEXER_STATE_ROOT" in
+    /*) ;;
+    *)
+        error "Multiplexer state root must be absolute: $MULTIPLEXER_STATE_ROOT"
+        exit 1
+        ;;
+esac
 
-if [[ ! -f "$DOTFILES/tmux.conf" ]]; then
-    error "tmux configuration not found: $DOTFILES/tmux.conf"
+TMUX_VERSION="${TMUX_VERSION:-$DOTFILES_TMUX_VERSION}"
+BYOBU_VERSION="${BYOBU_VERSION:-$DOTFILES_BYOBU_VERSION}"
+if [[ ! "$TMUX_VERSION" =~ ^[0-9][0-9A-Za-z._+-]*$ ]]; then
+    error "Invalid tmux version: $TMUX_VERSION"
+    exit 1
+fi
+if [[ ! "$BYOBU_VERSION" =~ ^[0-9][0-9A-Za-z._+-]*$ ]]; then
+    error "Invalid Byobu version: $BYOBU_VERSION"
+    exit 1
+fi
+validate_version_component "$TMUX_VERSION" "tmux version"
+validate_version_component "$BYOBU_VERSION" "Byobu version"
+
+prepare_managed_directory_root \
+    "$INSTALL_PREFIX" "multiplexer installation prefix"
+prepare_managed_directory_root \
+    "$MULTIPLEXER_STATE_ROOT" "multiplexer state root"
+prepare_managed_directory_root \
+    "$GENERATION_ROOT" "multiplexer generation root"
+
+resolve_byobu_tag_commit() {
+    local version="$1"
+    local remote_output
+
+    remote_output=$(
+        git ls-remote "$DOTFILES_BYOBU_ORIGIN" \
+            "refs/tags/$version" "refs/tags/$version^{}"
+    ) || return 1
+    printf '%s\n' "$remote_output" | python3 -c '
+import re
+import sys
+
+version = sys.argv[1]
+tag_ref = f"refs/tags/{version}"
+peeled_ref = tag_ref + "^{}"
+matches = {}
+for line in sys.stdin:
+    fields = line.rstrip("\n").split("\t")
+    if len(fields) != 2 or fields[1] not in (tag_ref, peeled_ref):
+        raise SystemExit(f"unexpected ls-remote record: {line.rstrip()!r}")
+    if fields[1] in matches:
+        raise SystemExit(f"duplicate ls-remote record: {fields[1]}")
+    if not re.fullmatch(r"[0-9a-f]{40}", fields[0]):
+        raise SystemExit(f"invalid Git commit identity: {fields[0]!r}")
+    matches[fields[1]] = fields[0]
+commit = matches.get(peeled_ref) or matches.get(tag_ref)
+if commit is None:
+    raise SystemExit(f"Byobu tag does not exist: {version}")
+print(commit)
+' "$version"
+}
+
+if [ "$TMUX_VERSION_EXPLICIT" = "true" ] &&
+        [ "$TMUX_VERSION" != "$DOTFILES_TMUX_VERSION" ]; then
+    TMUX_ARCHIVE_SHA256=$(
+        github_release_asset_sha256 \
+            tmux/tmux "$TMUX_VERSION" "tmux-$TMUX_VERSION.tar.gz"
+    )
+else
+    TMUX_ARCHIVE_SHA256="$DOTFILES_TMUX_ARCHIVE_SHA256"
+fi
+verify_sha256_value() {
+    local value="$1"
+    local label="$2"
+
+    if [ "${#value}" -ne 64 ] || [[ "$value" == *[!0-9a-f]* ]]; then
+        error "Invalid $label SHA-256: $value"
+        exit 1
+    fi
+}
+verify_sha256_value "$TMUX_ARCHIVE_SHA256" "tmux archive"
+
+if [ "$BYOBU_VERSION_EXPLICIT" = "true" ] &&
+        [ "$BYOBU_VERSION" != "$DOTFILES_BYOBU_VERSION" ]; then
+    BYOBU_COMMIT=$(resolve_byobu_tag_commit "$BYOBU_VERSION")
+else
+    BYOBU_COMMIT="$DOTFILES_BYOBU_COMMIT"
+fi
+if [[ ! "$BYOBU_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+    error "Invalid Byobu commit identity: $BYOBU_COMMIT"
     exit 1
 fi
 
-validate_version() {
-    local component="$1"
-    local version="$2"
-    if [[ -z "$version" || "$version" == *[!A-Za-z0-9._-]* ]]; then
-        error "Invalid $component version: $version"
-        exit 1
-    fi
+TRUSTMUX_ID=0
+if [ "$ENABLE_TRUSTMUX" = "true" ]; then
+    TRUSTMUX_ID=1
+fi
+PREFIX_SHA256=$(
+    printf '%s' "$INSTALL_PREFIX" | python3 -c '
+import hashlib
+import sys
+
+print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())
+'
+)
+GENERATION_SOURCE_SHA256=$(
+    printf '%s\0%s\0%s\0%s\0%s\0%s' \
+        "$TMUX_VERSION" \
+        "$TMUX_ARCHIVE_SHA256" \
+        "$BYOBU_VERSION" \
+        "$BYOBU_COMMIT" \
+        "$TRUSTMUX_ID" \
+        "$PREFIX_SHA256" |
+        python3 -c '
+import hashlib
+import sys
+
+print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())
+'
+)
+GENERATION_ID="tmux-$TMUX_VERSION-byobu-$BYOBU_VERSION-$GENERATION_SOURCE_SHA256"
+GENERATION_DIRECTORY="$GENERATION_ROOT/$GENERATION_ID"
+acquire_managed_installation_guard "$GENERATION_ROOT" "$GENERATION_ID"
+recover_managed_installation "$GENERATION_ROOT" "$GENERATION_ID"
+
+identity_value() {
+    sed -n "s/^$2=//p" "$1"
+}
+
+generation_closure_sha256() {
+    python3 - "$1" << 'PY'
+import hashlib
+import os
+import stat
+import sys
+
+root = os.path.abspath(sys.argv[1])
+digest = hashlib.sha256()
+for directory, child_directories, files in os.walk(
+    root, topdown=True, followlinks=False
+):
+    child_directories.sort()
+    files.sort()
+    relative_directory = os.path.relpath(directory, root)
+    names = child_directories + files
+    for name in names:
+        path = os.path.join(directory, name)
+        relative_path = (
+            name
+            if relative_directory == "."
+            else os.path.join(relative_directory, name)
+        )
+        if relative_path == ".dotfiles-install-identity":
+            continue
+        metadata = os.lstat(path)
+        if stat.S_ISLNK(metadata.st_mode):
+            kind = b"link"
+            content = os.readlink(path).encode()
+        elif stat.S_ISDIR(metadata.st_mode):
+            kind = b"directory"
+            content = b""
+        elif stat.S_ISREG(metadata.st_mode):
+            kind = b"file"
+            with open(path, "rb") as source:
+                file_digest = hashlib.sha256()
+                for block in iter(lambda: source.read(1024 * 1024), b""):
+                    file_digest.update(block)
+            content = file_digest.digest()
+        else:
+            raise SystemExit(f"unsupported generation object: {relative_path}")
+        digest.update(relative_path.encode())
+        digest.update(b"\0")
+        digest.update(kind)
+        digest.update(b"\0")
+        digest.update(f"{stat.S_IMODE(metadata.st_mode):04o}".encode())
+        digest.update(b"\0")
+        digest.update(content)
+        digest.update(b"\0")
+print(digest.hexdigest())
+PY
+}
+
+generation_valid() {
+    local directory="$1"
+    local identity="$directory/.dotfiles-install-identity"
+    local recorded_closure
+    local actual_closure
+    local byobu_output
+
+    [ -d "$directory" ] && [ ! -L "$directory" ] || return 1
+    [ -f "$directory/bin/tmux" ] &&
+        [ ! -L "$directory/bin/tmux" ] &&
+        [ -x "$directory/bin/tmux" ] || return 1
+    [ -f "$directory/bin/byobu" ] &&
+        [ ! -L "$directory/bin/byobu" ] &&
+        [ -x "$directory/bin/byobu" ] || return 1
+    [ -f "$identity" ] && [ ! -L "$identity" ] || return 1
+    [ "$(wc -l < "$identity")" -eq 9 ] || return 1
+    [ "$(identity_value "$identity" format)" = "1" ] || return 1
+    [ "$(identity_value "$identity" tmux_version)" = "$TMUX_VERSION" ] ||
+        return 1
+    [ "$(identity_value "$identity" tmux_archive_sha256)" = \
+        "$TMUX_ARCHIVE_SHA256" ] || return 1
+    [ "$(identity_value "$identity" byobu_version)" = "$BYOBU_VERSION" ] ||
+        return 1
+    [ "$(identity_value "$identity" byobu_commit)" = "$BYOBU_COMMIT" ] ||
+        return 1
+    [ "$(identity_value "$identity" trustmux)" = "$TRUSTMUX_ID" ] || return 1
+    [ "$(identity_value "$identity" install_prefix)" = "$INSTALL_PREFIX" ] ||
+        return 1
+    [ "$(identity_value "$identity" layout)" = "managed-selector-v1" ] ||
+        return 1
+    recorded_closure=$(identity_value "$identity" closure_sha256)
+    verify_sha256_value "$recorded_closure" "generation closure"
+    actual_closure=$(generation_closure_sha256 "$directory") || return 1
+    [ "$actual_closure" = "$recorded_closure" ] || return 1
+    [ "$("$directory/bin/tmux" -V)" = "tmux $TMUX_VERSION" ] || return 1
+    byobu_output=$(
+        BYOBU_PREFIX="$directory" \
+            PATH="$directory/bin:/usr/bin:/bin" \
+            "$directory/bin/byobu" --version
+    ) || return 1
+    printf '%s\n' "$byobu_output" |
+        grep -qx "byobu version $BYOBU_VERSION"
 }
 
 running_tmux_servers() {
     local user_id
-    user_id=$(id -u)
+    local process_root="${DOTFILES_MULTIPLEXER_TEST_PROCESS_ROOT:-/proc}"
+    local comm_file
+    local process_directory
+    local process_name
+    local process_user_id
 
-    local comm_file process_directory process_name process_user_id
-    for comm_file in /proc/[0-9]*/comm; do
-        [[ -r "$comm_file" ]] || continue
+    user_id=$(id -u)
+    if [ ! -d "$process_root" ] || [ -L "$process_root" ]; then
+        error "Process inspection root is not an ordinary directory: $process_root"
+        return 1
+    fi
+    for comm_file in "$process_root"/[0-9]*/comm; do
+        [ -r "$comm_file" ] || continue
         process_directory="${comm_file%/comm}"
-        process_user_id=$(stat --format='%u' "$process_directory" 2>/dev/null) || continue
-        [[ "$process_user_id" == "$user_id" ]] || continue
+        process_user_id=$(
+            stat --format='%u' "$process_directory" 2>/dev/null
+        ) || continue
+        [ "$process_user_id" = "$user_id" ] || continue
         IFS= read -r process_name < "$comm_file" || continue
-        if [[ "$process_name" == "tmux: server" ]]; then
+        if [ "$process_name" = "tmux: server" ]; then
             printf '%s\n' "${process_directory##*/}"
         fi
     done
 }
 
-github_release() {
-    local repository="$1"
-    local version="$2"
-    local endpoint
-    if [[ -n "$version" ]]; then
-        endpoint="https://api.github.com/repos/$repository/releases/tags/$version"
-    else
-        endpoint="https://api.github.com/repos/$repository/releases/latest"
-    fi
-    curl --fail --silent --show-error --location \
-        --header 'Accept: application/vnd.github+json' \
-        --header 'X-GitHub-Api-Version: 2022-11-28' \
-        "$endpoint"
-}
-
-info "Resolving official releases..."
-tmux_release=$(github_release tmux/tmux "$TMUX_VERSION")
-if [[ -z "$TMUX_VERSION" ]]; then
-    TMUX_VERSION=$(jq --exit-status --raw-output '.tag_name' <<< "$tmux_release")
-fi
-validate_version tmux "$TMUX_VERSION"
-
-tmux_asset_name="tmux-$TMUX_VERSION.tar.gz"
-tmux_asset_url=$(jq --exit-status --raw-output \
-    --arg name "$tmux_asset_name" \
-    '.assets[] | select(.name == $name) | .browser_download_url' \
-    <<< "$tmux_release")
-tmux_asset_digest=$(jq --exit-status --raw-output \
-    --arg name "$tmux_asset_name" \
-    '.assets[] | select(.name == $name) | .digest' \
-    <<< "$tmux_release")
-if [[ "$tmux_asset_digest" != sha256:* ]]; then
-    error "Official tmux asset has no SHA-256 digest: $tmux_asset_name"
-    exit 1
-fi
-tmux_asset_sha256="${tmux_asset_digest#sha256:}"
-
-byobu_release=$(github_release dustinkirkland/byobu "$BYOBU_VERSION")
-if [[ -z "$BYOBU_VERSION" ]]; then
-    BYOBU_VERSION=$(jq --exit-status --raw-output '.tag_name' <<< "$byobu_release")
-fi
-validate_version Byobu "$BYOBU_VERSION"
-
-info "Target stack: tmux $TMUX_VERSION, Byobu $BYOBU_VERSION"
-
-installed_tmux_version=""
-if [[ -x "$INSTALL_PREFIX/bin/tmux" ]]; then
-    installed_tmux_version=$("$INSTALL_PREFIX/bin/tmux" -V | sed -E 's/^tmux //')
-fi
-
-installed_byobu_version=""
-if [[ -x "$INSTALL_PREFIX/bin/byobu" ]]; then
-    installed_byobu_version=$(
-        BYOBU_PREFIX="$INSTALL_PREFIX" "$INSTALL_PREFIX/bin/byobu" --version |
-            sed -n -E 's/^byobu version //p' |
-            head -n 1
-    )
-fi
-
-build_required=true
-if [[ "$FORCE" == false && "$installed_tmux_version" == "$TMUX_VERSION" && \
-      "$installed_byobu_version" == "$BYOBU_VERSION" ]]; then
-    if [[ "$ENABLE_TRUSTMUX" == false || -x "$INSTALL_PREFIX/bin/trustmux" ]]; then
-        build_required=false
-    fi
-fi
-
-build_directory=""
-staged_tmux=""
-direct_socket=""
-byobu_socket=""
-
+BUILD_DIRECTORY=""
+PUBLICATION_STAGING=""
+STAGED_TMUX=""
+DIRECT_SOCKET=""
+BYOBU_SOCKET=""
 cleanup() {
-    if [[ -n "$direct_socket" && -x "${staged_tmux:-}" ]]; then
-        "$staged_tmux" -L "$direct_socket" kill-server 2>/dev/null || true
+    local final_status=$?
+
+    trap - EXIT HUP INT TERM
+    if [ -n "$DIRECT_SOCKET" ] && [ -x "${STAGED_TMUX:-}" ]; then
+        if ! "$STAGED_TMUX" -L "$DIRECT_SOCKET" kill-server >/dev/null 2>&1; then
+            warn "Could not stop staged tmux socket: $DIRECT_SOCKET"
+            [ "$final_status" -ne 0 ] || final_status=1
+        fi
     fi
-    if [[ -n "$byobu_socket" && -x "${staged_tmux:-}" ]]; then
-        "$staged_tmux" -L "$byobu_socket" kill-server 2>/dev/null || true
+    if [ -n "$BYOBU_SOCKET" ] && [ -x "${STAGED_TMUX:-}" ]; then
+        if ! "$STAGED_TMUX" -L "$BYOBU_SOCKET" kill-server >/dev/null 2>&1; then
+            warn "Could not stop staged Byobu socket: $BYOBU_SOCKET"
+            [ "$final_status" -ne 0 ] || final_status=1
+        fi
     fi
-    if [[ -n "$build_directory" && -d "$build_directory" ]]; then
-        case "$build_directory" in
+    if [ -n "$PUBLICATION_STAGING" ] &&
+            { [ -e "$PUBLICATION_STAGING" ] ||
+                [ -L "$PUBLICATION_STAGING" ]; }; then
+        if ! remove_managed_tree \
+                "$GENERATION_ROOT" "$PUBLICATION_STAGING"; then
+            error "Multiplexer publication staging requires inspection: $PUBLICATION_STAGING"
+            final_status=1
+        fi
+    fi
+    if [ -n "$BUILD_DIRECTORY" ] &&
+            { [ -e "$BUILD_DIRECTORY" ] || [ -L "$BUILD_DIRECTORY" ]; }; then
+        case "$BUILD_DIRECTORY" in
             "${TMPDIR:-/tmp}"/dotfiles-multiplexer.*)
-                rm -rf -- "$build_directory"
+                if ! find "$BUILD_DIRECTORY" -xdev -depth -delete; then
+                    error "Multiplexer build directory requires inspection: $BUILD_DIRECTORY"
+                    final_status=1
+                fi
                 ;;
             *)
-                error "Refusing to remove unexpected build directory: $build_directory"
+                error "Refusing unexpected multiplexer build cleanup: $BUILD_DIRECTORY"
+                final_status=1
                 ;;
         esac
     fi
+    exit "$final_status"
 }
 trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 smoke_test_tmux() {
     local tmux_binary="$1"
     local socket_name="$2"
     local expected_version="$3"
+    local actual_version
 
     "$tmux_binary" -L "$socket_name" -f /dev/null \
         new-session -d -s smoke 'sleep 30'
     "$tmux_binary" -L "$socket_name" source-file "$DOTFILES/tmux.conf"
-    local actual_version
-    actual_version=$("$tmux_binary" -L "$socket_name" display-message -p '#{version}')
-    if [[ "$actual_version" != "$expected_version" ]]; then
+    actual_version=$(
+        "$tmux_binary" -L "$socket_name" display-message -p '#{version}'
+    )
+    if [ "$actual_version" != "$expected_version" ]; then
         error "tmux server version mismatch: expected $expected_version, got $actual_version"
         return 1
     fi
     "$tmux_binary" -L "$socket_name" kill-server
 }
 
-if [[ "$build_required" == true ]]; then
-    running_tmux_processes=$(running_tmux_servers)
-    if [[ -n "$running_tmux_processes" ]]; then
-        error "A tmux server is running; refusing an in-place version change"
-        process_list="${running_tmux_processes//$'\n'/,}"
-        ps -o pid=,args= -p "$process_list" >&2
+BUILD_REQUIRED=true
+if [ "$FORCE" != "true" ] && generation_valid "$GENERATION_DIRECTORY"; then
+    BUILD_REQUIRED=false
+elif [ -L "$GENERATION_DIRECTORY" ] ||
+        { [ -e "$GENERATION_DIRECTORY" ] &&
+            [ ! -d "$GENERATION_DIRECTORY" ]; }; then
+    error "Refusing non-directory multiplexer generation: $GENERATION_DIRECTORY"
+    exit 1
+elif [ -e "$GENERATION_DIRECTORY" ] && [ "$FORCE" != "true" ]; then
+    error "Existing multiplexer generation has no valid recorded identity"
+    error "Inspect it, then rerun with --force to replace it transactionally"
+    exit 1
+fi
+
+EXPECTED_SELECTOR="generations/$GENERATION_ID"
+ACTIVE_SELECTOR=""
+if [ -L "$MULTIPLEXER_STATE_ROOT/current" ]; then
+    ACTIVE_SELECTOR=$(readlink "$MULTIPLEXER_STATE_ROOT/current")
+fi
+if [ "$BUILD_REQUIRED" = "true" ] ||
+        [ "$ACTIVE_SELECTOR" != "$EXPECTED_SELECTOR" ]; then
+    RUNNING_TMUX_PROCESSES=$(running_tmux_servers)
+    if [ -n "$RUNNING_TMUX_PROCESSES" ]; then
+        error "A tmux server is running; refusing stack activation"
+        PROCESS_LIST="${RUNNING_TMUX_PROCESSES//$'\n'/,}"
+        ps -o pid=,args= -p "$PROCESS_LIST" >&2
         exit 1
     fi
+fi
 
-    build_directory=$(mktemp -d "${TMPDIR:-/tmp}/dotfiles-multiplexer.XXXXXX")
-    tmux_archive="$build_directory/$tmux_asset_name"
-
-    info "Downloading tmux $TMUX_VERSION..."
-    curl --fail --location --retry 3 --output "$tmux_archive" "$tmux_asset_url"
-    printf '%s  %s\n' "$tmux_asset_sha256" "$tmux_archive" | sha256sum --check -
-    tar -xzf "$tmux_archive" -C "$build_directory"
-    tmux_source="$build_directory/tmux-$TMUX_VERSION"
-    if [[ ! -x "$tmux_source/configure" ]]; then
-        error "tmux release did not contain a configure script"
-        exit 1
-    fi
-
-    info "Resolving Byobu tag $BYOBU_VERSION..."
-    expected_byobu_commit=$(
-        git ls-remote https://github.com/dustinkirkland/byobu.git \
-            "refs/tags/$BYOBU_VERSION" "refs/tags/$BYOBU_VERSION^{}" |
-            awk '
-                $2 ~ /\^\{\}$/ { peeled_commit = $1 }
-                $2 !~ /\^\{\}$/ { tag_commit = $1 }
-                END { print peeled_commit != "" ? peeled_commit : tag_commit }
-            '
+if [ "$BUILD_REQUIRED" = "true" ]; then
+    info "Building tmux $TMUX_VERSION and Byobu $BYOBU_VERSION..."
+    BUILD_DIRECTORY=$(
+        mktemp -d "${TMPDIR:-/tmp}/dotfiles-multiplexer.XXXXXX"
     )
-    if [[ -z "$expected_byobu_commit" ]]; then
-        error "Byobu tag does not exist: $BYOBU_VERSION"
-        exit 1
-    fi
-    byobu_source="$build_directory/byobu-$BYOBU_VERSION"
-    git clone --quiet --depth 1 --branch "$BYOBU_VERSION" \
-        https://github.com/dustinkirkland/byobu.git "$byobu_source"
-    actual_byobu_commit=$(git -C "$byobu_source" rev-parse HEAD)
-    if [[ "$actual_byobu_commit" != "$expected_byobu_commit" ]]; then
-        error "Byobu tag commit changed during checkout"
+    PUBLICATION_STAGING=$(
+        create_managed_staging_directory "$GENERATION_ROOT" "$GENERATION_ID"
+    )
+    TMUX_ARCHIVE_NAME="tmux-$TMUX_VERSION.tar.gz"
+    TMUX_ARCHIVE="$BUILD_DIRECTORY/$TMUX_ARCHIVE_NAME"
+    TMUX_SOURCE_ROOT="tmux-$TMUX_VERSION"
+
+    download \
+        "https://github.com/tmux/tmux/releases/download/$TMUX_VERSION/$TMUX_ARCHIVE_NAME" \
+        "$TMUX_ARCHIVE"
+    verify_sha256 "$TMUX_ARCHIVE" "$TMUX_ARCHIVE_SHA256"
+    validate_single_root_tar_archive "$TMUX_ARCHIVE" "$TMUX_SOURCE_ROOT"
+    tar xf "$TMUX_ARCHIVE" -C "$BUILD_DIRECTORY" --no-same-owner
+    TMUX_SOURCE="$BUILD_DIRECTORY/$TMUX_SOURCE_ROOT"
+    if [ ! -f "$TMUX_SOURCE/configure" ] ||
+            [ -L "$TMUX_SOURCE/configure" ] ||
+            [ ! -x "$TMUX_SOURCE/configure" ]; then
+        error "tmux release did not contain an ordinary configure script"
         exit 1
     fi
 
-    tmux_configure_options=(
+    BYOBU_SOURCE="$BUILD_DIRECTORY/byobu-$BYOBU_VERSION"
+    git init --quiet "$BYOBU_SOURCE"
+    git -C "$BYOBU_SOURCE" remote add origin "$DOTFILES_BYOBU_ORIGIN"
+    git -c core.hooksPath=/dev/null -C "$BYOBU_SOURCE" \
+        fetch --quiet --no-tags --depth=1 origin "$BYOBU_COMMIT"
+    FETCHED_BYOBU_COMMIT=$(
+        git -C "$BYOBU_SOURCE" rev-parse --verify 'FETCH_HEAD^{commit}'
+    )
+    if [ "$FETCHED_BYOBU_COMMIT" != "$BYOBU_COMMIT" ]; then
+        error "Byobu fetch resolved to unexpected commit: $FETCHED_BYOBU_COMMIT"
+        exit 1
+    fi
+    git -c advice.detachedHead=false -c core.hooksPath=/dev/null \
+        -C "$BYOBU_SOURCE" checkout --quiet --detach "$BYOBU_COMMIT"
+    if ! pinned_git_checkout_valid \
+            "$BYOBU_SOURCE" "$DOTFILES_BYOBU_ORIGIN" "$BYOBU_COMMIT"; then
+        error "Byobu staged checkout failed identity validation"
+        exit 1
+    fi
+
+    TMUX_CONFIGURE_OPTIONS=(
         "--prefix=$INSTALL_PREFIX"
         --enable-sixel
     )
     if pkg-config --exists libutf8proc; then
-        tmux_configure_options+=(--enable-utf8proc)
+        TMUX_CONFIGURE_OPTIONS+=(--enable-utf8proc)
     fi
     if pkg-config --exists libsystemd; then
-        tmux_configure_options+=(--enable-systemd)
+        TMUX_CONFIGURE_OPTIONS+=(--enable-systemd)
     fi
-
-    info "Building tmux $TMUX_VERSION..."
     (
-        cd "$tmux_source"
-        ./configure "${tmux_configure_options[@]}"
+        cd "$TMUX_SOURCE"
+        ./configure "${TMUX_CONFIGURE_OPTIONS[@]}"
         make -j"$(nproc)"
     )
-    staged_tmux="$tmux_source/tmux"
-    [[ "$($staged_tmux -V)" == "tmux $TMUX_VERSION" ]]
-
-    direct_socket="multiplexer-stage-tmux-$$"
-    smoke_test_tmux "$staged_tmux" "$direct_socket" "$TMUX_VERSION"
-    direct_socket=""
-
-    byobu_configure_options=("--prefix=$INSTALL_PREFIX")
-    if [[ "$ENABLE_TRUSTMUX" == false ]]; then
-        byobu_configure_options+=(--disable-trustmux)
+    if [ "$("$TMUX_SOURCE/tmux" -V)" != "tmux $TMUX_VERSION" ]; then
+        error "Built tmux version does not match $TMUX_VERSION"
+        exit 1
     fi
+    STAGED_TMUX="$TMUX_SOURCE/tmux"
+    DIRECT_SOCKET="multiplexer-stage-tmux-$$"
+    smoke_test_tmux "$STAGED_TMUX" "$DIRECT_SOCKET" "$TMUX_VERSION"
+    DIRECT_SOCKET=""
 
-    info "Building Byobu $BYOBU_VERSION..."
+    BYOBU_CONFIGURE_OPTIONS=("--prefix=$INSTALL_PREFIX")
+    if [ "$ENABLE_TRUSTMUX" != "true" ]; then
+        BYOBU_CONFIGURE_OPTIONS+=(--disable-trustmux)
+    fi
     (
-        cd "$byobu_source"
+        cd "$BYOBU_SOURCE"
         ./autogen.sh
-        ./configure "${byobu_configure_options[@]}"
+        ./configure "${BYOBU_CONFIGURE_OPTIONS[@]}"
         make -j"$(nproc)"
     )
 
-    byobu_stage="$build_directory/byobu-stage"
-    make -C "$byobu_source" DESTDIR="$byobu_stage" install
-    staged_byobu_prefix="$byobu_stage$INSTALL_PREFIX"
-    staged_byobu="$staged_byobu_prefix/bin/byobu"
-    staged_byobu_version=$(
-        BYOBU_PREFIX="$staged_byobu_prefix" \
-            PATH="$tmux_source:$staged_byobu_prefix/bin:/usr/bin:/bin" \
-            "$staged_byobu" --version |
-            sed -n -E 's/^byobu version //p' |
-            head -n 1
-    )
-    if [[ "$staged_byobu_version" != "$BYOBU_VERSION" ]]; then
-        error "Staged Byobu version mismatch: $staged_byobu_version"
+    INSTALL_DESTDIR="$PUBLICATION_STAGING/root"
+    make -C "$TMUX_SOURCE" DESTDIR="$INSTALL_DESTDIR" install
+    make -C "$BYOBU_SOURCE" DESTDIR="$INSTALL_DESTDIR" install
+    PAYLOAD_DIRECTORY="$INSTALL_DESTDIR$INSTALL_PREFIX"
+    if [ ! -d "$PAYLOAD_DIRECTORY" ] || [ -L "$PAYLOAD_DIRECTORY" ]; then
+        error "Build did not produce an ordinary multiplexer prefix"
         exit 1
     fi
+    STAGED_TMUX="$PAYLOAD_DIRECTORY/bin/tmux"
+    STAGED_BYOBU="$PAYLOAD_DIRECTORY/bin/byobu"
 
-    byobu_socket="multiplexer-stage-byobu-$$"
-    BYOBU_PREFIX="$staged_byobu_prefix" \
-        PATH="$tmux_source:$staged_byobu_prefix/bin:/usr/bin:/bin" \
-        "$staged_byobu" -L "$byobu_socket" \
+    STAGED_BYOBU_OUTPUT=$(
+        BYOBU_PREFIX="$PAYLOAD_DIRECTORY" \
+            PATH="$PAYLOAD_DIRECTORY/bin:/usr/bin:/bin" \
+            "$STAGED_BYOBU" --version
+    )
+    if ! printf '%s\n' "$STAGED_BYOBU_OUTPUT" |
+            grep -qx "byobu version $BYOBU_VERSION"; then
+        error "Staged Byobu version does not match $BYOBU_VERSION"
+        exit 1
+    fi
+    BYOBU_SOCKET="multiplexer-stage-byobu-$$"
+    BYOBU_PREFIX="$PAYLOAD_DIRECTORY" \
+        PATH="$PAYLOAD_DIRECTORY/bin:/usr/bin:/bin" \
+        "$STAGED_BYOBU" -L "$BYOBU_SOCKET" \
         new-session -d -s smoke 'sleep 30'
-    staged_byobu_tmux_version=$(
-        "$staged_tmux" -L "$byobu_socket" display-message -p '#{version}'
+    STAGED_BYOBU_TMUX_VERSION=$(
+        "$STAGED_TMUX" -L "$BYOBU_SOCKET" display-message -p '#{version}'
     )
-    if [[ "$staged_byobu_tmux_version" != "$TMUX_VERSION" ]]; then
-        error "Staged Byobu used tmux $staged_byobu_tmux_version"
+    if [ "$STAGED_BYOBU_TMUX_VERSION" != "$TMUX_VERSION" ]; then
+        error "Staged Byobu used tmux $STAGED_BYOBU_TMUX_VERSION"
         exit 1
     fi
-    "$staged_tmux" -L "$byobu_socket" kill-server
-    byobu_socket=""
+    "$STAGED_TMUX" -L "$BYOBU_SOCKET" kill-server
+    BYOBU_SOCKET=""
 
-    backup_directory="${XDG_DATA_HOME:-$HOME/.local/share}/dotfiles/backups/multiplexer-$(date +%Y%m%d-%H%M%S)"
-    install -d -m 0755 "$backup_directory/bin"
-    if [[ -x "$INSTALL_PREFIX/bin/tmux" ]]; then
-        cp -a "$INSTALL_PREFIX/bin/tmux" "$backup_directory/bin/tmux"
+    CLOSURE_SHA256=$(generation_closure_sha256 "$PAYLOAD_DIRECTORY")
+    printf '%s\n' \
+        "format=1" \
+        "tmux_version=$TMUX_VERSION" \
+        "tmux_archive_sha256=$TMUX_ARCHIVE_SHA256" \
+        "byobu_version=$BYOBU_VERSION" \
+        "byobu_commit=$BYOBU_COMMIT" \
+        "trustmux=$TRUSTMUX_ID" \
+        "install_prefix=$INSTALL_PREFIX" \
+        "layout=managed-selector-v1" \
+        "closure_sha256=$CLOSURE_SHA256" \
+        > "$PAYLOAD_DIRECTORY/.dotfiles-install-identity"
+    if ! generation_valid "$PAYLOAD_DIRECTORY"; then
+        error "Staged multiplexer generation failed closure validation"
+        exit 1
     fi
-    for staged_binary in "$staged_byobu_prefix"/bin/*; do
-        binary_name=$(basename "$staged_binary")
-        if [[ -e "$INSTALL_PREFIX/bin/$binary_name" ]]; then
-            cp -a "$INSTALL_PREFIX/bin/$binary_name" "$backup_directory/bin/$binary_name"
-        fi
-    done
-    for installed_directory in etc/byobu lib/byobu share/byobu share/doc/byobu; do
-        if [[ -d "$INSTALL_PREFIX/$installed_directory" ]]; then
-            install -d -m 0755 "$backup_directory/$(dirname "$installed_directory")"
-            cp -a "$INSTALL_PREFIX/$installed_directory" \
-                "$backup_directory/$installed_directory"
-        fi
-    done
-    info "Backed up the installed stack to $backup_directory"
-
-    info "Installing tmux $TMUX_VERSION and Byobu $BYOBU_VERSION..."
-    make -C "$tmux_source" install
-    make -C "$byobu_source" install
+    publish_staged_directory \
+        "$GENERATION_ROOT" "$GENERATION_ID" "$PAYLOAD_DIRECTORY"
+    remove_managed_tree "$GENERATION_ROOT" "$PUBLICATION_STAGING"
+    PUBLICATION_STAGING=""
+    info "Published multiplexer generation $GENERATION_ID"
 else
-    info "tmux $TMUX_VERSION and Byobu $BYOBU_VERSION are already installed"
+    info "Multiplexer generation is already verified"
 fi
 
-update_plugins() {
-    local tpm_directory="$PLUGIN_ROOT/tpm"
-    install -d -m 0755 "$PLUGIN_ROOT"
-
-    for plugin_directory in "$PLUGIN_ROOT"/*; do
-        [[ -d "$plugin_directory/.git" ]] || continue
-        if [[ -n "$(git -C "$plugin_directory" status --porcelain)" ]]; then
-            error "Plugin repository has local changes: $plugin_directory"
-            return 1
-        fi
-    done
-
-    if [[ -d "$tpm_directory/.git" ]]; then
-        git -C "$tpm_directory" remote set-url origin \
-            https://github.com/tmux-plugins/tpm.git
-        git -C "$tpm_directory" pull --ff-only
-    elif [[ -e "$tpm_directory" ]]; then
-        error "TPM path exists but is not a Git checkout: $tpm_directory"
-        return 1
-    else
-        git clone https://github.com/tmux-plugins/tpm.git "$tpm_directory"
-    fi
-
-    TMUX_PLUGIN_MANAGER_PATH="$PLUGIN_ROOT/" \
-        "$tpm_directory/bin/install_plugins"
-    TMUX_PLUGIN_MANAGER_PATH="$PLUGIN_ROOT/" \
-        "$tpm_directory/bin/update_plugins" all
-}
-
-info "Updating TPM and configured plugins..."
-update_plugins
-
-installed_tmux_output=$("$INSTALL_PREFIX/bin/tmux" -V)
-installed_byobu_output=$(
-    BYOBU_PREFIX="$INSTALL_PREFIX" "$INSTALL_PREFIX/bin/byobu" --version
+ACTIVATION_ARGUMENTS=(
+    --state-root "$MULTIPLEXER_STATE_ROOT"
+    --install-prefix "$INSTALL_PREFIX"
+    --generation "$GENERATION_ID"
 )
-if [[ "$installed_tmux_output" != "tmux $TMUX_VERSION" ]]; then
-    error "Installed tmux version mismatch: $installed_tmux_output"
+if [ "$FORCE" = "true" ]; then
+    ACTIVATION_ARGUMENTS+=(--force)
+fi
+python3 "$DOTFILES/lib/multiplexer-publication.py" \
+    "${ACTIVATION_ARGUMENTS[@]}"
+
+info "Updating TPM and configured plugins as one plugin-root transaction..."
+update_multiplexer_plugins \
+    "$PLUGIN_ROOT" "$DOTFILES_TPM_ORIGIN" "$DOTFILES_TPM_COMMIT"
+
+INSTALLED_TMUX_OUTPUT=$("$INSTALL_PREFIX/bin/tmux" -V)
+INSTALLED_BYOBU_OUTPUT=$(
+    BYOBU_PREFIX="$INSTALL_PREFIX" \
+        PATH="$INSTALL_PREFIX/bin:/usr/bin:/bin" \
+        "$INSTALL_PREFIX/bin/byobu" --version
+)
+if [ "$INSTALLED_TMUX_OUTPUT" != "tmux $TMUX_VERSION" ]; then
+    error "Installed tmux version mismatch: $INSTALLED_TMUX_OUTPUT"
     exit 1
 fi
-if ! grep -qx "byobu version $BYOBU_VERSION" <<< "$installed_byobu_output"; then
+if ! printf '%s\n' "$INSTALLED_BYOBU_OUTPUT" |
+        grep -qx "byobu version $BYOBU_VERSION"; then
     error "Installed Byobu version mismatch"
     exit 1
 fi
 
-staged_tmux="$INSTALL_PREFIX/bin/tmux"
-direct_socket="multiplexer-installed-tmux-$$"
-smoke_test_tmux "$staged_tmux" "$direct_socket" "$TMUX_VERSION"
-direct_socket=""
+STAGED_TMUX="$INSTALL_PREFIX/bin/tmux"
+DIRECT_SOCKET="multiplexer-installed-tmux-$$"
+smoke_test_tmux "$STAGED_TMUX" "$DIRECT_SOCKET" "$TMUX_VERSION"
+DIRECT_SOCKET=""
 
-byobu_socket="multiplexer-installed-byobu-$$"
+BYOBU_SOCKET="multiplexer-installed-byobu-$$"
 BYOBU_PREFIX="$INSTALL_PREFIX" \
     PATH="$INSTALL_PREFIX/bin:/usr/bin:/bin" \
-    "$INSTALL_PREFIX/bin/byobu" -L "$byobu_socket" \
+    "$INSTALL_PREFIX/bin/byobu" -L "$BYOBU_SOCKET" \
     new-session -d -s smoke 'sleep 30'
-installed_byobu_tmux_version=$(
-    "$INSTALL_PREFIX/bin/tmux" -L "$byobu_socket" display-message -p '#{version}'
+INSTALLED_BYOBU_TMUX_VERSION=$(
+    "$INSTALL_PREFIX/bin/tmux" -L "$BYOBU_SOCKET" \
+        display-message -p '#{version}'
 )
-if [[ "$installed_byobu_tmux_version" != "$TMUX_VERSION" ]]; then
-    error "Installed Byobu used tmux $installed_byobu_tmux_version"
+if [ "$INSTALLED_BYOBU_TMUX_VERSION" != "$TMUX_VERSION" ]; then
+    error "Installed Byobu used tmux $INSTALLED_BYOBU_TMUX_VERSION"
     exit 1
 fi
-"$INSTALL_PREFIX/bin/tmux" -L "$byobu_socket" kill-server
-byobu_socket=""
+"$INSTALL_PREFIX/bin/tmux" -L "$BYOBU_SOCKET" kill-server
+BYOBU_SOCKET=""
 
-info "Installed tmux $TMUX_VERSION, Byobu $BYOBU_VERSION, and current plugins"
+info "Activated tmux $TMUX_VERSION, Byobu $BYOBU_VERSION, pinned TPM, and updated plugins"

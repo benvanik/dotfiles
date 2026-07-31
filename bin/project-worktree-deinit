@@ -1,0 +1,163 @@
+#!/bin/bash
+# Safely remove a sibling Git worktree using the <project>/main layout.
+
+set -euo pipefail
+
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../lib/project-worktrees.sh
+. "$SCRIPT_DIR/../lib/project-worktrees.sh"
+
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+info() { printf "${GREEN}[project-worktree]${NC} %s\n" "$1"; }
+error() { printf "${RED}[project-worktree]${NC} %s\n" "$1" >&2; }
+
+show_help() {
+    cat << 'EOF'
+project-worktree-deinit - Remove a sibling Git worktree
+
+USAGE
+    project-worktree-deinit <name>
+
+The command must be run from another worktree in the same repository. Git
+itself can delete ignored payload while removing a worktree, so this wrapper
+refuses modified, untracked, or ignored files, stops the associated tmux
+session, and repeats the full check before removal. No build directories or
+project configuration are removed separately.
+EOF
+}
+
+case "${1:-}" in
+    -h|--help)
+        show_help
+        exit 0
+        ;;
+esac
+
+if [ $# -ne 1 ]; then
+    show_help >&2
+    exit 1
+fi
+
+WORKTREE_NAME="$1"
+if [[ ! "$WORKTREE_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || \
+        [ "$WORKTREE_NAME" = "." ] || [ "$WORKTREE_NAME" = ".." ]; then
+    error "Invalid worktree name: $WORKTREE_NAME"
+    exit 1
+fi
+
+if [ "$WORKTREE_NAME" = "main" ]; then
+    error "The primary main worktree cannot be removed."
+    exit 1
+fi
+
+if ! CURRENT_WORKTREE=$(git rev-parse --show-toplevel 2>/dev/null); then
+    error "Run this command from inside another Git worktree."
+    exit 1
+fi
+
+if ! MAIN_WORKTREE=$(project_main_worktree "$CURRENT_WORKTREE"); then
+    error "No primary worktree named 'main' is registered for this repository."
+    exit 1
+fi
+
+if [ "$(basename "$MAIN_WORKTREE")" != "main" ]; then
+    error "The main worktree must be named 'main': $MAIN_WORKTREE"
+    exit 1
+fi
+
+PROJECT_ROOT=$(dirname "$MAIN_WORKTREE")
+WORKTREE_PATH="$PROJECT_ROOT/$WORKTREE_NAME"
+CURRENT_DIRECTORY=$(pwd -P)
+
+case "$CURRENT_DIRECTORY/" in
+    "$WORKTREE_PATH/"*)
+        error "Cannot remove the worktree containing the current directory."
+        error "Run this command from $MAIN_WORKTREE or another worktree."
+        exit 1
+        ;;
+esac
+
+REGISTERED=false
+while IFS= read -r -d '' line; do
+    if [ "$line" = "worktree $WORKTREE_PATH" ]; then
+        REGISTERED=true
+        break
+    fi
+done < <(git -C "$MAIN_WORKTREE" worktree list --porcelain -z)
+
+if [ "$REGISTERED" != "true" ]; then
+    error "Not a registered worktree: $WORKTREE_PATH"
+    exit 1
+fi
+
+SESSION_NAME=$(project_default_session_name "$WORKTREE_PATH")
+info "Removing worktree: $WORKTREE_PATH"
+
+restore_managed_override() {
+    if [ "$MANAGED_OVERRIDE" = "true" ]; then
+        ln -s "../main/AGENTS.override.md" \
+            "$WORKTREE_PATH/AGENTS.override.md"
+    fi
+}
+
+inspect_worktree_contents() {
+    local worktree_status
+    if ! worktree_status=$(
+        git -C "$WORKTREE_PATH" status \
+            --porcelain=v1 \
+            --untracked-files=all \
+            --ignored=matching
+    ); then
+        error "Could not inspect worktree contents."
+        return 1
+    fi
+    if [ -n "$worktree_status" ]; then
+        error "Worktree contains modified, untracked, or ignored files:"
+        printf '%s\n' "$worktree_status" >&2
+        return 1
+    fi
+}
+
+# The initializer owns this exact symlink. Remove it before asking Git to
+# evaluate cleanliness, restoring it if any other state blocks removal.
+MANAGED_OVERRIDE=false
+if [ -L "$WORKTREE_PATH/AGENTS.override.md" ] && \
+        [ "$(readlink "$WORKTREE_PATH/AGENTS.override.md")" = "../main/AGENTS.override.md" ]; then
+    unlink "$WORKTREE_PATH/AGENTS.override.md"
+    MANAGED_OVERRIDE=true
+fi
+
+# Git's worktree remover ignores ignored files during its cleanliness check
+# and then deletes them recursively. Refuse every remaining payload class so
+# build trees, local issue state, and caches cannot disappear silently.
+if ! inspect_worktree_contents; then
+    restore_managed_override
+    error "Worktree removal stopped; managed state was restored."
+    exit 1
+fi
+
+# Quiesce the exact associated session before the final inspection. A running
+# shell, agent, or build can otherwise create ignored payload after the first
+# clean check and Git will delete it as part of worktree removal.
+if ! "$SCRIPT_DIR/project-deinit" \
+        --session "$SESSION_NAME" --tmux-only --yes "$MAIN_WORKTREE"; then
+    restore_managed_override
+    error "Could not stop the associated session; managed state was restored."
+    exit 1
+fi
+if ! inspect_worktree_contents; then
+    restore_managed_override
+    error "Worktree changed while its session stopped; managed state was restored."
+    exit 1
+fi
+
+if ! git -C "$MAIN_WORKTREE" worktree remove "$WORKTREE_PATH"; then
+    restore_managed_override
+    error "Worktree removal failed; worktree contents were preserved."
+    exit 1
+fi
+
+info "Removed worktree: $WORKTREE_PATH"

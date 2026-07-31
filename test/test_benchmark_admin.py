@@ -833,7 +833,12 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
         self.assertEqual(intent["phase"], "prepared")
         self.assertEqual(intent["prior_digest"], prior_digest)
 
-        recovered = self.fixture.new_admin().install(
+        retry_runner = FakeRunner()
+        retry_maintenance = FakeMaintenance()
+        recovered = self.fixture.new_admin(
+            runner=retry_runner,
+            maintenance=retry_maintenance,
+        ).install(
             configuration_source=None,
             user_name="ben",
         )
@@ -843,6 +848,25 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
         self.assertEqual(
             os.readlink(self.fixture.mapped(CURRENT_SELECTOR)),
             f"generations/{recovered}",
+        )
+        stop_index = retry_runner.commands.index(
+            (
+                "/usr/bin/systemctl",
+                "stop",
+                "benchmarkd.service",
+            )
+        )
+        start_index = retry_runner.commands.index(
+            (
+                "/usr/bin/systemctl",
+                "start",
+                "benchmarkd.service",
+            )
+        )
+        self.assertLess(stop_index, start_index)
+        self.assertEqual(
+            retry_maintenance.events,
+            [("enter", True), ("exit", True)],
         )
 
     def test_sigkill_after_fresh_target_start_recovers_stopped_install(
@@ -1266,30 +1290,16 @@ class BenchmarkAdminUninstallTest(unittest.TestCase):
         self.assertFalse(self.fixture.mapped(INSTALL_ROOT).exists())
         self.assertEqual(
             self.fixture.maintenance.events,
-            [
-                ("enter", True),
-                ("exit", True),
-                ("enter", True),
-                ("exit", True),
-            ],
+            [("enter", True), ("exit", True)],
         )
         self.assertIn(stop_command, self.fixture.runner.commands)
-        self.assertLess(
-            self.fixture.timeline.index(
-                (
-                    "command",
-                    (
-                        "/usr/bin/systemctl",
-                        "start",
-                        "benchmarkd.service",
-                    ),
-                )
+        self.assertNotIn(
+            (
+                "/usr/bin/systemctl",
+                "start",
+                "benchmarkd.service",
             ),
-            self.fixture.timeline.index(("maintenance-enter", True)),
-        )
-        self.assertLess(
-            self.fixture.timeline.index(("maintenance-enter", True)),
-            self.fixture.timeline.index(("command", stop_command)),
+            self.fixture.runner.commands,
         )
 
     def test_uninstall_publication_interruption_promotes_the_fixed_journal(
@@ -1331,12 +1341,7 @@ class BenchmarkAdminUninstallTest(unittest.TestCase):
         self.assertFalse(self.fixture.mapped(INSTALL_ROOT).exists())
         self.assertEqual(
             self.fixture.maintenance.events,
-            [
-                ("enter", True),
-                ("exit", True),
-                ("enter", True),
-                ("exit", True),
-            ],
+            [("enter", True), ("exit", True)],
         )
 
     def test_exact_partial_uninstall_journal_is_recoverable_under_strict_umask(

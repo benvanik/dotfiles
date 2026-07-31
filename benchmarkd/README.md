@@ -177,13 +177,19 @@ an unreachable or unhealthy broker makes upgrade and uninstall fail. Restore
 the current generation and service to health, allow active and queued work to
 finish, and retry.
 
+Once a prepared intent is durable, it records that broker maintenance already
+observed an empty scheduler. The administrator flock and every fixed journal
+name continue to fence admission after the maintenance connection disappears.
+Recovery can therefore stop the socket and service synchronously and advance
+to `stopped` without executing the old broker again.
+
 Uninstall has one narrower recovery authority. While holding maintenance it
 publishes a root-owned write-ahead intent before stopping the broker. If that
 prepared operation is interrupted, any publication staging name or committed
-intent is a permanent broker admission fence. Retry may start the exact
-recorded generation for status and root maintenance, but that generation
-cannot admit work before the retry stops it. Only a durably recorded `stopped`
-transition permits filesystem removal without a broker socket.
+intent is a permanent broker admission fence. Retry revalidates the recorded
+projection and generation inventory, stops the service, and advances the exact
+intent. Only a durably recorded `stopped` transition permits filesystem
+removal without a broker socket.
 
 Generation deletion uses its own manifest-hard-link journal and retired-tree
 name, so interruption after any individual file or directory removal remains

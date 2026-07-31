@@ -1071,16 +1071,11 @@ class BenchmarkAdmin:
             )
         )
 
-    def _activate_current_service(
-        self,
-        *,
-        status_client: pathlib.Path | None = None,
-    ) -> None:
+    def _activate_current_service(self) -> None:
         """Start the broker to readiness before probing its protocol."""
 
         self._start_current_service()
-        client = self.layout.client if status_client is None else status_client
-        self.runner.run((os.fspath(client), "--status"))
+        self.runner.run((os.fspath(self.layout.client), "--status"))
 
     def _generation_client(self, digest: str) -> pathlib.Path:
         return self.layout.generations / digest / "bin/benchmark-lock"
@@ -1097,25 +1092,14 @@ class BenchmarkAdmin:
         intent: InstallIntent,
         projection: InstallationProjection,
     ) -> InstallIntent:
-        """Restore a prepared prior, then stop it under broker maintenance."""
+        """Synchronously stop the prior under the recorded empty-scheduler fence."""
 
         if intent.phase != "prepared":
             raise AssertionError("prepared install recovery has the wrong phase")
         projection.require_exact_prior()
-        if intent.prior_digest is None:
-            return self.journal.transition_install(intent, phase="stopped")
-
-        self.runner.run(("/usr/bin/systemctl", "daemon-reload"))
-        self._start_current_service()
-        with self.maintenance.hold(installed=True):
-            self.runner.run(
-                (
-                    os.fspath(self._generation_client(intent.prior_digest)),
-                    "--status",
-                )
-            )
+        if intent.prior_digest is not None:
             self._stop_for_install()
-            return self.journal.transition_install(intent, phase="stopped")
+        return self.journal.transition_install(intent, phase="stopped")
 
     def _complete_install_rollback(
         self,
@@ -1682,25 +1666,7 @@ class BenchmarkAdmin:
             if intent.phase == "prepared":
                 self._require_uninstall_source(intent)
                 if intent.current_digest is not None:
-                    status_client = (
-                        self.layout.generations
-                        / intent.current_digest
-                        / "bin/benchmark-lock"
-                    )
-                    self._activate_current_service(status_client=status_client)
-                    with self.maintenance.hold(installed=True):
-                        self._stop_for_uninstall()
-                        intent = self.journal.transition_uninstall(
-                            intent,
-                            phase="stopped",
-                        )
-                        self._complete_uninstall(intent)
-                    self.report(
-                        "removed benchmarkd software; retained "
-                        f"{CONFIG_PATH}, {STATE_DIRECTORY}, and the "
-                        "benchmark system group"
-                    )
-                    return
+                    self._stop_for_uninstall()
                 intent = self.journal.transition_uninstall(
                     intent,
                     phase="stopped",

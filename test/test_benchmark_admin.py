@@ -139,6 +139,20 @@ class FakeMaintenance:
             self.timeline.append(("maintenance-exit", installed))
 
 
+class RejectingMaintenance:
+    def __init__(self) -> None:
+        self.entries: list[bool] = []
+
+    @contextlib.contextmanager
+    def hold(self, *, installed: bool):
+        self.entries.append(installed)
+        raise BenchmarkLockError(
+            "injected busy benchmark scheduler",
+            code="maintenance_busy",
+        )
+        yield
+
+
 class FakeAccounts:
     def __init__(self, group_id: int) -> None:
         self._group_id = group_id
@@ -691,6 +705,44 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
         self.assertLess(maintenance_enters[1], timeline_status)
         self.assertLess(timeline_status, maintenance_exits[1])
 
+    def test_upgrade_requires_empty_scheduler_before_building_generation(
+        self,
+    ) -> None:
+        digest = self.fixture.install()
+        launcher = self.fixture.source_root / "benchmarkd/bin/benchmarkd"
+        launcher.write_bytes(launcher.read_bytes() + b"\n")
+        maintenance = RejectingMaintenance()
+        admin = self.fixture.new_admin(maintenance=maintenance)
+
+        with (
+            mock.patch("benchmark_lock.admin.build_generation") as build,
+            mock.patch.object(
+                admin.generation_store,
+                "verify",
+            ) as verify_generation,
+            mock.patch.object(
+                admin,
+                "_prepare_layout",
+            ) as prepare_layout,
+            self.assertRaisesRegex(
+                BenchmarkLockError,
+                "busy benchmark scheduler",
+            ),
+        ):
+            admin.install(
+                configuration_source=None,
+                user_name="ben",
+            )
+
+        build.assert_not_called()
+        verify_generation.assert_not_called()
+        prepare_layout.assert_not_called()
+        self.assertEqual(maintenance.entries, [True])
+        self.assertEqual(
+            self.fixture.admin.generation_store.inventory_digests(),
+            (digest,),
+        )
+
     def test_reinstalling_current_generation_does_not_interrupt_service(
         self,
     ) -> None:
@@ -704,7 +756,10 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
         )
 
         self.assertEqual(observed, digest)
-        self.assertEqual(self.fixture.maintenance.events, [])
+        self.assertEqual(
+            self.fixture.maintenance.events,
+            [("enter", True), ("exit", True)],
+        )
         self.assertNotIn(
             ("/usr/bin/systemctl", "stop", "benchmarkd.socket"),
             self.fixture.runner.commands,
@@ -1153,7 +1208,10 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
             old_socket_unit,
         )
         self.assertEqual(len(self.fixture.runner.commands), command_count)
-        self.assertEqual(self.fixture.maintenance.events, [])
+        self.assertEqual(
+            self.fixture.maintenance.events,
+            [("enter", True), ("exit", True)],
+        )
 
     def test_fresh_install_refuses_projection_without_current_generation(
         self,
@@ -1215,6 +1273,36 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
 class BenchmarkAdminUninstallTest(unittest.TestCase):
     def setUp(self) -> None:
         self.fixture = AdminFixture(self)
+
+    def test_uninstall_requires_empty_scheduler_before_generation_scan(
+        self,
+    ) -> None:
+        self.fixture.install()
+        maintenance = RejectingMaintenance()
+        admin = self.fixture.new_admin(maintenance=maintenance)
+        self.fixture.runner.commands.clear()
+
+        with (
+            mock.patch.object(
+                admin.generation_store,
+                "verify",
+            ) as verify_generation,
+            mock.patch.object(
+                admin.generation_store,
+                "require_quiescent",
+            ) as scan_generations,
+            self.assertRaisesRegex(
+                BenchmarkLockError,
+                "busy benchmark scheduler",
+            ),
+        ):
+            admin.uninstall()
+
+        verify_generation.assert_not_called()
+        scan_generations.assert_not_called()
+        self.assertEqual(maintenance.entries, [True])
+        self.assertEqual(self.fixture.runner.commands, [])
+        self.assertTrue(self.fixture.mapped(CURRENT_SELECTOR).exists())
 
     def test_uninstall_removes_only_verified_software_and_retains_state(self) -> None:
         self.fixture.install()
@@ -1627,7 +1715,10 @@ class BenchmarkAdminUninstallTest(unittest.TestCase):
             self.fixture.admin.uninstall()
 
         self.assertEqual(self.fixture.runner.commands, [])
-        self.assertEqual(self.fixture.maintenance.events, [])
+        self.assertEqual(
+            self.fixture.maintenance.events,
+            [("enter", True), ("exit", True)],
+        )
         self.assertTrue(self.fixture.mapped(CURRENT_SELECTOR).exists())
 
     def test_uninstall_requires_a_complete_projection_before_commit(self) -> None:
@@ -1640,7 +1731,10 @@ class BenchmarkAdminUninstallTest(unittest.TestCase):
             self.fixture.admin.uninstall()
 
         self.assertEqual(self.fixture.runner.commands, [])
-        self.assertEqual(self.fixture.maintenance.events, [])
+        self.assertEqual(
+            self.fixture.maintenance.events,
+            [("enter", True), ("exit", True)],
+        )
         self.assertFalse(os.path.lexists(self.fixture.mapped(UNINSTALL_INTENT_PATH)))
         self.assertTrue(self.fixture.mapped(CURRENT_SELECTOR).exists())
 
@@ -1670,7 +1764,10 @@ class BenchmarkAdminUninstallTest(unittest.TestCase):
             self.fixture.admin.uninstall()
 
         self.assertEqual(self.fixture.runner.commands, [])
-        self.assertEqual(self.fixture.maintenance.events, [])
+        self.assertEqual(
+            self.fixture.maintenance.events,
+            [("enter", True), ("exit", True)],
+        )
         self.assertTrue(self.fixture.mapped(CURRENT_SELECTOR).exists())
 
     def test_uninstall_refuses_projection_without_current_generation(self) -> None:

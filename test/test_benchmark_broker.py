@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import os
 import pathlib
 import queue
@@ -169,6 +170,43 @@ class FakePolicy:
     def leave(self) -> None:
         self.leaves += 1
         self.state = "idle"
+
+
+class FakeAdmissionFence:
+    def __init__(self, *, active: bool = False) -> None:
+        self.active = active
+        self.observation_depth = 0
+
+    def refresh(self) -> bool:
+        return self.active
+
+    @contextlib.contextmanager
+    def hold_observation(self):
+        self.observation_depth += 1
+        try:
+            yield self.active
+        finally:
+            self.observation_depth -= 1
+
+
+class FenceAssertingScheduler(LeaseScheduler):
+    def __init__(self, fence: FakeAdmissionFence) -> None:
+        super().__init__()
+        self.fence = fence
+        self.admission_observed = False
+        self.activation_observed = False
+
+    def admit(self, **arguments):
+        if self.fence.observation_depth != 1:
+            raise AssertionError("admission escaped administrator observation")
+        self.admission_observed = True
+        return super().admit(**arguments)
+
+    def activate(self, lease_id: str, *, now: float) -> Lease:
+        if self.fence.observation_depth != 1:
+            raise AssertionError("activation escaped administrator observation")
+        self.activation_observed = True
+        return super().activate(lease_id, now=now)
 
 
 class FakePersistence:
@@ -352,6 +390,50 @@ class BenchmarkBrokerTest(unittest.TestCase):
         )
         self.wait_until(lambda: not self.fixture.broker.scheduler.snapshot.queued)
         connection.close()
+
+    def test_admission_and_grant_hold_shared_administrator_authority(
+        self,
+    ) -> None:
+        fence = FakeAdmissionFence()
+        scheduler = FenceAssertingScheduler(fence)
+        fixture = BrokerFixture(
+            scheduler=scheduler,
+            admission_fence=fence,
+        )
+        self.addCleanup(fixture.close)
+        connection = fixture.connect()
+        self.addCleanup(connection.close)
+
+        send_request(connection, AcquireRequest("linearized"))
+        self.assertIsInstance(receive_event(connection), QueuedEvent)
+        self.assertIsInstance(receive_event(connection), GrantedEvent)
+        self.assertTrue(scheduler.admission_observed)
+        self.assertTrue(scheduler.activation_observed)
+        self.assertEqual(fence.observation_depth, 0)
+
+    def test_administrator_winning_after_preflight_prevents_grant(self) -> None:
+        fence = FakeAdmissionFence()
+        fixture = BrokerFixture(admission_fence=fence)
+        self.addCleanup(fixture.close)
+        connection = fixture.connect()
+        self.addCleanup(connection.close)
+        administrator_won = threading.Event()
+
+        def begin_administration() -> None:
+            fence.active = True
+            administrator_won.set()
+
+        fixture.policy.enter_callback = begin_administration
+
+        send_request(connection, AcquireRequest("administrator-wins"))
+        self.assertIsInstance(receive_event(connection), QueuedEvent)
+        self.assertTrue(administrator_won.wait(3))
+        self.wait_until(lambda: fixture.broker.scheduler.snapshot.preparing is not None)
+        self.assertIsNone(fixture.broker.scheduler.snapshot.active)
+
+        fence.active = False
+        self.assertIsInstance(receive_event(connection), GrantedEvent)
+        self.assertIsNotNone(fixture.broker.scheduler.snapshot.active)
 
     def test_socket_hup_after_grant_does_not_release_live_process(self) -> None:
         active_connection = self.fixture.connect()
@@ -537,12 +619,8 @@ class BenchmarkBrokerTest(unittest.TestCase):
         self.assertEqual(connections[-1].recv(1), b"")
 
     def test_root_maintenance_is_bound_to_the_request_channel(self) -> None:
-        admission_fenced = False
-
-        def refresh_admission_fence() -> bool:
-            return admission_fenced
-
-        self.fixture.broker.admission_fence = refresh_admission_fence
+        admission_fence = FakeAdmissionFence()
+        self.fixture.broker.admission_fence = admission_fence
         server, client = socket.socketpair(
             socket.AF_UNIX,
             socket.SOCK_SEQPACKET,
@@ -567,7 +645,7 @@ class BenchmarkBrokerTest(unittest.TestCase):
             self.fixture.broker.scheduler.snapshot.maintenance_owner,
             PeerIdentity(pid=123, uid=0, gid=0),
         )
-        admission_fenced = True
+        admission_fence.active = True
         client.close()
         self.fixture.broker._channel_ready(ticket)
         self.assertIsNone(self.fixture.broker.scheduler.snapshot.maintenance_owner)
@@ -673,15 +751,12 @@ class BenchmarkBrokerTest(unittest.TestCase):
             ),
             connection=server,
         )
-        fence_active = True
-
-        def refresh_fence() -> bool:
-            return fence_active
+        admission_fence = FakeAdmissionFence(active=True)
 
         fixture = BrokerFixture(
             scheduler=scheduler,
             recovered_tickets=(recovered,),
-            admission_fence=refresh_fence,
+            admission_fence=admission_fence,
         )
         self.addCleanup(fixture.close)
         self.addCleanup(client.close)
@@ -700,7 +775,7 @@ class BenchmarkBrokerTest(unittest.TestCase):
             (lease,),
         )
 
-        fence_active = False
+        admission_fence.active = False
         self.assertEqual(
             receive_event(client),
             GrantedEvent(lease.lease_id, fixture.policy.identity),

@@ -991,7 +991,9 @@ class BenchmarkAdmin:
                 code="benchmark_admin_layout_invalid",
             )
 
-    def _current_digest(self) -> str | None:
+    def _current_selector_digest(self) -> str | None:
+        """Read the validated current selector without traversing its generation."""
+
         if not os.path.lexists(self.layout.current):
             return None
         try:
@@ -1018,7 +1020,12 @@ class BenchmarkAdmin:
                 "current benchmark generation selector is invalid",
                 code="benchmark_admin_layout_invalid",
             )
-        self.generation_store.verify(digest)
+        return digest
+
+    def _current_digest(self) -> str | None:
+        digest = self._current_selector_digest()
+        if digest is not None:
+            self.generation_store.verify(digest)
         return digest
 
     def _has_live_projection(self) -> bool:
@@ -1296,72 +1303,85 @@ class BenchmarkAdmin:
             if configuration_source is None
             else self._read_config_source(configuration_source)
         )
-        generation = build_generation(self.source_root)
-        self._prepare_layout()
-        self.journal.require_mutually_exclusive()
-        if self._has_uninstall_state():
-            raise _admin_error(
-                "benchmarkd has a committed uninstall transaction; "
-                "run benchmark-admin uninstall to complete it",
-                code="benchmark_admin_uninstall_pending",
-            )
-        if self.journal.has_install_state():
-            raise _admin_error(
-                "benchmarkd install state appeared while its administrator "
-                "lock was held",
-                code="benchmark_admin_install_invalid",
-            )
-        self._require_no_install_stages()
-        prior_digest = self._current_digest()
-        if prior_digest is None and self._has_live_projection():
+        selected_prior_digest = self._current_selector_digest()
+        if selected_prior_digest is None and self._has_live_projection():
             raise _admin_error(
                 "benchmarkd has a live projection without a current generation; "
                 "restore the installed selector before installing",
                 code="benchmark_admin_layout_invalid",
             )
-        self._install_configuration(requested_configuration)
-        self._require_epoch_security()
-        self.generation_store.publish(generation)
-        if prior_digest == generation.digest:
+        maintenance = (
+            contextlib.nullcontext()
+            if selected_prior_digest is None
+            else self.maintenance.hold(installed=True)
+        )
+        with maintenance:
+            self._prepare_layout()
+            self.journal.require_mutually_exclusive()
+            if self._has_uninstall_state():
+                raise _admin_error(
+                    "benchmarkd has a committed uninstall transaction; "
+                    "run benchmark-admin uninstall to complete it",
+                    code="benchmark_admin_uninstall_pending",
+                )
+            if self.journal.has_install_state():
+                raise _admin_error(
+                    "benchmarkd install state appeared while its administrator "
+                    "lock was held",
+                    code="benchmark_admin_install_invalid",
+                )
+            self._require_no_install_stages()
+            prior_digest = self._current_digest()
+            if prior_digest != selected_prior_digest:
+                raise _admin_error(
+                    "current benchmark generation changed while the "
+                    "administrator lock was held",
+                    code="benchmark_admin_layout_invalid",
+                )
+            generation = build_generation(self.source_root)
+            self._install_configuration(requested_configuration)
+            self._require_epoch_security()
+            self.generation_store.publish(generation)
+            if prior_digest == generation.digest:
+                projection = self._installation_projection(
+                    prior_digest=prior_digest,
+                    target_digest=generation.digest,
+                )
+                projection.require_exact_target()
+                self.runner.run(
+                    (
+                        "/usr/bin/systemd-sysusers",
+                        os.fspath(self.layout.sysusers),
+                    )
+                )
+                self.accounts.add_user(user_name)
+                self.runner.run(("/usr/bin/systemctl", "daemon-reload"))
+                self._activate_current_service()
+                self.report(
+                    f"benchmarkd generation {generation.digest} is already current; "
+                    f"new group membership for {user_name!r} takes effect at "
+                    "next login"
+                )
+                return generation.digest
+
+            intent = InstallIntent(
+                prior_digest=prior_digest,
+                target_digest=generation.digest,
+                user_name=user_name,
+                phase="prepared",
+            )
             projection = self._installation_projection(
                 prior_digest=prior_digest,
                 target_digest=generation.digest,
             )
-            projection.require_exact_target()
-            self.runner.run(
-                (
-                    "/usr/bin/systemd-sysusers",
-                    os.fspath(self.layout.sysusers),
-                )
-            )
-            self.accounts.add_user(user_name)
-            self.runner.run(("/usr/bin/systemctl", "daemon-reload"))
-            self._activate_current_service()
-            self.report(
-                f"benchmarkd generation {generation.digest} is already current; "
-                f"new group membership for {user_name!r} takes effect at next login"
-            )
-            return generation.digest
-
-        intent = InstallIntent(
-            prior_digest=prior_digest,
-            target_digest=generation.digest,
-            user_name=user_name,
-            phase="prepared",
-        )
-        projection = self._installation_projection(
-            prior_digest=prior_digest,
-            target_digest=generation.digest,
-        )
-        projection.require_exact_prior()
-        if prior_digest is None:
+            projection.require_exact_prior()
             self.journal.publish_install(intent)
-            intent = self.journal.transition_install(intent, phase="stopped")
-        else:
-            with self.maintenance.hold(installed=True):
-                self.journal.publish_install(intent)
+            if prior_digest is not None:
                 self._stop_for_install()
-                intent = self.journal.transition_install(intent, phase="stopped")
+            intent = self.journal.transition_install(
+                intent,
+                phase="stopped",
+            )
         self._complete_stopped_install(
             intent=intent,
             projection=projection,
@@ -1678,20 +1698,24 @@ class BenchmarkAdmin:
             )
             return
 
-        current_digest = self._current_digest()
-        if current_digest is None and self._has_live_projection():
+        selected_current_digest = self._current_selector_digest()
+        if selected_current_digest is None and self._has_live_projection():
             raise _admin_error(
                 "benchmarkd has a live projection without a current generation; "
                 "restore the installed selector before uninstalling",
                 code="benchmark_admin_layout_invalid",
             )
-        if current_digest is None and not os.path.lexists(self.layout.install_root):
+        if selected_current_digest is None and not os.path.lexists(
+            self.layout.install_root
+        ):
             self.report(
                 "benchmarkd software is already absent; retained "
                 f"{CONFIG_PATH}, {STATE_DIRECTORY}, and the benchmark system group"
             )
             return
-        if current_digest is None and not os.path.lexists(self.layout.generations):
+        if selected_current_digest is None and not os.path.lexists(
+            self.layout.generations
+        ):
             try:
                 with os.scandir(self.layout.install_root) as iterator:
                     remaining = tuple(entry.name for entry in iterator)
@@ -1713,29 +1737,40 @@ class BenchmarkAdmin:
                 f"{CONFIG_PATH}, {STATE_DIRECTORY}, and the benchmark system group"
             )
             return
-        generations = self.generation_store.require_quiescent()
-        installed = current_digest is not None
-        expected_external = (
-            ()
-            if current_digest is None
-            else self._external_file_payloads(self.layout.generations / current_digest)
-        )
-        if installed:
-            self._require_symlink(
-                self.layout.client,
-                os.fspath(INSTALL_ROOT / "current/bin/benchmark-lock"),
-            )
-        for destination, content, _description in expected_external:
-            self._require_removable_external_regular(
-                destination,
-                expected=content,
-            )
-        intent = UninstallIntent(
-            current_digest=current_digest,
-            generation_digests=tuple(generation.digest for generation in generations),
-            phase="prepared",
-        )
+        installed = selected_current_digest is not None
         with self.maintenance.hold(installed=installed):
+            current_digest = self._current_digest()
+            if current_digest != selected_current_digest:
+                raise _admin_error(
+                    "current benchmark generation changed while the "
+                    "administrator lock was held",
+                    code="benchmark_admin_layout_invalid",
+                )
+            generations = self.generation_store.require_quiescent()
+            expected_external = (
+                ()
+                if current_digest is None
+                else self._external_file_payloads(
+                    self.layout.generations / current_digest
+                )
+            )
+            if installed:
+                self._require_symlink(
+                    self.layout.client,
+                    os.fspath(INSTALL_ROOT / "current/bin/benchmark-lock"),
+                )
+            for destination, content, _description in expected_external:
+                self._require_removable_external_regular(
+                    destination,
+                    expected=content,
+                )
+            intent = UninstallIntent(
+                current_digest=current_digest,
+                generation_digests=tuple(
+                    generation.digest for generation in generations
+                ),
+                phase="prepared",
+            )
             self.journal.publish_uninstall(intent)
             if installed:
                 self._stop_for_uninstall()

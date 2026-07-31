@@ -9,7 +9,8 @@ import signal
 import socket
 import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import AbstractContextManager, contextmanager
 from typing import Protocol
 
 from .errors import BenchmarkLockError
@@ -135,7 +136,16 @@ Clock = Callable[[], float]
 Reporter = Callable[[str], None]
 OwnerSignaler = Callable[[int, int], None]
 OwnerWaiter = Callable[[int, float | None], bool]
-AdmissionFenceProbe = Callable[[], bool]
+
+
+class AdmissionFence(Protocol):
+    """Administrator state with an exact broker transition boundary."""
+
+    def refresh(self) -> bool:
+        """Observe current administration state without retaining authority."""
+
+    def hold_observation(self) -> AbstractContextManager[bool]:
+        """Hold shared authority while a broker transition is linearized."""
 
 
 def _ignore_report(_message: str) -> None:
@@ -203,7 +213,7 @@ class BenchmarkBroker:
         wait_owner: OwnerWaiter = wait_for_pidfd,
         monotonic: Clock = time.monotonic,
         report: Reporter = _ignore_report,
-        admission_fence: AdmissionFenceProbe | None = None,
+        admission_fence: AdmissionFence | None = None,
     ) -> None:
         self.listener = listener
         self.policy = policy
@@ -424,16 +434,17 @@ class BenchmarkBroker:
         if connection is None:
             return
         try:
-            self._refresh_admission_fence()
             request = receive_request(
                 connection,
                 expected_credentials=ticket.identity.credentials.as_tuple(),
             )
             if isinstance(request, StatusRequest):
+                self._refresh_admission_fence()
                 self._send_status(connection)
                 self._discard_unadmitted(ticket)
                 return
             if isinstance(request, MaintenanceRequest):
+                self._refresh_admission_fence()
                 maintenance_owner = PeerIdentity(
                     pid=ticket.identity.credentials.pid,
                     uid=ticket.identity.credentials.uid,
@@ -446,16 +457,17 @@ class BenchmarkBroker:
             if not isinstance(request, AcquireRequest):
                 raise AssertionError("protocol returned an unknown request")
             credentials = ticket.identity.credentials
-            lease = self.scheduler.admit(
-                peer=PeerIdentity(
-                    pid=credentials.pid,
-                    uid=credentials.uid,
-                    gid=credentials.gid,
-                ),
-                label=request.label,
-                inherited_lease_id=request.inherited_lease_id,
-                now=self.monotonic(),
-            )
+            with self._hold_admission_boundary():
+                lease = self.scheduler.admit(
+                    peer=PeerIdentity(
+                        pid=credentials.pid,
+                        uid=credentials.uid,
+                        gid=credentials.gid,
+                    ),
+                    label=request.label,
+                    inherited_lease_id=request.inherited_lease_id,
+                    now=self.monotonic(),
+                )
             ticket.lease = lease
             self._accepted.pop(connection.fileno(), None)
             self._tickets[lease.lease_id] = ticket
@@ -493,7 +505,16 @@ class BenchmarkBroker:
     def _refresh_admission_fence(self) -> None:
         if self.admission_fence is None:
             return
-        self.scheduler.set_admission_fence(self.admission_fence())
+        self.scheduler.set_admission_fence(self.admission_fence.refresh())
+
+    @contextmanager
+    def _hold_admission_boundary(self) -> Iterator[None]:
+        if self.admission_fence is None:
+            yield
+            return
+        with self.admission_fence.hold_observation() as fenced:
+            self.scheduler.set_admission_fence(fenced)
+            yield
 
     def _owner_ready(self, ticket: _Ticket) -> None:
         if ticket.identity.pid_descriptor < 0:
@@ -586,41 +607,44 @@ class BenchmarkBroker:
     def _activate_and_grant(self, ticket: _Ticket, preparing: Lease) -> bool:
         """Linearize a grant before or after every asynchronous stop request."""
 
-        if not hasattr(signal, "pthread_sigmask"):
-            raise BenchmarkLockError(
-                "atomic benchmark grant shutdown requires pthread_sigmask",
-                code="benchmark_platform_unsupported",
-            )
-        try:
-            prior_mask = signal.pthread_sigmask(
-                signal.SIG_BLOCK,
-                {signal.SIGINT, signal.SIGTERM},
-            )
-        except OSError as error:
-            raise BenchmarkLockError(
-                f"cannot block stop signals around benchmark grant: {error}",
-                code="benchmark_grant_failed",
-            ) from error
-        try:
-            with self._grant_boundary:
-                if self.stop_event.is_set():
-                    return False
-                active = self.scheduler.activate(
-                    preparing.lease_id,
-                    now=self.monotonic(),
+        with self._hold_admission_boundary():
+            if self.scheduler.snapshot.admission_fenced:
+                return False
+            if not hasattr(signal, "pthread_sigmask"):
+                raise BenchmarkLockError(
+                    "atomic benchmark grant shutdown requires pthread_sigmask",
+                    code="benchmark_platform_unsupported",
                 )
-                ticket.lease = active
-                self.persistence.retain_active(active)
-                self._send_grant(ticket, active)
-                return True
-        finally:
             try:
-                signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
+                prior_mask = signal.pthread_sigmask(
+                    signal.SIG_BLOCK,
+                    {signal.SIGINT, signal.SIGTERM},
+                )
             except OSError as error:
                 raise BenchmarkLockError(
-                    f"cannot restore stop signals after benchmark grant: {error}",
+                    f"cannot block stop signals around benchmark grant: {error}",
                     code="benchmark_grant_failed",
                 ) from error
+            try:
+                with self._grant_boundary:
+                    if self.stop_event.is_set():
+                        return False
+                    active = self.scheduler.activate(
+                        preparing.lease_id,
+                        now=self.monotonic(),
+                    )
+                    ticket.lease = active
+                    self.persistence.retain_active(active)
+                    self._send_grant(ticket, active)
+                    return True
+            finally:
+                try:
+                    signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
+                except OSError as error:
+                    raise BenchmarkLockError(
+                        f"cannot restore stop signals after benchmark grant: {error}",
+                        code="benchmark_grant_failed",
+                    ) from error
 
     def _send_grant(self, ticket: _Ticket, lease: Lease) -> None:
         if ticket.connection is None:

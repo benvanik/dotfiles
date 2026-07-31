@@ -11,7 +11,7 @@ import stat
 import sys
 import traceback
 from collections.abc import Callable
-from contextlib import contextmanager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Protocol
 
 from .administration_state import AdministrationAdmissionFence
@@ -102,6 +102,9 @@ class RuntimeAdmissionFence(Protocol):
 
     def refresh(self) -> bool:
         """Return whether new admissions and grants remain fenced."""
+
+    def hold_observation(self) -> AbstractContextManager[bool]:
+        """Hold shared authority across one broker admission or grant."""
 
     def close(self) -> None:
         """Release observation resources without changing root authority."""
@@ -568,7 +571,7 @@ def run_daemon(
                 signal_owner=signal_owner,
                 wait_owner=wait_owner,
                 report=report,
-                admission_fence=admission_fence.refresh,
+                admission_fence=admission_fence,
             )
             if lifecycle.termination_requested:
                 broker.request_clean_stop()

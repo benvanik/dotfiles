@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import os
 import pathlib
 import stat
+from collections.abc import Iterator
 
 from .errors import BenchmarkLockError
 
@@ -250,27 +252,36 @@ class AdministrationAdmissionFence:
             ) from error
         return True
 
-    def refresh(self) -> bool:
-        """Return whether admissions remain fenced at this instant."""
+    @contextlib.contextmanager
+    def hold_observation(self) -> Iterator[bool]:
+        """Observe the fence while excluding an administrator cutover."""
 
         if self._closed:
             raise _state_error("benchmark administration fence is closed")
         if not self._lock_shared_nonblocking():
-            return True
+            yield True
+            return
         try:
             if self._fence_reason is not None:
-                return True
-            try:
-                self._install_fenced = self._install_state_present()
-                if not self._uninstall_fenced:
-                    self._uninstall_fenced = self._uninstall_state_present()
-            except BenchmarkLockError as error:
-                self._install_fenced = True
-                self._uninstall_fenced = True
-                self._fence_reason = f"{error.code}: {error}"
-            return self._install_fenced or self._uninstall_fenced
+                yield True
+            else:
+                try:
+                    self._install_fenced = self._install_state_present()
+                    if not self._uninstall_fenced:
+                        self._uninstall_fenced = self._uninstall_state_present()
+                except BenchmarkLockError as error:
+                    self._install_fenced = True
+                    self._uninstall_fenced = True
+                    self._fence_reason = f"{error.code}: {error}"
+                yield self._install_fenced or self._uninstall_fenced
         finally:
             fcntl.flock(self._admin_lock_descriptor, fcntl.LOCK_UN)
+
+    def refresh(self) -> bool:
+        """Return whether admissions remain fenced at this instant."""
+
+        with self.hold_observation() as fenced:
+            return fenced
 
     @property
     def reason(self) -> str | None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import errno
 import io
 import os
@@ -186,6 +187,12 @@ class FakeAdmissionFence:
         if self.closed:
             raise AssertionError("closed admission fence was refreshed")
         return self.active
+
+    @contextlib.contextmanager
+    def hold_observation(self):
+        if self.closed:
+            raise AssertionError("closed admission fence was observed")
+        yield self.active
 
     def close(self) -> None:
         self.closed = True

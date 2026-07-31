@@ -136,6 +136,19 @@ class AdministrationAdmissionFenceTest(unittest.TestCase):
         self.assertFalse(fence.refresh())
         self.assertEqual(observed, [True])
 
+    def test_observation_authority_spans_the_callers_transition(self) -> None:
+        fence = self.fence()
+        contender = os.open(self.lock_path, os.O_RDWR | os.O_CLOEXEC)
+        self.addCleanup(os.close, contender)
+
+        with fence.hold_observation() as fenced:
+            self.assertFalse(fenced)
+            with self.assertRaises(BlockingIOError):
+                fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(contender, fcntl.LOCK_UN)
+
     def test_missing_or_unsafe_installation_state_fails_closed(self) -> None:
         self.install_root.rmdir()
         fence = self.fence()

@@ -159,18 +159,22 @@ Every install or uninstall takes an exclusive, root-owned mode-`0600` flock at
 restart, reboot, and software uninstall and remains writable inside the
 otherwise read-only service filesystem. Concurrent administrator commands wait
 instead of interleaving filesystem and systemd mutations. The broker observes
-that same inode under a short shared flock. If benchmarkd restarts while an
-administrator owns the exclusive lock, it becomes ready for status and root
-maintenance requests but cannot admit or grant benchmark work. A successful
-upgrade clears that crash-visible fence only after the administrator releases
-the exclusive lock.
+that same inode under a short shared flock retained through each scheduler
+admission and final active publication/grant. The shared broker transition and
+exclusive administrator acquisition therefore have one kernel-ordered
+boundary; a cached observation cannot open a grant race. If benchmarkd restarts
+while an administrator owns the exclusive lock, it becomes ready for status and
+root maintenance requests but cannot admit or grant benchmark work. A
+successful upgrade clears that crash-visible fence only after the administrator
+releases the exclusive lock.
 
 An upgrade or uninstall of an active installation also acquires the broker's
 root-only connection fence. It is granted only while no lease or waiter
-exists. Admission and recovered-FIFO grant paths honor both fences. If the
-maintenance channel disappears, the broker refreshes the crash-visible fence
-before releasing its connection owner, so a dying administrator cannot open
-an admission interval.
+exists. That empty-scheduler boundary precedes generation hashing, publication
+inventory traversal, and other substantive installed-operation work. Admission
+and recovered-FIFO grant paths honor both fences. If the maintenance channel
+disappears, the broker refreshes the crash-visible fence before releasing its
+connection owner, so a dying administrator cannot open an admission interval.
 
 There is no ad-hoc offline maintenance bypass. Before a mutation is committed,
 an unreachable or unhealthy broker makes upgrade and uninstall fail. Restore

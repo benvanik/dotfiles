@@ -3,15 +3,16 @@ from __future__ import annotations
 import errno
 import io
 import os
+import pathlib
 import signal
-import socket
+import subprocess
+import tempfile
 import unittest
-from types import SimpleNamespace
 from unittest import mock
 
 from benchmark_lock.client import (
+    AGENTS_MD_SNIPPET,
     LEASE_ENVIRONMENT_VARIABLE,
-    _connect_broker,
     main,
 )
 from benchmark_lock.errors import BenchmarkLockError
@@ -57,6 +58,11 @@ class BenchmarkClientTest(unittest.TestCase):
             (["--help"], 0, "usage: benchmark-lock"),
             ([], 2, "a foreground COMMAND is required"),
             (
+                ["--agents-md", "true"],
+                2,
+                "--agents-md cannot be combined",
+            ),
+            (
                 ["--status", "--label", "invalid"],
                 2,
                 "--status cannot be combined",
@@ -80,6 +86,66 @@ class BenchmarkClientTest(unittest.TestCase):
                     expected_text,
                     output.getvalue() + error.getvalue(),
                 )
+
+    def test_agents_md_is_exact_concise_and_never_connects(self) -> None:
+        output = RecordingStream()
+        error = RecordingStream()
+        with mock.patch("benchmark_lock.client._connect_broker") as connect:
+            status = main(
+                ["--agents-md"],
+                output=output,
+                error=error,
+                environment={},
+            )
+
+        self.assertEqual(status, 0)
+        connect.assert_not_called()
+        self.assertEqual(output.getvalue(), f"{AGENTS_MD_SNIPPET}\n")
+        self.assertEqual(error.getvalue(), "")
+        self.assertLessEqual(len(AGENTS_MD_SNIPPET.split()), 85)
+        for required_text in (
+            "[--label LABEL]",
+            "FIFO",
+            "exits or crashes",
+            "unwrapped host or GPU load",
+            "never nest `benchmark-lock`",
+            "--status",
+        ):
+            self.assertIn(required_text, output.getvalue())
+        for administrative_text in ("benchmark-admin", "doctor", "install", "sudo"):
+            self.assertNotIn(administrative_text, output.getvalue())
+
+    def test_repository_launcher_isolated_from_cwd_and_pythonpath(self) -> None:
+        repository_root = pathlib.Path(__file__).resolve().parents[1]
+        environment = dict(os.environ)
+        environment["PYTHONPATH"] = "/untrusted/python/path"
+        with tempfile.TemporaryDirectory() as working_directory:
+            result = subprocess.run(
+                [repository_root / "bin/benchmark-lock", "--agents-md"],
+                cwd=working_directory,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            help_result = subprocess.run(
+                [repository_root / "bin/benchmark-lock", "--help"],
+                cwd=working_directory,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, f"{AGENTS_MD_SNIPPET}\n")
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(help_result.returncode, 0, help_result.stderr)
+        self.assertIn(
+            "Broker setup and repair: ~/.dotfiles/bin/benchmark-admin --help",
+            help_result.stdout,
+        )
+        self.assertEqual(help_result.stderr, "")
 
     def test_status_is_allowed_inside_an_active_lease(self) -> None:
         connection = FakeConnection()
@@ -422,37 +488,6 @@ class BenchmarkClientTest(unittest.TestCase):
             error.getvalue(),
         )
         self.assertGreater(error.flush_count, 0)
-
-    def test_connect_uses_validated_root_seqpacket_endpoint(self) -> None:
-        connection = mock.Mock()
-        group = SimpleNamespace(gr_gid=742)
-        with (
-            mock.patch(
-                "benchmark_lock.client.grp.getgrnam",
-                return_value=group,
-            ) as get_group,
-            mock.patch("benchmark_lock.client.validate_root_socket_path") as validate,
-            mock.patch("benchmark_lock.client.require_root_peer") as require_root,
-            mock.patch(
-                "benchmark_lock.client.socket.socket",
-                return_value=connection,
-            ) as socket_factory,
-        ):
-            self.assertIs(_connect_broker(), connection)
-
-        get_group.assert_called_once_with("benchmark")
-        validate.assert_called_once()
-        self.assertEqual(
-            validate.call_args.kwargs["expected_group_id"],
-            742,
-        )
-        socket_factory.assert_called_once_with(
-            socket.AF_UNIX,
-            socket.SOCK_SEQPACKET | getattr(socket, "SOCK_CLOEXEC", 0),
-        )
-        connection.set_inheritable.assert_called_once_with(False)
-        connection.connect.assert_called_once()
-        require_root.assert_called_once_with(connection)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import io
 import json
 import os
@@ -17,7 +18,6 @@ from unittest import mock
 from benchmark_lock.admin import (
     ADMIN_LOCK_PATH,
     BENCHMARK_GROUP_NAME,
-    CLIENT_PATH,
     CONFIG_PATH,
     CONTROL_SOCKET_PATH,
     CURRENT_SELECTOR,
@@ -45,6 +45,9 @@ from benchmark_lock.fdstore import (
     CONTROL_DESCRIPTOR_NAME,
     FILE_DESCRIPTOR_STORE_MAX,
 )
+
+
+FORBIDDEN_SYSTEM_CLIENT_PATH = pathlib.Path("/usr/local/bin/benchmark-lock")
 
 
 def _configuration(*, unique_id: str = "4610468131039e0") -> bytes:
@@ -126,6 +129,8 @@ class FailActivationThenKillRollbackRunner(FakeRunner):
 class FakeMaintenance:
     def __init__(self, timeline: list[object] | None = None) -> None:
         self.events: list[tuple[str, bool]] = []
+        self.probes = 0
+        self.fail_next_probe = False
         self.timeline = [] if timeline is None else timeline
 
     @contextlib.contextmanager
@@ -137,6 +142,22 @@ class FakeMaintenance:
         finally:
             self.events.append(("exit", installed))
             self.timeline.append(("maintenance-exit", installed))
+
+    def probe(self) -> None:
+        self.probes += 1
+        self.timeline.append(("maintenance-probe",))
+        if self.fail_next_probe:
+            self.fail_next_probe = False
+            raise BenchmarkLockError(
+                "injected broker health probe failure",
+                code="injected_broker_probe_failure",
+            )
+
+
+class KillOnProbeMaintenance(FakeMaintenance):
+    def probe(self) -> None:
+        super().probe()
+        os.kill(os.getpid(), signal.SIGKILL)
 
 
 class RejectingMaintenance:
@@ -151,6 +172,9 @@ class RejectingMaintenance:
             code="maintenance_busy",
         )
         yield
+
+    def probe(self) -> None:
+        raise AssertionError("rejected maintenance must not probe the broker")
 
 
 class FakeAccounts:
@@ -187,7 +211,6 @@ class AdminFixture:
             "usr",
             "usr/local",
             "usr/local/lib",
-            "usr/local/bin",
             "etc",
             "var",
             "var/lib",
@@ -205,6 +228,7 @@ class AdminFixture:
         repository_root = pathlib.Path(__file__).resolve().parents[1]
         self.source_root = pathlib.Path(self.temporary.name) / "source"
         for relative in (
+            "bin",
             "lib/benchmark_lock",
             "benchmarkd/bin",
             "benchmarkd/systemd",
@@ -215,7 +239,7 @@ class AdminFixture:
             destination = self.source_root / "lib/benchmark_lock" / source.name
             destination.write_bytes(source.read_bytes())
         for relative in (
-            "benchmarkd/bin/benchmark-lock",
+            "bin/benchmark-lock",
             "benchmarkd/bin/benchmarkd",
             "benchmarkd/systemd/benchmarkd.socket",
             "benchmarkd/systemd/benchmarkd.service",
@@ -310,12 +334,13 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
         runner: FakeRunner,
         *,
         configuration_source: pathlib.Path | None,
+        maintenance: FakeMaintenance | None = None,
     ) -> None:
         process_id = os.fork()
         if process_id == 0:
             child_admin = self.fixture.new_admin(
                 runner=runner,
-                maintenance=FakeMaintenance(),
+                maintenance=(FakeMaintenance() if maintenance is None else maintenance),
             )
             child_admin.install(
                 configuration_source=configuration_source,
@@ -351,10 +376,26 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
             os.readlink(self.fixture.mapped(CURRENT_SELECTOR)),
             f"generations/{digest}",
         )
-        self.assertEqual(
-            os.readlink(self.fixture.mapped(CLIENT_PATH)),
-            "/usr/local/lib/benchmarkd/current/bin/benchmark-lock",
+        self.assertFalse(
+            os.path.lexists(self.fixture.mapped(FORBIDDEN_SYSTEM_CLIENT_PATH))
         )
+        self.assertFalse((generation / "bin/benchmark-lock").exists())
+        import_result = subprocess.run(
+            [
+                "/usr/bin/python3",
+                "-I",
+                "-c",
+                (
+                    "import sys; sys.dont_write_bytecode = True; "
+                    f"sys.path.insert(0, {os.fspath(generation / 'lib')!r}); "
+                    "import benchmark_lock.daemon"
+                ),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(import_result.returncode, 0, import_result.stderr)
         self.assertEqual(
             self.fixture.mapped(SOCKET_UNIT_PATH).read_bytes(),
             (generation / "share/systemd/benchmarkd.socket").read_bytes(),
@@ -386,6 +427,12 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
             self.fixture.maintenance.events,
             [("enter", True), ("exit", True)],
         )
+        self.assertEqual(self.fixture.maintenance.probes, 1)
+        maintenance_enter = self.fixture.timeline.index(("maintenance-enter", True))
+        maintenance_probe = self.fixture.timeline.index(("maintenance-probe",))
+        maintenance_exit = self.fixture.timeline.index(("maintenance-exit", True))
+        self.assertLess(maintenance_enter, maintenance_probe)
+        self.assertLess(maintenance_probe, maintenance_exit)
         self.assertIn(
             (
                 "/usr/bin/systemd-sysusers",
@@ -403,7 +450,7 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
             self.fixture.runner.commands,
         )
         client_help = subprocess.run(
-            [generation / "bin/benchmark-lock", "--help"],
+            [self.fixture.source_root / "bin/benchmark-lock", "--help"],
             check=False,
             capture_output=True,
             text=True,
@@ -413,6 +460,7 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
 
         self.assertEqual(self.fixture.admin.doctor(user_name="ben"), digest)
         self.assertEqual(self.fixture.accounts.required_users, ["ben"])
+        self.assertEqual(self.fixture.maintenance.probes, 1)
 
     def test_operation_lock_serializes_mutating_administrators(self) -> None:
         attempting = threading.Event()
@@ -438,6 +486,42 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
         contender.join()
         self.assertEqual(len(identities), 2)
         self.assertEqual(identities[1], identities[0])
+
+    def test_doctor_holds_one_shared_snapshot_against_install_cutover(self) -> None:
+        digest = self.fixture.install()
+        attempting_shared_lock = threading.Event()
+        completed = threading.Event()
+        results: list[str] = []
+        failures: list[BaseException] = []
+        original_flock = fcntl.flock
+
+        def observe_flock(descriptor: int, operation: int) -> None:
+            if operation == fcntl.LOCK_SH:
+                attempting_shared_lock.set()
+            original_flock(descriptor, operation)
+
+        def run_doctor() -> None:
+            try:
+                results.append(self.fixture.admin.doctor(user_name=None))
+            except BaseException as error:
+                failures.append(error)
+            finally:
+                completed.set()
+
+        with mock.patch(
+            "benchmark_lock.admin.fcntl.flock",
+            side_effect=observe_flock,
+        ):
+            with self.fixture.admin._hold_operation_lock():
+                contender = threading.Thread(target=run_doctor)
+                contender.start()
+                attempting_shared_lock.wait()
+                self.assertFalse(completed.is_set())
+
+            contender.join()
+
+        self.assertEqual(failures, [])
+        self.assertEqual(results, [digest])
 
     def test_operation_lock_is_exact_under_restrictive_umask(self) -> None:
         observed_directory_modes: list[int] = []
@@ -603,8 +687,8 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
         repository_root = pathlib.Path(__file__).resolve().parents[1]
         for relative in (
             "bin/benchmark-admin",
+            "bin/benchmark-lock",
             "benchmarkd/bin/benchmarkd",
-            "benchmarkd/bin/benchmark-lock",
         ):
             with self.subTest(relative=relative):
                 self.assertEqual(
@@ -618,6 +702,7 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
         launcher.write_bytes(launcher.read_bytes() + b"\n")
         self.fixture.runner.commands.clear()
         self.fixture.maintenance.events.clear()
+        self.fixture.maintenance.probes = 0
         self.fixture.timeline.clear()
 
         upgraded = self.fixture.admin.install(
@@ -635,6 +720,7 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
                 ("exit", True),
             ],
         )
+        self.assertEqual(self.fixture.maintenance.probes, 1)
         stop_socket = self.fixture.runner.commands.index(
             ("/usr/bin/systemctl", "stop", "benchmarkd.socket")
         )
@@ -685,25 +771,20 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
                 ),
             )
         )
-        timeline_status = self.fixture.timeline.index(
-            (
-                "command",
-                (
-                    os.fspath(
-                        self.fixture.mapped(GENERATION_DIRECTORY)
-                        / upgraded
-                        / "bin/benchmark-lock"
-                    ),
-                    "--status",
-                ),
-            )
-        )
+        timeline_probe = self.fixture.timeline.index(("maintenance-probe",))
         self.assertLess(maintenance_enters[0], timeline_stop)
         self.assertLess(timeline_stop, maintenance_exits[0])
         self.assertLess(maintenance_exits[0], timeline_enable)
         self.assertLess(timeline_enable, maintenance_enters[1])
-        self.assertLess(maintenance_enters[1], timeline_status)
-        self.assertLess(timeline_status, maintenance_exits[1])
+        self.assertLess(maintenance_enters[1], timeline_probe)
+        self.assertLess(timeline_probe, maintenance_exits[1])
+        self.assertFalse(
+            any(
+                "benchmark-lock" in argument
+                for command in self.fixture.runner.commands
+                for argument in command
+            )
+        )
 
     def test_upgrade_requires_empty_scheduler_before_building_generation(
         self,
@@ -749,6 +830,8 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
         digest = self.fixture.install()
         self.fixture.runner.commands.clear()
         self.fixture.maintenance.events.clear()
+        self.fixture.maintenance.probes = 0
+        self.fixture.timeline.clear()
 
         observed = self.fixture.admin.install(
             configuration_source=None,
@@ -760,6 +843,12 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
             self.fixture.maintenance.events,
             [("enter", True), ("exit", True)],
         )
+        self.assertEqual(self.fixture.maintenance.probes, 1)
+        maintenance_enter = self.fixture.timeline.index(("maintenance-enter", True))
+        maintenance_probe = self.fixture.timeline.index(("maintenance-probe",))
+        maintenance_exit = self.fixture.timeline.index(("maintenance-exit", True))
+        self.assertLess(maintenance_enter, maintenance_probe)
+        self.assertLess(maintenance_probe, maintenance_exit)
         self.assertNotIn(
             ("/usr/bin/systemctl", "stop", "benchmarkd.socket"),
             self.fixture.runner.commands,
@@ -771,6 +860,37 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
                 "--now",
                 "benchmarkd.socket",
             ),
+            self.fixture.runner.commands,
+        )
+
+    def test_same_generation_probe_failure_never_stops_or_journals(self) -> None:
+        digest = self.fixture.install()
+        self.fixture.runner.commands.clear()
+        self.fixture.maintenance.events.clear()
+        self.fixture.maintenance.probes = 0
+        self.fixture.maintenance.fail_next_probe = True
+
+        with self.assertRaisesRegex(
+            BenchmarkLockError,
+            "injected broker health probe failure",
+        ):
+            self.fixture.admin.install(
+                configuration_source=None,
+                user_name="ben",
+            )
+
+        self.assertEqual(
+            os.readlink(self.fixture.mapped(CURRENT_SELECTOR)),
+            f"generations/{digest}",
+        )
+        self.assertEqual(self.fixture.maintenance.probes, 1)
+        self.assertFalse(self.fixture.admin.journal.has_install_state())
+        self.assertNotIn(
+            ("/usr/bin/systemctl", "stop", "benchmarkd.socket"),
+            self.fixture.runner.commands,
+        )
+        self.assertNotIn(
+            ("/usr/bin/systemctl", "stop", "benchmarkd.service"),
             self.fixture.runner.commands,
         )
 
@@ -923,20 +1043,15 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
             retry_maintenance.events,
             [("enter", True), ("exit", True)],
         )
+        self.assertEqual(retry_maintenance.probes, 1)
 
-    def test_sigkill_after_fresh_target_start_recovers_stopped_install(
+    def test_sigkill_during_target_probe_recovers_stopped_install(
         self,
     ) -> None:
         self._fork_killed_install(
-            KillAfterCommandRunner(
-                (
-                    "/usr/bin/systemctl",
-                    "enable",
-                    "--now",
-                    "benchmarkd.socket",
-                )
-            ),
+            FakeRunner(),
             configuration_source=self.fixture.config_source,
+            maintenance=KillOnProbeMaintenance(),
         )
 
         intent_path = self.fixture.mapped(INSTALL_INTENT_PATH)
@@ -951,12 +1066,16 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
 
         self.assertEqual(recovered, intent["target_digest"])
         self.assertFalse(os.path.lexists(intent_path))
+        self.assertEqual(self.fixture.maintenance.probes, 1)
 
     def test_sigkill_during_durable_rollback_resumes_prior(self) -> None:
         prior_digest = self.fixture.install()
         launcher = self.fixture.source_root / "benchmarkd/bin/benchmarkd"
         prior_launcher = launcher.read_bytes()
         launcher.write_bytes(prior_launcher + b"\n")
+        self.fixture.maintenance.events.clear()
+        self.fixture.maintenance.probes = 0
+        self.fixture.timeline.clear()
         self._fork_killed_install(
             FailActivationThenKillRollbackRunner(),
             configuration_source=None,
@@ -979,6 +1098,7 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
             os.readlink(self.fixture.mapped(CURRENT_SELECTOR)),
             f"generations/{prior_digest}",
         )
+        self.assertEqual(self.fixture.maintenance.probes, 2)
 
     def test_activation_failure_restores_prior_generation(self) -> None:
         digest = self.fixture.install()
@@ -994,6 +1114,9 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
             "start",
             "benchmarkd.service",
         )
+        self.fixture.maintenance.events.clear()
+        self.fixture.maintenance.probes = 0
+        self.fixture.timeline.clear()
 
         with self.assertRaisesRegex(BenchmarkLockError, "injected"):
             self.fixture.admin.install(
@@ -1019,6 +1142,120 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
             if command[1:3] == ("enable", "--now")
         ]
         self.assertGreaterEqual(len(enable_calls), 3)
+        self.assertEqual(self.fixture.maintenance.probes, 1)
+
+    def test_target_probe_failure_rolls_back_to_a_proven_prior_generation(
+        self,
+    ) -> None:
+        prior_digest = self.fixture.install()
+        launcher = self.fixture.source_root / "benchmarkd/bin/benchmarkd"
+        launcher.write_bytes(launcher.read_bytes() + b"\n")
+        self.fixture.maintenance.events.clear()
+        self.fixture.maintenance.probes = 0
+        self.fixture.maintenance.fail_next_probe = True
+        self.fixture.timeline.clear()
+
+        with self.assertRaisesRegex(
+            BenchmarkLockError,
+            "injected broker health probe failure",
+        ):
+            self.fixture.admin.install(
+                configuration_source=None,
+                user_name="ben",
+            )
+
+        self.assertEqual(
+            os.readlink(self.fixture.mapped(CURRENT_SELECTOR)),
+            f"generations/{prior_digest}",
+        )
+        self.assertEqual(self.fixture.maintenance.probes, 2)
+        self.assertEqual(
+            self.fixture.maintenance.events,
+            [
+                ("enter", True),
+                ("exit", True),
+                ("enter", True),
+                ("exit", True),
+                ("enter", True),
+                ("exit", True),
+            ],
+        )
+        probe_indices = [
+            index
+            for index, event in enumerate(self.fixture.timeline)
+            if event == ("maintenance-probe",)
+        ]
+        self.assertEqual(len(probe_indices), 2)
+        rollback_start = max(
+            index
+            for index, event in enumerate(self.fixture.timeline)
+            if event
+            == (
+                "command",
+                ("/usr/bin/systemctl", "start", "benchmarkd.service"),
+            )
+        )
+        self.assertLess(rollback_start, probe_indices[1])
+
+    def test_fresh_target_probe_failure_removes_the_live_projection(self) -> None:
+        self.fixture.maintenance.fail_next_probe = True
+
+        with self.assertRaisesRegex(
+            BenchmarkLockError,
+            "injected broker health probe failure",
+        ):
+            self.fixture.install()
+
+        self.assertEqual(self.fixture.maintenance.probes, 1)
+        self.assertFalse(self.fixture.admin.journal.has_install_state())
+        for path in (
+            CURRENT_SELECTOR,
+            SOCKET_UNIT_PATH,
+            SERVICE_UNIT_PATH,
+            SYSUSERS_PATH,
+        ):
+            self.assertFalse(os.path.lexists(self.fixture.mapped(path)))
+
+    def test_rollback_probe_failure_remains_durable_and_resumable(self) -> None:
+        prior_digest = self.fixture.install()
+        launcher = self.fixture.source_root / "benchmarkd/bin/benchmarkd"
+        prior_launcher = launcher.read_bytes()
+        launcher.write_bytes(prior_launcher + b"\n")
+        self.fixture.runner.fail_command = (
+            "/usr/bin/systemctl",
+            "start",
+            "benchmarkd.service",
+        )
+        self.fixture.maintenance.fail_next_probe = True
+
+        with self.assertRaisesRegex(
+            BenchmarkLockError,
+            "rollback could not complete",
+        ):
+            self.fixture.admin.install(
+                configuration_source=None,
+                user_name="ben",
+            )
+
+        intent_path = self.fixture.mapped(INSTALL_INTENT_PATH)
+        self.assertEqual(json.loads(intent_path.read_bytes())["phase"], "rollback")
+        self.assertEqual(
+            os.readlink(self.fixture.mapped(CURRENT_SELECTOR)),
+            f"generations/{prior_digest}",
+        )
+
+        launcher.write_bytes(prior_launcher)
+        retry_maintenance = FakeMaintenance()
+        recovered = self.fixture.new_admin(
+            maintenance=retry_maintenance,
+        ).install(
+            configuration_source=None,
+            user_name="ben",
+        )
+
+        self.assertEqual(recovered, prior_digest)
+        self.assertFalse(os.path.lexists(intent_path))
+        self.assertEqual(retry_maintenance.probes, 2)
 
     def test_fixed_projection_stage_is_replayed_after_interruption(self) -> None:
         self.fixture.install()
@@ -1138,7 +1375,9 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
             self.fixture.install()
 
         self.assertFalse(os.path.lexists(self.fixture.mapped(CURRENT_SELECTOR)))
-        self.assertFalse(os.path.lexists(self.fixture.mapped(CLIENT_PATH)))
+        self.assertFalse(
+            os.path.lexists(self.fixture.mapped(FORBIDDEN_SYSTEM_CLIENT_PATH))
+        )
         self.assertFalse(self.fixture.mapped(SOCKET_UNIT_PATH).exists())
         self.assertFalse(self.fixture.mapped(SERVICE_UNIT_PATH).exists())
         self.assertFalse(self.fixture.mapped(SYSUSERS_PATH).exists())
@@ -1166,12 +1405,14 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
         self.assertEqual(intent["phase"], "stopped")
         for path in (
             CURRENT_SELECTOR,
-            CLIENT_PATH,
             SOCKET_UNIT_PATH,
             SERVICE_UNIT_PATH,
             SYSUSERS_PATH,
         ):
             self.assertTrue(os.path.lexists(self.fixture.mapped(path)))
+        self.assertFalse(
+            os.path.lexists(self.fixture.mapped(FORBIDDEN_SYSTEM_CLIENT_PATH))
+        )
         self.assertTrue(self.fixture.mapped(CONFIG_PATH).exists())
         self.assertTrue(self.fixture.mapped(GENERATION_DIRECTORY).exists())
         recovered = self.fixture.new_admin().install(
@@ -1259,15 +1500,21 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
             report=self.fixture.messages.append,
             check_runtime=True,
         )
+        self.fixture.maintenance.probes = 0
 
         self.assertEqual(admin.doctor(user_name=None), digest)
-        self.assertIn(
-            (os.fspath(self.fixture.mapped(CLIENT_PATH)), "--status"),
-            self.fixture.runner.commands,
+        self.assertEqual(self.fixture.maintenance.probes, 1)
+        self.assertFalse(
+            any(
+                "benchmark-lock" in argument
+                for command in self.fixture.runner.commands
+                for argument in command
+            )
         )
         os.chmod(socket_path, 0o666)
         with self.assertRaisesRegex(BenchmarkLockError, "wrong type"):
             admin.doctor(user_name=None)
+        self.assertEqual(self.fixture.maintenance.probes, 1)
 
 
 class BenchmarkAdminUninstallTest(unittest.TestCase):
@@ -1317,7 +1564,9 @@ class BenchmarkAdminUninstallTest(unittest.TestCase):
         self.fixture.admin.uninstall()
 
         self.assertFalse(self.fixture.mapped(INSTALL_ROOT).exists())
-        self.assertFalse(os.path.lexists(self.fixture.mapped(CLIENT_PATH)))
+        self.assertFalse(
+            os.path.lexists(self.fixture.mapped(FORBIDDEN_SYSTEM_CLIENT_PATH))
+        )
         self.assertFalse(self.fixture.mapped(SOCKET_UNIT_PATH).exists())
         self.assertFalse(self.fixture.mapped(SERVICE_UNIT_PATH).exists())
         self.assertFalse(self.fixture.mapped(SYSUSERS_PATH).exists())
@@ -1748,12 +1997,10 @@ class BenchmarkAdminUninstallTest(unittest.TestCase):
             configuration_source=None,
             user_name="ben",
         )
-        first_client = (
-            self.fixture.mapped(GENERATION_DIRECTORY)
-            / first_digest
-            / "bin/benchmark-lock"
+        first_broker = (
+            self.fixture.mapped(GENERATION_DIRECTORY) / first_digest / "bin/benchmarkd"
         )
-        os.chmod(first_client, 0o755)
+        os.chmod(first_broker, 0o755)
         self.fixture.runner.commands.clear()
         self.fixture.maintenance.events.clear()
 

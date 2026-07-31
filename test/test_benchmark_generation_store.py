@@ -12,12 +12,16 @@ from unittest import mock
 
 from benchmark_lock import generation_store
 from benchmark_lock.errors import BenchmarkLockError
-from benchmark_lock.generation_format import build_generation
+from benchmark_lock.generation_format import (
+    BROKER_RUNTIME_MODULE_NAMES,
+    Generation,
+    build_generation,
+)
 from benchmark_lock.generation_store import GenerationStore
 
 
 EXPECTED_FIXTURE_DIGEST = (
-    "5469a7e8c7e3ba999cba2d393a51dc84520df3907ee9c90d47d73bdb5188ad38"
+    "0bad5de014210d3f40141feb652e75c0cc780b46995ccf129ae5ae8d875b9a96"
 )
 
 
@@ -37,11 +41,14 @@ class StoreFixture:
         self.gid = os.getgid()
         self.messages: list[str] = []
         source_files = {
-            "lib/benchmark_lock/__init__.py": b"init\n",
+            **{
+                f"lib/benchmark_lock/{name}": f"{name}\n".encode()
+                for name in BROKER_RUNTIME_MODULE_NAMES
+            },
+            "lib/benchmark_lock/admin.py": b"admin\n",
             "lib/benchmark_lock/client.py": b"client\n",
-            "lib/benchmark_lock/daemon.py": b"daemon\n",
-            "lib/benchmark_lock/extra.py": b"extra\n",
-            "benchmarkd/bin/benchmark-lock": b"lock\n",
+            "lib/benchmark_lock/control_channel.py": b"control channel\n",
+            "bin/benchmark-lock": b"client launcher\n",
             "benchmarkd/bin/benchmarkd": b"broker\n",
             "benchmarkd/systemd/benchmarkd.service": b"service\n",
             "benchmarkd/systemd/benchmarkd.socket": b"socket\n",
@@ -84,6 +91,11 @@ class StoreFixture:
 
     def publish(self) -> None:
         self.store.publish(self.generation)
+
+    def build_changed_broker_generation(self) -> Generation:
+        broker_source = self.source / "lib/benchmark_lock/broker.py"
+        broker_source.write_bytes(b"changed broker\n")
+        return build_generation(self.source)
 
     def leave_prepared_removal(self) -> None:
         self.publish()
@@ -173,6 +185,60 @@ class GenerationV1Test(unittest.TestCase):
             sorted(entry.path.as_posix() for entry in generation.entries),
         )
 
+    def test_generation_is_the_exact_broker_runtime_closure(self) -> None:
+        expected_paths = {
+            *(f"lib/benchmark_lock/{name}" for name in BROKER_RUNTIME_MODULE_NAMES),
+            "bin/benchmarkd",
+            "share/systemd/benchmarkd.service",
+            "share/systemd/benchmarkd.socket",
+            "share/sysusers/benchmarkd.conf",
+        }
+        observed_paths = {
+            entry.path.as_posix() for entry in self.fixture.generation.entries
+        }
+
+        self.assertEqual(observed_paths, expected_paths)
+        self.assertNotIn(
+            "lib/benchmark_lock/admin.py",
+            observed_paths,
+        )
+        self.assertNotIn(
+            "lib/benchmark_lock/client.py",
+            observed_paths,
+        )
+        self.assertNotIn(
+            "lib/benchmark_lock/control_channel.py",
+            observed_paths,
+        )
+        self.assertNotIn("bin/benchmark-lock", observed_paths)
+
+    def test_generation_requires_every_declared_broker_module(self) -> None:
+        missing_name = BROKER_RUNTIME_MODULE_NAMES[-1]
+        os.unlink(self.fixture.source / "lib/benchmark_lock" / missing_name)
+
+        with self.assertRaisesRegex(
+            BenchmarkLockError,
+            f"broker runtime is incomplete; missing {missing_name}",
+        ):
+            build_generation(self.fixture.source)
+
+    def test_user_side_changes_do_not_change_broker_generation_identity(self) -> None:
+        expected = self.fixture.generation
+        user_side_sources = (
+            "lib/benchmark_lock/admin.py",
+            "lib/benchmark_lock/client.py",
+            "lib/benchmark_lock/control_channel.py",
+            "bin/benchmark-lock",
+        )
+
+        for relative_path in user_side_sources:
+            with self.subTest(relative_path=relative_path):
+                (self.fixture.source / relative_path).write_bytes(
+                    f"changed {relative_path}\n".encode()
+                )
+                observed = build_generation(self.fixture.source)
+                self.assertEqual(observed, expected)
+
     def test_publish_is_immutable_idempotent_and_fully_verified(self) -> None:
         first = self.fixture.store.publish(self.fixture.generation)
         first_inode = os.lstat(first.root).st_ino
@@ -205,19 +271,17 @@ class GenerationV1Test(unittest.TestCase):
 
     def test_publish_refuses_to_replace_modified_generation_bytes(self) -> None:
         self.fixture.publish()
-        client = self.fixture.live / "bin/benchmark-lock"
-        os.chmod(client, 0o755)
+        broker = self.fixture.live / "bin/benchmarkd"
+        os.chmod(broker, 0o755)
 
         with self.assertRaises(BenchmarkLockError):
             self.fixture.store.publish(self.fixture.generation)
 
-        self.assertEqual(stat.S_IMODE(os.lstat(client).st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE(os.lstat(broker).st_mode), 0o755)
 
     def test_publish_enforces_the_bounded_generation_inventory(self) -> None:
         self.fixture.publish()
-        extra = self.fixture.source / "lib/benchmark_lock/second.py"
-        extra.write_bytes(b"second\n")
-        second = build_generation(self.fixture.source)
+        second = self.fixture.build_changed_broker_generation()
 
         with (
             mock.patch.object(generation_store, "MAX_GENERATIONS", 1),
@@ -467,9 +531,7 @@ class GenerationPublicationRecoveryTest(unittest.TestCase):
     def test_whole_store_is_preflighted_before_publication_recovery(self) -> None:
         fixture = StoreFixture(self)
         first = fixture.store.publish(fixture.generation)
-        extra = fixture.source / "lib/benchmark_lock/second.py"
-        extra.write_bytes(b"second\n")
-        second = build_generation(fixture.source)
+        second = fixture.build_changed_broker_generation()
         second_staging = fixture.generations / f".publish-{second.digest}.tree"
         target = second_staging / second.entries[0].path
 
@@ -482,8 +544,8 @@ class GenerationPublicationRecoveryTest(unittest.TestCase):
         ):
             with self.assertRaises(InjectedInterruption):
                 fixture.store.publish(second)
-        first_client = first.root / "bin/benchmark-lock"
-        os.chmod(first_client, 0o755)
+        first_broker = first.root / "bin/benchmarkd"
+        os.chmod(first_broker, 0o755)
 
         with self.assertRaises(BenchmarkLockError):
             fixture.new_store().publish(second)
@@ -643,9 +705,7 @@ class GenerationRemovalTest(unittest.TestCase):
     def test_multiple_generations_are_preflighted_before_recovery(self) -> None:
         fixture = StoreFixture(self)
         first = fixture.store.publish(fixture.generation)
-        extra = fixture.source / "lib/benchmark_lock/second.py"
-        extra.write_bytes(b"second\n")
-        second_generation = build_generation(fixture.source)
+        second_generation = fixture.build_changed_broker_generation()
         second = fixture.store.publish(second_generation)
 
         def after_retirement(
@@ -660,8 +720,8 @@ class GenerationRemovalTest(unittest.TestCase):
         with fixture.interrupt_after(os, "rename", after_retirement):
             with self.assertRaises(InjectedInterruption):
                 fixture.store.remove(first.digest)
-        second_client = second.root / "bin/benchmark-lock"
-        os.chmod(second_client, 0o755)
+        second_broker = second.root / "bin/benchmarkd"
+        os.chmod(second_broker, 0o755)
 
         with self.assertRaises(BenchmarkLockError):
             fixture.new_store().recover_removals()
@@ -689,7 +749,7 @@ class GenerationRemovalHostileStateTest(unittest.TestCase):
         fixture = StoreFixture(self)
         fixture.publish()
         os.rename(fixture.live, fixture.retired)
-        sentinel = fixture.retired / "bin/benchmark-lock"
+        sentinel = fixture.retired / "bin/benchmarkd"
 
         with self.assertRaisesRegex(BenchmarkLockError, "lacks its removal intent"):
             fixture.store.recover_removals()

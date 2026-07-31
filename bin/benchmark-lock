@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -I
-"""Installed entry point for the unprivileged benchmark client."""
+"""Dotfiles entry point for the unprivileged benchmark client."""
 
 from __future__ import annotations
 
@@ -8,8 +8,8 @@ import sys
 
 
 sys.dont_write_bytecode = True
-GENERATION_ROOT = pathlib.Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(GENERATION_ROOT / "lib"))
+REPOSITORY_ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPOSITORY_ROOT / "lib"))
 
 from benchmark_lock.client import main  # noqa: E402
 

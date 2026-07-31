@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import errno
-import grp
 import os
 import pathlib
 import re
@@ -14,13 +13,9 @@ import sys
 from collections.abc import Mapping, Sequence
 from typing import NoReturn, TextIO
 
+from .control_channel import connect_broker
 from .errors import BenchmarkLockError
-from .linux import (
-    CONTROL_SOCKET_PATH,
-    disable_aslr_for_exec,
-    require_root_peer,
-    validate_root_socket_path,
-)
+from .linux import disable_aslr_for_exec
 from .protocol import (
     AcquireRequest,
     ErrorEvent,
@@ -36,7 +31,18 @@ from .protocol import (
 
 
 LEASE_ENVIRONMENT_VARIABLE = "BENCHMARK_LOCK_LEASE_ID"
-BENCHMARK_GROUP_NAME = "benchmark"
+
+AGENTS_MD_SNIPPET = """\
+## Benchmark runs
+
+Run every benchmark as
+`~/.dotfiles/bin/benchmark-lock [--label LABEL] -- COMMAND [ARG ...]`.
+The wrapper waits in FIFO order, applies benchmark policy, and releases its
+lease automatically when the foreground process exits or crashes. The lease
+serializes cooperating wrappers; unwrapped host or GPU load can still invalidate
+a measurement. Wrap the outermost command once; never nest `benchmark-lock`.
+Never run benchmark work outside the wrapper.
+Use `~/.dotfiles/bin/benchmark-lock --status` to inspect the holder and queue."""
 
 _DEFAULT_LABEL_CHARACTER = re.compile(r"[A-Za-z0-9._:+/@=-]")
 _DEFAULT_LABEL_FIRST_CHARACTER = re.compile(r"[A-Za-z0-9]")
@@ -74,6 +80,7 @@ class _ArgumentParser(argparse.ArgumentParser):
             description=(
                 "run one foreground command while holding the machine benchmark lease"
             ),
+            epilog=("Broker setup and repair: ~/.dotfiles/bin/benchmark-admin --help"),
             allow_abbrev=False,
         )
 
@@ -113,6 +120,11 @@ def _argument_parser(*, output: TextIO, error: TextIO) -> _ArgumentParser:
         help="show broker state without acquiring a lease",
     )
     parser.add_argument(
+        "--agents-md",
+        action="store_true",
+        help="print a concise AGENTS.md usage contract and exit",
+    )
+    parser.add_argument(
         "command",
         nargs=argparse.REMAINDER,
         metavar="COMMAND",
@@ -128,54 +140,7 @@ def _report(
     print(message, file=stream, flush=True)
 
 
-def _benchmark_group_id() -> int:
-    try:
-        return grp.getgrnam(BENCHMARK_GROUP_NAME).gr_gid
-    except KeyError as error:
-        raise BenchmarkLockError(
-            f"system group {BENCHMARK_GROUP_NAME!r} is not installed",
-            code="benchmark_broker_unavailable",
-        ) from error
-
-
-def connect_broker() -> socket.socket:
-    """Connect one CLOEXEC sequenced-packet channel to the root broker."""
-
-    group_id = _benchmark_group_id()
-    validate_root_socket_path(
-        CONTROL_SOCKET_PATH,
-        expected_group_id=group_id,
-    )
-    socket_type = socket.SOCK_SEQPACKET | getattr(
-        socket,
-        "SOCK_CLOEXEC",
-        0,
-    )
-    try:
-        connection = socket.socket(socket.AF_UNIX, socket_type)
-    except OSError as error:
-        raise BenchmarkLockError(
-            f"cannot create benchmark broker channel: {error}",
-            code="benchmark_broker_unavailable",
-        ) from error
-    try:
-        connection.set_inheritable(False)
-        connection.connect(os.fspath(CONTROL_SOCKET_PATH))
-        require_root_peer(connection)
-        return connection
-    except BenchmarkLockError:
-        connection.close()
-        raise
-    except OSError as error:
-        connection.close()
-        raise BenchmarkLockError(
-            f"cannot connect to benchmark broker: {error}",
-            code="benchmark_broker_unavailable",
-        ) from error
-
-
-# Kept as the client seam used by focused tests; administration imports the
-# public name above rather than depending on a command-private helper.
+# Kept as the command seam used by focused client tests.
 _connect_broker = connect_broker
 
 
@@ -396,6 +361,14 @@ def main(
         command = tuple(parsed.command)
         if command[:1] == ("--",):
             command = command[1:]
+        if parsed.agents_md:
+            if parsed.status or parsed.label is not None or command:
+                parser.error(
+                    "--agents-md cannot be combined with --status, --label, "
+                    "or a command"
+                )
+            _report(stdout, AGENTS_MD_SNIPPET)
+            return 0
         if parsed.status:
             if parsed.label is not None or command:
                 parser.error("--status cannot be combined with a command or --label")

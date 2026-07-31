@@ -153,10 +153,16 @@ if command -v python3 &>/dev/null; then
         else
             fail "Benchmark administrator help"
         fi
+        if "$DOTFILES/bin/benchmark-lock" --agents-md >/dev/null; then
+            pass "Benchmark agent instructions"
+        else
+            fail "Benchmark agent instructions"
+        fi
     else
         skip "benchmark broker tests require Linux"
         skip "benchmark broker optimized-mode tests require Linux"
         skip "benchmark administrator requires Linux"
+        skip "benchmark agent instructions require Linux"
     fi
 else
     fail "python3 required for Python commands"

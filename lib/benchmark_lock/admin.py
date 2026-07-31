@@ -2,7 +2,7 @@
 
 Normal dotfiles installation deliberately knows nothing about this module.
 The administrator invokes ``benchmark-admin`` for the one operation that
-publishes root-owned code, policy, units, and the unprivileged client.
+publishes root-owned broker code, policy, and units.
 """
 
 from __future__ import annotations
@@ -44,6 +44,7 @@ from .configuration import (
     canonical_policy_configuration,
     parse_policy_configuration,
 )
+from .control_channel import BENCHMARK_GROUP_NAME
 from .errors import BenchmarkLockError
 from .generation_format import MAX_SOURCE_FILE_BYTES, build_generation
 from .generation_store import GenerationStore
@@ -58,7 +59,6 @@ from .installation_projection import (
 EPOCH_PATH = STATE_DIRECTORY / "active-epoch.json"
 GENERATION_DIRECTORY = INSTALL_ROOT / "generations"
 CURRENT_SELECTOR = INSTALL_ROOT / "current"
-CLIENT_PATH = pathlib.Path("/usr/local/bin/benchmark-lock")
 SYSTEMD_UNIT_DIRECTORY = pathlib.Path("/usr/local/lib/systemd/system")
 SOCKET_UNIT_PATH = SYSTEMD_UNIT_DIRECTORY / "benchmarkd.socket"
 SERVICE_UNIT_PATH = SYSTEMD_UNIT_DIRECTORY / "benchmarkd.service"
@@ -67,10 +67,7 @@ CONTROL_SOCKET_PATH = pathlib.Path("/run/benchmarkd/control.sock")
 SOCKET_UNIT_STAGE_PATH = SYSTEMD_UNIT_DIRECTORY / ".benchmarkd.socket.install"
 SERVICE_UNIT_STAGE_PATH = SYSTEMD_UNIT_DIRECTORY / ".benchmarkd.service.install"
 SYSUSERS_STAGE_PATH = SYSUSERS_PATH.with_name(".benchmarkd.conf.install")
-CLIENT_STAGE_PATH = CLIENT_PATH.with_name(".benchmark-lock.install")
 CURRENT_STAGE_PATH = INSTALL_ROOT / ".current.install"
-
-BENCHMARK_GROUP_NAME = "benchmark"
 
 _DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}")
 _USER_PATTERN = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
@@ -108,6 +105,9 @@ class MaintenanceCoordinator(Protocol):
     def hold(self, *, installed: bool) -> AbstractContextManager[None]:
         """Hold root maintenance authority through a mutating cutover."""
 
+    def probe(self) -> None:
+        """Require one healthy broker status exchange."""
+
 
 class ProductionMaintenanceCoordinator:
     """Root control-channel maintenance fence, loaded only when needed."""
@@ -118,6 +118,11 @@ class ProductionMaintenanceCoordinator:
         from .maintenance import hold_maintenance
 
         return hold_maintenance()
+
+    def probe(self) -> None:
+        from .maintenance import probe_status
+
+        probe_status()
 
 
 class AccountManager(Protocol):
@@ -247,10 +252,6 @@ class _Layout:
         return self.map(CURRENT_SELECTOR)
 
     @property
-    def client(self) -> pathlib.Path:
-        return self.map(CLIENT_PATH)
-
-    @property
     def config(self) -> pathlib.Path:
         return self.map(CONFIG_PATH)
 
@@ -317,10 +318,6 @@ class _Layout:
     @property
     def sysusers_stage(self) -> pathlib.Path:
         return self.map(SYSUSERS_STAGE_PATH)
-
-    @property
-    def client_stage(self) -> pathlib.Path:
-        return self.map(CLIENT_STAGE_PATH)
 
     @property
     def current_stage(self) -> pathlib.Path:
@@ -479,8 +476,8 @@ class BenchmarkAdmin:
             )
 
     @contextlib.contextmanager
-    def _hold_operation_lock(self):
-        """Serialize every host-mutating administrator transaction."""
+    def _hold_operation_lock(self, *, shared: bool = False):
+        """Serialize mutations and hold coherent shared audit snapshots."""
 
         self._ensure_operation_lock_directory()
         flags = os.O_RDWR | os.O_CLOEXEC
@@ -524,7 +521,8 @@ class BenchmarkAdmin:
                     code="benchmark_admin_lock_failed",
                 )
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                operation = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+                fcntl.flock(descriptor, operation)
             except OSError as error:
                 raise _admin_error(
                     f"cannot acquire benchmark administrator lock: {error}",
@@ -626,7 +624,6 @@ class BenchmarkAdmin:
             self.layout.map(pathlib.Path("/usr")),
             self.layout.map(pathlib.Path("/usr/local")),
             self.layout.map(pathlib.Path("/usr/local/lib")),
-            self.layout.map(pathlib.Path("/usr/local/bin")),
             self.layout.map(pathlib.Path("/etc")),
             self.layout.map(pathlib.Path("/var")),
             self.layout.map(pathlib.Path("/var/lib")),
@@ -658,7 +655,6 @@ class BenchmarkAdmin:
             self.layout.map(pathlib.Path("/usr")),
             self.layout.map(pathlib.Path("/usr/local")),
             self.layout.map(pathlib.Path("/usr/local/lib")),
-            self.layout.map(pathlib.Path("/usr/local/bin")),
             self.layout.map(pathlib.Path("/etc")),
             self.layout.map(pathlib.Path("/var")),
             self.layout.map(pathlib.Path("/var/lib")),
@@ -872,7 +868,6 @@ class BenchmarkAdmin:
             self.layout.socket_unit_stage,
             self.layout.service_unit_stage,
             self.layout.sysusers_stage,
-            self.layout.client_stage,
             self.layout.current_stage,
         )
 
@@ -911,7 +906,6 @@ class BenchmarkAdmin:
                     prior_root
                 )
             }
-        stable_client = os.fspath(INSTALL_ROOT / "current/bin/benchmark-lock")
         items = (
             RegularProjection(
                 description="benchmarkd socket unit",
@@ -935,13 +929,6 @@ class BenchmarkAdmin:
                 target=target_external[self.layout.sysusers],
             ),
             SymlinkProjection(
-                description="benchmark-lock stable client",
-                destination=self.layout.client,
-                stage=self.layout.client_stage,
-                prior=None if prior_digest is None else stable_client,
-                target=stable_client,
-            ),
-            SymlinkProjection(
                 description="benchmarkd current generation",
                 destination=self.layout.current,
                 stage=self.layout.current_stage,
@@ -956,40 +943,22 @@ class BenchmarkAdmin:
             report=self.report,
         )
 
-    def _projection_subset(
+    def _projection_for_destinations(
         self,
         projection: InstallationProjection,
-        selection: slice,
+        destinations: tuple[pathlib.Path, ...],
     ) -> InstallationProjection:
+        indexed = {item.destination: item for item in projection.items}
+        if len(indexed) != len(projection.items) or any(
+            destination not in indexed for destination in destinations
+        ):
+            raise AssertionError("install projection phases are incomplete")
         return InstallationProjection(
-            items=projection.items[selection],
+            items=tuple(indexed[destination] for destination in destinations),
             root_uid=self.root_uid,
             root_gid=self.root_gid,
             report=self.report,
         )
-
-    def _require_symlink(
-        self,
-        path: pathlib.Path,
-        expected_target: str,
-    ) -> None:
-        try:
-            metadata = os.lstat(path)
-        except OSError as error:
-            raise _admin_error(
-                f"cannot inspect managed selector {path}: {error}",
-                code="benchmark_admin_layout_invalid",
-            ) from error
-        if (
-            not stat.S_ISLNK(metadata.st_mode)
-            or metadata.st_uid != self.root_uid
-            or metadata.st_gid != self.root_gid
-            or os.readlink(path) != expected_target
-        ):
-            raise _admin_error(
-                f"managed selector is not the exact root-owned link: {path}",
-                code="benchmark_admin_layout_invalid",
-            )
 
     def _current_selector_digest(self) -> str | None:
         """Read the validated current selector without traversing its generation."""
@@ -1032,7 +1001,6 @@ class BenchmarkAdmin:
         return any(
             os.path.lexists(path)
             for path in (
-                self.layout.client,
                 self.layout.socket_unit,
                 self.layout.service_unit,
                 self.layout.sysusers,
@@ -1077,15 +1045,6 @@ class BenchmarkAdmin:
                 "benchmarkd.service",
             )
         )
-
-    def _activate_current_service(self) -> None:
-        """Start the broker to readiness before probing its protocol."""
-
-        self._start_current_service()
-        self.runner.run((os.fspath(self.layout.client), "--status"))
-
-    def _generation_client(self, digest: str) -> pathlib.Path:
-        return self.layout.generations / digest / "bin/benchmark-lock"
 
     def _stop_for_install(self) -> None:
         """Synchronously stop socket activation and the complete broker cgroup."""
@@ -1147,12 +1106,7 @@ class BenchmarkAdmin:
         self.accounts.add_user(intent.user_name)
         self._start_current_service()
         with self.maintenance.hold(installed=True):
-            self.runner.run(
-                (
-                    os.fspath(self._generation_client(intent.prior_digest)),
-                    "--status",
-                )
-            )
+            self.maintenance.probe()
             projection.require_exact_prior()
         self.journal.remove_install(intent)
 
@@ -1167,12 +1121,18 @@ class BenchmarkAdmin:
         if intent.phase != "stopped":
             raise AssertionError("stopped install recovery has the wrong phase")
         projection.require_target_prefix()
-        unit_projection = self._projection_subset(projection, slice(0, 2))
-        tail_projection = self._projection_subset(projection, slice(2, None))
+        unit_projection = self._projection_for_destinations(
+            projection,
+            (self.layout.socket_unit, self.layout.service_unit),
+        )
+        stopped_tail_projection = self._projection_for_destinations(
+            projection,
+            (self.layout.sysusers, self.layout.current),
+        )
         unit_projection.converge_target()
         self.runner.run(("/usr/bin/systemctl", "daemon-reload"))
         self._stop_for_install()
-        tail_projection.converge_target()
+        stopped_tail_projection.converge_target()
         projection.require_exact_target()
         self.runner.run(
             (
@@ -1185,12 +1145,7 @@ class BenchmarkAdmin:
         try:
             self._start_current_service()
             with self.maintenance.hold(installed=True):
-                self.runner.run(
-                    (
-                        os.fspath(self._generation_client(intent.target_digest)),
-                        "--status",
-                    )
-                )
+                self.maintenance.probe()
                 projection.require_exact_target()
         except BaseException as activation_error:
             try:
@@ -1291,7 +1246,6 @@ class BenchmarkAdmin:
             self._require_no_install_stages()
         else:
             self._require_no_install_stages()
-
         self.accounts.validate_user(user_name)
         if configuration_source is None and not os.path.lexists(self.layout.config):
             raise _admin_error(
@@ -1356,7 +1310,9 @@ class BenchmarkAdmin:
                 )
                 self.accounts.add_user(user_name)
                 self.runner.run(("/usr/bin/systemctl", "daemon-reload"))
-                self._activate_current_service()
+                self._start_current_service()
+                self.maintenance.probe()
+                projection.require_exact_target()
                 self.report(
                     f"benchmarkd generation {generation.digest} is already current; "
                     f"new group membership for {user_name!r} takes effect at "
@@ -1415,6 +1371,13 @@ class BenchmarkAdmin:
         """Audit the installed immutable closure and live socket."""
 
         self._require_root()
+        self._require_directory(self.layout.state, mode=0o700)
+        with self._hold_operation_lock(shared=True):
+            return self._doctor(user_name=user_name)
+
+    def _doctor(self, *, user_name: str | None) -> str:
+        """Audit one installation while holding its shared admin snapshot."""
+
         self._require_directory(self.layout.install_root, mode=0o755)
         self._require_directory(self.layout.generations, mode=0o755)
         self._require_directory(self.layout.config.parent, mode=0o700)
@@ -1449,10 +1412,6 @@ class BenchmarkAdmin:
                 "benchmarkd has no current generation",
                 code="benchmark_admin_not_installed",
             )
-        self._require_symlink(
-            self.layout.client,
-            os.fspath(INSTALL_ROOT / "current/bin/benchmark-lock"),
-        )
         self._require_managed_file(
             self.layout.socket_unit,
             self.layout.generations / digest / "share/systemd/benchmarkd.socket",
@@ -1499,12 +1458,7 @@ class BenchmarkAdmin:
                 )
             )
             self._require_runtime_socket()
-            self.runner.run(
-                (
-                    os.fspath(self.layout.client),
-                    "--status",
-                )
-            )
+            self.maintenance.probe()
         self.report(f"benchmarkd generation {digest} is installed and healthy")
         return digest
 
@@ -1590,10 +1544,6 @@ class BenchmarkAdmin:
                 )
             return
         generation_root = self.layout.generations / current_digest
-        self._require_symlink(
-            self.layout.client,
-            os.fspath(INSTALL_ROOT / "current/bin/benchmark-lock"),
-        )
         for destination, content, _description in self._external_file_payloads(
             generation_root
         ):
@@ -1633,19 +1583,11 @@ class BenchmarkAdmin:
 
         if current_digest is not None:
             generation_root = self.layout.generations / current_digest
-            if os.path.lexists(self.layout.client):
-                self._require_symlink(
-                    self.layout.client,
-                    os.fspath(INSTALL_ROOT / "current/bin/benchmark-lock"),
-                )
             for destination, content, _description in self._external_file_payloads(
                 generation_root
             ):
                 self._remove_external_regular(destination, expected=content)
             self.runner.run(("/usr/bin/systemctl", "daemon-reload"))
-            if os.path.lexists(self.layout.client):
-                os.unlink(self.layout.client)
-                self._fsync_directory(self.layout.client.parent)
             self._current_digest()
             os.unlink(self.layout.current)
             self._fsync_directory(self.layout.current.parent)
@@ -1754,11 +1696,6 @@ class BenchmarkAdmin:
                     self.layout.generations / current_digest
                 )
             )
-            if installed:
-                self._require_symlink(
-                    self.layout.client,
-                    os.fspath(INSTALL_ROOT / "current/bin/benchmark-lock"),
-                )
             for destination, content, _description in expected_external:
                 self._require_removable_external_regular(
                     destination,

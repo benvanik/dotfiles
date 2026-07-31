@@ -1,4 +1,10 @@
-"""Strict packet protocol shared by the benchmark client and broker."""
+"""Strict packet protocol shared by the benchmark client and broker.
+
+The v1 packet shapes are a frozen rolling-upgrade ABI: checkout clients and
+administration must interoperate with the independently installed prior broker
+generation. A later wire version requires a staged dual-version migration; v1
+encoders and parsers never change in place.
+"""
 
 from __future__ import annotations
 

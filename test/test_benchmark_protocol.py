@@ -49,6 +49,86 @@ def _canonical(value: object) -> bytes:
 
 
 class BenchmarkProtocolTest(unittest.TestCase):
+    def test_v1_wire_is_frozen_for_source_client_broker_cutovers(self) -> None:
+        self.assertEqual(REQUEST_SCHEMA, "benchmarkd.request.v1")
+        self.assertEqual(EVENT_SCHEMA, "benchmarkd.event.v1")
+        request_packets = (
+            (
+                AcquireRequest("kernel"),
+                b'{"inherited_lease_id":null,"label":"kernel",'
+                b'"operation":"acquire","schema":"benchmarkd.request.v1"}\n',
+            ),
+            (
+                StatusRequest(),
+                b'{"operation":"status","schema":"benchmarkd.request.v1"}\n',
+            ),
+            (
+                MaintenanceRequest(),
+                b'{"operation":"maintenance","schema":"benchmarkd.request.v1"}\n',
+            ),
+        )
+        for request, frozen_packet in request_packets:
+            with self.subTest(request=request):
+                self.assertEqual(encode_request(request), frozen_packet)
+                self.assertEqual(parse_request(frozen_packet), request)
+
+        active = ActiveLease(
+            lease_id="b" * 32,
+            pid=1234,
+            uid=1000,
+            label="active benchmark",
+            elapsed_seconds=67,
+        )
+        event_packets = (
+            (
+                QueuedEvent(LEASE_ID, 2, active),
+                b'{"active":{"elapsed_seconds":67,'
+                b'"label":"active benchmark",'
+                b'"lease_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",'
+                b'"pid":1234,"uid":1000},'
+                b'"lease_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+                b'"position":2,"schema":"benchmarkd.event.v1",'
+                b'"type":"queued"}\n',
+            ),
+            (
+                WaitingEvent(LEASE_ID, 1, None),
+                b'{"active":null,'
+                b'"lease_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+                b'"position":1,"schema":"benchmarkd.event.v1",'
+                b'"type":"waiting"}\n',
+            ),
+            (
+                GrantedEvent(LEASE_ID, "performance"),
+                b'{"aslr":"process",'
+                b'"lease_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+                b'"policy":"performance","schema":"benchmarkd.event.v1",'
+                b'"type":"granted"}\n',
+            ),
+            (
+                ErrorEvent("policy_failed", "The fixed policy failed."),
+                b'{"code":"policy_failed",'
+                b'"message":"The fixed policy failed.",'
+                b'"schema":"benchmarkd.event.v1","type":"error"}\n',
+            ),
+            (
+                StatusEvent(active, 3, "held"),
+                b'{"active":{"elapsed_seconds":67,'
+                b'"label":"active benchmark",'
+                b'"lease_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",'
+                b'"pid":1234,"uid":1000},"policy_state":"held",'
+                b'"queue_depth":3,"schema":"benchmarkd.event.v1",'
+                b'"type":"status"}\n',
+            ),
+            (
+                MaintenanceEvent(),
+                b'{"schema":"benchmarkd.event.v1","type":"maintenance"}\n',
+            ),
+        )
+        for event, frozen_packet in event_packets:
+            with self.subTest(event=event):
+                self.assertEqual(encode_event(event), frozen_packet)
+                self.assertEqual(parse_event(frozen_packet), event)
+
     def test_packet_root_must_be_an_object(self) -> None:
         with self.assertRaises(BenchmarkLockError) as caught:
             canonical_json_bytes(  # type: ignore[arg-type]

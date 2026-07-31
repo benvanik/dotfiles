@@ -23,9 +23,9 @@ fail() {
     exit 1
 }
 
-if [ -e "$DOTFILES/bin/benchmark-lock" ] ||
-        [ -L "$DOTFILES/bin/benchmark-lock" ]; then
-    fail "repository benchmark-lock would shadow the installed broker client"
+if [ ! -f "$DOTFILES/bin/benchmark-lock" ] ||
+        [ ! -x "$DOTFILES/bin/benchmark-lock" ]; then
+    fail "canonical repository benchmark-lock is not executable"
 fi
 
 FAKE_BIN="$TEST_ROOT/fake-bin"

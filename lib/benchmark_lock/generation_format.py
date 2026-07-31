@@ -26,6 +26,20 @@ MAX_SOURCE_FILE_BYTES = 4 * 1024 * 1024
 MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_GENERATION_FILES = 128
 
+BROKER_RUNTIME_MODULE_NAMES = (
+    "__init__.py",
+    "administration_state.py",
+    "broker.py",
+    "configuration.py",
+    "daemon.py",
+    "errors.py",
+    "fdstore.py",
+    "linux.py",
+    "policy.py",
+    "protocol.py",
+    "scheduler.py",
+)
+
 DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}")
 GENERATION_DIRECTORIES = (
     pathlib.PurePosixPath("bin"),
@@ -410,20 +424,15 @@ def build_generation(source_root: pathlib.Path) -> Generation:
             f"cannot enumerate benchmark package sources: {error}",
             code="benchmark_admin_source_invalid",
         ) from error
-    python_names = tuple(
-        name
-        for name in source_names
-        if name.endswith(".py") and not name.startswith(".")
-    )
-    required = frozenset({"__init__.py", "client.py", "daemon.py"})
-    if not required.issubset(python_names):
-        missing = ", ".join(sorted(required - frozenset(python_names)))
+    missing_names = frozenset(BROKER_RUNTIME_MODULE_NAMES) - frozenset(source_names)
+    if missing_names:
+        missing = ", ".join(sorted(missing_names))
         raise _generation_error(
-            f"benchmark package is incomplete; missing {missing}",
+            f"benchmark broker runtime is incomplete; missing {missing}",
             code="benchmark_admin_source_invalid",
         )
     entries: list[GenerationEntry] = []
-    for name in python_names:
+    for name in BROKER_RUNTIME_MODULE_NAMES:
         entries.append(
             GenerationEntry(
                 path=pathlib.PurePosixPath("lib/benchmark_lock") / name,
@@ -431,14 +440,13 @@ def build_generation(source_root: pathlib.Path) -> Generation:
                 mode=0o444,
             )
         )
-    for name in ("benchmark-lock", "benchmarkd"):
-        entries.append(
-            GenerationEntry(
-                path=pathlib.PurePosixPath("bin") / name,
-                content=_read_source_file(deployment_root / "bin" / name),
-                mode=0o555,
-            )
+    entries.append(
+        GenerationEntry(
+            path=pathlib.PurePosixPath("bin/benchmarkd"),
+            content=_read_source_file(deployment_root / "bin/benchmarkd"),
+            mode=0o555,
         )
+    )
     for source, destination in (
         (
             deployment_root / "systemd/benchmarkd.socket",

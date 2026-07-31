@@ -4,9 +4,11 @@
 lease:
 
 ```bash
-benchmark-lock --status
-benchmark-lock --label gfx1100-gemm -- ./build/kernel_benchmark
-benchmark-lock -- ctest --test-dir build -R gpu
+~/.dotfiles/bin/benchmark-lock --agents-md
+~/.dotfiles/bin/benchmark-lock --status
+~/.dotfiles/bin/benchmark-lock --label gfx1100-gemm -- \
+  ./build/kernel_benchmark
+~/.dotfiles/bin/benchmark-lock -- ctest --test-dir build -R gpu
 ```
 
 The client waits, prints the current holder and its queue position when useful,
@@ -127,16 +129,18 @@ sudo ~/.dotfiles/bin/benchmark-admin install --user "$USER"
 sudo ~/.dotfiles/bin/benchmark-admin doctor --user "$USER"
 ```
 
-The repository has no `bin/benchmark-lock`: only the installed, root-owned
-projection owns that command name. `bin/benchmark-unlock` remains solely to
-recover `/tmp/benchmark-lock-*` state left by the retired snapshot-style tool;
-it is not part of the process-scoped lease lifecycle.
+The sole client executable is the user-owned
+`~/.dotfiles/bin/benchmark-lock`. It runs directly from the dotfiles checkout;
+root installation never copies, links, or executes it. `--agents-md` prints a
+small project-instruction snippet for benchmark users. `bin/benchmark-unlock`
+remains solely to recover `/tmp/benchmark-lock-*` state left by the retired
+snapshot-style tool; it is not part of the process-scoped lease lifecycle.
 
 An upgrade first fences new admissions, then stops and atomically replaces the
-service. The current release is a root-owned content-addressed generation
-under `/usr/local/lib/benchmarkd`; `/usr/local/bin/benchmark-lock` is a stable
-projection. Configuration lives at `/etc/benchmarkd/config.json`, and the
-crash-recovery epoch lives under `/var/lib/benchmarkd`.
+service. Root owns only the content-addressed broker generation under
+`/usr/local/lib/benchmarkd`, its units and policy, and its runtime/state paths.
+Configuration lives at `/etc/benchmarkd/config.json`, and the crash-recovery
+epoch lives under `/var/lib/benchmarkd`.
 
 Generation publication is itself a recoverable transaction. A complete
 manifest is atomically published before the fixed staging tree becomes
@@ -153,6 +157,15 @@ rollback; `benchmark-admin` does not expose an unsafe partial version of that
 transaction. Because uninstall retains configuration and epoch state, a later
 reinstall continues to use that same policy.
 
+The source client and administrator can be newer than the installed immutable
+broker during every pull and cutover. The `benchmarkd.request.v1` and
+`benchmarkd.event.v1` packet shapes are therefore a frozen rolling-upgrade ABI;
+literal compatibility fixtures pin every request and event used by acquisition,
+status, maintenance, activation proof, and rollback. A future wire version
+cannot replace v1 in place. Its first deployment must add broker-side dual
+version support while clients and administrator recovery remain on v1; only a
+later source update may adopt the new version.
+
 Every install or uninstall takes an exclusive, root-owned mode-`0600` flock at
 `/var/lib/benchmarkd/admin.lock`. Its mode-`0700` parent is the retained
 `StateDirectory=benchmarkd`, so the exact authority inode survives service
@@ -167,6 +180,10 @@ while an administrator owns the exclusive lock, it becomes ready for status and
 root maintenance requests but cannot admit or grant benchmark work. A
 successful upgrade clears that crash-visible fence only after the administrator
 releases the exclusive lock.
+
+`benchmark-admin doctor` holds a shared lock on the same inode for its complete
+filesystem and runtime audit. It therefore reports one coherent committed
+generation rather than racing an install or uninstall cutover.
 
 An upgrade or uninstall of an active installation also acquires the broker's
 root-only connection fence. It is granted only while no lease or waiter
@@ -200,9 +217,9 @@ name, so interruption after any individual file or directory removal remains
 verifiable and resumable. Install and doctor refuse to proceed while this
 committed removal exists.
 
-`benchmark-admin uninstall` removes verified software and units but retains the
-configuration, recovery state, and `benchmark` group. It refuses to remove
-foreign or modified paths.
+`benchmark-admin uninstall` removes verified broker software and units but
+retains the user client, configuration, recovery state, and `benchmark` group.
+It refuses to remove foreign or modified paths.
 
 ## Baseline pressure
 
@@ -211,7 +228,7 @@ already in the `performance` profile or a GPU is already forced to `high`, that
 is the baseline it will faithfully restore. Put the host in its intended idle
 state before relying on the broker to return it there.
 
-`benchmark-lock --status` reports the active holder, queue depth, and policy
-state. Infrastructure failures return 125; an unexecutable command returns 126;
-a missing command returns 127. The benchmark command otherwise owns its exact
-exit status.
+`~/.dotfiles/bin/benchmark-lock --status` reports the active holder, queue
+depth, and policy state. Infrastructure failures return 125; an unexecutable
+command returns 126; a missing command returns 127. The benchmark command
+otherwise owns its exact exit status.

@@ -1,6 +1,15 @@
 #!/bin/bash
 # Shared Git worktree conventions for project-* commands.
 
+# Prints local files shared from the primary worktree into sibling worktrees.
+# These names are consumed by both worktree creation and removal so managed
+# links have one ownership definition.
+project_worktree_shared_files() {
+    printf '%s\n' \
+        "AGENTS.override.md" \
+        ".bazelrc.local"
+}
+
 # Prints the primary worktree in the required <project>/main layout.
 #
 # The primary directory remains the repository anchor even while it checks out

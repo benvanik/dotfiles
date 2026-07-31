@@ -96,11 +96,14 @@ fi
 SESSION_NAME=$(project_default_session_name "$WORKTREE_PATH")
 info "Removing worktree: $WORKTREE_PATH"
 
-restore_managed_override() {
-    if [ "$MANAGED_OVERRIDE" = "true" ]; then
-        ln -s "../main/AGENTS.override.md" \
-            "$WORKTREE_PATH/AGENTS.override.md"
-    fi
+restore_managed_links() {
+    local shared_file
+    for shared_file in "${MANAGED_SHARED_FILES[@]}"; do
+        if ! ln -s "../main/$shared_file" "$WORKTREE_PATH/$shared_file"; then
+            error "Could not restore the managed $shared_file link."
+            return 1
+        fi
+    done
 }
 
 inspect_worktree_contents() {
@@ -121,20 +124,23 @@ inspect_worktree_contents() {
     fi
 }
 
-# The initializer owns this exact symlink. Remove it before asking Git to
-# evaluate cleanliness, restoring it if any other state blocks removal.
-MANAGED_OVERRIDE=false
-if [ -L "$WORKTREE_PATH/AGENTS.override.md" ] && \
-        [ "$(readlink "$WORKTREE_PATH/AGENTS.override.md")" = "../main/AGENTS.override.md" ]; then
-    unlink "$WORKTREE_PATH/AGENTS.override.md"
-    MANAGED_OVERRIDE=true
-fi
+# The initializer owns these exact symlinks. Remove them before asking Git to
+# evaluate cleanliness, restoring them if any other state blocks removal.
+MANAGED_SHARED_FILES=()
+while IFS= read -r shared_file; do
+    shared_path="$WORKTREE_PATH/$shared_file"
+    if [ -L "$shared_path" ] && \
+            [ "$(readlink "$shared_path")" = "../main/$shared_file" ]; then
+        unlink "$shared_path"
+        MANAGED_SHARED_FILES+=("$shared_file")
+    fi
+done < <(project_worktree_shared_files)
 
 # Git's worktree remover ignores ignored files during its cleanliness check
 # and then deletes them recursively. Refuse every remaining payload class so
 # build trees, local issue state, and caches cannot disappear silently.
 if ! inspect_worktree_contents; then
-    restore_managed_override
+    restore_managed_links
     error "Worktree removal stopped; managed state was restored."
     exit 1
 fi
@@ -144,18 +150,18 @@ fi
 # clean check and Git will delete it as part of worktree removal.
 if ! "$SCRIPT_DIR/project-deinit" \
         --session "$SESSION_NAME" --tmux-only --yes "$MAIN_WORKTREE"; then
-    restore_managed_override
+    restore_managed_links
     error "Could not stop the associated session; managed state was restored."
     exit 1
 fi
 if ! inspect_worktree_contents; then
-    restore_managed_override
+    restore_managed_links
     error "Worktree changed while its session stopped; managed state was restored."
     exit 1
 fi
 
 if ! git -C "$MAIN_WORKTREE" worktree remove "$WORKTREE_PATH"; then
-    restore_managed_override
+    restore_managed_links
     error "Worktree removal failed; worktree contents were preserved."
     exit 1
 fi

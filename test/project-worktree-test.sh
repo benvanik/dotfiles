@@ -56,6 +56,7 @@ git clone -q --branch main "$REMOTE" "$MAIN_WORKTREE"
 # continuously checks out the main branch.
 git -C "$MAIN_WORKTREE" switch -q -c integration/primary-work
 printf 'shared instructions\n' > "$MAIN_WORKTREE/AGENTS.override.md"
+printf 'shared bazel configuration\n' > "$MAIN_WORKTREE/.bazelrc.local"
 (
     cd "$MAIN_WORKTREE"
     "$BASH_EXECUTABLE" "$DOTFILES/bin/project-worktree-init" \
@@ -68,6 +69,12 @@ FEATURE_WORKTREE="$PROJECT_ROOT/feature"
     fail "override link does not target the main worktree"
 [ "$(cat "$FEATURE_WORKTREE/AGENTS.override.md")" = "shared instructions" ] || \
     fail "override link does not resolve to shared contents"
+[ -L "$FEATURE_WORKTREE/.bazelrc.local" ] || \
+    fail "bazel configuration link was not created"
+[ "$(readlink "$FEATURE_WORKTREE/.bazelrc.local")" = "../main/.bazelrc.local" ] || \
+    fail "bazel configuration link does not target the main worktree"
+[ "$(cat "$FEATURE_WORKTREE/.bazelrc.local")" = "shared bazel configuration" ] || \
+    fail "bazel configuration link does not resolve to shared contents"
 
 # Ignored state is still local data. Git's own worktree removal check omits it,
 # so the wrapper must detect it before Git recursively deletes the worktree.
@@ -147,13 +154,16 @@ if git -C "$MAIN_WORKTREE" show-ref --verify --quiet \
     fail "reserved attic request created a branch"
 fi
 
-# A post-checkout failure must not leave a registered worktree or the branch
-# created for it. Stub only the final symlink operation.
+# A post-checkout failure must remove earlier managed links and must not leave a
+# registered worktree or the branch created for it. Stub the second link only.
 LINK_FAILURE_BIN="$TEST_ROOT/link-failure-bin"
 mkdir -p "$LINK_FAILURE_BIN"
 cat > "$LINK_FAILURE_BIN/ln" << 'EOF'
 #!/bin/bash
-exit 71
+case "${3:-}" in
+    */.bazelrc.local) exit 71 ;;
+esac
+exec /bin/ln "$@"
 EOF
 chmod +x "$LINK_FAILURE_BIN/ln"
 if (
@@ -185,6 +195,8 @@ fi
 [ -d "$FEATURE_WORKTREE" ] || fail "dirty worktree was removed"
 [ -L "$FEATURE_WORKTREE/AGENTS.override.md" ] || \
     fail "managed override was not restored after failed removal"
+[ -L "$FEATURE_WORKTREE/.bazelrc.local" ] || \
+    fail "managed bazel configuration was not restored after failed removal"
 
 unlink "$FEATURE_WORKTREE/untracked.txt"
 if (
@@ -197,6 +209,8 @@ fi
     fail "ignored worktree state was removed"
 [ -L "$FEATURE_WORKTREE/AGENTS.override.md" ] || \
     fail "managed override was not restored after ignored-state refusal"
+[ -L "$FEATURE_WORKTREE/.bazelrc.local" ] || \
+    fail "managed bazel configuration was not restored after ignored-state refusal"
 
 find "$FEATURE_WORKTREE/.worktree-local" -depth -delete
 (
@@ -293,6 +307,8 @@ fi
     fail "failed session shutdown removed the worktree"
 [ -L "$PLAIN_PREFIX_WORKTREE/AGENTS.override.md" ] ||
     fail "failed session shutdown did not restore the managed override"
+[ -L "$PLAIN_PREFIX_WORKTREE/.bazelrc.local" ] ||
+    fail "failed session shutdown did not restore the managed bazel configuration"
 
 QUIESCED_STATE="$PREFIXED_WORKTREE/quiesced-state"
 if (
@@ -309,6 +325,8 @@ fi
     fail "tmux quiescence fixture did not write worktree state"
 [ -L "$PREFIXED_WORKTREE/AGENTS.override.md" ] ||
     fail "managed override was not restored after the quiescence recheck"
+[ -L "$PREFIXED_WORKTREE/.bazelrc.local" ] ||
+    fail "managed bazel configuration was not restored after the quiescence recheck"
 grep -Fqx "has-session -t =$PREFIXED_SESSION" "$TMUX_LOG" ||
     fail "deinitializer did not look up the exact tmux session"
 grep -Fqx "kill-session -t =$PREFIXED_SESSION" "$TMUX_LOG" ||
@@ -364,6 +382,7 @@ grep -Fqx "kill-session -t =tmux-only.session" "$TMUX_LOG" ||
     fail "tmux-only cleanup did not kill the exact requested session"
 
 unlink "$MAIN_WORKTREE/AGENTS.override.md"
+unlink "$MAIN_WORKTREE/.bazelrc.local"
 (
     cd "$MAIN_WORKTREE"
     "$BASH_EXECUTABLE" "$DOTFILES/bin/project-worktree-init" \
@@ -372,6 +391,8 @@ unlink "$MAIN_WORKTREE/AGENTS.override.md"
 PLAIN_WORKTREE="$PROJECT_ROOT/plain"
 [ ! -e "$PLAIN_WORKTREE/AGENTS.override.md" ] || \
     fail "override link was created without a main override"
+[ ! -e "$PLAIN_WORKTREE/.bazelrc.local" ] || \
+    fail "bazel configuration link was created without a main configuration"
 (
     cd "$MAIN_WORKTREE"
     "$BASH_EXECUTABLE" "$DOTFILES/bin/project-worktree-deinit" plain >/dev/null

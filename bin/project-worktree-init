@@ -31,8 +31,8 @@ LAYOUT
     checked-out branch may vary; new branches start from main by default.
     New worktrees are created at <project>/<name>.
 
-    If main/AGENTS.override.md exists, the new worktree receives a relative
-    AGENTS.override.md symlink to that shared file.
+    If main/AGENTS.override.md or main/.bazelrc.local exists, the new worktree
+    receives a relative symlink to each shared local file.
 
 EXAMPLES
     project-worktree-init users/me/feature
@@ -95,7 +95,6 @@ fi
 
 PROJECT_ROOT=$(dirname "$MAIN_WORKTREE")
 WORKTREE_PATH="$PROJECT_ROOT/$WORKTREE_NAME"
-OVERRIDE_SOURCE="$MAIN_WORKTREE/AGENTS.override.md"
 
 if [ -e "$WORKTREE_PATH" ] || [ -L "$WORKTREE_PATH" ]; then
     error "Destination already exists: $WORKTREE_PATH"
@@ -112,20 +111,26 @@ elif git -C "$MAIN_WORKTREE" show-ref --verify --quiet "refs/remotes/origin/$BRA
     BRANCH_MODE="remote"
 fi
 
-if [ -L "$OVERRIDE_SOURCE" ] && [ ! -e "$OVERRIDE_SOURCE" ]; then
-    error "The main worktree has a broken AGENTS.override.md symlink."
-    exit 1
-fi
-if [ -e "$OVERRIDE_SOURCE" ] && [ ! -f "$OVERRIDE_SOURCE" ]; then
-    error "The main worktree's AGENTS.override.md is not a regular file."
-    exit 1
-fi
-
-if [ -e "$OVERRIDE_SOURCE" ] && \
-        git -C "$MAIN_WORKTREE" cat-file -e "$START_POINT:AGENTS.override.md" 2>/dev/null; then
-    error "AGENTS.override.md is tracked on $START_POINT and cannot be replaced by a shared symlink."
-    exit 1
-fi
+SHARED_FILES=()
+while IFS= read -r shared_file; do
+    shared_source="$MAIN_WORKTREE/$shared_file"
+    if [ -L "$shared_source" ] && [ ! -e "$shared_source" ]; then
+        error "The main worktree has a broken $shared_file symlink."
+        exit 1
+    fi
+    if [ -e "$shared_source" ] && [ ! -f "$shared_source" ]; then
+        error "The main worktree's $shared_file is not a regular file."
+        exit 1
+    fi
+    if [ -e "$shared_source" ] && git -C "$MAIN_WORKTREE" cat-file -e \
+            "$START_POINT:$shared_file" 2>/dev/null; then
+        error "$shared_file is tracked on $START_POINT and cannot be replaced by a shared symlink."
+        exit 1
+    fi
+    if [ -e "$shared_source" ]; then
+        SHARED_FILES+=("$shared_file")
+    fi
+done < <(project_worktree_shared_files)
 
 CREATED_BRANCH_OID=""
 if [ "$BRANCH_MODE" != "local" ]; then
@@ -149,10 +154,18 @@ case "$BRANCH_MODE" in
         ;;
 esac
 
-if [ -e "$OVERRIDE_SOURCE" ]; then
-    if ! ln -s "../main/AGENTS.override.md" \
-            "$WORKTREE_PATH/AGENTS.override.md"; then
-        error "Could not link the shared AGENTS.override.md; rolling back the new worktree."
+LINKED_SHARED_FILES=()
+for shared_file in "${SHARED_FILES[@]}"; do
+    shared_target="../main/$shared_file"
+    if ! ln -s "$shared_target" "$WORKTREE_PATH/$shared_file"; then
+        error "Could not link the shared $shared_file; rolling back the new worktree."
+        for linked_file in "${LINKED_SHARED_FILES[@]}"; do
+            if ! unlink "$WORKTREE_PATH/$linked_file"; then
+                error "Could not remove the managed $linked_file link during rollback."
+                error "The new worktree was preserved for manual recovery: $WORKTREE_PATH"
+                exit 1
+            fi
+        done
         if ! git -C "$MAIN_WORKTREE" worktree remove "$WORKTREE_PATH"; then
             error "Rollback refused to remove the new worktree because its contents changed:"
             error "$WORKTREE_PATH"
@@ -167,8 +180,9 @@ if [ -e "$OVERRIDE_SOURCE" ]; then
         error "New worktree and branch were rolled back."
         exit 1
     fi
-    info "Linked AGENTS.override.md -> ../main/AGENTS.override.md"
-fi
+    LINKED_SHARED_FILES+=("$shared_file")
+    info "Linked $shared_file -> $shared_target"
+done
 
 info "Created worktree: $WORKTREE_PATH"
 printf '  cd %q\n' "$WORKTREE_PATH"

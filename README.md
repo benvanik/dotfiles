@@ -87,14 +87,16 @@ cd ../main
 project-worktree-deinit feature
 ```
 
-When `main/AGENTS.override.md` exists, `project-worktree-init` links it into
-each new worktree. Deinitialization refuses a worktree containing any other
-modified, untracked, or ignored files, stops its exact tmux session, and
-rechecks the complete worktree before removal. Default tmux names carry a
-readable project/worktree prefix plus a digest of the physical project path,
-so identically named repositories cannot attach to each other's sessions.
-Worktree lifetime and project configuration are separate: initialize each new
-worktree explicitly.
+When `main/AGENTS.override.md` or `main/.bazelrc.local` exists,
+`project-worktree-init` links the shared local file into each new worktree.
+This lets sibling Bazel worktrees keep independent output bases and servers
+while sharing the primary checkout's repository and disk-cache policy.
+Deinitialization refuses a worktree containing any other modified, untracked,
+or ignored files, stops its exact tmux session, and rechecks the complete
+worktree before removal. Default tmux names carry a readable project/worktree
+prefix plus a digest of the physical project path, so identically named
+repositories cannot attach to each other's sessions. Worktree lifetime and
+project configuration are separate: initialize each new worktree explicitly.
 
 `agents/WORKING_CONTRACT.md` is the canonical global agent contract.
 `dotfiles install` and `dotfiles update` publish byte-identical regular-file

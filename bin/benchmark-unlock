@@ -1,5 +1,8 @@
 #!/bin/bash
-# Restore machine-level benchmark knobs saved by benchmark-lock.
+# Recover machine-level knobs saved by the retired snapshot-style lock.
+#
+# This command exists only for historical /tmp/benchmark-lock-* state. The
+# current benchmark-lock is process-scoped and needs no matching unlock.
 
 set -euo pipefail
 

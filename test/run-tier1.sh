@@ -133,6 +133,31 @@ if command -v python3 &>/dev/null; then
     else
         fail "Model-lab orchestration tests"
     fi
+    if [ "$(uname -s)" = "Linux" ]; then
+        if PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$DOTFILES/lib" \
+            python3 -m unittest discover -s test -p 'test_benchmark_*.py'; then
+            pass "Benchmark broker tests"
+        else
+            fail "Benchmark broker tests"
+        fi
+        if PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$DOTFILES/lib" \
+            python3 -O -m unittest discover \
+                -s test -p 'test_benchmark_*.py'; then
+            pass "Benchmark broker optimized-mode tests"
+        else
+            fail "Benchmark broker optimized-mode tests"
+        fi
+        if PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$DOTFILES/lib" \
+            "$DOTFILES/bin/benchmark-admin" --help >/dev/null; then
+            pass "Benchmark administrator help"
+        else
+            fail "Benchmark administrator help"
+        fi
+    else
+        skip "benchmark broker tests require Linux"
+        skip "benchmark broker optimized-mode tests require Linux"
+        skip "benchmark administrator requires Linux"
+    fi
 else
     fail "python3 required for Python commands"
 fi

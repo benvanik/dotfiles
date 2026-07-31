@@ -109,6 +109,7 @@ Some command families are useful only on machines doing GPU or compiler work:
 |--------|-------|---------|
 | `runpod*` | [RunPod](https://www.runpod.io/) | Generic GPU hosts, claims, SSH, and billing lifetime |
 | `model-lab*`, `model-session` | Model lab | Private model services and isolated Pi sessions |
+| `benchmark-lock` | [Benchmark broker](benchmarkd/README.md) | Process-scoped FIFO admission and exact host-policy restoration |
 | `therock-*` | [TheRock](https://github.com/ROCm/TheRock) | ROCm/HIP compiler development |
 | `vulkan-*` | Vulkan SDK | SDK installation and layer building |
 

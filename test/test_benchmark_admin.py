@@ -1339,18 +1339,22 @@ class BenchmarkAdminUninstallTest(unittest.TestCase):
             ],
         )
 
-    def test_restrictive_umask_partial_uninstall_journal_is_recoverable(
+    def test_exact_partial_uninstall_journal_is_recoverable_under_strict_umask(
         self,
     ) -> None:
         self.fixture.install()
         publish_path = self.fixture.mapped(UNINSTALL_PUBLISH_PATH)
         previous_umask = os.umask(0o0777)
         try:
-            descriptor = os.open(
-                publish_path,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
-                0o600,
-            )
+            production_umask = os.umask(0)
+            try:
+                descriptor = os.open(
+                    publish_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+                    0o600,
+                )
+            finally:
+                os.umask(production_umask)
         finally:
             os.umask(previous_umask)
         try:
@@ -1358,7 +1362,7 @@ class BenchmarkAdminUninstallTest(unittest.TestCase):
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
-        self.assertEqual(stat.S_IMODE(os.lstat(publish_path).st_mode), 0)
+        self.assertEqual(stat.S_IMODE(os.lstat(publish_path).st_mode), 0o600)
 
         self.fixture.maintenance.events.clear()
         self.fixture.admin.uninstall()

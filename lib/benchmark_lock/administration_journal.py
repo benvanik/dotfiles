@@ -404,7 +404,7 @@ class AdministrationJournal:
             or metadata.st_gid != self.root_gid
             or metadata.st_nlink != 1
             or metadata.st_size > MAX_INTENT_BYTES
-            or _mode(metadata) & ~0o644
+            or _mode(metadata) != 0o600
         ):
             raise parse_error
         self.report(f"discarding incomplete benchmark {operation} journal {path}")

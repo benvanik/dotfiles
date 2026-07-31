@@ -346,6 +346,26 @@ class AdministrationJournalTest(unittest.TestCase):
         )
         self.assertTrue(self.fixture.install_paths.publish.is_symlink())
 
+    def test_malformed_read_only_stage_fails_closed_without_discard(self) -> None:
+        self.fixture.write(
+            self.fixture.install_paths.publish,
+            b"{",
+            mode=0o444,
+        )
+
+        with self.assertRaises(BenchmarkLockError) as caught:
+            self.fixture.journal.recover_install()
+
+        self.assertEqual(
+            caught.exception.code,
+            "benchmark_admin_install_invalid",
+        )
+        self.assertEqual(self.fixture.install_paths.publish.read_bytes(), b"{")
+        self.assertEqual(
+            os.lstat(self.fixture.install_paths.publish).st_mode & 0o777,
+            0o444,
+        )
+
     def test_overlapping_publication_and_intent_fail_closed(self) -> None:
         self.fixture.write(
             self.fixture.install_paths.publish,

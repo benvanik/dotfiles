@@ -1,0 +1,19 @@
+# Managed by benchmark-admin.
+[Unit]
+Description=Exclusive local benchmark lease broker
+
+[Socket]
+ListenSequentialPacket=/run/benchmarkd/control.sock
+SocketUser=root
+SocketGroup=benchmark
+SocketMode=0660
+DirectoryMode=0755
+Accept=no
+PassCredentials=yes
+FlushPending=no
+FileDescriptorName=benchmarkd.control
+Service=benchmarkd.service
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

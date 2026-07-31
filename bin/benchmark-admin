@@ -1,0 +1,17 @@
+#!/usr/bin/python3 -I
+"""Explicit administrator entry point for the benchmark broker."""
+
+from __future__ import annotations
+
+import pathlib
+import sys
+
+
+sys.dont_write_bytecode = True
+DOTFILES_ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(DOTFILES_ROOT / "lib"))
+
+from benchmark_lock.admin_cli import main  # noqa: E402
+
+
+raise SystemExit(main(source_root=DOTFILES_ROOT))

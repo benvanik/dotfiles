@@ -478,6 +478,37 @@ class BenchmarkBrokerTest(unittest.TestCase):
             any("injected attestation failure" in line for line in fixture.reports)
         )
 
+    def test_ready_callback_runs_after_listener_preparation(self) -> None:
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        listener.bind(f"\0benchmark-ready-test-{os.getpid()}-{id(self)}")
+        listener.listen()
+        broker = BenchmarkBroker(
+            listener=listener,
+            policy=FakePolicy(),
+        )
+        callback_count = 0
+
+        def ready() -> None:
+            nonlocal callback_count
+            callback_count += 1
+            registered = {
+                key.fd: key.data for key in broker.selector.get_map().values()
+            }
+            self.assertEqual(
+                registered[listener.fileno()],
+                ("listener", None),
+            )
+            self.assertFalse(listener.getblocking())
+            broker.request_stop()
+
+        try:
+            broker.run(ready=ready)
+        finally:
+            listener.close()
+
+        self.assertEqual(callback_count, 1)
+        self.assertTrue(broker._closed)
+
     def test_unadmitted_connections_are_bounded(self) -> None:
         connections = [self.fixture.connect() for _index in range(17)]
         for connection in connections:
@@ -741,7 +772,12 @@ class BenchmarkBrokerTest(unittest.TestCase):
         ticket = fixture.broker._tickets[active.lease_id]
         worker.close_input()
         self.assertEqual(worker.process.wait(), 0)
-        self.wait_until(lambda: fixture.broker.scheduler.snapshot.active is None)
+        self.wait_until(
+            lambda: (
+                fixture.broker.scheduler.snapshot.active is None
+                and ticket.identity.pid_descriptor == -1
+            )
+        )
 
         self.assertEqual(
             persistence.events,

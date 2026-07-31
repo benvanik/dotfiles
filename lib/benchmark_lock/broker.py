@@ -224,21 +224,23 @@ class BenchmarkBroker:
         self._grant_boundary = threading.Lock()
         self._adopt_recovered_tickets(tuple(recovered_tickets))
 
-    def run(self) -> None:
-        """Serve until requested to stop; the caller owns the listener."""
+    def run(self, *, ready: Callable[[], None] | None = None) -> None:
+        """Prepare every descriptor, publish readiness, and serve until stopped."""
 
-        # Credentials must be enabled before accept so a request sent
-        # immediately after connect already carries SCM_CREDENTIALS.
-        enable_sender_credentials(self.listener)
-        self.listener.setblocking(False)
-        self.selector.register(
-            self.listener,
-            selectors.EVENT_READ,
-            ("listener", None),
-        )
-        self._register_recovered_tickets()
-        self._invalidate_recovered_active()
         try:
+            # Credentials must be enabled before accept so a request sent
+            # immediately after connect already carries SCM_CREDENTIALS.
+            enable_sender_credentials(self.listener)
+            self.listener.setblocking(False)
+            self.selector.register(
+                self.listener,
+                selectors.EVENT_READ,
+                ("listener", None),
+            )
+            self._register_recovered_tickets()
+            self._invalidate_recovered_active()
+            if ready is not None:
+                ready()
             while not self.stop_event.is_set():
                 for key, _events in self.selector.select(EVENT_LOOP_TICK_SECONDS):
                     kind, ticket = key.data

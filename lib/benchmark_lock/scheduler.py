@@ -54,6 +54,7 @@ class SchedulerSnapshot:
     preparing: Lease | None
     queued: tuple[Lease, ...]
     maintenance_owner: PeerIdentity | None
+    admission_fenced: bool
 
 
 LeaseIdFactory = Callable[[], str]
@@ -85,6 +86,7 @@ class LeaseScheduler:
         self._preparing: Lease | None = None
         self._active: Lease | None = None
         self._maintenance_owner: PeerIdentity | None = None
+        self._admission_fenced = False
         self._live_lease_ids: set[str] = set()
 
     @property
@@ -94,6 +96,7 @@ class LeaseScheduler:
             preparing=self._preparing,
             queued=tuple(self._queued),
             maintenance_owner=self._maintenance_owner,
+            admission_fenced=self._admission_fenced,
         )
 
     def admit(
@@ -106,7 +109,7 @@ class LeaseScheduler:
     ) -> Lease:
         """Append one request to the immutable FIFO admission order."""
 
-        if self._maintenance_owner is not None:
+        if self._maintenance_owner is not None or self._admission_fenced:
             raise BenchmarkLockError(
                 "benchmark service is in administrator maintenance",
                 code="maintenance_active",
@@ -175,7 +178,12 @@ class LeaseScheduler:
     def begin_preparing(self) -> Lease | None:
         """Claim the live FIFO head for a policy transaction."""
 
-        if self._active is not None or self._preparing is not None:
+        if (
+            self._active is not None
+            or self._preparing is not None
+            or self._maintenance_owner is not None
+            or self._admission_fenced
+        ):
             return None
         if not self._queued:
             return None
@@ -277,6 +285,14 @@ class LeaseScheduler:
         self._maintenance_owner = None
         self._require_invariants()
 
+    def set_admission_fence(self, active: bool) -> None:
+        """Apply crash-visible administration independently of a live channel."""
+
+        if not isinstance(active, bool):
+            raise ValueError("benchmark admission fence state must be boolean")
+        self._admission_fenced = active
+        self._require_invariants()
+
     def restore(
         self,
         *,
@@ -284,6 +300,7 @@ class LeaseScheduler:
         preparing: Lease | None,
         queued: Iterable[Lease],
         next_sequence: int,
+        admission_fenced: bool = False,
     ) -> None:
         """Validate and load boot-local recovery metadata."""
 
@@ -292,6 +309,7 @@ class LeaseScheduler:
             or self._preparing is not None
             or self._queued
             or self._maintenance_owner is not None
+            or self._admission_fenced
             or self._live_lease_ids
         ):
             raise BenchmarkLockError(
@@ -302,6 +320,7 @@ class LeaseScheduler:
         self._preparing = preparing
         self._queued = deque(queued)
         self._next_sequence = next_sequence
+        self._admission_fenced = admission_fenced
         restored_leases = list(self._queued)
         if preparing is not None:
             restored_leases.insert(0, preparing)
@@ -319,6 +338,7 @@ class LeaseScheduler:
             self._queued.clear()
             self._live_lease_ids.clear()
             self._next_sequence = 1
+            self._admission_fenced = False
             raise BenchmarkLockError(
                 f"recovered scheduler metadata violates FIFO invariants: {violation}",
                 code="invalid_scheduler_recovery",
@@ -333,6 +353,8 @@ class LeaseScheduler:
             leases.insert(0, self._active)
         if any(not isinstance(lease, Lease) for lease in leases):
             return "a scheduler entry is not a lease"
+        if not isinstance(self._admission_fenced, bool):
+            return "the administration admission fence is not boolean"
         if len(leases) > self._maximum_tickets:
             return "the live ticket count exceeds its admission bound"
         if self._maintenance_owner is not None and leases:

@@ -135,6 +135,7 @@ Clock = Callable[[], float]
 Reporter = Callable[[str], None]
 OwnerSignaler = Callable[[int, int], None]
 OwnerWaiter = Callable[[int, float | None], bool]
+AdmissionFenceProbe = Callable[[], bool]
 
 
 def _ignore_report(_message: str) -> None:
@@ -202,6 +203,7 @@ class BenchmarkBroker:
         wait_owner: OwnerWaiter = wait_for_pidfd,
         monotonic: Clock = time.monotonic,
         report: Reporter = _ignore_report,
+        admission_fence: AdmissionFenceProbe | None = None,
     ) -> None:
         self.listener = listener
         self.policy = policy
@@ -214,6 +216,7 @@ class BenchmarkBroker:
         self.wait_owner = wait_owner
         self.monotonic = monotonic
         self.report = report
+        self.admission_fence = admission_fence
         self.selector = selectors.DefaultSelector()
         self.stop_event = threading.Event()
         self._accepted: dict[int, _Ticket] = {}
@@ -239,9 +242,11 @@ class BenchmarkBroker:
             )
             self._register_recovered_tickets()
             self._invalidate_recovered_active()
+            self._refresh_admission_fence()
             if ready is not None:
                 ready()
             while not self.stop_event.is_set():
+                self._refresh_admission_fence()
                 for key, _events in self.selector.select(EVENT_LOOP_TICK_SECONDS):
                     kind, ticket = key.data
                     if kind == "listener":
@@ -419,6 +424,7 @@ class BenchmarkBroker:
         if connection is None:
             return
         try:
+            self._refresh_admission_fence()
             request = receive_request(
                 connection,
                 expected_credentials=ticket.identity.credentials.as_tuple(),
@@ -475,11 +481,19 @@ class BenchmarkBroker:
                 queue_depth=len(snapshot.queued),
                 policy_state=(
                     "maintenance"
-                    if snapshot.maintenance_owner is not None
+                    if (
+                        snapshot.maintenance_owner is not None
+                        or snapshot.admission_fenced
+                    )
                     else self.policy.state
                 ),
             ),
         )
+
+    def _refresh_admission_fence(self) -> None:
+        if self.admission_fence is None:
+            return
+        self.scheduler.set_admission_fence(self.admission_fence())
 
     def _owner_ready(self, ticket: _Ticket) -> None:
         if ticket.identity.pid_descriptor < 0:
@@ -781,6 +795,7 @@ class BenchmarkBroker:
     def _cleanup_ticket(self, ticket: _Ticket) -> None:
         maintenance_owner = ticket.maintenance_owner
         if maintenance_owner is not None:
+            self._refresh_admission_fence()
             self.scheduler.leave_maintenance(maintenance_owner)
             ticket.maintenance_owner = None
         lease = ticket.lease

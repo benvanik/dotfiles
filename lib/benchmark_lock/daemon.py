@@ -14,6 +14,7 @@ from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from typing import Protocol
 
+from .administration_state import AdministrationAdmissionFence
 from .broker import (
     BenchmarkBroker,
     RecoveredBrokerTicket,
@@ -45,6 +46,28 @@ from .scheduler import LeaseScheduler, LeaseState
 
 
 POLICY_JOURNAL_PATH = pathlib.Path("/var/lib/benchmarkd/active-epoch.json")
+PERMANENT_FAILURE_EXIT_STATUS = 78
+
+_PERMANENT_FAILURE_CODES = frozenset(
+    {
+        "benchmark_admin_required",
+        "benchmark_hardware_identity_changed",
+        "benchmark_platform_unsupported",
+        "benchmark_policy_journal_failed",
+        "benchmark_policy_recovery_required",
+        "benchmark_systemd_unavailable",
+        "invalid_benchmark_administration_state",
+        "invalid_benchmark_policy_configuration",
+        "invalid_broker_recovery",
+        "invalid_fdstore_activation",
+        "invalid_fdstore_descriptor",
+        "invalid_fdstore_name",
+        "invalid_fdstore_record",
+        "invalid_fdstore_ticket",
+        "invalid_scheduler_recovery",
+        "invalid_scheduler_transition",
+    }
+)
 
 
 class RecoverableHostPolicy(Protocol):
@@ -74,6 +97,16 @@ class BrokerRuntime(Protocol):
         """Request a policy-restoring, persistence-releasing stop."""
 
 
+class RuntimeAdmissionFence(Protocol):
+    """Crash-visible root administration observed by the broker."""
+
+    def refresh(self) -> bool:
+        """Return whether new admissions and grants remain fenced."""
+
+    def close(self) -> None:
+        """Release observation resources without changing root authority."""
+
+
 class SystemdServiceNotifier(SystemdNotifier):
     """Production systemd fd-store and service-lifecycle notifier."""
 
@@ -91,6 +124,7 @@ OwnerSignaler = Callable[[int, int], None]
 OwnerWaiter = Callable[[int, float | None], bool]
 BrokerProvider = Callable[[], BrokerRuntime | None]
 Reporter = Callable[[str], None]
+AdmissionFenceFactory = Callable[[], RuntimeAdmissionFence]
 
 
 def _configuration_error(message: str) -> BenchmarkLockError:
@@ -324,7 +358,11 @@ def _invalidate_recovered_active(
         )
 
 
-def _restore_scheduler(activation: ActivationState) -> LeaseScheduler:
+def _restore_scheduler(
+    activation: ActivationState,
+    *,
+    admission_fenced: bool,
+) -> LeaseScheduler:
     active = tuple(
         recovered.lease
         for recovered in activation.tickets
@@ -350,6 +388,7 @@ def _restore_scheduler(activation: ActivationState) -> LeaseScheduler:
             default=0,
         )
         + 1,
+        admission_fenced=admission_fenced,
     )
     return scheduler
 
@@ -467,6 +506,7 @@ def run_daemon(
     wait_owner: OwnerWaiter = wait_for_pidfd,
     report: Reporter = _stderr_report,
     manage_signals: bool = True,
+    admission_fence_factory: AdmissionFenceFactory = AdministrationAdmissionFence,
 ) -> None:
     """Recover all authority, publish readiness, and run the root broker."""
 
@@ -476,6 +516,7 @@ def run_daemon(
             "benchmarkd must run as root",
             code="benchmark_admin_required",
         )
+    admission_fence = admission_fence_factory()
     listener: socket.socket | None = None
     tickets: tuple[RecoveredBrokerTicket, ...] = ()
     raw_descriptors: set[int] = set()
@@ -506,7 +547,10 @@ def run_daemon(
             )
             policy = policy_factory(configuration)
             policy.recover()
-            scheduler = _restore_scheduler(activation)
+            scheduler = _restore_scheduler(
+                activation,
+                admission_fenced=admission_fence.refresh(),
+            )
 
             listener = socket.socket(fileno=activation.control_descriptor)
             raw_descriptors.remove(activation.control_descriptor)
@@ -524,6 +568,7 @@ def run_daemon(
                 signal_owner=signal_owner,
                 wait_owner=wait_owner,
                 report=report,
+                admission_fence=admission_fence.refresh,
             )
             if lifecycle.termination_requested:
                 broker.request_clean_stop()
@@ -534,11 +579,14 @@ def run_daemon(
                 if lifecycle.ready_sent or lifecycle.termination_requested:
                     lifecycle.send_stopping()
             finally:
-                _close_broker_tickets(tickets)
-                if listener is not None:
-                    listener.close()
-                for descriptor in raw_descriptors:
-                    _close_descriptor(descriptor)
+                try:
+                    _close_broker_tickets(tickets)
+                    if listener is not None:
+                        listener.close()
+                    for descriptor in raw_descriptors:
+                        _close_descriptor(descriptor)
+                finally:
+                    admission_fence.close()
 
 
 def main() -> int:
@@ -552,7 +600,11 @@ def main() -> int:
             file=sys.stderr,
             flush=True,
         )
-        return 1
+        return (
+            PERMANENT_FAILURE_EXIT_STATUS
+            if error.code in _PERMANENT_FAILURE_CODES
+            else 1
+        )
     except Exception:
         traceback.print_exc()
         return 1

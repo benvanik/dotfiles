@@ -177,6 +177,20 @@ class FakePolicy:
         self.state = "idle"
 
 
+class FakeAdmissionFence:
+    def __init__(self, *, active: bool = False) -> None:
+        self.active = active
+        self.closed = False
+
+    def refresh(self) -> bool:
+        if self.closed:
+            raise AssertionError("closed admission fence was refreshed")
+        return self.active
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class FakeBroker:
     def __init__(
         self,
@@ -432,8 +446,11 @@ class BenchmarkDaemonRecoveryTest(unittest.TestCase):
         manage_signals: bool = False,
         run_action=None,
         startup_action=None,
+        admission_fenced: bool = False,
     ) -> FakeNotifier:
         notifier = FakeNotifier(events)
+        admission_fence = FakeAdmissionFence(active=admission_fenced)
+        captured["admission_fence_state"] = admission_fence
 
         def broker_factory(**arguments) -> FakeBroker:
             return FakeBroker(
@@ -489,6 +506,7 @@ class BenchmarkDaemonRecoveryTest(unittest.TestCase):
                 wait_owner=wait_owner,
                 report=lambda message: events.append(f"report:{message}"),
                 manage_signals=manage_signals,
+                admission_fence_factory=lambda: admission_fence,
             )
         return notifier
 
@@ -576,6 +594,29 @@ class BenchmarkDaemonRecoveryTest(unittest.TestCase):
         self.assertNotIn("active-kill", events)
         self.assertNotIn("active-exit", events)
         self.assertLess(events.index("policy-recover"), events.index("ready"))
+
+    def test_restart_carries_administrator_fence_into_recovered_scheduler(
+        self,
+    ) -> None:
+        events: list[str] = []
+        captured: dict[str, object] = {}
+        queued = _lease(LEASE_A, sequence=1, state=LeaseState.QUEUED)
+        activation = self.activation_fixture.build((queued,))
+
+        self._run(
+            activation,
+            events=events,
+            captured=captured,
+            admission_fenced=True,
+        )
+
+        scheduler = captured["scheduler"]
+        self.assertIsInstance(scheduler, LeaseScheduler)
+        self.assertTrue(scheduler.snapshot.admission_fenced)
+        self.assertIsNone(scheduler.begin_preparing())
+        fence = captured["admission_fence_state"]
+        self.assertIsInstance(fence, FakeAdmissionFence)
+        self.assertTrue(fence.closed)
 
     def test_signal_requests_clean_stop_and_stopping_is_exactly_once(self) -> None:
         events: list[str] = []
@@ -776,6 +817,7 @@ class BenchmarkDaemonRecoveryTest(unittest.TestCase):
                 wait_owner=wait_owner,
                 report=lambda message: events.append(f"report:{message}"),
                 manage_signals=False,
+                admission_fence_factory=FakeAdmissionFence,
             )
             if watcher is None:
                 self.fail("real broker factory did not start its grant watcher")
@@ -831,6 +873,7 @@ class BenchmarkDaemonRecoveryTest(unittest.TestCase):
                 effective_uid=0,
                 configuration_owner_uid=os.getuid(),
                 manage_signals=False,
+                admission_fence_factory=FakeAdmissionFence,
             )
 
         self.assertEqual(notifier.ready_count, 0)
@@ -893,6 +936,7 @@ class BenchmarkDaemonRecoveryTest(unittest.TestCase):
                     or True
                 ),
                 manage_signals=False,
+                admission_fence_factory=FakeAdmissionFence,
             )
 
         self.assertEqual(events, ["kill", "exit"])
@@ -942,3 +986,31 @@ class BenchmarkDaemonRecoveryTest(unittest.TestCase):
             error_output.getvalue(),
             "benchmarkd: injected_failure: injected startup failure\n",
         )
+
+    def test_entry_point_stops_restarting_on_permanent_failure(self) -> None:
+        failures = (
+            (
+                "invalid_benchmark_policy_configuration",
+                "installed policy is malformed",
+            ),
+            (
+                "invalid_scheduler_recovery",
+                "stored FIFO state is malformed",
+            ),
+        )
+        for code, message in failures:
+            with self.subTest(code=code):
+                failure = BenchmarkLockError(message, code=code)
+                error_output = io.StringIO()
+                with (
+                    mock.patch.object(daemon, "SystemdServiceNotifier"),
+                    mock.patch.object(daemon, "run_daemon", side_effect=failure),
+                    mock.patch("sys.stderr", error_output),
+                ):
+                    status = daemon.main()
+
+                self.assertEqual(status, daemon.PERMANENT_FAILURE_EXIT_STATUS)
+                self.assertEqual(
+                    error_output.getvalue(),
+                    f"benchmarkd: {code}: {message}\n",
+                )

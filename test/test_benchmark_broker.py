@@ -537,6 +537,12 @@ class BenchmarkBrokerTest(unittest.TestCase):
         self.assertEqual(connections[-1].recv(1), b"")
 
     def test_root_maintenance_is_bound_to_the_request_channel(self) -> None:
+        admission_fenced = False
+
+        def refresh_admission_fence() -> bool:
+            return admission_fenced
+
+        self.fixture.broker.admission_fence = refresh_admission_fence
         server, client = socket.socketpair(
             socket.AF_UNIX,
             socket.SOCK_SEQPACKET,
@@ -561,9 +567,22 @@ class BenchmarkBrokerTest(unittest.TestCase):
             self.fixture.broker.scheduler.snapshot.maintenance_owner,
             PeerIdentity(pid=123, uid=0, gid=0),
         )
+        admission_fenced = True
         client.close()
         self.fixture.broker._channel_ready(ticket)
         self.assertIsNone(self.fixture.broker.scheduler.snapshot.maintenance_owner)
+        self.assertTrue(self.fixture.broker.scheduler.snapshot.admission_fenced)
+
+        acquire = self.fixture.connect()
+        self.addCleanup(acquire.close)
+        send_request(acquire, AcquireRequest("fenced-after-maintenance"))
+        self.assertEqual(
+            receive_event(acquire),
+            ErrorEvent(
+                code="maintenance_active",
+                message="benchmark service is in administrator maintenance",
+            ),
+        )
 
     def test_recovered_queued_ticket_is_adopted_and_granted(self) -> None:
         server, client = socket.socketpair(
@@ -615,6 +634,78 @@ class BenchmarkBrokerTest(unittest.TestCase):
         )
         self.assertEqual(fixture.policy.entries, 1)
         self.assertEqual(fixture.policy.preflights, 1)
+
+    def test_recovered_fifo_cannot_grant_until_restart_fence_clears(self) -> None:
+        server, client = socket.socketpair(
+            socket.AF_UNIX,
+            socket.SOCK_SEQPACKET,
+        )
+        lease = Lease(
+            lease_id="c" * 32,
+            sequence=3,
+            peer=PeerIdentity(
+                pid=os.getpid(),
+                uid=os.getuid(),
+                gid=os.getgid(),
+            ),
+            label="fenced-recovered-queue",
+            inherited_lease_id=None,
+            enqueued_at=1.0,
+            state=LeaseState.QUEUED,
+        )
+        scheduler = LeaseScheduler()
+        scheduler.restore(
+            active=None,
+            preparing=None,
+            queued=(lease,),
+            next_sequence=4,
+            admission_fenced=True,
+        )
+        recovered = RecoveredBrokerTicket(
+            lease=lease,
+            identity=LinuxPeerIdentity(
+                credentials=PeerCredentials(
+                    pid=os.getpid(),
+                    uid=os.getuid(),
+                    gid=os.getgid(),
+                ),
+                pid_descriptor=os.pidfd_open(os.getpid()),
+            ),
+            connection=server,
+        )
+        fence_active = True
+
+        def refresh_fence() -> bool:
+            return fence_active
+
+        fixture = BrokerFixture(
+            scheduler=scheduler,
+            recovered_tickets=(recovered,),
+            admission_fence=refresh_fence,
+        )
+        self.addCleanup(fixture.close)
+        self.addCleanup(client.close)
+
+        self.assertEqual(
+            receive_event(client),
+            WaitingEvent(
+                lease_id=lease.lease_id,
+                position=1,
+                active=None,
+            ),
+        )
+        self.assertEqual(fixture.policy.entries, 0)
+        self.assertEqual(
+            fixture.broker.scheduler.snapshot.queued,
+            (lease,),
+        )
+
+        fence_active = False
+        self.assertEqual(
+            receive_event(client),
+            GrantedEvent(lease.lease_id, fixture.policy.identity),
+        )
+        self.assertEqual(fixture.policy.entries, 1)
 
     def test_recovered_active_ticket_is_invalidated_not_recertified(self) -> None:
         server, client = socket.socketpair(

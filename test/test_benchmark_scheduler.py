@@ -131,6 +131,45 @@ class LeaseSchedulerTest(unittest.TestCase):
             self.scheduler.enter_maintenance(root)
         self.assertEqual(raised.exception.code, "maintenance_busy")
 
+    def test_crash_visible_fence_survives_connection_maintenance(self) -> None:
+        root = PeerIdentity(pid=1, uid=0, gid=0)
+        self.scheduler.set_admission_fence(True)
+
+        with self.assertRaises(BenchmarkLockError) as raised:
+            self.admit(self.peer_a)
+        self.assertEqual(raised.exception.code, "maintenance_active")
+        self.scheduler.enter_maintenance(root)
+        self.assertTrue(self.scheduler.snapshot.admission_fenced)
+        self.scheduler.leave_maintenance(root)
+        self.assertTrue(self.scheduler.snapshot.admission_fenced)
+
+        self.scheduler.set_admission_fence(False)
+        admitted = self.admit(self.peer_a)
+        self.assertEqual(self.scheduler.snapshot.queued, (admitted,))
+
+    def test_recovered_fifo_head_cannot_prepare_while_fenced(self) -> None:
+        queued = Lease(
+            lease_id="queued",
+            sequence=1,
+            peer=self.peer_a,
+            label="queued",
+            inherited_lease_id=None,
+            enqueued_at=1.0,
+            state=LeaseState.QUEUED,
+        )
+        scheduler = LeaseScheduler()
+        scheduler.restore(
+            active=None,
+            preparing=None,
+            queued=(queued,),
+            next_sequence=2,
+            admission_fenced=True,
+        )
+
+        self.assertIsNone(scheduler.begin_preparing())
+        scheduler.set_admission_fence(False)
+        self.assertEqual(scheduler.begin_preparing().lease_id, queued.lease_id)
+
     def test_duplicate_lease_identity_fails_loud(self) -> None:
         scheduler = LeaseScheduler(lease_id_factory=lambda: "same")
         scheduler.admit(

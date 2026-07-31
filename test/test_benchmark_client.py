@@ -147,6 +147,9 @@ class BenchmarkClientTest(unittest.TestCase):
             call_order.append("aslr")
             return 0
 
+        def restore_signals() -> None:
+            call_order.append("signals")
+
         def execvpe(
             executable: str,
             arguments: list[str],
@@ -176,6 +179,10 @@ class BenchmarkClientTest(unittest.TestCase):
                 side_effect=disable_aslr,
             ),
             mock.patch(
+                "benchmark_lock.client._restore_exec_signal_dispositions",
+                side_effect=restore_signals,
+            ),
+            mock.patch(
                 "benchmark_lock.client.os.execvpe",
                 side_effect=execvpe,
             ),
@@ -188,7 +195,7 @@ class BenchmarkClientTest(unittest.TestCase):
                     environment=original_environment,
                 )
 
-        self.assertEqual(call_order, ["aslr", "exec"])
+        self.assertEqual(call_order, ["aslr", "signals", "exec"])
         self.assertEqual(observed["executable"], "tool")
         self.assertEqual(
             observed["arguments"],
@@ -249,7 +256,7 @@ class BenchmarkClientTest(unittest.TestCase):
         request = send.call_args.args[1]
         self.assertEqual(request.inherited_lease_id, LEASE_ID)
 
-    def test_broker_and_personality_failures_return_125(self) -> None:
+    def test_broker_and_process_control_failures_return_125(self) -> None:
         error = RecordingStream()
         with mock.patch(
             "benchmark_lock.client._connect_broker",
@@ -288,6 +295,45 @@ class BenchmarkClientTest(unittest.TestCase):
                 side_effect=BenchmarkLockError(
                     "denied",
                     code="benchmark_aslr_control_failed",
+                ),
+            ),
+            mock.patch("benchmark_lock.client.os.execvpe") as execute,
+        ):
+            self.assertEqual(
+                main(
+                    ["true"],
+                    output=RecordingStream(),
+                    error=RecordingStream(),
+                    environment={},
+                ),
+                125,
+            )
+        execute.assert_not_called()
+        self.assertTrue(connection.closed)
+
+        connection = FakeConnection()
+        with (
+            mock.patch(
+                "benchmark_lock.client._connect_broker",
+                return_value=connection,
+            ),
+            mock.patch("benchmark_lock.client.send_request"),
+            mock.patch(
+                "benchmark_lock.client.receive_event",
+                side_effect=(
+                    QueuedEvent(LEASE_ID, 1, None),
+                    GrantedEvent(LEASE_ID, "performance"),
+                ),
+            ),
+            mock.patch(
+                "benchmark_lock.client.disable_aslr_for_exec",
+                return_value=0,
+            ),
+            mock.patch(
+                "benchmark_lock.client._restore_exec_signal_dispositions",
+                side_effect=BenchmarkLockError(
+                    "denied",
+                    code="benchmark_signal_control_failed",
                 ),
             ),
             mock.patch("benchmark_lock.client.os.execvpe") as execute,

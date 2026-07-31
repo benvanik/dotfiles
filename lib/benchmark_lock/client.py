@@ -50,6 +50,11 @@ _EXEC_NOT_INVOKABLE = frozenset(
         errno.ETXTBSY,
     }
 )
+_PYTHON_IGNORED_EXEC_SIGNALS = tuple(
+    getattr(signal, name)
+    for name in ("SIGPIPE", "SIGXFZ", "SIGXFSZ")
+    if hasattr(signal, name)
+)
 
 
 class _ParserExit(Exception):
@@ -245,6 +250,19 @@ def _exec_failure_status(error: OSError) -> int:
     return 125
 
 
+def _restore_exec_signal_dispositions() -> None:
+    """Remove Python's inherited signal changes before replacing the client."""
+
+    try:
+        for signal_number in _PYTHON_IGNORED_EXEC_SIGNALS:
+            signal.signal(signal_number, signal.SIG_DFL)
+    except (OSError, ValueError) as error:
+        raise BenchmarkLockError(
+            f"cannot restore benchmark command signal dispositions: {error}",
+            code="benchmark_signal_control_failed",
+        ) from error
+
+
 def _exec_command(
     command: tuple[str, ...],
     *,
@@ -344,6 +362,7 @@ def _run_acquire(
                         code="invalid_benchmark_protocol",
                     )
                 disable_aslr_for_exec()
+                _restore_exec_signal_dispositions()
                 return _exec_command(
                     command,
                     lease_id=event.lease_id,

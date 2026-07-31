@@ -102,6 +102,25 @@ status = _run_acquire(
 raise SystemExit(status)
 """
 
+_SIGNAL_EXEC_CLIENT = r"""
+import os
+import socket
+import sys
+
+from benchmark_lock.client import _run_acquire
+
+connection = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+connection.connect(sys.argv[1])
+status = _run_acquire(
+    connection,
+    command=("/bin/cat", "/proc/self/status"),
+    label="signal-boundary",
+    environment=os.environ,
+    error=sys.stderr,
+)
+raise SystemExit(status)
+"""
+
 
 class FakePolicy:
     identity = "test-performance"
@@ -725,6 +744,42 @@ class BenchmarkBrokerTest(unittest.TestCase):
             ),
             global_aslr_before,
         )
+        self.wait_until(lambda: self.fixture.policy.state == "idle")
+
+    def test_real_client_exec_restores_python_ignored_signals(self) -> None:
+        environment = dict(os.environ)
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        environment["PYTHONPATH"] = os.fspath(
+            pathlib.Path(__file__).resolve().parents[1] / "lib"
+        )
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                _SIGNAL_EXEC_CLIENT,
+                os.fspath(self.fixture.socket_path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environment,
+        )
+        stdout, stderr = process.communicate(timeout=5)
+
+        self.assertEqual(process.returncode, 0)
+        self.assertEqual(stderr, "")
+        ignored_line = next(
+            line for line in stdout.splitlines() if line.startswith("SigIgn:")
+        )
+        ignored_mask = int(ignored_line.split()[1], 16)
+        for signal_name in ("SIGPIPE", "SIGXFZ", "SIGXFSZ"):
+            if hasattr(signal, signal_name):
+                signal_number = getattr(signal, signal_name)
+                self.assertEqual(
+                    ignored_mask & (1 << (signal_number - 1)),
+                    0,
+                    signal_name,
+                )
         self.wait_until(lambda: self.fixture.policy.state == "idle")
 
     def test_real_pidfds_drive_fifo_after_cancellation_and_sigkill(

@@ -101,6 +101,9 @@ fi
 # Source machine-specific config from ~/.shrc.local.
 # This file is NOT synced - use for paths/settings unique to this machine.
 # Platform-common settings go in shell/platform/<platform>.sh instead.
+# Ambient shells discard inherited versioned-tool state before reading local
+# configuration. An active direnv environment is an explicit project selection
+# and remains intact for nested shells.
 #
 # Example ~/.shrc.local contents:
 #   # Machine-specific PATH additions.
@@ -109,6 +112,15 @@ fi
 #
 #   # Tool version overrides (if not using direnv).
 #   export LLVM_ROOT="$HOME/tools/llvm/20.1.0"
+
+if [ -z "${DIRENV_DIR:-}" ]; then
+    # shellcheck source=../tools/reset-environment.sh
+    if [ ! -f "$HOME/.dotfiles/tools/reset-environment.sh" ] ||
+            ! . "$HOME/.dotfiles/tools/reset-environment.sh"; then
+        printf '\033[31m[tools]\033[0m Could not reset inherited tool environment\n' >&2
+        return 1
+    fi
+fi
 
 if [ -f "$HOME/.shrc.local" ]; then
     . "$HOME/.shrc.local"

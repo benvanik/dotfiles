@@ -278,7 +278,10 @@ cat > "$TMUX_STUB_DIR/tmux" << 'EOF'
 #!/bin/bash
 printf '%s\n' "$*" >> "$TMUX_LOG"
 case "$1" in
-    has-session) exit 0 ;;
+    has-session)
+        [ "${TMUX_HAS_SESSION:-true}" = "true" ]
+        exit
+        ;;
     kill-session)
         if [ "${TMUX_KILL_FAIL:-false}" = "true" ]; then
             exit 72
@@ -355,6 +358,15 @@ grep -Fqx "has-session -t =literal.session" "$TMUX_LOG" ||
     fail "project-dev did not look up the exact tmux session"
 grep -Fqx "attach-session -t =literal.session" "$TMUX_LOG" ||
     fail "project-dev did not attach to the exact tmux session"
+
+: > "$TMUX_LOG"
+TMUX="" SHELL=/bin/bash TMUX_HAS_SESSION=false \
+PATH="$TMUX_STUB_DIR:$PATH" TMUX_LOG="$TMUX_LOG" \
+    "$BASH_EXECUTABLE" "$DOTFILES/bin/project-dev" \
+    fresh.session "$MAIN_WORKTREE" >/dev/null
+grep -Fqx "new-session -s fresh.session -c $MAIN_WORKTREE $DOTFILES/lib/project-shell.sh /bin/bash" \
+    "$TMUX_LOG" ||
+    fail "project-dev did not launch a clean target shell"
 
 if TMUX="" PATH="$TMUX_STUB_DIR:$PATH" TMUX_LOG="$TMUX_LOG" \
         "$BASH_EXECUTABLE" "$DOTFILES/bin/project-dev" \

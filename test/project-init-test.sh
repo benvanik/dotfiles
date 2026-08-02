@@ -702,19 +702,20 @@ jq -e '.settings["cmake.environment"] == null' \
 
 # Replacements operate on the original template string exactly once. A tool
 # root containing another token must remain literal.
-LLVM_VERSION_WITH_TOKEN="home-\$BUILD_DIR-sentinel"
-LLVM_ROOT_WITH_TOKEN="$TEST_HOME/tools/llvm/$LLVM_VERSION_WITH_TOKEN"
+LLVM_TOKEN_HOME="$TEST_ROOT/home-\$BUILD_DIR-sentinel"
+LLVM_ROOT_WITH_TOKEN="$LLVM_TOKEN_HOME/tools/llvm/22.0.0"
 LLVM_TOKEN_PROJECT="$TEST_ROOT/llvm-token-project"
 mkdir -p "$LLVM_ROOT_WITH_TOKEN" "$LLVM_TOKEN_PROJECT"
-ln -s "$LLVM_VERSION_WITH_TOKEN" "$TEST_HOME/tools/llvm/latest"
-HOME="$TEST_HOME" \
-XDG_CACHE_HOME="$TEST_HOME/.cache" \
-XDG_CONFIG_HOME="$TEST_HOME/.config" \
+ln -s "$DOTFILES" "$LLVM_TOKEN_HOME/.dotfiles"
+ln -s 22.0.0 "$LLVM_TOKEN_HOME/tools/llvm/latest"
+HOME="$LLVM_TOKEN_HOME" \
+XDG_CACHE_HOME="$LLVM_TOKEN_HOME/.cache" \
+XDG_CONFIG_HOME="$LLVM_TOKEN_HOME/.config" \
     "$BASH_EXECUTABLE" "$DOTFILES/bin/project-init" \
     --no-env --vscode --llvm \
     --cmake-build-dir "$JSON_BUILD_DIRECTORY" \
     "$LLVM_TOKEN_PROJECT" >/dev/null
-jq -e --arg expected "$LLVM_ROOT_WITH_TOKEN/bin/clangd" \
+jq -e --arg expected "$LLVM_TOKEN_HOME/tools/llvm/latest/bin/clangd" \
     '.settings["clangd.path"] == $expected' \
     "$LLVM_TOKEN_PROJECT/llvm-token-project.code-workspace" >/dev/null ||
     fail "JSON template replacements cascaded through a replacement value"

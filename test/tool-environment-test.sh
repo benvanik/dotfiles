@@ -327,13 +327,17 @@ mkdir -p "$MISSING_HELPER_HOME/tools" "$MISSING_HELPER_HOME/.dotfiles/tools"
     # shellcheck source=../tools/versions.sh
     . "$DOTFILES/tools/versions.sh"
 
-    expected="$CMAKE_LINUX_DEFAULT"
+    expected="$TEST_HOME/tools/cmake/latest"
     [ "$(_find_version "$TEST_HOME/tools/cmake" latest)" = "$expected" ] || \
-        fail "relative latest link did not resolve"
+        fail "relative latest link did not retain its stable selector"
+    [ "$(_version_from_path "$expected")" = "4.3.3" ] || \
+        fail "relative latest selector did not report its generation"
 
-    expected="$TEST_HOME/tools/ninja/1.13.2"
+    expected="$TEST_HOME/tools/ninja/latest"
     [ "$(_find_version "$TEST_HOME/tools/ninja" latest)" = "$expected" ] || \
-        fail "absolute latest link did not resolve"
+        fail "absolute latest link did not retain its stable selector"
+    [ "$(_version_from_path "$expected")" = "1.13.2" ] || \
+        fail "absolute latest selector did not report its generation"
 
     ln -s "missing" "$TEST_HOME/tools/cmake/broken"
     if _resolve_linked_directory "$TEST_HOME/tools/cmake/broken" >/dev/null; then
@@ -361,9 +365,9 @@ mkdir -p "$MISSING_HELPER_HOME/tools" "$MISSING_HELPER_HOME/.dotfiles/tools"
     # shellcheck source=../tools/tools.sh
     . "$DOTFILES/tools/tools.sh"
     . "$DOTFILES/tools/tools.sh"
-    [ "$CMAKE_ROOT" = "$CMAKE_LINUX_DEFAULT" ] || \
+    [ "$CMAKE_ROOT" = "$TEST_HOME/tools/cmake/latest" ] || \
         fail "default CMake root is incorrect"
-    [ "$NINJA_ROOT" = "$TEST_HOME/tools/ninja/1.13.2" ] || \
+    [ "$NINJA_ROOT" = "$TEST_HOME/tools/ninja/latest" ] || \
         fail "default Ninja root is incorrect"
     case ":$PATH:" in
         *":$CMAKE_ROOT/bin:"*) ;;
@@ -373,6 +377,18 @@ mkdir -p "$MISSING_HELPER_HOME/tools" "$MISSING_HELPER_HOME/.dotfiles/tools"
         "repeated shell PATH" "$PATH" "$CMAKE_ROOT/bin"
     assert_one_colon_entry \
         "repeated shell PATH" "$PATH" "$NINJA_ROOT/bin"
+
+    unlink "$TEST_HOME/tools/cmake/latest"
+    ln -s 4.2.0 "$TEST_HOME/tools/cmake/latest"
+    . "$DOTFILES/tools/tools.sh"
+    [ "$CMAKE_ROOT" = "$TEST_HOME/tools/cmake/latest" ] || \
+        fail "default CMake root froze after selector replacement"
+    [ "$(_version_from_path "$CMAKE_ROOT")" = "4.2.0" ] || \
+        fail "default CMake root did not follow selector replacement"
+    assert_one_colon_entry \
+        "repointed shell PATH" "$PATH" "$CMAKE_ROOT/bin"
+    unlink "$TEST_HOME/tools/cmake/latest"
+    ln -s 4.3.3 "$TEST_HOME/tools/cmake/latest"
 )
 
 (
@@ -490,6 +506,88 @@ printf '%s\n' \
         "$LD_LIBRARY_PATH" "$SHRC_SELECTED_LLVM/lib"
 )
 
+# A long-lived ambient parent is not an explicit tool selection. Its resolved
+# roots and paths are discarded before the base shell selects the stable latest
+# selector. Active direnv state remains explicit for nested project shells.
+SHRC_AMBIENT_HOME="$TEST_ROOT/shrc-ambient-home"
+mkdir -p "$SHRC_AMBIENT_HOME"
+ln -s "$DOTFILES" "$SHRC_AMBIENT_HOME/.dotfiles"
+ln -s "$SHRC_HOME/tools" "$SHRC_AMBIENT_HOME/tools"
+: > "$SHRC_AMBIENT_HOME/.shrc.local"
+(
+    HOME="$SHRC_AMBIENT_HOME"
+    LLVM_ROOT="$SHRC_AMBIENT_HOME/tools/llvm/21.1.6"
+    PATH="$LLVM_ROOT/bin:/usr/bin:/bin"
+    export HOME LLVM_ROOT PATH
+    unset DIRENV_DIR
+
+    # shellcheck source=../shell/shrc
+    . "$DOTFILES/shell/shrc"
+    [ "$LLVM_ROOT" = "$SHRC_AMBIENT_HOME/tools/llvm/latest" ] ||
+        fail "ambient shell retained an inherited LLVM generation"
+    [ "$CC" = "$SHRC_AMBIENT_HOME/tools/llvm/latest/bin/clang" ] ||
+        fail "ambient shell compiler did not use the stable selector"
+    assert_zero_colon_entry \
+        "ambient shell PATH" \
+        "$PATH" "$SHRC_AMBIENT_HOME/tools/llvm/21.1.6/bin"
+    assert_one_colon_entry \
+        "ambient shell PATH" "$PATH" "$LLVM_ROOT/bin"
+)
+(
+    HOME="$SHRC_AMBIENT_HOME"
+    DIRENV_DIR="-$TEST_ROOT/selected-project"
+    LLVM_ROOT="$SHRC_AMBIENT_HOME/tools/llvm/21.1.6"
+    PATH="$LLVM_ROOT/bin:/usr/bin:/bin"
+    export DIRENV_DIR HOME LLVM_ROOT PATH
+
+    # shellcheck source=../shell/shrc
+    . "$DOTFILES/shell/shrc"
+    [ "$LLVM_ROOT" = "$SHRC_AMBIENT_HOME/tools/llvm/21.1.6" ] ||
+        fail "nested shell discarded an active direnv selection"
+    [ "$CC" = "$LLVM_ROOT/bin/clang" ] ||
+        fail "nested shell did not activate its direnv compiler"
+)
+
+# project-dev's shell launcher is an ownership boundary: no source-project or
+# persistent tmux tool state reaches the target shell before its own direnv.
+PROJECT_SHELL_EXECUTABLE="$TEST_ROOT/project-shell-fixture"
+PROJECT_SHELL_RESULT="$TEST_ROOT/project-shell-result"
+PROJECT_VIRTUAL_ENVIRONMENT="$TEST_ROOT/source-project-venv"
+mkdir -p "$PROJECT_VIRTUAL_ENVIRONMENT/bin"
+cat > "$PROJECT_SHELL_EXECUTABLE" <<'EOF'
+#!/bin/sh
+[ -z "${CMAKE_ROOT:-}" ] || exit 11
+[ -z "${ROCM_ROOT:-}" ] || exit 12
+[ -z "${ROCM_HOME:-}" ] || exit 13
+[ -z "${HIP_PATH:-}" ] || exit 14
+[ -z "${DIRENV_DIR:-}" ] || exit 15
+[ -z "${DIRENV_DIFF:-}" ] || exit 16
+[ -z "${VIRTUAL_ENV:-}" ] || exit 17
+[ -z "${LDFLAGS:-}" ] || exit 18
+[ "$PATH" = "/custom/bin:/usr/bin:/bin" ] || exit 19
+[ "${CMAKE_PREFIX_PATH:-}" = "/opt/cmake" ] || exit 20
+[ "$SHELL" = "$0" ] || exit 21
+printf 'passed\n' > "$PROJECT_SHELL_RESULT"
+EOF
+chmod +x "$PROJECT_SHELL_EXECUTABLE"
+HOME="$TEST_HOME" \
+CMAKE_ROOT="$CMAKE_LINUX_SELECTED" \
+ROCM_ROOT="$TEST_HOME/tools/rocm/old-sdk" \
+ROCM_HOME="$TEST_HOME/tools/rocm/old-sdk" \
+HIP_PATH="$TEST_HOME/tools/rocm/old-sdk" \
+DIRENV_DIR="-$TEST_ROOT/source-project" \
+DIRENV_DIFF="source-project-diff" \
+VIRTUAL_ENV="$PROJECT_VIRTUAL_ENVIRONMENT" \
+MOLD_ROOT="$MOLD_SELECTED" \
+DOTFILES_MOLD_PATH_ENTRY="$MOLD_SELECTED/bin" \
+LDFLAGS="-fuse-ld=mold -Wl,--as-needed" \
+PATH="$PROJECT_VIRTUAL_ENVIRONMENT/bin:$CMAKE_LINUX_SELECTED/bin:/custom/bin:/usr/bin:/bin" \
+CMAKE_PREFIX_PATH="$TEST_HOME/tools/rocm/old-sdk:/opt/cmake" \
+PROJECT_SHELL_RESULT="$PROJECT_SHELL_RESULT" \
+    /bin/sh "$DOTFILES/lib/project-shell.sh" "$PROJECT_SHELL_EXECUTABLE"
+grep -qxF passed "$PROJECT_SHELL_RESULT" ||
+    fail "project shell launcher did not establish a clean environment"
+
 # The ambient loader may continue checking independent defaults after one
 # damaged explicit root, but it must return failure instead of reporting a
 # fully healthy shell environment.
@@ -551,7 +649,7 @@ printf '%s\n' \
     use_cmake latest
     use_cmake latest
     # shellcheck disable=SC2031
-    [ "$CMAKE_ROOT" = "$TEST_HOME/tools/cmake/4.3.3" ] || \
+    [ "$CMAKE_ROOT" = "$TEST_HOME/tools/cmake/latest" ] || \
         fail "direnv CMake root is incorrect"
     # shellcheck disable=SC2031
     case ":$PATH:" in
@@ -572,12 +670,16 @@ printf '%s\n' \
     esac
     assert_zero_colon_entry \
         "switched CMake PATH" "$PATH" "$CMAKE_LINUX_DEFAULT/bin"
+    assert_zero_colon_entry \
+        "switched CMake PATH" \
+        "$PATH" "$TEST_HOME/tools/cmake/latest/bin"
 
     use_cmake latest
-    [ "${PATH%%:*}" = "$CMAKE_LINUX_DEFAULT/bin" ] || \
+    [ "${PATH%%:*}" = "$TEST_HOME/tools/cmake/latest/bin" ] || \
         fail "reselected CMake did not return to the front of PATH"
     assert_one_colon_entry \
-        "reselected CMake PATH" "$PATH" "$CMAKE_LINUX_DEFAULT/bin"
+        "reselected CMake PATH" \
+        "$PATH" "$TEST_HOME/tools/cmake/latest/bin"
     assert_zero_colon_entry \
         "reselected CMake PATH" \
         "$PATH" "$CMAKE_MACOS_SELECTED/CMake.app/Contents/bin"
@@ -1054,6 +1156,7 @@ SHELL_HOOK_HOME="$TEST_ROOT/shell-hook-home"
 SHELL_HOOK_BIN="$TEST_ROOT/shell-hook-bin"
 SHELL_HOOK_LOG="$TEST_ROOT/shell-hook.log"
 mkdir -p "$SHELL_HOOK_HOME" "$SHELL_HOOK_BIN"
+ln -s "$DOTFILES" "$SHELL_HOOK_HOME/.dotfiles"
 ln -s "$DOTFILES/shell/shrc" "$SHELL_HOOK_HOME/.shrc"
 cat > "$SHELL_HOOK_BIN/direnv" << 'EOF'
 #!/bin/sh

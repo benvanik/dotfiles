@@ -4,6 +4,8 @@
 set -e
 
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+PROJECT_LIB_DIR=$(CDPATH='' cd -- "$SCRIPT_DIR/../lib" && pwd)
+PROJECT_SHELL_LAUNCHER="$PROJECT_LIB_DIR/project-shell.sh"
 # shellcheck source=../lib/project-worktrees.sh
 . "$SCRIPT_DIR/../lib/project-worktrees.sh"
 
@@ -113,7 +115,8 @@ if [ -n "$TMUX" ]; then
     else
         info "Creating new session: $session_name (shell: $USER_SHELL)"
         $MUX set-option -g default-shell "$USER_SHELL"
-        $MUX new-session -d -s "$session_name" -c "$target_dir"
+        $MUX new-session -d -s "$session_name" -c "$target_dir" \
+            "$PROJECT_SHELL_LAUNCHER" "$USER_SHELL"
         $MUX switch-client -t "$session_target"
     fi
 else
@@ -123,7 +126,8 @@ else
         exec $MUX attach-session -t "$session_target"
     else
         info "Creating new session: $session_name (shell: $USER_SHELL)"
-        # Pass shell directly to new-session to avoid needing server for set-option.
-        exec $MUX new-session -s "$session_name" -c "$target_dir" "$USER_SHELL"
+        # Pass a direct argv command so tmux does not involve shell quoting.
+        exec $MUX new-session -s "$session_name" -c "$target_dir" \
+            "$PROJECT_SHELL_LAUNCHER" "$USER_SHELL"
     fi
 fi

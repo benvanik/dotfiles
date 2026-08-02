@@ -45,7 +45,7 @@ _PI_TOOLS=(
     "bazel:latest:Bazel build system"
     "mold:latest:Mold linker (explicit opt-in)"
     "cuda:latest:NVIDIA CUDA toolkit"
-    "rocm:>=6.0.0:AMD ROCm/HIP"
+    "rocm:latest:AMD ROCm/HIP"
     "vulkan:latest:Vulkan SDK"
 )
 

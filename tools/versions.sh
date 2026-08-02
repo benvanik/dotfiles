@@ -59,15 +59,18 @@ _resolve_linked_directory() {
 
 # Find best version matching requirement.
 # Args: tool_dir, requirement (>=X.Y.Z, X.Y.Z, or "latest").
-# Returns: full path to version directory.
+# Returns: full path to the selected directory. The latest selection retains
+# its stable selector path so an atomic selector update reaches existing
+# environments without replacing every exported root and search path.
 _find_version() {
     local tool_dir="$1" requirement="$2"
 
     # Handle "latest" symlink.
     if [ "$requirement" = "latest" ]; then
         if [ -L "$tool_dir/latest" ]; then
-            _resolve_linked_directory "$tool_dir/latest"
-            return
+            _resolve_linked_directory "$tool_dir/latest" >/dev/null || return 1
+            printf '%s\n' "$tool_dir/latest"
+            return 0
         elif [ -e "$tool_dir/latest" ]; then
             # A copied or otherwise obstructed selector is not equivalent to
             # an absent selector. Publication cannot replace it safely, so
@@ -121,7 +124,16 @@ _find_version() {
     return 1
 }
 
-# Get version string from path (just the directory name).
+# Get the selected version string. Stable selectors report their current
+# generation rather than the literal selector name.
 _version_from_path() {
-    basename "$1"
+    local selected_path="$1"
+    local resolved_path=""
+
+    if [ "${selected_path##*/}" = "latest" ] && [ -L "$selected_path" ]; then
+        resolved_path=$(_resolve_linked_directory "$selected_path") || return 1
+        basename "$resolved_path"
+    else
+        basename "$selected_path"
+    fi
 }

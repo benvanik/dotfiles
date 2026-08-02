@@ -43,8 +43,10 @@ ambient `FORCE` variable has no authority.
 
 ### Global Defaults
 
-The shell automatically loads latest versions from ~/tools/ for interactive shells.
-This is handled by `~/.dotfiles/tools/tools.sh` (sourced from ~/.shrc).
+The shell automatically loads the stable `~/tools/<tool>/latest` selectors.
+Repointing one selector updates existing exported roots and search paths without
+restarting a login session or a long-lived tmux server. This is handled by
+`~/.dotfiles/tools/tools.sh` (sourced from ~/.shrc).
 `mold` is intentionally excluded from those ambient defaults.
 
 ### Per-Project Versions
@@ -91,7 +93,7 @@ use_mold
 
 # GPU SDKs - silent skip on non-Linux
 use_cuda ">=12.9.0"
-use_rocm ">=6.0.0"
+use_rocm
 
 # Load machine-specific overrides
 source_local_envrc

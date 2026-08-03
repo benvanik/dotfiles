@@ -24,6 +24,12 @@ fail() {
     exit 1
 }
 
+# The harness owns its ambient tool baseline. A developer may invoke it from a
+# long-lived shell whose selected payload has since been replaced; that state
+# must not become an accidental test fixture.
+# shellcheck source=../tools/reset-environment.sh
+. "$DOTFILES/tools/reset-environment.sh"
+
 advance_file_mtime() {
     python3 - "$1" << 'PY'
 import os
@@ -853,6 +859,11 @@ chmod +x "$ROCM_VENV/bin/rocm-sdk"
 cat > "$ROCM_SDK/bin/hipconfig" << 'EOF'
 #!/bin/sh
 [ "${1:-}" = "--platform" ] || exit 2
+sdk_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P) || exit
+[ "${ROCM_PATH:-}" = "$sdk_root" ] || {
+    printf 'hipconfig inherited ROCM_PATH=%s\n' "${ROCM_PATH:-<unset>}" >&2
+    exit 3
+}
 [ -z "${HIP_PLATFORM:-}" ] || {
     printf '%s\n' "$HIP_PLATFORM"
     exit 0
@@ -862,8 +873,9 @@ EOF
 chmod +x "$ROCM_SDK/bin/hipconfig"
 (
     ROCM_ROOT="$ROCM_VENV"
+    ROCM_PATH="$TEST_HOME/tools/rocm/removed-sdk"
     PATH="/usr/bin:/bin"
-    export ROCM_ROOT PATH
+    export ROCM_PATH ROCM_ROOT PATH
 
     # shellcheck source=../tools/platform.sh
     . "$DOTFILES/tools/platform.sh"
@@ -898,6 +910,11 @@ touch "$ROCM_BUILD/build.ninja"
 cat > "$ROCM_BUILD/core/hip-runtime/bin/hipconfig" << 'EOF'
 #!/bin/sh
 [ "${1:-}" = "--platform" ] || exit 2
+sdk_root=$(CDPATH='' cd -- "$(dirname -- "$0")/../../.." && pwd -P) || exit
+[ "${ROCM_PATH:-}" = "$sdk_root" ] || {
+    printf 'hipconfig inherited ROCM_PATH=%s\n' "${ROCM_PATH:-<unset>}" >&2
+    exit 3
+}
 [ -z "${HIP_PLATFORM:-}" ] || {
     printf '%s\n' "$HIP_PLATFORM"
     exit 0
@@ -926,6 +943,11 @@ EOF
 cat > "$ROCM_CONVENTIONAL/bin/hipconfig" << 'EOF'
 #!/bin/sh
 [ "${1:-}" = "--platform" ] || exit 2
+sdk_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P) || exit
+[ "${ROCM_PATH:-}" = "$sdk_root" ] || {
+    printf 'hipconfig inherited ROCM_PATH=%s\n' "${ROCM_PATH:-<unset>}" >&2
+    exit 3
+}
 [ -z "${HIP_PLATFORM:-}" ] || {
     printf '%s\n' "$HIP_PLATFORM"
     exit 0

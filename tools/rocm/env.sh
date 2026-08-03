@@ -88,10 +88,13 @@ _rocm_environment_activate() {
 
     # Some TheRock hip-config.cmake packages do not encode the hipconfig path.
     # Query every selected root rather than carrying a backend from the prior
-    # root across an in-process version switch.
+    # root across an in-process version switch. hipconfig also consults
+    # ROCM_PATH while detecting its compiler backend; bind that input to the
+    # selected SDK so an inherited environment cannot make this probe execute
+    # tools from a superseded installation.
     if ! hip_platform="$(
         unset HIP_PLATFORM
-        "$hipconfig_executable" --platform
+        ROCM_PATH="$sdk_root" "$hipconfig_executable" --platform
     )"; then
         printf 'Could not determine the ROCm HIP platform: %s\n' \
             "$sdk_root" >&2

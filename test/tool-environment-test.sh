@@ -1169,6 +1169,24 @@ if command -v zsh >/dev/null 2>&1; then
         ROCM_ROOT=""
         . "$HOME/.dotfiles/tools/rocm/env.sh"
     ' || fail "zsh could not source the inactive ROCm environment"
+
+    HISTORY_TEST_HOME="$TEST_ROOT/history-home"
+    mkdir -p \
+        "$HISTORY_TEST_HOME/.oh-my-zsh/plugins/per-directory-history"
+    printf ':\n' > \
+        "$HISTORY_TEST_HOME/.oh-my-zsh/plugins/per-directory-history/per-directory-history.plugin.zsh"
+    # shellcheck disable=SC2016  # Expanded by the child zsh process.
+    if ! env -i HOME="$HISTORY_TEST_HOME" PATH="/usr/bin:/bin" \
+            zsh -dfc '
+                . "$1"
+                [ "$HISTORY_BASE" = "$HOME/.directory_history" ] || exit 1
+                case "${(t)HISTORY_BASE}" in
+                    *-export*) ;;
+                    *) exit 2 ;;
+                esac
+            ' zsh "$DOTFILES/shell/zshrc.d/per-directory-history.zsh"; then
+        fail "zsh project history did not publish a stable direnv baseline"
+    fi
 fi
 
 # The common shrc is sourced by POSIX login shells and must never evaluate a

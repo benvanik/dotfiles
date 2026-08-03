@@ -18,8 +18,12 @@
 _omz_pdh_plugin="$HOME/.oh-my-zsh/plugins/per-directory-history/per-directory-history.plugin.zsh"
 
 if [[ -f "$_omz_pdh_plugin" ]]; then
-    # Set default history base if not already set by direnv.
+    # Set the ambient history base if direnv has not selected a project root.
+    # It must be exported before direnv captures its baseline; otherwise
+    # leaving the first project unsets HISTORY_BASE and the plugin falls back
+    # to writing a literal history file in every directory visited afterward.
     : ${HISTORY_BASE:=$HOME/.directory_history}
+    export HISTORY_BASE
 
     # Ensure the directory exists.
     [[ -d "$HISTORY_BASE" ]] || mkdir -p "$HISTORY_BASE"

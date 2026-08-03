@@ -75,6 +75,11 @@ FEATURE_WORKTREE="$PROJECT_ROOT/feature"
     fail "bazel configuration link does not target the main worktree"
 [ "$(cat "$FEATURE_WORKTREE/.bazelrc.local")" = "shared bazel configuration" ] || \
     fail "bazel configuration link does not resolve to shared contents"
+if [ -n "$(git -C "$FEATURE_WORKTREE" \
+        -c core.excludesFile="$DOTFILES/git/ignore_global" \
+        status --porcelain)" ]; then
+    fail "managed shared links made a new worktree appear dirty"
+fi
 
 # Ignored state is still local data. Git's own worktree removal check omits it,
 # so the wrapper must detect it before Git recursively deletes the worktree.

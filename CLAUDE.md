@@ -131,7 +131,7 @@ This replaces verbose direnv logging (`DIRENV_LOG_FORMAT=""` in shrc).
 | `bin/update-multiplexer` | Build and publish the pinned tmux/Byobu stack |
 | `git/config` | Shared git config |
 | `bin/dotfiles` | Main CLI for testing/maintenance |
-| `bin/project-init` | Initialize project with direnv .envrc |
+| `bin/project-init` | Bootstrap project repository and direnv environment |
 | `tools/direnvrc` | direnv functions for versioned tools |
 | `lib/packages.sh` | Package definitions for install-deps.sh |
 | `lib/bootstrap-pins.sh` | Reviewed shell, multiplexer, and Node identities |

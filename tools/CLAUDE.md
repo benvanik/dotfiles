@@ -4,7 +4,7 @@
 
 | Command | Purpose |
 |---------|---------|
-| `project-init` | Initialize project with .envrc |
+| `project-init` | Bootstrap a project and its .envrc |
 | `~/.dotfiles/tools/cuda/install.sh 12.9.1` | Install CUDA SDK to ~/tools/cuda/ |
 | `~/.dotfiles/tools/rocm/install.sh 7.14.0a20260612` | Install ROCm to ~/tools/rocm/ |
 | `use_cuda [version]` | In .envrc: load the CUDA SDK |

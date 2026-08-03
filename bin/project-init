@@ -5,6 +5,7 @@
 #
 # Examples:
 #   project-init                  # Interactive selection
+#   project-init ~/src/demo/main  # Bootstrap a worktree-ready repository
 #   project-init --build          # Build tools preset
 #   project-init --build --gpu    # Build + GPU tools
 #   project-init -by              # Build tools, no confirm
@@ -18,6 +19,8 @@ source "$PROJECT_INIT_DIR/../tools/versions.sh"
 source "$PROJECT_INIT_DIR/../tools/platform.sh"
 # shellcheck source=../tools/rocm/root.sh
 source "$PROJECT_INIT_DIR/../tools/rocm/root.sh"
+# shellcheck source=../lib/project-repository.sh
+source "$PROJECT_INIT_DIR/../lib/project-repository.sh"
 
 # Colors.
 GREEN='\033[0;32m'
@@ -497,6 +500,8 @@ OPTIONS
     --none              Select no tools (non-interactive)
     --mold              Explicitly select the mold linker
     -y, --yes           Skip confirmation prompt
+    --repository        Require a worktree-ready <project>/main Git repository
+    --no-repository     Generate project files without repository bootstrap
     --no-env            Generate only a VS Code workspace; environment and
                         Claude settings options are rejected
     --no-history        Disable per-project shell history
@@ -526,6 +531,13 @@ INTERACTIVE MODE
 
     If .envrc already exists, current tools are pre-selected.
 
+REPOSITORY BOOTSTRAP
+    A directory named main that is not already owned by a Git repository is
+    initialized as the primary <project>/main worktree. project-init creates
+    the first main commit from generated, committable project files so sibling
+    worktrees can be added immediately. --no-repository disables this inferred
+    bootstrap; --repository requires the primary layout explicitly.
+
 NON-INTERACTIVE PRESETS
     --build         cmake, ninja, llvm, bazel
     --build --gpu   Above + cuda, rocm, vulkan
@@ -538,13 +550,18 @@ EXAMPLES
     project-init --build --gpu    # Build + GPU tools
     project-init --build --mold   # Build tools with mold linker
     project-init -by              # Build tools, no confirm
-    project-init ~/new-project    # Init specific directory
+    project-init ~/src/new-project/main
+                                  # Bootstrap a new primary worktree
 
 FILES CREATED
     .envrc              Project tool configuration (commit this)
     .envrc.local        Machine overrides template (gitignored)
     .history/           Default per-project shell history (if enabled)
     <name>.code-workspace  VS Code workspace file (if --vscode)
+
+    In a new <project>/main directory, .git and the initial main commit are
+    also created. When direnv and ~/.direnvrc are installed, environment
+    validation must succeed before that commit is published.
 
 SEE ALSO
     direnv, use_llvm, use_cmake, use_rocm (in ~/.direnvrc)
@@ -560,6 +577,7 @@ parse_args() {
     PRESET_ALL=false
     SELECT_NONE=false
     SELECT_MOLD=false
+    REPOSITORY_MODE=auto
     TARGET_DIR="."
     TARGET_DIR_SET=false
     HISTORY_PATH=""
@@ -607,6 +625,20 @@ parse_args() {
                 ;;
             -y|--yes)
                 AUTO_CONFIRM=true
+                ;;
+            --repository)
+                if [ "$REPOSITORY_MODE" = "disabled" ]; then
+                    error "--repository cannot be combined with --no-repository"
+                    exit 1
+                fi
+                REPOSITORY_MODE=enabled
+                ;;
+            --no-repository)
+                if [ "$REPOSITORY_MODE" = "enabled" ]; then
+                    error "--no-repository cannot be combined with --repository"
+                    exit 1
+                fi
+                REPOSITORY_MODE=disabled
                 ;;
             --no-history)
                 USE_HISTORY=false
@@ -746,6 +778,10 @@ parse_args() {
 
     if [ "$NO_ENV" = "true" ] && [ "$VSCODE_ENABLED" != "true" ]; then
         error "--no-env requires --vscode"
+        exit 1
+    fi
+    if [ "$NO_ENV" = "true" ] && [ "$REPOSITORY_MODE" = "enabled" ]; then
+        error "--no-env cannot be combined with --repository"
         exit 1
     fi
     if [ "$SELECT_NONE" = "true" ] &&
@@ -1366,6 +1402,41 @@ PY
     staging_path=""
 )
 
+authorize_generated_environment() {
+    DIRENV_RESULT=missing
+    if ! command -v direnv >/dev/null 2>&1; then
+        return 0
+    fi
+    if ! direnv allow; then
+        error "Could not authorize the generated direnv environment."
+        return 1
+    fi
+    DIRENV_RESULT=allowed
+    if [ ! -f "$HOME/.direnvrc" ]; then
+        warn "Direnv was allowed but ~/.direnvrc is not installed; activation was not validated."
+        return 0
+    fi
+    if ! direnv exec . /bin/sh -c ':'; then
+        error "The generated direnv environment could not be loaded."
+        return 1
+    fi
+    DIRENV_RESULT=validated
+}
+
+report_project_ready() {
+    case "$DIRENV_RESULT" in
+        validated)
+            echo -e "${GREEN}Done! Direnv is allowed and validated.${NC}"
+            ;;
+        allowed)
+            echo -e "${GREEN}Done! Project files are initialized.${NC}"
+            ;;
+        missing)
+            echo -e "${YELLOW}Note: direnv not found. Install it and run 'direnv allow' to activate.${NC}"
+            ;;
+    esac
+}
+
 # ============================================================================
 # Main
 # ============================================================================
@@ -1396,6 +1467,14 @@ main() {
         info "Created directory: $TARGET_DIR"
     fi
     cd -- "$TARGET_DIR"
+
+    local environment_enabled=true
+    [ "$NO_ENV" != "true" ] || environment_enabled=false
+    if ! project_repository_prepare_bootstrap \
+            "$PWD" "$REPOSITORY_MODE" "$environment_enabled"; then
+        error "Could not prepare repository bootstrap."
+        exit 1
+    fi
 
     if [ -n "$VSCODE_EXTRA_SETTINGS" ]; then
         if [ ! -f "$VSCODE_EXTRA_SETTINGS" ]; then
@@ -1728,8 +1807,11 @@ main() {
        [ "$needs_envrc_local" = "false" ] &&
        [ "$needs_history" = "false" ] &&
        [ "$needs_workspace" = "false" ] &&
-       [ "$needs_claude" = "false" ]; then
+       [ "$needs_claude" = "false" ] &&
+       [ "$PROJECT_REPOSITORY_CREATE_COMMIT" = "false" ]; then
         info "No changes needed. All files are up to date."
+        authorize_generated_environment || exit 1
+        report_project_ready
         exit 0
     fi
 
@@ -1751,6 +1833,11 @@ main() {
         info "Will write VS Code workspace: $workspace_file"
     [ "$needs_claude" != "true" ] ||
         info "Will write Claude Code settings: .claude/settings.local.json"
+    if [ "$PROJECT_REPOSITORY_INITIALIZE" = "true" ]; then
+        info "Will initialize a worktree-ready Git repository on branch main"
+    elif [ "$PROJECT_REPOSITORY_CREATE_COMMIT" = "true" ]; then
+        info "Will create the unborn repository's initial main commit"
+    fi
 
     # Confirm unless -y.
     if [ "$AUTO_CONFIRM" != "true" ]; then
@@ -1773,6 +1860,13 @@ main() {
         require_generated_file_generation \
             ".claude/settings.local.json" "$claude_generation" \
             "Claude settings" || exit 1
+    fi
+    if [ "$PROJECT_REPOSITORY_CREATE_COMMIT" = "true" ]; then
+        if ! project_repository_require_bootstrap_state \
+                "$PWD" "$PROJECT_REPOSITORY_EXPECTED_CLASSIFICATION"; then
+            error "Repository bootstrap stopped before project files changed."
+            exit 1
+        fi
     fi
 
     # Materialize every requested directory boundary before publishing any
@@ -1835,9 +1929,32 @@ main() {
         info "Wrote Claude Code settings: .claude/settings.local.json"
     fi
 
+    # When the installed direnv integration can validate a generated
+    # environment, it must execute successfully before that environment becomes
+    # the durable first commit of a new project repository.
+    authorize_generated_environment || exit 1
+
+    if [ "$PROJECT_REPOSITORY_CREATE_COMMIT" = "true" ]; then
+        local repository_paths=(".envrc")
+        if [ "$VSCODE_ENABLED" = "true" ]; then
+            repository_paths+=("$workspace_file")
+        fi
+        if ! project_repository_publish_bootstrap \
+                "$PWD" "$PROJECT_REPOSITORY_INITIALIZE" \
+                "${repository_paths[@]}"; then
+            error "The repository remains recoverable at: $PWD"
+            exit 1
+        fi
+    fi
+
     echo ""
     echo -e "${GREEN}Created:${NC}"
-    echo "  .envrc       - Project tool configuration (commit this)"
+    if [ "$PROJECT_REPOSITORY_CREATE_COMMIT" = "true" ]; then
+        echo "  .envrc       - Project tool configuration (committed)"
+        echo "  Git          - Initial main commit $PROJECT_REPOSITORY_COMMIT"
+    else
+        echo "  .envrc       - Project tool configuration (commit this)"
+    fi
     [ ! -f ".envrc.local" ] || echo "  .envrc.local - Machine overrides (gitignored)"
     [ "$USE_HISTORY" != "true" ] || [ -z "$history_directory" ] ||
         echo "  $history_directory - Per-project shell history"
@@ -1845,13 +1962,7 @@ main() {
     [ "$CLAUDE_ENABLED" = "true" ] && echo "  .claude/settings.local.json - Claude Code sandbox settings"
     echo ""
 
-    # Allow direnv.
-    if command -v direnv >/dev/null 2>&1; then
-        direnv allow
-        echo -e "${GREEN}Done! Environment is now active.${NC}"
-    else
-        echo -e "${YELLOW}Note: direnv not found. Install it and run 'direnv allow' to activate.${NC}"
-    fi
+    report_project_ready
 }
 
 main "$@"

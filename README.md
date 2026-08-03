@@ -77,15 +77,24 @@ commands use a `<project>/main` primary checkout and create feature worktrees
 at `<project>/<name>`:
 
 ```bash
+mkdir -p ~/src/my-project/main
 cd ~/src/my-project/main
+project-init
 project-worktree-init users/me/feature feature
+direnv allow ../feature
 cd ../feature
-project-init --build --vscode
 project-dev
 project-code .
 cd ../main
 project-worktree-deinit feature
 ```
+
+In a new directory named `main`, `project-init` initializes Git on branch
+`main` and creates the first commit from its generated, committable files. This
+is the commit boundary Git requires before a sibling worktree can exist.
+Existing repositories keep their history; ordinary directories retain the
+environment-only behavior. `--repository` requires the primary layout and
+`--no-repository` suppresses the inferred bootstrap.
 
 When `main/AGENTS.override.md` or `main/.bazelrc.local` exists,
 `project-worktree-init` links the shared local file into each new worktree.
@@ -96,7 +105,9 @@ or ignored files, stops its exact tmux session, and rechecks the complete
 worktree before removal. Default tmux names carry a readable project/worktree
 prefix plus a digest of the physical project path, so identically named
 repositories cannot attach to each other's sessions. Worktree lifetime and
-project configuration are separate: initialize each new worktree explicitly.
+project configuration are separate: the tracked `.envrc` follows each branch,
+while `project-worktree-init` prints the explicit direnv authorization for the
+new path.
 
 `agents/WORKING_CONTRACT.md` is the canonical global agent contract.
 `dotfiles install` and `dotfiles update` publish byte-identical regular-file

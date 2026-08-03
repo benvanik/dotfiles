@@ -8,6 +8,10 @@
 .envrc.local
 .history/
 
+# Primary-worktree-owned policy linked into sibling worktrees.
+AGENTS.override.md
+.bazelrc.local
+
 # OS artifacts.
 .DS_Store
 Thumbs.db

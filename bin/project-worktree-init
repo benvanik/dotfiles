@@ -34,6 +34,9 @@ LAYOUT
     If main/AGENTS.override.md or main/.bazelrc.local exists, the new worktree
     receives a relative symlink to each shared local file.
 
+    A tracked .envrc is inherited with the branch. The command prints the
+    explicit direnv authorization needed before entering the new worktree.
+
 EXAMPLES
     project-worktree-init users/me/feature
     project-worktree-init users/me/feature experiment
@@ -185,4 +188,7 @@ for shared_file in "${SHARED_FILES[@]}"; do
 done
 
 info "Created worktree: $WORKTREE_PATH"
+if [ -f "$WORKTREE_PATH/.envrc" ]; then
+    printf '  direnv allow %q\n' "$WORKTREE_PATH"
+fi
 printf '  cd %q\n' "$WORKTREE_PATH"

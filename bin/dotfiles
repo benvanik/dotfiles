@@ -412,7 +412,7 @@ _show_summary() {
     fi
 
     info "Project workflow:"
-    info "  project-init      Initialize project .envrc"
+    info "  project-init      Bootstrap project repository and .envrc"
     info "  project-dev       Create/attach to project tmux session"
     info "  project-code      Launch VS Code for project"
     info "  project-deinit    Remove project .envrc"

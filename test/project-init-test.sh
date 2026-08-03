@@ -19,6 +19,12 @@ cleanup_test_root() {
 }
 trap cleanup_test_root EXIT
 
+# Pre-commit hooks export repository-local Git paths. They must not leak into
+# the independent repositories created below.
+while IFS= read -r git_environment_variable; do
+    unset "$git_environment_variable"
+done < <(git rev-parse --local-env-vars)
+
 fail() {
     echo "project init test: $1" >&2
     exit 1
@@ -66,6 +72,8 @@ printf '%s\n' "unrelated-local-output" > "$IGNORE_PROJECT/.gitignore"
 printf '%s\n' "source_local_envrc" > "$IGNORE_PROJECT/.envrc"
 printf '%s\n' "machine-only" > "$IGNORE_PROJECT/.envrc.local"
 printf '%s\n' "history" > "$IGNORE_PROJECT/.history/state"
+printf '%s\n' "local agent policy" > "$IGNORE_PROJECT/AGENTS.override.md"
+printf '%s\n' "local Bazel policy" > "$IGNORE_PROJECT/.bazelrc.local"
 if git -C "$IGNORE_PROJECT" \
         -c core.excludesFile="$DOTFILES/git/ignore_global" \
         check-ignore -q .envrc; then
@@ -82,6 +90,128 @@ git -C "$IGNORE_PROJECT" \
     -c core.excludesFile="$DOTFILES/git/ignore_global" \
     check-ignore -q .history/state ||
     fail "global ignore stopped covering project history"
+git -C "$IGNORE_PROJECT" \
+    -c core.excludesFile="$DOTFILES/git/ignore_global" \
+    check-ignore -q AGENTS.override.md ||
+    fail "global ignore stopped covering the shared agent override"
+git -C "$IGNORE_PROJECT" \
+    -c core.excludesFile="$DOTFILES/git/ignore_global" \
+    check-ignore -q .bazelrc.local ||
+    fail "global ignore stopped covering shared Bazel policy"
+
+# The unambiguous <project>/main layout is a repository bootstrap boundary.
+# Its first generated commit makes project-worktree-init usable immediately;
+# local environment and history state remain ignored and uncommitted.
+BOOTSTRAP_HOME="$TEST_ROOT/bootstrap-home"
+BOOTSTRAP_ROOT="$TEST_ROOT/bootstrap-project"
+BOOTSTRAP_MAIN="$BOOTSTRAP_ROOT/main"
+mkdir -p "$BOOTSTRAP_HOME" "$BOOTSTRAP_MAIN"
+ln -s "$DOTFILES" "$BOOTSTRAP_HOME/.dotfiles"
+HOME="$BOOTSTRAP_HOME" \
+XDG_CACHE_HOME="$BOOTSTRAP_HOME/.cache" \
+XDG_CONFIG_HOME="$BOOTSTRAP_HOME/.config" \
+XDG_DATA_HOME="$BOOTSTRAP_HOME/.local/share" \
+GIT_AUTHOR_NAME="Project Init Test" \
+GIT_AUTHOR_EMAIL="project-init@example.com" \
+GIT_COMMITTER_NAME="Project Init Test" \
+GIT_COMMITTER_EMAIL="project-init@example.com" \
+GIT_CONFIG_COUNT=1 \
+GIT_CONFIG_KEY_0=core.excludesFile \
+GIT_CONFIG_VALUE_0="$DOTFILES/git/ignore_global" \
+    "$BASH_EXECUTABLE" "$DOTFILES/bin/project-init" \
+    --none --yes "$BOOTSTRAP_MAIN" >/dev/null
+[ -d "$BOOTSTRAP_MAIN/.git" ] ||
+    fail "main project directory was not initialized as a Git repository"
+[ "$(git -C "$BOOTSTRAP_MAIN" branch --show-current)" = "main" ] ||
+    fail "bootstrapped repository did not select branch main"
+[ "$(git -C "$BOOTSTRAP_MAIN" log -1 --format=%s)" = \
+    "Initialize project" ] ||
+    fail "bootstrapped repository is missing its initial project commit"
+[ "$(git -C "$BOOTSTRAP_MAIN" ls-tree --name-only HEAD)" = ".envrc" ] ||
+    fail "initial project commit included local or caller-owned files"
+[ -f "$BOOTSTRAP_MAIN/.envrc.local" ] ||
+    fail "repository bootstrap omitted the local environment template"
+[ -d "$BOOTSTRAP_MAIN/.history" ] ||
+    fail "repository bootstrap omitted project history"
+if [ -n "$(git -C "$BOOTSTRAP_MAIN" \
+        -c core.excludesFile="$DOTFILES/git/ignore_global" \
+        status --porcelain)" ]; then
+    fail "bootstrapped project was not clean after its initial commit"
+fi
+BOOTSTRAP_WORKTREE_OUTPUT=$(
+    cd "$BOOTSTRAP_MAIN"
+    "$BASH_EXECUTABLE" "$DOTFILES/bin/project-worktree-init" \
+        users/test/bootstrap bootstrap
+)
+printf '%s\n' "$BOOTSTRAP_WORKTREE_OUTPUT" |
+    grep -Fqx "  direnv allow $BOOTSTRAP_ROOT/bootstrap" ||
+    fail "first sibling worktree omitted direnv authorization guidance"
+[ "$(git -C "$BOOTSTRAP_ROOT/bootstrap" branch --show-current)" = \
+    "users/test/bootstrap" ] ||
+    fail "bootstrapped project could not create its first sibling worktree"
+[ -f "$BOOTSTRAP_ROOT/bootstrap/.envrc" ] ||
+    fail "first sibling worktree did not inherit the project environment"
+
+FILES_ONLY_MAIN="$TEST_ROOT/files-only/main"
+mkdir -p "$FILES_ONLY_MAIN"
+HOME="$BOOTSTRAP_HOME" \
+    "$BASH_EXECUTABLE" "$DOTFILES/bin/project-init" \
+    --none --yes --no-history --no-repository "$FILES_ONLY_MAIN" \
+    >/dev/null
+[ ! -e "$FILES_ONLY_MAIN/.git" ] ||
+    fail "--no-repository did not suppress inferred Git bootstrap"
+
+WRONG_LAYOUT_PROJECT="$TEST_ROOT/wrong-layout-project"
+mkdir -p "$WRONG_LAYOUT_PROJECT"
+if HOME="$BOOTSTRAP_HOME" \
+        "$BASH_EXECUTABLE" "$DOTFILES/bin/project-init" \
+        --none --yes --no-history --repository "$WRONG_LAYOUT_PROJECT" \
+        >/dev/null 2>&1; then
+    fail "--repository accepted a primary worktree not named main"
+fi
+[ ! -e "$WRONG_LAYOUT_PROJECT/.envrc" ] ||
+    fail "invalid repository layout changed project files before rejection"
+
+# Authorization is not activation. When an installed direnv loader rejects the
+# generated environment, project-init must fail after preserving the generated
+# files instead of claiming that the environment is active.
+VALIDATION_HOME="$TEST_ROOT/validation-home"
+VALIDATION_BIN="$TEST_ROOT/validation-bin"
+VALIDATION_PROJECT="$TEST_ROOT/validation-project/main"
+VALIDATION_LOG="$TEST_ROOT/validation.log"
+mkdir -p "$VALIDATION_HOME" "$VALIDATION_BIN" "$VALIDATION_PROJECT"
+ln -s "$DOTFILES" "$VALIDATION_HOME/.dotfiles"
+ln -s "$DOTFILES/tools/direnvrc" "$VALIDATION_HOME/.direnvrc"
+cat > "$VALIDATION_BIN/direnv" << 'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >> "$PROJECT_INIT_VALIDATION_LOG"
+case "${1:-}" in
+    allow) exit 0 ;;
+    exec) exit 71 ;;
+    *) exit 64 ;;
+esac
+EOF
+chmod +x "$VALIDATION_BIN/direnv"
+if HOME="$VALIDATION_HOME" \
+        PATH="$VALIDATION_BIN:$PATH" \
+        PROJECT_INIT_VALIDATION_LOG="$VALIDATION_LOG" \
+        GIT_AUTHOR_NAME="Project Init Test" \
+        GIT_AUTHOR_EMAIL="project-init@example.com" \
+        GIT_COMMITTER_NAME="Project Init Test" \
+        GIT_COMMITTER_EMAIL="project-init@example.com" \
+        "$BASH_EXECUTABLE" "$DOTFILES/bin/project-init" \
+        --none --yes --no-history "$VALIDATION_PROJECT" \
+        >/dev/null 2>&1; then
+    fail "project initialization accepted a rejected direnv environment"
+fi
+[ -f "$VALIDATION_PROJECT/.envrc" ] ||
+    fail "direnv validation failure discarded the generated environment"
+[ ! -e "$VALIDATION_PROJECT/.git" ] ||
+    fail "direnv validation failure published a project repository"
+grep -qxF allow "$VALIDATION_LOG" ||
+    fail "project initialization did not authorize direnv before validation"
+grep -qxF "exec . /bin/sh -c :" "$VALIDATION_LOG" ||
+    fail "project initialization did not execute its direnv validation witness"
 
 # Installer transaction state alone is not an installed tool. A failed or
 # killed publication must not make a later project request an unusable
@@ -650,6 +780,11 @@ fi
     fail "real direnv ran a child with a rejected CMake root"
 grep -qF "CMake root is incomplete" "$DIRENV_LOG" ||
     fail "real direnv did not report the rejected CMake root"
+cat > "$DIRENV_CMAKE_ROOT/bin/cmake" << 'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod +x "$DIRENV_CMAKE_ROOT/bin/cmake"
 
 JSON_PROJECT_DIRECTORY="$TEST_ROOT/json-project"
 JSON_BUILD_DIRECTORY="$TEST_ROOT/build & pipe|quote\"backslash\\"
@@ -1018,14 +1153,32 @@ if [ "$(uname -s)" = "Linux" ]; then
     ROCM_VENV="$TEST_HOME/tools/rocm/7.0.0"
     ROCM_SDK="$TEST_HOME/assembled ROCm SDK"
     ROCM_PROJECT_DIRECTORY="$TEST_ROOT/rocm-project"
-    mkdir -p "$ROCM_VENV/bin" "$ROCM_SDK" "$ROCM_PROJECT_DIRECTORY"
+    mkdir -p \
+        "$ROCM_VENV/bin" \
+        "$ROCM_SDK/bin" \
+        "$ROCM_SDK/include/hip" \
+        "$ROCM_SDK/lib/cmake/hip" \
+        "$ROCM_SDK/lib/llvm/bin" \
+        "$ROCM_SDK/lib/rocm_sysdeps/lib" \
+        "$ROCM_PROJECT_DIRECTORY"
     touch "$ROCM_VENV/pyvenv.cfg"
+    touch \
+        "$ROCM_SDK/include/hip/hip_runtime.h" \
+        "$ROCM_SDK/lib/libamdhip64.so" \
+        "$ROCM_SDK/lib/cmake/hip/hip-config.cmake"
     cat > "$ROCM_VENV/bin/rocm-sdk" << EOF
 #!/bin/sh
 [ "\${1:-} \${2:-}" = "path --root" ] || exit 2
 printf '%s\n' '$ROCM_SDK'
 EOF
     chmod +x "$ROCM_VENV/bin/rocm-sdk"
+    cat > "$ROCM_SDK/bin/hipconfig" << EOF
+#!/bin/sh
+[ "\${1:-}" = "--platform" ] || exit 2
+[ "\${ROCM_PATH:-}" = '$ROCM_SDK' ] || exit 3
+printf 'amd\n'
+EOF
+    chmod +x "$ROCM_SDK/bin/hipconfig"
     ln -s "7.0.0" "$TEST_HOME/tools/rocm/latest"
 
     HOME="$TEST_HOME" \

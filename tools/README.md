@@ -54,10 +54,17 @@ restarting a login session or a long-lived tmux server. This is handled by
 Use `project-init` to set up a new project:
 
 ```bash
-cd my-project
+mkdir -p my-project/main
+cd my-project/main
 project-init
 project-init --build --mold
 ```
+
+The `<project>/main` form is worktree-ready: when no repository owns that
+directory, `project-init` initializes Git on branch `main` and commits the
+generated shared configuration. In an existing repository or an ordinary
+directory it only converges project files. `--repository` requires bootstrap;
+`--no-repository` keeps file generation explicit.
 
 This creates:
 
@@ -69,7 +76,8 @@ On rerun, `project-init` preserves supported directive arguments, including
 exact tool versions and history choices. It refuses to rewrite an `.envrc`
 containing unmanaged content; machine-only additions belong in `.envrc.local`.
 Use `--none` for an explicit empty tool selection. Canceling the interactive
-selector leaves the existing environment untouched.
+selector leaves the existing environment untouched. A successful run asks
+direnv to execute the generated environment before reporting it validated.
 
 ### Manual .envrc
 

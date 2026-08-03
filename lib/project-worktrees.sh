@@ -1,13 +1,27 @@
 #!/bin/bash
 # Shared Git worktree conventions for project-* commands.
 
-# Prints local files shared from the primary worktree into sibling worktrees.
-# These names are consumed by both worktree creation and removal so managed
-# links have one ownership definition.
+# Prints typed local entries shared from the primary worktree into siblings.
+# Each line is <kind><tab><path>. Creation validates the source according to
+# its kind; removal consumes the same list so managed links have one ownership
+# definition.
+project_worktree_shared_entries() {
+    printf '%s\t%s\n' \
+        "file" "AGENTS.override.md" \
+        "file" ".bazelrc.local" \
+        "directory" ".beads"
+}
+
+# Retains the original file-only query for callers that do not manage links.
 project_worktree_shared_files() {
-    printf '%s\n' \
-        "AGENTS.override.md" \
-        ".bazelrc.local"
+    local shared_kind
+    local shared_path
+
+    while IFS=$'\t' read -r shared_kind shared_path; do
+        if [ "$shared_kind" = "file" ]; then
+            printf '%s\n' "$shared_path"
+        fi
+    done < <(project_worktree_shared_entries)
 }
 
 # Prints the primary worktree in the required <project>/main layout.

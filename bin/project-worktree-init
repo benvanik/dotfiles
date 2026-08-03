@@ -31,8 +31,9 @@ LAYOUT
     checked-out branch may vary; new branches start from main by default.
     New worktrees are created at <project>/<name>.
 
-    If main/AGENTS.override.md or main/.bazelrc.local exists, the new worktree
-    receives a relative symlink to each shared local file.
+    If main/AGENTS.override.md, main/.bazelrc.local, or main/.beads exists, the
+    new worktree receives a relative symlink to that shared local state. The
+    main worktree must own .beads as a physical directory.
 
     A tracked .envrc is inherited with the branch. The command prints the
     explicit direnv authorization needed before entering the new worktree.
@@ -114,26 +115,44 @@ elif git -C "$MAIN_WORKTREE" show-ref --verify --quiet "refs/remotes/origin/$BRA
     BRANCH_MODE="remote"
 fi
 
-SHARED_FILES=()
-while IFS= read -r shared_file; do
-    shared_source="$MAIN_WORKTREE/$shared_file"
-    if [ -L "$shared_source" ] && [ ! -e "$shared_source" ]; then
-        error "The main worktree has a broken $shared_file symlink."
-        exit 1
-    fi
-    if [ -e "$shared_source" ] && [ ! -f "$shared_source" ]; then
-        error "The main worktree's $shared_file is not a regular file."
-        exit 1
-    fi
+SHARED_PATHS=()
+while IFS=$'\t' read -r shared_kind shared_path; do
+    shared_source="$MAIN_WORKTREE/$shared_path"
+    case "$shared_kind" in
+        file)
+            if [ -L "$shared_source" ] && [ ! -e "$shared_source" ]; then
+                error "The main worktree has a broken $shared_path symlink."
+                exit 1
+            fi
+            if [ -e "$shared_source" ] && [ ! -f "$shared_source" ]; then
+                error "The main worktree's $shared_path is not a regular file."
+                exit 1
+            fi
+            ;;
+        directory)
+            if [ -L "$shared_source" ]; then
+                error "The main worktree's $shared_path must be a physical directory, not a symlink."
+                exit 1
+            fi
+            if [ -e "$shared_source" ] && [ ! -d "$shared_source" ]; then
+                error "The main worktree's $shared_path is not a directory."
+                exit 1
+            fi
+            ;;
+        *)
+            error "Unknown shared worktree entry kind: $shared_kind"
+            exit 1
+            ;;
+    esac
     if [ -e "$shared_source" ] && git -C "$MAIN_WORKTREE" cat-file -e \
-            "$START_POINT:$shared_file" 2>/dev/null; then
-        error "$shared_file is tracked on $START_POINT and cannot be replaced by a shared symlink."
+            "$START_POINT:$shared_path" 2>/dev/null; then
+        error "$shared_path is tracked on $START_POINT and cannot be replaced by a shared symlink."
         exit 1
     fi
     if [ -e "$shared_source" ]; then
-        SHARED_FILES+=("$shared_file")
+        SHARED_PATHS+=("$shared_path")
     fi
-done < <(project_worktree_shared_files)
+done < <(project_worktree_shared_entries)
 
 CREATED_BRANCH_OID=""
 if [ "$BRANCH_MODE" != "local" ]; then
@@ -157,14 +176,14 @@ case "$BRANCH_MODE" in
         ;;
 esac
 
-LINKED_SHARED_FILES=()
-for shared_file in "${SHARED_FILES[@]}"; do
-    shared_target="../main/$shared_file"
-    if ! ln -s "$shared_target" "$WORKTREE_PATH/$shared_file"; then
-        error "Could not link the shared $shared_file; rolling back the new worktree."
-        for linked_file in "${LINKED_SHARED_FILES[@]}"; do
-            if ! unlink "$WORKTREE_PATH/$linked_file"; then
-                error "Could not remove the managed $linked_file link during rollback."
+LINKED_SHARED_PATHS=()
+for shared_path in "${SHARED_PATHS[@]}"; do
+    shared_target="../main/$shared_path"
+    if ! ln -s "$shared_target" "$WORKTREE_PATH/$shared_path"; then
+        error "Could not link the shared $shared_path; rolling back the new worktree."
+        for linked_path in "${LINKED_SHARED_PATHS[@]}"; do
+            if ! unlink "$WORKTREE_PATH/$linked_path"; then
+                error "Could not remove the managed $linked_path link during rollback."
                 error "The new worktree was preserved for manual recovery: $WORKTREE_PATH"
                 exit 1
             fi
@@ -183,8 +202,8 @@ for shared_file in "${SHARED_FILES[@]}"; do
         error "New worktree and branch were rolled back."
         exit 1
     fi
-    LINKED_SHARED_FILES+=("$shared_file")
-    info "Linked $shared_file -> $shared_target"
+    LINKED_SHARED_PATHS+=("$shared_path")
+    info "Linked $shared_path -> $shared_target"
 done
 
 info "Created worktree: $WORKTREE_PATH"

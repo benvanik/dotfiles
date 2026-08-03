@@ -97,10 +97,10 @@ SESSION_NAME=$(project_default_session_name "$WORKTREE_PATH")
 info "Removing worktree: $WORKTREE_PATH"
 
 restore_managed_links() {
-    local shared_file
-    for shared_file in "${MANAGED_SHARED_FILES[@]}"; do
-        if ! ln -s "../main/$shared_file" "$WORKTREE_PATH/$shared_file"; then
-            error "Could not restore the managed $shared_file link."
+    local shared_path
+    for shared_path in "${MANAGED_SHARED_PATHS[@]}"; do
+        if ! ln -s "../main/$shared_path" "$WORKTREE_PATH/$shared_path"; then
+            error "Could not restore the managed $shared_path link."
             return 1
         fi
     done
@@ -126,15 +126,15 @@ inspect_worktree_contents() {
 
 # The initializer owns these exact symlinks. Remove them before asking Git to
 # evaluate cleanliness, restoring them if any other state blocks removal.
-MANAGED_SHARED_FILES=()
-while IFS= read -r shared_file; do
-    shared_path="$WORKTREE_PATH/$shared_file"
-    if [ -L "$shared_path" ] && \
-            [ "$(readlink "$shared_path")" = "../main/$shared_file" ]; then
-        unlink "$shared_path"
-        MANAGED_SHARED_FILES+=("$shared_file")
+MANAGED_SHARED_PATHS=()
+while IFS=$'\t' read -r _ shared_path; do
+    shared_entry="$WORKTREE_PATH/$shared_path"
+    if [ -L "$shared_entry" ] && \
+            [ "$(readlink "$shared_entry")" = "../main/$shared_path" ]; then
+        unlink "$shared_entry"
+        MANAGED_SHARED_PATHS+=("$shared_path")
     fi
-done < <(project_worktree_shared_files)
+done < <(project_worktree_shared_entries)
 
 # Git's worktree remover ignores ignored files during its cleanliness check
 # and then deletes them recursively. Refuse every remaining payload class so

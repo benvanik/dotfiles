@@ -57,6 +57,8 @@ git clone -q --branch main "$REMOTE" "$MAIN_WORKTREE"
 git -C "$MAIN_WORKTREE" switch -q -c integration/primary-work
 printf 'shared instructions\n' > "$MAIN_WORKTREE/AGENTS.override.md"
 printf 'shared bazel configuration\n' > "$MAIN_WORKTREE/.bazelrc.local"
+mkdir "$MAIN_WORKTREE/.beads"
+printf 'shared issue database\n' > "$MAIN_WORKTREE/.beads/state"
 (
     cd "$MAIN_WORKTREE"
     "$BASH_EXECUTABLE" "$DOTFILES/bin/project-worktree-init" \
@@ -75,11 +77,71 @@ FEATURE_WORKTREE="$PROJECT_ROOT/feature"
     fail "bazel configuration link does not target the main worktree"
 [ "$(cat "$FEATURE_WORKTREE/.bazelrc.local")" = "shared bazel configuration" ] || \
     fail "bazel configuration link does not resolve to shared contents"
+[ -L "$FEATURE_WORKTREE/.beads" ] || fail "beads link was not created"
+[ "$(readlink "$FEATURE_WORKTREE/.beads")" = "../main/.beads" ] || \
+    fail "beads link does not target the main worktree"
+[ "$(cat "$FEATURE_WORKTREE/.beads/state")" = "shared issue database" ] || \
+    fail "beads link does not resolve to the main database"
 if [ -n "$(git -C "$FEATURE_WORKTREE" \
         -c core.excludesFile="$DOTFILES/git/ignore_global" \
         status --porcelain)" ]; then
     fail "managed shared links made a new worktree appear dirty"
 fi
+
+# Repeating an initialization must preserve the registered worktree and every
+# managed link instead of trying to repair or replace an existing destination.
+if (
+    cd "$MAIN_WORKTREE"
+    "$BASH_EXECUTABLE" "$DOTFILES/bin/project-worktree-init" \
+        users/test/feature feature
+) >/dev/null 2>&1; then
+    fail "repeated worktree initialization unexpectedly succeeded"
+fi
+[ -L "$FEATURE_WORKTREE/.beads" ] || \
+    fail "repeated initialization changed the managed beads link"
+
+# Directory state has one physical owner. A main-worktree symlink, including a
+# broken one, must fail before a worktree or branch is created.
+mv "$MAIN_WORKTREE/.beads" "$TEST_ROOT/main-beads"
+ln -s missing-beads "$MAIN_WORKTREE/.beads"
+if (
+    cd "$MAIN_WORKTREE"
+    "$BASH_EXECUTABLE" "$DOTFILES/bin/project-worktree-init" \
+        users/test/broken-shared broken-shared
+) >/dev/null 2>&1; then
+    fail "symlinked main beads directory was accepted"
+fi
+[ ! -e "$PROJECT_ROOT/broken-shared" ] || \
+    fail "invalid main beads source created a worktree"
+if git -C "$MAIN_WORKTREE" show-ref --verify --quiet \
+        refs/heads/users/test/broken-shared; then
+    fail "invalid main beads source created a branch"
+fi
+unlink "$MAIN_WORKTREE/.beads"
+mv "$TEST_ROOT/main-beads" "$MAIN_WORKTREE/.beads"
+[ "$(cat "$FEATURE_WORKTREE/.beads/state")" = "shared issue database" ] || \
+    fail "main beads restoration did not repair the sibling link"
+
+# Replacing an exact managed link transfers ownership away from the lifecycle
+# command. Deinitialization must preserve that ignored payload and refuse.
+unlink "$FEATURE_WORKTREE/.beads"
+mkdir "$FEATURE_WORKTREE/.beads"
+printf 'replacement state\n' > "$FEATURE_WORKTREE/.beads/state"
+if (
+    cd "$MAIN_WORKTREE"
+    "$BASH_EXECUTABLE" "$DOTFILES/bin/project-worktree-deinit" feature
+) >/dev/null 2>&1; then
+    fail "changed shared-directory destination was silently removed"
+fi
+[ "$(cat "$FEATURE_WORKTREE/.beads/state")" = "replacement state" ] || \
+    fail "changed shared-directory destination was not preserved"
+[ -L "$FEATURE_WORKTREE/AGENTS.override.md" ] || \
+    fail "managed override was not restored after changed-link refusal"
+[ -L "$FEATURE_WORKTREE/.bazelrc.local" ] || \
+    fail "managed bazel policy was not restored after changed-link refusal"
+unlink "$FEATURE_WORKTREE/.beads/state"
+rmdir "$FEATURE_WORKTREE/.beads"
+ln -s ../main/.beads "$FEATURE_WORKTREE/.beads"
 
 # Ignored state is still local data. Git's own worktree removal check omits it,
 # so the wrapper must detect it before Git recursively deletes the worktree.
@@ -166,7 +228,7 @@ mkdir -p "$LINK_FAILURE_BIN"
 cat > "$LINK_FAILURE_BIN/ln" << 'EOF'
 #!/bin/bash
 case "${3:-}" in
-    */.bazelrc.local) exit 71 ;;
+    */.beads) exit 71 ;;
 esac
 exec /bin/ln "$@"
 EOF
@@ -177,17 +239,17 @@ if (
         "$BASH_EXECUTABLE" "$DOTFILES/bin/project-worktree-init" \
         users/test/link-failure link-failure
 ) >/dev/null 2>&1; then
-    fail "managed-override link failure unexpectedly succeeded"
+    fail "managed-state link failure unexpectedly succeeded"
 fi
 [ ! -e "$PROJECT_ROOT/link-failure" ] ||
-    fail "managed-override link failure left a worktree directory"
+    fail "managed-state link failure left a worktree directory"
 if git -C "$MAIN_WORKTREE" worktree list --porcelain |
         grep -Fqx "worktree $PROJECT_ROOT/link-failure"; then
-    fail "managed-override link failure left a registered worktree"
+    fail "managed-state link failure left a registered worktree"
 fi
 if git -C "$MAIN_WORKTREE" show-ref --verify --quiet \
         refs/heads/users/test/link-failure; then
-    fail "managed-override link failure left its newly created branch"
+    fail "managed-state link failure left its newly created branch"
 fi
 
 printf 'dirty\n' > "$FEATURE_WORKTREE/untracked.txt"
@@ -202,6 +264,8 @@ fi
     fail "managed override was not restored after failed removal"
 [ -L "$FEATURE_WORKTREE/.bazelrc.local" ] || \
     fail "managed bazel configuration was not restored after failed removal"
+[ -L "$FEATURE_WORKTREE/.beads" ] || \
+    fail "managed beads link was not restored after failed removal"
 
 unlink "$FEATURE_WORKTREE/untracked.txt"
 if (
@@ -216,6 +280,8 @@ fi
     fail "managed override was not restored after ignored-state refusal"
 [ -L "$FEATURE_WORKTREE/.bazelrc.local" ] || \
     fail "managed bazel configuration was not restored after ignored-state refusal"
+[ -L "$FEATURE_WORKTREE/.beads" ] || \
+    fail "managed beads link was not restored after ignored-state refusal"
 
 find "$FEATURE_WORKTREE/.worktree-local" -depth -delete
 (
@@ -223,6 +289,8 @@ find "$FEATURE_WORKTREE/.worktree-local" -depth -delete
     "$BASH_EXECUTABLE" "$DOTFILES/bin/project-worktree-deinit" feature >/dev/null
 )
 [ ! -e "$FEATURE_WORKTREE" ] || fail "clean worktree was not removed"
+[ "$(cat "$MAIN_WORKTREE/.beads/state")" = "shared issue database" ] || \
+    fail "worktree removal changed the main beads database"
 
 # The first removal leaves a local branch; creating it again exercises the
 # existing-local-branch path.
@@ -317,6 +385,8 @@ fi
     fail "failed session shutdown did not restore the managed override"
 [ -L "$PLAIN_PREFIX_WORKTREE/.bazelrc.local" ] ||
     fail "failed session shutdown did not restore the managed bazel configuration"
+[ -L "$PLAIN_PREFIX_WORKTREE/.beads" ] || \
+    fail "failed session shutdown did not restore the managed beads link"
 
 QUIESCED_STATE="$PREFIXED_WORKTREE/quiesced-state"
 if (
@@ -335,6 +405,8 @@ fi
     fail "managed override was not restored after the quiescence recheck"
 [ -L "$PREFIXED_WORKTREE/.bazelrc.local" ] ||
     fail "managed bazel configuration was not restored after the quiescence recheck"
+[ -L "$PREFIXED_WORKTREE/.beads" ] || \
+    fail "managed beads link was not restored after the quiescence recheck"
 grep -Fqx "has-session -t =$PREFIXED_SESSION" "$TMUX_LOG" ||
     fail "deinitializer did not look up the exact tmux session"
 grep -Fqx "kill-session -t =$PREFIXED_SESSION" "$TMUX_LOG" ||
@@ -400,6 +472,8 @@ grep -Fqx "kill-session -t =tmux-only.session" "$TMUX_LOG" ||
 
 unlink "$MAIN_WORKTREE/AGENTS.override.md"
 unlink "$MAIN_WORKTREE/.bazelrc.local"
+unlink "$MAIN_WORKTREE/.beads/state"
+rmdir "$MAIN_WORKTREE/.beads"
 (
     cd "$MAIN_WORKTREE"
     "$BASH_EXECUTABLE" "$DOTFILES/bin/project-worktree-init" \
@@ -410,6 +484,8 @@ PLAIN_WORKTREE="$PROJECT_ROOT/plain"
     fail "override link was created without a main override"
 [ ! -e "$PLAIN_WORKTREE/.bazelrc.local" ] || \
     fail "bazel configuration link was created without a main configuration"
+[ ! -e "$PLAIN_WORKTREE/.beads" ] || \
+    fail "beads link was created without a main database"
 (
     cd "$MAIN_WORKTREE"
     "$BASH_EXECUTABLE" "$DOTFILES/bin/project-worktree-deinit" plain >/dev/null

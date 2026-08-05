@@ -248,6 +248,17 @@ if [ $link_fail -eq 0 ]; then
 fi
 
 # ============================================================================
+# Pre-commit Hook Isolation
+# ============================================================================
+section "pre-commit" "Pre-commit Git environment isolation"
+
+if "$BASH" "$DOTFILES/test/pre-commit-hook-test.sh"; then
+    pass "pre-commit Git environment isolation"
+else
+    fail "pre-commit Git environment isolation"
+fi
+
+# ============================================================================
 # Project Worktree Lifecycle
 # ============================================================================
 section "worktrees" "Project worktree lifecycle"

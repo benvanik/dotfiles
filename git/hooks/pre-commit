@@ -7,8 +7,20 @@
 
 set -e
 
-# Find dotfiles directory (relative to .git/hooks/).
-DOTFILES="$(cd "$(dirname "$0")/../.." && pwd)"
+# Resolve the worktree before clearing Git's repository-local environment. A
+# managed hook lives in the common Git directory, so resolving relative to $0
+# would validate the primary checkout even when another worktree is committing.
+DOTFILES="$(git rev-parse --show-toplevel)"
+
+# Hooks inherit repository-local Git paths. Integration tests create their own
+# repositories, and those Git commands must discover the fixture repository
+# instead of reusing the committing worktree's index and configuration.
+git_environment_variables="$(git rev-parse --local-env-vars)"
+# Git emits one variable name per line; splitting supplies each name to unset.
+# shellcheck disable=SC2086
+unset $git_environment_variables
+unset git_environment_variables
+export DOTFILES
 
 echo "Running dotfiles test..."
 if "$DOTFILES/bin/dotfiles" test; then

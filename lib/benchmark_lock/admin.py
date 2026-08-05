@@ -54,6 +54,7 @@ from .installation_projection import (
     SymlinkProjection,
     publish_new_regular,
 )
+from .policy import AmdGpuIdentity, FixedHostPolicyConfig, LinuxHostFilesystem
 
 
 EPOCH_PATH = STATE_DIRECTORY / "active-epoch.json"
@@ -84,6 +85,13 @@ class CommandRunner(Protocol):
 
     def run(self, command: tuple[str, ...]) -> None:
         """Run one exact argv vector or raise."""
+
+
+class GpuIdentityReader(Protocol):
+    """Administrator-selected PCI identity discovery boundary."""
+
+    def read_gpu_identity(self, bdf: str) -> AmdGpuIdentity:
+        """Read the exact AMD display-controller identity at one PCI BDF."""
 
 
 class SubprocessCommandRunner:
@@ -385,6 +393,7 @@ class BenchmarkAdmin:
         runner: CommandRunner | None = None,
         maintenance: MaintenanceCoordinator | None = None,
         accounts: AccountManager | None = None,
+        identity_reader: GpuIdentityReader | None = None,
         destination_root: pathlib.Path = pathlib.Path("/"),
         root_uid: int = 0,
         root_gid: int = 0,
@@ -401,6 +410,9 @@ class BenchmarkAdmin:
         )
         self.accounts = (
             ProductionAccountManager(self.runner) if accounts is None else accounts
+        )
+        self.identity_reader = (
+            LinuxHostFilesystem() if identity_reader is None else identity_reader
         )
         self.layout = _Layout(pathlib.Path(destination_root))
         self.root_uid = root_uid
@@ -768,14 +780,17 @@ class BenchmarkAdmin:
             )
         return content
 
-    def _read_config_source(self, path: pathlib.Path) -> bytes:
-        content = _read_source_file(path)
-        if len(content) > MAX_CONFIG_BYTES:
-            raise _admin_error(
-                "benchmarkd policy configuration exceeds its fixed size limit",
-                code="invalid_benchmark_policy_configuration",
+    def _configuration_for_gpus(self, gpu_bdfs: tuple[str, ...]) -> bytes:
+        try:
+            config = FixedHostPolicyConfig(
+                tuple(self.identity_reader.read_gpu_identity(bdf) for bdf in gpu_bdfs)
             )
-        return canonical_policy_configuration(parse_policy_configuration(content))
+        except ValueError as error:
+            raise _admin_error(
+                f"benchmarkd GPU selection is invalid: {error}",
+                code="invalid_benchmark_policy_configuration",
+            ) from error
+        return canonical_policy_configuration(config)
 
     def _install_configuration(
         self,
@@ -806,7 +821,7 @@ class BenchmarkAdmin:
             return
         if requested_configuration is None:
             raise _admin_error(
-                "first installation requires --config FILE",
+                "first installation requires at least one --gpu BDF",
                 code="benchmark_admin_config_required",
             )
         publish_new_regular(
@@ -1208,7 +1223,7 @@ class BenchmarkAdmin:
     def install(
         self,
         *,
-        configuration_source: pathlib.Path | None,
+        gpu_bdfs: tuple[str, ...],
         user_name: str,
     ) -> str:
         """Publish and activate one complete immutable release."""
@@ -1216,14 +1231,14 @@ class BenchmarkAdmin:
         self._require_root()
         with self._hold_operation_lock():
             return self._install(
-                configuration_source=configuration_source,
+                gpu_bdfs=gpu_bdfs,
                 user_name=user_name,
             )
 
     def _install(
         self,
         *,
-        configuration_source: pathlib.Path | None,
+        gpu_bdfs: tuple[str, ...],
         user_name: str,
     ) -> str:
         """Run one serialized installation transaction."""
@@ -1247,15 +1262,13 @@ class BenchmarkAdmin:
         else:
             self._require_no_install_stages()
         self.accounts.validate_user(user_name)
-        if configuration_source is None and not os.path.lexists(self.layout.config):
+        if not gpu_bdfs and not os.path.lexists(self.layout.config):
             raise _admin_error(
-                "first installation requires --config FILE",
+                "first installation requires at least one --gpu BDF",
                 code="benchmark_admin_config_required",
             )
         requested_configuration = (
-            None
-            if configuration_source is None
-            else self._read_config_source(configuration_source)
+            None if not gpu_bdfs else self._configuration_for_gpus(gpu_bdfs)
         )
         selected_prior_digest = self._current_selector_digest()
         if selected_prior_digest is None and self._has_live_projection():

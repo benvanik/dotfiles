@@ -72,8 +72,8 @@ production boundary requires:
 - `libsystemd.so.0` with `sd_notify_barrier`.
 - `power-profiles-daemon` available on the system bus, exposing a non-degraded
   `performance` profile and the profile-hold API.
-- The AMDGPU/KFD sysfs ABI for every configured GPU: immutable PCI identity
-  fields, a readable and writable
+- The AMDGPU/KFD sysfs ABI for every configured GPU: immutable PCI display
+  identity fields, an optional `unique_id`, a readable and writable
   `power_dpm_force_performance_level`, and the KFD ownership ledger at
   `/sys/class/kfd/kfd/proc`.
 
@@ -93,36 +93,32 @@ for each grant; an installation succeeding does not waive them.
 ## One-time installation
 
 Installation is explicit and separate from `dotfiles install` and
-`install-deps.sh`. Select each benchmark GPU by its immutable sysfs identity.
-For example, after choosing a PCI BDF:
+`install-deps.sh`. Select each benchmark GPU by PCI BDF:
 
 ```bash
-gpu_path=/sys/bus/pci/devices/0000:23:00.0
-for field in vendor device subsystem_vendor subsystem_device revision unique_id class; do
-  printf '%s=' "$field"
-  <"$gpu_path/$field" tr -d '\n'
-  printf '\n'
-done
+lspci -Dnn | grep -Ei 'vga|display'
 ```
 
-Create a machine-local file outside this repository, mode `0600`:
-
-```json
-{"gpus":[{"bdf":"0000:23:00.0","device":"0x744c","device_class":"0x030000","revision":"0xc8","subsystem_device":"0x0000","subsystem_vendor":"0x1002","unique_id":"1","vendor":"0x1002"}],"policy_identity":"amd-performance-v1","schema":"benchmarkd.config.v1"}
-```
-
-The values above are illustrative; every value must match the selected device.
-Install the first immutable generation with:
+The first installation discovers and validates the complete immutable identity
+at each selected BDF, then publishes the canonical root-owned configuration
+with the broker generation:
 
 ```bash
-chmod 600 ~/.config/benchmarkd/config.json
 sudo ~/.dotfiles/bin/benchmark-admin install \
-  --config ~/.config/benchmarkd/config.json \
+  --gpu 0000:23:00.0 \
   --user "$USER"
 ```
 
+Repeat `--gpu BDF` for a multi-GPU benchmark host. Discrete GPUs normally
+contribute a VGA-class identity and a `unique_id`; integrated GPUs may use
+another PCI display subclass and omit that sysfs serial. The administrator
+preserves those observed facts directly instead of asking the operator to
+transcribe or invent them. An unavailable `unique_id` is recorded as `null`;
+that policy constrains the identity fields the kernel exposed instead of
+treating a serial added by a later kernel as a hardware replacement.
+
 New group membership takes effect in a new login session. Later code upgrades
-preserve the installed policy and omit `--config`:
+preserve the installed policy and omit `--gpu`:
 
 ```bash
 sudo ~/.dotfiles/bin/benchmark-admin install --user "$USER"

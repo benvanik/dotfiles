@@ -76,9 +76,12 @@ def _argument_parser(*, output: TextIO, error: TextIO) -> _ArgumentParser:
         error=error,
     )
     install.add_argument(
-        "--config",
-        type=pathlib.Path,
-        help="required policy JSON for the first installation",
+        "--gpu",
+        action="append",
+        default=[],
+        dest="gpu_bdfs",
+        metavar="BDF",
+        help="benchmark GPU PCI BDF; required and repeatable on first install",
     )
     install.add_argument(
         "--user",
@@ -143,7 +146,7 @@ def main(
                     code="benchmark_admin_user_required",
                 )
             admin.install(
-                configuration_source=parsed.config,
+                gpu_bdfs=tuple(parsed.gpu_bdfs),
                 user_name=user_name,
             )
         elif parsed.operation == "doctor":

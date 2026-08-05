@@ -24,6 +24,8 @@ from .errors import BenchmarkLockError
 _PCI_BDF_PATTERN = re.compile(r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]")
 _HEX_ID_PATTERN = re.compile(r"0x[0-9a-f]{4}")
 _HEX_REVISION_PATTERN = re.compile(r"0x[0-9a-f]{2}")
+_PCI_CLASS_PATTERN = re.compile(r"0x[0-9a-f]{6}")
+_DISPLAY_CONTROLLER_CLASS_PATTERN = re.compile(r"0x03[0-9a-f]{4}")
 _UNIQUE_ID_PATTERN = re.compile(r"[0-9a-f]{1,64}")
 _BOOT_ID_PATTERN = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
@@ -70,7 +72,7 @@ class AmdGpuIdentity:
     subsystem_vendor: str
     subsystem_device: str
     revision: str
-    unique_id: str
+    unique_id: str | None
     device_class: str = _DISPLAY_CONTROLLER_CLASS
 
     def __post_init__(self) -> None:
@@ -81,18 +83,20 @@ class AmdGpuIdentity:
             ("subsystem_vendor", self.subsystem_vendor, _HEX_ID_PATTERN),
             ("subsystem_device", self.subsystem_device, _HEX_ID_PATTERN),
             ("revision", self.revision, _HEX_REVISION_PATTERN),
-            ("unique_id", self.unique_id, _UNIQUE_ID_PATTERN),
-            ("device_class", self.device_class, re.compile(r"0x[0-9a-f]{6}")),
+            ("device_class", self.device_class, _PCI_CLASS_PATTERN),
         )
         for name, value, pattern in fields_and_patterns:
             if not isinstance(value, str) or not _matches(pattern, value):
                 raise ValueError(f"{name} is not a canonical hardware identity")
+        if self.unique_id is not None and (
+            not isinstance(self.unique_id, str)
+            or not _matches(_UNIQUE_ID_PATTERN, self.unique_id)
+        ):
+            raise ValueError("unique_id is not a canonical hardware identity")
         if self.vendor != _AMD_VENDOR_ID:
             raise ValueError("benchmark GPUs must have AMD vendor ID 0x1002")
-        if self.device_class != _DISPLAY_CONTROLLER_CLASS:
-            raise ValueError(
-                "benchmark GPUs must be VGA-compatible display controllers"
-            )
+        if not _matches(_DISPLAY_CONTROLLER_CLASS_PATTERN, self.device_class):
+            raise ValueError("benchmark GPUs must be PCI display controllers")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -103,10 +107,10 @@ class FixedHostPolicyConfig:
     policy_identity: str = "amd-performance-v1"
 
     def __post_init__(self) -> None:
-        if not self.gpus:
-            raise ValueError("fixed host policy requires at least one GPU")
         if not isinstance(self.gpus, tuple):
             raise ValueError("gpus must be an immutable tuple")
+        if not self.gpus or len(self.gpus) > 64:
+            raise ValueError("fixed host policy requires between one and 64 GPUs")
         bdfs = tuple(gpu.bdf for gpu in self.gpus)
         if len(set(bdfs)) != len(bdfs):
             raise ValueError("fixed host policy contains a duplicate PCI BDF")
@@ -385,7 +389,13 @@ class LinuxHostFilesystem:
                 code="benchmark_policy_unavailable",
             ) from error
         try:
-            data = os.read(descriptor, 257)
+            try:
+                data = os.read(descriptor, 257)
+            except OSError as error:
+                raise _policy_error(
+                    f"cannot read {description}: {error}",
+                    code="benchmark_policy_unavailable",
+                ) from error
             if len(data) > 256:
                 raise _policy_error(
                     f"{description} exceeds its fixed representation",
@@ -412,6 +422,20 @@ class LinuxHostFilesystem:
                 code="benchmark_policy_unavailable",
             )
         return value
+
+    @classmethod
+    def _read_optional_single_line(
+        cls,
+        path: pathlib.Path,
+        *,
+        description: str,
+    ) -> str | None:
+        try:
+            return cls._read_single_line(path, description=description)
+        except BenchmarkLockError as error:
+            if isinstance(error.__cause__, FileNotFoundError):
+                return None
+            raise
 
     def boot_id(self) -> str:
         value = self._read_single_line(
@@ -447,8 +471,13 @@ class LinuxHostFilesystem:
                 code="benchmark_external_compute",
             )
 
-    def _device_path(self, expected: AmdGpuIdentity) -> pathlib.Path:
-        selected = self._sysfs_root / "bus/pci/devices" / expected.bdf
+    def _device_path(self, bdf: str) -> pathlib.Path:
+        if not isinstance(bdf, str) or not _matches(_PCI_BDF_PATTERN, bdf):
+            raise _policy_error(
+                f"PCI BDF {bdf!r} is not canonical",
+                code="benchmark_policy_unavailable",
+            )
+        selected = self._sysfs_root / "bus/pci/devices" / bdf
         devices_root = self._sysfs_root / "devices"
         try:
             canonical_devices_root = devices_root.resolve(strict=True)
@@ -456,44 +485,86 @@ class LinuxHostFilesystem:
             canonical_device.relative_to(canonical_devices_root)
         except (OSError, ValueError) as error:
             raise _policy_error(
-                f"PCI BDF {expected.bdf} does not resolve inside sysfs devices",
+                f"PCI BDF {bdf} does not resolve inside sysfs devices",
                 code="benchmark_policy_unavailable",
             ) from error
         if not canonical_device.is_dir():
             raise _policy_error(
-                f"PCI BDF {expected.bdf} is not a device directory",
+                f"PCI BDF {bdf} is not a device directory",
                 code="benchmark_policy_unavailable",
             )
         return canonical_device
 
-    def _observed_gpu_identity(
+    def _read_gpu_identity_fields(
         self,
-        expected: AmdGpuIdentity,
-    ) -> AmdGpuIdentity:
-        device_path = self._device_path(expected)
+        bdf: str,
+        device_path: pathlib.Path,
+    ) -> dict[str, str]:
         fields = {
             "vendor": "vendor",
             "device": "device",
             "subsystem_vendor": "subsystem_vendor",
             "subsystem_device": "subsystem_device",
             "revision": "revision",
-            "unique_id": "unique_id",
             "device_class": "class",
         }
-        values = {
+        return {
             field: self._read_single_line(
                 device_path / filename,
-                description=f"{expected.bdf} {filename}",
+                description=f"{bdf} {filename}",
             )
             for field, filename in fields.items()
         }
+
+    @staticmethod
+    def _make_gpu_identity(
+        bdf: str,
+        fields: Mapping[str, str],
+        unique_id: str | None,
+    ) -> AmdGpuIdentity:
         try:
-            return AmdGpuIdentity(bdf=expected.bdf, **values)
+            return AmdGpuIdentity(
+                bdf=bdf,
+                vendor=fields["vendor"],
+                device=fields["device"],
+                subsystem_vendor=fields["subsystem_vendor"],
+                subsystem_device=fields["subsystem_device"],
+                revision=fields["revision"],
+                unique_id=unique_id,
+                device_class=fields["device_class"],
+            )
         except ValueError as error:
             raise _policy_error(
-                f"PCI BDF {expected.bdf} has malformed hardware identity: {error}",
+                f"PCI BDF {bdf} has malformed hardware identity: {error}",
                 code="benchmark_policy_unavailable",
             ) from error
+
+    def read_gpu_identity(self, bdf: str) -> AmdGpuIdentity:
+        """Discover one exact AMD display-controller identity from sysfs."""
+
+        device_path = self._device_path(bdf)
+        fields = self._read_gpu_identity_fields(bdf, device_path)
+        unique_id = self._read_optional_single_line(
+            device_path / "unique_id",
+            description=f"{bdf} unique_id",
+        )
+        return self._make_gpu_identity(bdf, fields, unique_id)
+
+    def _observed_gpu_identity(
+        self,
+        expected: AmdGpuIdentity,
+    ) -> AmdGpuIdentity:
+        device_path = self._device_path(expected.bdf)
+        fields = self._read_gpu_identity_fields(expected.bdf, device_path)
+        unique_id = (
+            None
+            if expected.unique_id is None
+            else self._read_single_line(
+                device_path / "unique_id",
+                description=f"{expected.bdf} unique_id",
+            )
+        )
+        return self._make_gpu_identity(expected.bdf, fields, unique_id)
 
     def assert_gpu_identity(self, expected: AmdGpuIdentity) -> None:
         observed = self._observed_gpu_identity(expected)
@@ -506,7 +577,7 @@ class LinuxHostFilesystem:
     def read_gpu_level(self, expected: AmdGpuIdentity) -> str:
         self.assert_gpu_identity(expected)
         value = self._read_single_line(
-            self._device_path(expected) / "power_dpm_force_performance_level",
+            self._device_path(expected.bdf) / "power_dpm_force_performance_level",
             description=f"{expected.bdf} forced performance level",
         )
         if value not in _GPU_LEVELS:
@@ -523,7 +594,7 @@ class LinuxHostFilesystem:
                 code="benchmark_policy_apply_failed",
             )
         self.assert_gpu_identity(expected)
-        path = self._device_path(expected) / "power_dpm_force_performance_level"
+        path = self._device_path(expected.bdf) / "power_dpm_force_performance_level"
         flags = os.O_WRONLY | os.O_CLOEXEC | os.O_TRUNC
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
@@ -652,7 +723,7 @@ class EpochJournal:
         return True
 
     @staticmethod
-    def _identity_json(identity: AmdGpuIdentity) -> dict[str, str]:
+    def _identity_json(identity: AmdGpuIdentity) -> dict[str, str | None]:
         return {
             "bdf": identity.bdf,
             "vendor": identity.vendor,

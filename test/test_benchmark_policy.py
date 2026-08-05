@@ -162,7 +162,13 @@ class FailingJournal(EpochJournal):
 
 
 class PolicyFixture:
-    def __init__(self, test: unittest.TestCase, *, gpu_count: int = 1) -> None:
+    def __init__(
+        self,
+        test: unittest.TestCase,
+        *,
+        gpu_count: int = 1,
+        integrated_gpu: bool = False,
+    ) -> None:
         self.test = test
         self.temporary = tempfile.TemporaryDirectory()
         test.addCleanup(self.temporary.cleanup)
@@ -179,7 +185,10 @@ class PolicyFixture:
         self.kfd_processes.mkdir(parents=True)
         self.state_root.mkdir(mode=0o700)
         self.boot_id_path.write_text(f"{_BOOT_ID}\n", encoding="ascii")
-        self.identities = tuple(self._create_gpu(index) for index in range(gpu_count))
+        self.identities = tuple(
+            self._create_gpu(index, integrated=integrated_gpu)
+            for index in range(gpu_count)
+        )
         self.config = FixedHostPolicyConfig(self.identities)
         self.linux_filesystem = LinuxHostFilesystem(
             sysfs_root=self.sysfs_root,
@@ -195,7 +204,7 @@ class PolicyFixture:
         )
         self.power_profiles = FakePowerProfiles()
 
-    def _create_gpu(self, index: int) -> AmdGpuIdentity:
+    def _create_gpu(self, index: int, *, integrated: bool) -> AmdGpuIdentity:
         bdf = f"0000:{index + 1:02x}:00.0"
         identity = AmdGpuIdentity(
             bdf=bdf,
@@ -204,7 +213,8 @@ class PolicyFixture:
             subsystem_vendor="0x1eae",
             subsystem_device=f"0x{0x7901 + index:04x}",
             revision="0xc8",
-            unique_id=f"4610468131039e{index:x}",
+            unique_id=(None if integrated else f"4610468131039e{index:x}"),
+            device_class="0x038000" if integrated else "0x030000",
         )
         device = self.devices_root / f"pci0000:{index + 1:02x}" / bdf
         device.mkdir(parents=True)
@@ -214,10 +224,11 @@ class PolicyFixture:
             "subsystem_vendor": identity.subsystem_vendor,
             "subsystem_device": identity.subsystem_device,
             "revision": identity.revision,
-            "unique_id": identity.unique_id,
             "class": identity.device_class,
             "power_dpm_force_performance_level": "auto",
         }
+        if identity.unique_id is not None:
+            values["unique_id"] = identity.unique_id
         for name, value in values.items():
             (device / name).write_text(f"{value}\n", encoding="ascii")
         (self.pci_links / bdf).symlink_to(device)
@@ -261,6 +272,27 @@ class PolicyFixture:
 
 
 class FixedHostPolicyConfigTest(unittest.TestCase):
+    def test_config_bounds_selected_gpu_count(self) -> None:
+        identity = AmdGpuIdentity(
+            bdf="0000:01:00.0",
+            vendor="0x1002",
+            device="0x744c",
+            subsystem_vendor="0x1eae",
+            subsystem_device="0x7901",
+            revision="0xc8",
+            unique_id="1",
+        )
+
+        with self.assertRaisesRegex(ValueError, "between one and 64"):
+            FixedHostPolicyConfig(())
+        with self.assertRaisesRegex(ValueError, "between one and 64"):
+            FixedHostPolicyConfig(
+                tuple(
+                    dataclasses.replace(identity, bdf=f"0000:{index:02x}:00.0")
+                    for index in range(65)
+                )
+            )
+
     def test_config_contains_only_fixed_hardware_identity(self) -> None:
         self.assertEqual(
             tuple(field.name for field in dataclasses.fields(FixedHostPolicyConfig)),
@@ -286,6 +318,57 @@ class FixedHostPolicyConfigTest(unittest.TestCase):
                 revision="0xc8",
                 unique_id="1",
             )
+        with self.assertRaises(ValueError):
+            AmdGpuIdentity(
+                bdf="0000:01:00.0",
+                vendor="0x1002",
+                device="0x744c",
+                subsystem_vendor="0x1eae",
+                subsystem_device="0x7901",
+                revision="0xc8",
+                unique_id=None,
+                device_class="0x020000",
+            )
+
+    def test_integrated_display_identity_preserves_absent_unique_id(self) -> None:
+        fixture = PolicyFixture(self, integrated_gpu=True)
+        identity = fixture.identities[0]
+
+        self.assertEqual(
+            fixture.linux_filesystem.read_gpu_identity(identity.bdf),
+            identity,
+        )
+        fixture.policy().enter()
+        document = json.loads(fixture.journal_path.read_bytes())
+        self.assertIsNone(document["gpus"][0]["identity"]["unique_id"])
+        fixture.policy(
+            power_profiles=FakePowerProfiles(),
+            filesystem=RecordingFilesystem(
+                fixture.linux_filesystem,
+                journal_path=fixture.journal_path,
+            ),
+        ).recover()
+
+        unique_id_path = (fixture.pci_links / identity.bdf).resolve() / "unique_id"
+        unique_id_path.write_text("1\n", encoding="ascii")
+        fixture.linux_filesystem.assert_gpu_identity(identity)
+        self.assertEqual(
+            fixture.linux_filesystem.read_gpu_identity(identity.bdf).unique_id,
+            "1",
+        )
+
+    def test_discrete_gpu_serial_remains_an_exact_identity_constraint(self) -> None:
+        fixture = PolicyFixture(self)
+        identity = fixture.identities[0]
+        fixture.set_identity_field(identity, "unique_id", "2")
+
+        with self.assertRaises(BenchmarkLockError) as raised:
+            fixture.linux_filesystem.assert_gpu_identity(identity)
+
+        self.assertEqual(
+            raised.exception.code,
+            "benchmark_hardware_identity_changed",
+        )
 
     def test_policy_identity_matches_the_grant_protocol(self) -> None:
         identity = AmdGpuIdentity(

@@ -138,9 +138,15 @@ def parse_policy_configuration(payload: bytes) -> FixedHostPolicyConfig:
             _GPU_FIELDS,
             description=f"benchmarkd GPU {index}",
         )
-        if not all(isinstance(raw_gpu[field], str) for field in _GPU_FIELDS):
+        string_fields = _GPU_FIELDS - {"unique_id"}
+        if not all(isinstance(raw_gpu[field], str) for field in string_fields):
             raise _configuration_error(
-                f"benchmarkd GPU {index} identity fields must be strings"
+                f"benchmarkd GPU {index} fixed identity fields must be strings"
+            )
+        unique_id = raw_gpu["unique_id"]
+        if unique_id is not None and not isinstance(unique_id, str):
+            raise _configuration_error(
+                f"benchmarkd GPU {index} unique_id must be a string or null"
             )
         try:
             gpus.append(
@@ -151,7 +157,7 @@ def parse_policy_configuration(payload: bytes) -> FixedHostPolicyConfig:
                     subsystem_vendor=raw_gpu["subsystem_vendor"],
                     subsystem_device=raw_gpu["subsystem_device"],
                     revision=raw_gpu["revision"],
-                    unique_id=raw_gpu["unique_id"],
+                    unique_id=unique_id,
                     device_class=raw_gpu["device_class"],
                 )
             )

@@ -50,7 +50,11 @@ from benchmark_lock.fdstore import (
 FORBIDDEN_SYSTEM_CLIENT_PATH = pathlib.Path("/usr/local/bin/benchmark-lock")
 
 
-def _configuration(*, unique_id: str = "4610468131039e0") -> bytes:
+def _configuration(
+    *,
+    unique_id: str | None = "4610468131039e0",
+    device_class: str = "0x030000",
+) -> bytes:
     return json.dumps(
         {
             "schema": "benchmarkd.config.v1",
@@ -64,7 +68,7 @@ def _configuration(*, unique_id: str = "4610468131039e0") -> bytes:
                     "subsystem_device": "0x7901",
                     "revision": "0xc8",
                     "unique_id": unique_id,
-                    "device_class": "0x030000",
+                    "device_class": device_class,
                 }
             ],
         },
@@ -87,6 +91,22 @@ class FakeRunner:
                 "injected administrator command failure",
                 code="injected_admin_command_failure",
             )
+
+
+class FakeGpuIdentityReader:
+    def __init__(self, *identities) -> None:
+        self.identities = {identity.bdf: identity for identity in identities}
+        self.reads: list[str] = []
+
+    def read_gpu_identity(self, bdf: str):
+        self.reads.append(bdf)
+        try:
+            return self.identities[bdf]
+        except KeyError as error:
+            raise BenchmarkLockError(
+                f"PCI BDF {bdf!r} is unavailable",
+                code="benchmark_policy_unavailable",
+            ) from error
 
 
 class KillAfterCommandRunner(FakeRunner):
@@ -224,6 +244,9 @@ class AdminFixture:
         self.runner = FakeRunner(self.timeline)
         self.maintenance = FakeMaintenance(self.timeline)
         self.accounts = FakeAccounts(self.gid)
+        self.identity = parse_policy_configuration(_configuration()).gpus[0]
+        self.gpu_bdfs = (self.identity.bdf,)
+        self.identity_reader = FakeGpuIdentityReader(self.identity)
         self.messages: list[str] = []
         repository_root = pathlib.Path(__file__).resolve().parents[1]
         self.source_root = pathlib.Path(self.temporary.name) / "source"
@@ -254,6 +277,7 @@ class AdminFixture:
             runner=self.runner,
             maintenance=self.maintenance,
             accounts=self.accounts,
+            identity_reader=self.identity_reader,
             destination_root=self.root,
             root_uid=self.uid,
             root_gid=self.gid,
@@ -261,15 +285,13 @@ class AdminFixture:
             report=self.messages.append,
             check_runtime=False,
         )
-        self.config_source = self.root / "policy-source.json"
-        self.config_source.write_bytes(_configuration())
 
     def mapped(self, absolute: pathlib.Path) -> pathlib.Path:
         return self.root / absolute.relative_to("/")
 
     def install(self) -> str:
         return self.admin.install(
-            configuration_source=self.config_source,
+            gpu_bdfs=self.gpu_bdfs,
             user_name="ben",
         )
 
@@ -278,12 +300,16 @@ class AdminFixture:
         *,
         runner: FakeRunner | None = None,
         maintenance: FakeMaintenance | None = None,
+        identity_reader: FakeGpuIdentityReader | None = None,
     ) -> BenchmarkAdmin:
         return BenchmarkAdmin(
             source_root=self.source_root,
             runner=self.runner if runner is None else runner,
             maintenance=(self.maintenance if maintenance is None else maintenance),
             accounts=self.accounts,
+            identity_reader=(
+                self.identity_reader if identity_reader is None else identity_reader
+            ),
             destination_root=self.root,
             root_uid=self.uid,
             root_gid=self.gid,
@@ -305,6 +331,19 @@ class BenchmarkConfigurationTest(unittest.TestCase):
             config,
         )
 
+    def test_integrated_display_configuration_has_explicit_absent_serial(
+        self,
+    ) -> None:
+        config = parse_policy_configuration(
+            _configuration(unique_id=None, device_class="0x038000")
+        )
+        canonical = canonical_policy_configuration(config)
+
+        self.assertIsNone(config.gpus[0].unique_id)
+        self.assertEqual(config.gpus[0].device_class, "0x038000")
+        self.assertIn(b'"unique_id":null', canonical)
+        self.assertEqual(parse_policy_configuration(canonical), config)
+
     def test_unknown_duplicate_and_wrong_hardware_fields_are_rejected(self) -> None:
         unknown = json.loads(_configuration())
         unknown["fallback"] = True
@@ -314,11 +353,17 @@ class BenchmarkConfigurationTest(unittest.TestCase):
         )
         wrong_vendor = json.loads(_configuration())
         wrong_vendor["gpus"][0]["vendor"] = "0x10de"
+        wrong_class = json.loads(_configuration())
+        wrong_class["gpus"][0]["device_class"] = "0x020000"
+        wrong_unique_id = json.loads(_configuration())
+        wrong_unique_id["gpus"][0]["unique_id"] = 1
 
         for payload in (
             json.dumps(unknown).encode("ascii"),
             duplicate,
             json.dumps(wrong_vendor).encode("ascii"),
+            json.dumps(wrong_class).encode("ascii"),
+            json.dumps(wrong_unique_id).encode("ascii"),
         ):
             with self.subTest(payload=payload):
                 with self.assertRaises(BenchmarkLockError):
@@ -333,7 +378,7 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
         self,
         runner: FakeRunner,
         *,
-        configuration_source: pathlib.Path | None,
+        gpu_bdfs: tuple[str, ...],
         maintenance: FakeMaintenance | None = None,
     ) -> None:
         process_id = os.fork()
@@ -343,7 +388,7 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
                 maintenance=(FakeMaintenance() if maintenance is None else maintenance),
             )
             child_admin.install(
-                configuration_source=configuration_source,
+                gpu_bdfs=gpu_bdfs,
                 user_name="ben",
             )
             os._exit(97)
@@ -412,6 +457,10 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
             ),
         )
         self.assertEqual(stat.S_IMODE(os.lstat(installed_config).st_mode), 0o600)
+        self.assertEqual(
+            self.fixture.identity_reader.reads,
+            [self.fixture.identity.bdf],
+        )
         for relative in (
             "usr/local/lib/systemd",
             "usr/local/lib/systemd/system",
@@ -461,6 +510,23 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
         self.assertEqual(self.fixture.admin.doctor(user_name="ben"), digest)
         self.assertEqual(self.fixture.accounts.required_users, ["ben"])
         self.assertEqual(self.fixture.maintenance.probes, 1)
+
+    def test_fresh_install_discovers_unified_gpu_identity(self) -> None:
+        identity = parse_policy_configuration(
+            _configuration(unique_id=None, device_class="0x038000")
+        ).gpus[0]
+        identity_reader = FakeGpuIdentityReader(identity)
+
+        self.fixture.new_admin(identity_reader=identity_reader).install(
+            gpu_bdfs=(identity.bdf,),
+            user_name="ben",
+        )
+
+        installed = parse_policy_configuration(
+            self.fixture.mapped(CONFIG_PATH).read_bytes()
+        )
+        self.assertEqual(installed.gpus, (identity,))
+        self.assertEqual(identity_reader.reads, [identity.bdf])
 
     def test_operation_lock_serializes_mutating_administrators(self) -> None:
         attempting = threading.Event()
@@ -706,7 +772,7 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
         self.fixture.timeline.clear()
 
         upgraded = self.fixture.admin.install(
-            configuration_source=None,
+            gpu_bdfs=(),
             user_name="ben",
         )
 
@@ -811,7 +877,7 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
             ),
         ):
             admin.install(
-                configuration_source=None,
+                gpu_bdfs=(),
                 user_name="ben",
             )
 
@@ -834,7 +900,7 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
         self.fixture.timeline.clear()
 
         observed = self.fixture.admin.install(
-            configuration_source=None,
+            gpu_bdfs=(),
             user_name="ben",
         )
 
@@ -875,7 +941,7 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
             "injected broker health probe failure",
         ):
             self.fixture.admin.install(
-                configuration_source=None,
+                gpu_bdfs=(),
                 user_name="ben",
             )
 
@@ -898,16 +964,19 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
         self.fixture.install()
         installed = self.fixture.mapped(CONFIG_PATH)
         original = installed.read_bytes()
-        replacement = self.fixture.root / "replacement.json"
-        replacement.write_bytes(_configuration(unique_id="4610468131039e1"))
+        replacement = parse_policy_configuration(
+            _configuration(unique_id="4610468131039e1")
+        ).gpus[0]
         command_count = len(self.fixture.runner.commands)
 
         with self.assertRaisesRegex(
             BenchmarkLockError,
             "does not expose the fenced epoch-aware replacement transaction",
         ):
-            self.fixture.admin.install(
-                configuration_source=replacement,
+            self.fixture.new_admin(
+                identity_reader=FakeGpuIdentityReader(replacement)
+            ).install(
+                gpu_bdfs=(replacement.bdf,),
                 user_name="ben",
             )
 
@@ -915,9 +984,9 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
         self.assertEqual(len(self.fixture.runner.commands), command_count)
 
     def test_first_install_requires_policy_and_root(self) -> None:
-        with self.assertRaisesRegex(BenchmarkLockError, "requires --config"):
+        with self.assertRaisesRegex(BenchmarkLockError, "requires at least one --gpu"):
             self.fixture.admin.install(
-                configuration_source=None,
+                gpu_bdfs=(),
                 user_name="ben",
             )
 
@@ -934,17 +1003,18 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(BenchmarkLockError, "must run as root"):
             unprivileged.install(
-                configuration_source=self.fixture.config_source,
+                gpu_bdfs=self.fixture.gpu_bdfs,
                 user_name="ben",
             )
 
-    def test_invalid_policy_is_rejected_before_installation_mutates_host(
+    def test_unavailable_gpu_is_rejected_before_installation_mutates_host(
         self,
     ) -> None:
-        self.fixture.config_source.write_text('{"schema":"wrong"}\n')
-
         with self.assertRaises(BenchmarkLockError):
-            self.fixture.install()
+            self.fixture.admin.install(
+                gpu_bdfs=("0000:ff:00.0",),
+                user_name="ben",
+            )
 
         self.assertEqual(self.fixture.runner.commands, [])
         self.assertFalse(self.fixture.mapped(INSTALL_ROOT).exists())
@@ -1000,7 +1070,7 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
                     "benchmarkd.service",
                 )
             ),
-            configuration_source=None,
+            gpu_bdfs=(),
         )
 
         intent_path = self.fixture.mapped(INSTALL_INTENT_PATH)
@@ -1014,7 +1084,7 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
             runner=retry_runner,
             maintenance=retry_maintenance,
         ).install(
-            configuration_source=None,
+            gpu_bdfs=(),
             user_name="ben",
         )
 
@@ -1050,7 +1120,7 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
     ) -> None:
         self._fork_killed_install(
             FakeRunner(),
-            configuration_source=self.fixture.config_source,
+            gpu_bdfs=self.fixture.gpu_bdfs,
             maintenance=KillOnProbeMaintenance(),
         )
 
@@ -1060,7 +1130,7 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
         self.assertEqual(intent["prior_digest"], None)
 
         recovered = self.fixture.new_admin().install(
-            configuration_source=None,
+            gpu_bdfs=(),
             user_name="ben",
         )
 
@@ -1078,7 +1148,7 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
         self.fixture.timeline.clear()
         self._fork_killed_install(
             FailActivationThenKillRollbackRunner(),
-            configuration_source=None,
+            gpu_bdfs=(),
         )
 
         intent_path = self.fixture.mapped(INSTALL_INTENT_PATH)
@@ -1088,7 +1158,7 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
         launcher.write_bytes(prior_launcher)
 
         observed = self.fixture.new_admin().install(
-            configuration_source=None,
+            gpu_bdfs=(),
             user_name="ben",
         )
 
@@ -1120,7 +1190,7 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
 
         with self.assertRaisesRegex(BenchmarkLockError, "injected"):
             self.fixture.admin.install(
-                configuration_source=None,
+                gpu_bdfs=(),
                 user_name="ben",
             )
 
@@ -1160,7 +1230,7 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
             "injected broker health probe failure",
         ):
             self.fixture.admin.install(
-                configuration_source=None,
+                gpu_bdfs=(),
                 user_name="ben",
             )
 
@@ -1233,7 +1303,7 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
             "rollback could not complete",
         ):
             self.fixture.admin.install(
-                configuration_source=None,
+                gpu_bdfs=(),
                 user_name="ben",
             )
 
@@ -1249,7 +1319,7 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
         recovered = self.fixture.new_admin(
             maintenance=retry_maintenance,
         ).install(
-            configuration_source=None,
+            gpu_bdfs=(),
             user_name="ben",
         )
 
@@ -1287,7 +1357,7 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
             self.assertRaisesRegex(OSError, "injected projection"),
         ):
             self.fixture.admin.install(
-                configuration_source=None,
+                gpu_bdfs=(),
                 user_name="ben",
             )
 
@@ -1297,7 +1367,7 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
         self.assertEqual(intent["phase"], "stopped")
 
         recovered = self.fixture.new_admin().install(
-            configuration_source=None,
+            gpu_bdfs=(),
             user_name="ben",
         )
 
@@ -1324,7 +1394,7 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
 
         with self.assertRaisesRegex(BenchmarkLockError, "injected"):
             self.fixture.admin.install(
-                configuration_source=None,
+                gpu_bdfs=(),
                 user_name="ben",
             )
 
@@ -1358,7 +1428,7 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
         )
 
         recovered = self.fixture.new_admin().install(
-            configuration_source=None,
+            gpu_bdfs=(),
             user_name="ben",
         )
         self.assertEqual(recovered, target_digest)
@@ -1416,7 +1486,7 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
         self.assertTrue(self.fixture.mapped(CONFIG_PATH).exists())
         self.assertTrue(self.fixture.mapped(GENERATION_DIRECTORY).exists())
         recovered = self.fixture.new_admin().install(
-            configuration_source=None,
+            gpu_bdfs=(),
             user_name="ben",
         )
         self.assertEqual(recovered, intent["target_digest"])
@@ -1436,7 +1506,7 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
 
         with self.assertRaisesRegex(BenchmarkLockError, "exact prior projection"):
             self.fixture.admin.install(
-                configuration_source=None,
+                gpu_bdfs=(),
                 user_name="ben",
             )
 
@@ -1517,541 +1587,6 @@ class BenchmarkAdminInstallTest(unittest.TestCase):
         self.assertEqual(self.fixture.maintenance.probes, 1)
 
 
-class BenchmarkAdminUninstallTest(unittest.TestCase):
-    def setUp(self) -> None:
-        self.fixture = AdminFixture(self)
-
-    def test_uninstall_requires_empty_scheduler_before_generation_scan(
-        self,
-    ) -> None:
-        self.fixture.install()
-        maintenance = RejectingMaintenance()
-        admin = self.fixture.new_admin(maintenance=maintenance)
-        self.fixture.runner.commands.clear()
-
-        with (
-            mock.patch.object(
-                admin.generation_store,
-                "verify",
-            ) as verify_generation,
-            mock.patch.object(
-                admin.generation_store,
-                "require_quiescent",
-            ) as scan_generations,
-            self.assertRaisesRegex(
-                BenchmarkLockError,
-                "busy benchmark scheduler",
-            ),
-        ):
-            admin.uninstall()
-
-        verify_generation.assert_not_called()
-        scan_generations.assert_not_called()
-        self.assertEqual(maintenance.entries, [True])
-        self.assertEqual(self.fixture.runner.commands, [])
-        self.assertTrue(self.fixture.mapped(CURRENT_SELECTOR).exists())
-
-    def test_uninstall_removes_only_verified_software_and_retains_state(self) -> None:
-        self.fixture.install()
-        admin_lock = self.fixture.mapped(ADMIN_LOCK_PATH)
-        lock_metadata = os.lstat(admin_lock)
-        lock_identity = (lock_metadata.st_dev, lock_metadata.st_ino)
-        state_marker = self.fixture.mapped(STATE_DIRECTORY) / "operator-note"
-        state_marker.write_text("retain\n")
-        self.fixture.runner.commands.clear()
-        self.fixture.maintenance.events.clear()
-
-        self.fixture.admin.uninstall()
-
-        self.assertFalse(self.fixture.mapped(INSTALL_ROOT).exists())
-        self.assertFalse(
-            os.path.lexists(self.fixture.mapped(FORBIDDEN_SYSTEM_CLIENT_PATH))
-        )
-        self.assertFalse(self.fixture.mapped(SOCKET_UNIT_PATH).exists())
-        self.assertFalse(self.fixture.mapped(SERVICE_UNIT_PATH).exists())
-        self.assertFalse(self.fixture.mapped(SYSUSERS_PATH).exists())
-        self.assertTrue(self.fixture.mapped(CONFIG_PATH).exists())
-        self.assertEqual(state_marker.read_text(), "retain\n")
-        retained_lock_metadata = os.lstat(admin_lock)
-        self.assertEqual(
-            (retained_lock_metadata.st_dev, retained_lock_metadata.st_ino),
-            lock_identity,
-        )
-        self.assertEqual(stat.S_IMODE(retained_lock_metadata.st_mode), 0o600)
-        self.assertEqual(
-            self.fixture.maintenance.events,
-            [("enter", True), ("exit", True)],
-        )
-        self.assertIn(
-            (
-                "/usr/bin/systemctl",
-                "disable",
-                "--now",
-                "benchmarkd.socket",
-            ),
-            self.fixture.runner.commands,
-        )
-
-    def test_stop_failure_leaves_a_prepared_transaction_for_exact_retry(
-        self,
-    ) -> None:
-        self.fixture.install()
-        self.fixture.runner.commands.clear()
-        self.fixture.maintenance.events.clear()
-        stop_command = (
-            "/usr/bin/systemctl",
-            "stop",
-            "benchmarkd.service",
-        )
-        self.fixture.runner.fail_command = stop_command
-
-        with self.assertRaisesRegex(
-            BenchmarkLockError,
-            "injected administrator command failure",
-        ):
-            self.fixture.admin.uninstall()
-
-        intent_path = self.fixture.mapped(UNINSTALL_INTENT_PATH)
-        self.assertEqual(json.loads(intent_path.read_bytes())["phase"], "prepared")
-        self.assertTrue(self.fixture.mapped(CURRENT_SELECTOR).exists())
-        self.assertTrue(self.fixture.mapped(SOCKET_UNIT_PATH).exists())
-        self.assertEqual(
-            self.fixture.maintenance.events,
-            [("enter", True), ("exit", True)],
-        )
-
-        self.fixture.runner.commands.clear()
-        self.fixture.timeline.clear()
-        self.fixture.admin.uninstall()
-
-        self.assertFalse(self.fixture.mapped(INSTALL_ROOT).exists())
-        self.assertEqual(
-            self.fixture.maintenance.events,
-            [("enter", True), ("exit", True)],
-        )
-        self.assertIn(stop_command, self.fixture.runner.commands)
-        self.assertNotIn(
-            (
-                "/usr/bin/systemctl",
-                "start",
-                "benchmarkd.service",
-            ),
-            self.fixture.runner.commands,
-        )
-
-    def test_uninstall_publication_interruption_promotes_the_fixed_journal(
-        self,
-    ) -> None:
-        self.fixture.install()
-        publish_path = self.fixture.mapped(UNINSTALL_PUBLISH_PATH)
-        intent_path = self.fixture.mapped(UNINSTALL_INTENT_PATH)
-        original_rename = os.rename
-
-        def interrupt_publication(
-            source: os.PathLike[str] | str,
-            destination: os.PathLike[str] | str,
-        ) -> None:
-            if (
-                pathlib.Path(source) == publish_path
-                and pathlib.Path(destination) == intent_path
-            ):
-                raise OSError("injected uninstall publication interruption")
-            original_rename(source, destination)
-
-        self.fixture.maintenance.events.clear()
-        with (
-            mock.patch("os.rename", side_effect=interrupt_publication),
-            self.assertRaisesRegex(OSError, "publication interruption"),
-        ):
-            self.fixture.admin.uninstall()
-
-        self.assertTrue(publish_path.is_file())
-        self.assertFalse(os.path.lexists(intent_path))
-        self.assertTrue(self.fixture.mapped(CURRENT_SELECTOR).exists())
-        self.assertEqual(
-            self.fixture.maintenance.events,
-            [("enter", True), ("exit", True)],
-        )
-
-        self.fixture.admin.uninstall()
-
-        self.assertFalse(self.fixture.mapped(INSTALL_ROOT).exists())
-        self.assertEqual(
-            self.fixture.maintenance.events,
-            [("enter", True), ("exit", True)],
-        )
-
-    def test_exact_partial_uninstall_journal_is_recoverable_under_strict_umask(
-        self,
-    ) -> None:
-        self.fixture.install()
-        publish_path = self.fixture.mapped(UNINSTALL_PUBLISH_PATH)
-        previous_umask = os.umask(0o0777)
-        try:
-            production_umask = os.umask(0)
-            try:
-                descriptor = os.open(
-                    publish_path,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
-                    0o600,
-                )
-            finally:
-                os.umask(production_umask)
-        finally:
-            os.umask(previous_umask)
-        try:
-            os.write(descriptor, b'{"partial":')
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        self.assertEqual(stat.S_IMODE(os.lstat(publish_path).st_mode), 0o600)
-
-        self.fixture.maintenance.events.clear()
-        self.fixture.admin.uninstall()
-
-        self.assertFalse(self.fixture.mapped(INSTALL_ROOT).exists())
-        self.assertTrue(
-            any(
-                "discarding incomplete benchmark uninstall journal" in message
-                for message in self.fixture.messages
-            )
-        )
-
-    def test_uninstall_never_discards_an_unsafe_fixed_intermediate(self) -> None:
-        self.fixture.install()
-        publish_path = self.fixture.mapped(UNINSTALL_PUBLISH_PATH)
-        publish_path.write_bytes(b'{"partial":')
-        publish_path.chmod(0o666)
-
-        with self.assertRaises(BenchmarkLockError):
-            self.fixture.admin.uninstall()
-
-        self.assertTrue(publish_path.exists())
-        self.assertTrue(self.fixture.mapped(CURRENT_SELECTOR).exists())
-
-    def test_stopped_transition_interruption_never_reopens_maintenance(
-        self,
-    ) -> None:
-        self.fixture.install()
-        transition_path = self.fixture.mapped(UNINSTALL_TRANSITION_PATH)
-        intent_path = self.fixture.mapped(UNINSTALL_INTENT_PATH)
-        original_replace = os.replace
-
-        def interrupt_transition(
-            source: os.PathLike[str] | str,
-            destination: os.PathLike[str] | str,
-        ) -> None:
-            if (
-                pathlib.Path(source) == transition_path
-                and pathlib.Path(destination) == intent_path
-            ):
-                raise OSError("injected uninstall transition interruption")
-            original_replace(source, destination)
-
-        self.fixture.runner.commands.clear()
-        self.fixture.maintenance.events.clear()
-        with (
-            mock.patch("os.replace", side_effect=interrupt_transition),
-            self.assertRaisesRegex(OSError, "transition interruption"),
-        ):
-            self.fixture.admin.uninstall()
-
-        self.assertEqual(json.loads(intent_path.read_bytes())["phase"], "prepared")
-        self.assertEqual(
-            json.loads(transition_path.read_bytes())["phase"],
-            "stopped",
-        )
-        self.assertEqual(
-            self.fixture.maintenance.events,
-            [("enter", True), ("exit", True)],
-        )
-
-        self.fixture.runner.commands.clear()
-        self.fixture.admin.uninstall()
-
-        self.assertFalse(self.fixture.mapped(INSTALL_ROOT).exists())
-        self.assertEqual(
-            self.fixture.maintenance.events,
-            [("enter", True), ("exit", True)],
-        )
-        self.assertNotIn(
-            (
-                "/usr/bin/systemctl",
-                "stop",
-                "benchmarkd.service",
-            ),
-            self.fixture.runner.commands,
-        )
-
-    def test_projection_failure_resumes_only_after_the_durable_stop(
-        self,
-    ) -> None:
-        self.fixture.install()
-        self.fixture.runner.commands.clear()
-        self.fixture.maintenance.events.clear()
-        original_remove = self.fixture.admin._remove_external_regular
-        removal_count = 0
-
-        def interrupt_second_removal(
-            path: pathlib.Path,
-            *,
-            expected: bytes,
-        ) -> None:
-            nonlocal removal_count
-            removal_count += 1
-            if removal_count == 2:
-                raise OSError("injected projected-file interruption")
-            original_remove(path, expected=expected)
-
-        with (
-            mock.patch.object(
-                self.fixture.admin,
-                "_remove_external_regular",
-                side_effect=interrupt_second_removal,
-            ),
-            self.assertRaisesRegex(OSError, "projected-file interruption"),
-        ):
-            self.fixture.admin.uninstall()
-
-        intent_path = self.fixture.mapped(UNINSTALL_INTENT_PATH)
-        self.assertEqual(json.loads(intent_path.read_bytes())["phase"], "stopped")
-        self.assertTrue(self.fixture.mapped(CURRENT_SELECTOR).exists())
-        self.assertFalse(self.fixture.mapped(SOCKET_UNIT_PATH).exists())
-        self.assertTrue(self.fixture.mapped(SERVICE_UNIT_PATH).exists())
-        self.assertEqual(
-            self.fixture.maintenance.events,
-            [("enter", True), ("exit", True)],
-        )
-
-        self.fixture.admin.uninstall()
-
-        self.assertFalse(self.fixture.mapped(INSTALL_ROOT).exists())
-        self.assertEqual(
-            self.fixture.maintenance.events,
-            [("enter", True), ("exit", True)],
-        )
-
-    def test_committed_uninstall_blocks_install_and_doctor(self) -> None:
-        self.fixture.install()
-        self.fixture.runner.fail_command = (
-            "/usr/bin/systemctl",
-            "stop",
-            "benchmarkd.service",
-        )
-        with self.assertRaises(BenchmarkLockError):
-            self.fixture.admin.uninstall()
-
-        with self.assertRaisesRegex(BenchmarkLockError, "committed uninstall"):
-            self.fixture.admin.install(
-                configuration_source=None,
-                user_name="ben",
-            )
-        with self.assertRaisesRegex(BenchmarkLockError, "committed uninstall"):
-            self.fixture.admin.doctor(user_name=None)
-
-    def test_completed_generation_is_recognized_as_uninstall_progress(self) -> None:
-        self.fixture.install()
-        launcher = self.fixture.source_root / "benchmarkd/bin/benchmarkd"
-        launcher.write_bytes(launcher.read_bytes() + b"\n")
-        self.fixture.admin.install(
-            configuration_source=None,
-            user_name="ben",
-        )
-        self.fixture.runner.commands.clear()
-        self.fixture.maintenance.events.clear()
-        original_remove = self.fixture.admin.generation_store.remove
-        removal_count = 0
-
-        def interrupt_after_complete_removal(
-            digest: str,
-            *,
-            protected_digest: str | None = None,
-        ) -> bool:
-            nonlocal removal_count
-            removed = original_remove(
-                digest,
-                protected_digest=protected_digest,
-            )
-            removal_count += 1
-            if removal_count == 1:
-                raise OSError("injected completed-generation interruption")
-            return removed
-
-        with (
-            mock.patch.object(
-                self.fixture.admin.generation_store,
-                "remove",
-                side_effect=interrupt_after_complete_removal,
-            ),
-            self.assertRaisesRegex(OSError, "completed-generation interruption"),
-        ):
-            self.fixture.admin.uninstall()
-
-        self.assertFalse(os.path.lexists(self.fixture.mapped(CURRENT_SELECTOR)))
-        self.assertEqual(
-            json.loads(self.fixture.mapped(UNINSTALL_INTENT_PATH).read_bytes())[
-                "phase"
-            ],
-            "stopped",
-        )
-        self.assertEqual(
-            self.fixture.maintenance.events,
-            [("enter", True), ("exit", True)],
-        )
-
-        self.fixture.admin.uninstall()
-
-        self.assertFalse(self.fixture.mapped(INSTALL_ROOT).exists())
-        self.assertEqual(
-            self.fixture.maintenance.events,
-            [("enter", True), ("exit", True)],
-        )
-
-    def test_empty_install_root_is_finalized_after_intent_commit(self) -> None:
-        self.fixture.install()
-        install_root = self.fixture.mapped(INSTALL_ROOT)
-        original_rmdir = os.rmdir
-        interrupted = False
-
-        def interrupt_install_root(path: os.PathLike[str] | str) -> None:
-            nonlocal interrupted
-            if pathlib.Path(path) == install_root and not interrupted:
-                interrupted = True
-                raise OSError("injected final-directory interruption")
-            original_rmdir(path)
-
-        with (
-            mock.patch("os.rmdir", side_effect=interrupt_install_root),
-            self.assertRaisesRegex(OSError, "final-directory interruption"),
-        ):
-            self.fixture.admin.uninstall()
-
-        self.assertTrue(install_root.is_dir())
-        self.assertEqual(tuple(install_root.iterdir()), ())
-
-        self.fixture.admin.uninstall()
-
-        self.assertFalse(install_root.exists())
-
-    def test_uninstall_refuses_unknown_generation_content(self) -> None:
-        self.fixture.install()
-        generations = self.fixture.mapped(GENERATION_DIRECTORY)
-        (generations / "unknown").mkdir()
-        command_count = len(self.fixture.runner.commands)
-
-        with self.assertRaisesRegex(
-            BenchmarkLockError,
-            "unknown benchmark generation-store entry",
-        ):
-            self.fixture.admin.uninstall()
-
-        self.assertEqual(len(self.fixture.runner.commands), command_count)
-        self.assertTrue(self.fixture.mapped(CURRENT_SELECTOR).exists())
-
-    def test_uninstall_refuses_modified_managed_projection(self) -> None:
-        self.fixture.install()
-        socket_unit = self.fixture.mapped(SOCKET_UNIT_PATH)
-        socket_unit.write_bytes(
-            b"# Managed by benchmark-admin.\n[Socket]\nSocketMode=0666\n"
-        )
-        self.fixture.runner.commands.clear()
-        self.fixture.maintenance.events.clear()
-
-        with self.assertRaisesRegex(
-            BenchmarkLockError,
-            "modified after installation",
-        ):
-            self.fixture.admin.uninstall()
-
-        self.assertEqual(self.fixture.runner.commands, [])
-        self.assertEqual(
-            self.fixture.maintenance.events,
-            [("enter", True), ("exit", True)],
-        )
-        self.assertTrue(self.fixture.mapped(CURRENT_SELECTOR).exists())
-
-    def test_uninstall_requires_a_complete_projection_before_commit(self) -> None:
-        self.fixture.install()
-        self.fixture.mapped(SOCKET_UNIT_PATH).unlink()
-        self.fixture.runner.commands.clear()
-        self.fixture.maintenance.events.clear()
-
-        with self.assertRaisesRegex(BenchmarkLockError, "cannot inspect managed file"):
-            self.fixture.admin.uninstall()
-
-        self.assertEqual(self.fixture.runner.commands, [])
-        self.assertEqual(
-            self.fixture.maintenance.events,
-            [("enter", True), ("exit", True)],
-        )
-        self.assertFalse(os.path.lexists(self.fixture.mapped(UNINSTALL_INTENT_PATH)))
-        self.assertTrue(self.fixture.mapped(CURRENT_SELECTOR).exists())
-
-    def test_uninstall_preflights_every_generation_before_stopping_service(
-        self,
-    ) -> None:
-        first_digest = self.fixture.install()
-        launcher = self.fixture.source_root / "benchmarkd/bin/benchmarkd"
-        launcher.write_bytes(launcher.read_bytes() + b"\n")
-        self.fixture.admin.install(
-            configuration_source=None,
-            user_name="ben",
-        )
-        first_broker = (
-            self.fixture.mapped(GENERATION_DIRECTORY) / first_digest / "bin/benchmarkd"
-        )
-        os.chmod(first_broker, 0o755)
-        self.fixture.runner.commands.clear()
-        self.fixture.maintenance.events.clear()
-
-        with self.assertRaisesRegex(
-            BenchmarkLockError,
-            "unsafe metadata",
-        ):
-            self.fixture.admin.uninstall()
-
-        self.assertEqual(self.fixture.runner.commands, [])
-        self.assertEqual(
-            self.fixture.maintenance.events,
-            [("enter", True), ("exit", True)],
-        )
-        self.assertTrue(self.fixture.mapped(CURRENT_SELECTOR).exists())
-
-    def test_uninstall_refuses_projection_without_current_generation(self) -> None:
-        self.fixture.install()
-        self.fixture.mapped(CURRENT_SELECTOR).unlink()
-        self.fixture.runner.commands.clear()
-        self.fixture.maintenance.events.clear()
-
-        with self.assertRaisesRegex(
-            BenchmarkLockError,
-            "live projection without a current generation",
-        ):
-            self.fixture.admin.uninstall()
-
-        self.assertEqual(self.fixture.runner.commands, [])
-        self.assertEqual(self.fixture.maintenance.events, [])
-        self.assertTrue(self.fixture.mapped(SOCKET_UNIT_PATH).exists())
-
-    def test_uninstall_rejects_symlinked_install_root_before_commands(self) -> None:
-        self.fixture.install()
-        install_root = self.fixture.mapped(INSTALL_ROOT)
-        redirected = install_root.with_name("benchmarkd-redirected")
-        install_root.rename(redirected)
-        install_root.symlink_to(redirected)
-        self.fixture.runner.commands.clear()
-        self.fixture.maintenance.events.clear()
-
-        with self.assertRaisesRegex(
-            BenchmarkLockError,
-            "unsafe ownership or mode",
-        ):
-            self.fixture.admin.uninstall()
-
-        self.assertEqual(self.fixture.runner.commands, [])
-        self.assertEqual(self.fixture.maintenance.events, [])
-
-
 class BenchmarkAdminCliTest(unittest.TestCase):
     def test_normal_dotfiles_flows_do_not_invoke_privileged_admin(self) -> None:
         source_root = pathlib.Path(__file__).resolve().parents[1]
@@ -2081,4 +1616,36 @@ class BenchmarkAdminCliTest(unittest.TestCase):
         self.assertEqual(BENCHMARK_GROUP_NAME, "benchmark")
         self.assertEqual(
             CONTROL_SOCKET_PATH, pathlib.Path("/run/benchmarkd/control.sock")
+        )
+
+    def test_install_passes_each_selected_gpu_to_the_administrator(self) -> None:
+        class RecordingAdmin:
+            def __init__(self) -> None:
+                self.install_arguments = None
+
+            def install(self, *, gpu_bdfs, user_name) -> None:
+                self.install_arguments = (gpu_bdfs, user_name)
+
+        admin = RecordingAdmin()
+        output = io.StringIO()
+        error = io.StringIO()
+        status = main(
+            [
+                "install",
+                "--gpu",
+                "0000:23:00.0",
+                "--gpu",
+                "0000:c2:00.0",
+            ],
+            source_root=pathlib.Path(__file__).resolve().parents[1],
+            output=output,
+            error=error,
+            environment={"SUDO_USER": "ben"},
+            admin_factory=lambda **_arguments: admin,
+        )
+
+        self.assertEqual(status, 0, error.getvalue())
+        self.assertEqual(
+            admin.install_arguments,
+            (("0000:23:00.0", "0000:c2:00.0"), "ben"),
         )

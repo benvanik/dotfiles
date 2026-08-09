@@ -74,6 +74,7 @@ printf '%s\n' "source_local_envrc" > "$IGNORE_PROJECT/.envrc"
 printf '%s\n' "machine-only" > "$IGNORE_PROJECT/.envrc.local"
 printf '%s\n' "history" > "$IGNORE_PROJECT/.history/state"
 printf '%s\n' "local agent policy" > "$IGNORE_PROJECT/AGENTS.override.md"
+printf '%s\n' "local Bazel cache policy" > "$IGNORE_PROJECT/.bazelrc.cache"
 printf '%s\n' "local Bazel policy" > "$IGNORE_PROJECT/.bazelrc.local"
 if git -C "$IGNORE_PROJECT" \
         -c core.excludesFile="$DOTFILES/git/ignore_global" \
@@ -95,6 +96,10 @@ git -C "$IGNORE_PROJECT" \
     -c core.excludesFile="$DOTFILES/git/ignore_global" \
     check-ignore -q AGENTS.override.md ||
     fail "global ignore stopped covering the shared agent override"
+git -C "$IGNORE_PROJECT" \
+    -c core.excludesFile="$DOTFILES/git/ignore_global" \
+    check-ignore -q .bazelrc.cache ||
+    fail "global ignore stopped covering shared Bazel cache policy"
 git -C "$IGNORE_PROJECT" \
     -c core.excludesFile="$DOTFILES/git/ignore_global" \
     check-ignore -q .bazelrc.local ||

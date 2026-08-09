@@ -3,6 +3,7 @@
 
 BAZEL_CACHE_MANAGED_HOME_RC_HEADER='# Managed by dotfiles. Set BAZEL_CACHE_ROOT in ~/.shrc.local.'
 BAZEL_CACHE_GUARD_MARKER=USE_THE_WORKTREE_BAZELRC
+BAZEL_CACHE_PROJECT_RC=.bazelrc.cache
 
 bazel_cache_configured_root() {
     local machine_config="$HOME/.shrc.local"
@@ -98,6 +99,7 @@ bazel_cache_print_home_bazelrc() {
     printf '%s\n' "$BAZEL_CACHE_MANAGED_HOME_RC_HEADER"
     printf 'startup --output_user_root=%s\n' "$output_user_root"
     printf 'build --disk_cache=%s/cache/disk\n' "$output_user_root"
+    printf 'try-import %%workspace%%/%s\n' "$BAZEL_CACHE_PROJECT_RC"
 }
 
 bazel_cache_render_home_bazelrc() {
@@ -112,9 +114,10 @@ bazel_cache_print_guard_marker() {
     cat << EOF
 This default Bazel output user root is intentionally read-only.
 
-Projects using the project infrastructure place machine-local Bazel policy in
-the primary worktree's .bazelrc.local. Create siblings with
-project-worktree-init so that policy is linked into every worktree.
+Projects using the project infrastructure place cache location in the primary
+worktree's .bazelrc.cache and other machine-local Bazel policy in
+.bazelrc.local. Create siblings with project-worktree-init so both files are
+linked into every worktree.
 
 All projects inherit ~/.bazelrc and place default Bazel state under this
 machine's configured cache root:
@@ -149,7 +152,7 @@ bazel_cache_default_root_state_count() (
     printf '%d\n' "$count"
 )
 
-# Publishes machine cache placement and protects Bazel's default HOME root.
+# Publishes fallback cache placement and protects Bazel's default HOME root.
 # bin/dotfiles supplies the local-file publication and fsync helpers used here.
 bazel_cache_configure() (
     local cache_root="$1"

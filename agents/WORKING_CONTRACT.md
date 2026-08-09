@@ -357,8 +357,8 @@ quality, or development velocity.
   worktrees, with `project-worktree-init <branch> [name]`. Never invoke
   `git worktree add`, move a worktree manually, or construct a worktree by
   copying files. The initializer establishes project-local shared state such as
-  `.bazelrc.local`; if the required layout is unsupported, improve the
-  lifecycle tool instead of bypassing it.
+  `.bazelrc.cache` and `.bazelrc.local`; if the required layout is unsupported,
+  improve the lifecycle tool instead of bypassing it.
 - Treat every worktree as active and valuable unless the user explicitly says
   to deinitialize that exact worktree. Requests to clean up old, dead, stale,
   merged, or irrelevant branches or work do not authorize worktree removal.

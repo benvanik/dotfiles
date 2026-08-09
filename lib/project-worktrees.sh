@@ -8,6 +8,7 @@
 project_worktree_shared_entries() {
     printf '%s\t%s\n' \
         "file" "AGENTS.override.md" \
+        "file" ".bazelrc.cache" \
         "file" ".bazelrc.local" \
         "directory" ".beads"
 }

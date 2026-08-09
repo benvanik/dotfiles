@@ -99,8 +99,11 @@ put the repository's `build_tools/bin` directory on `PATH` whenever that
 convention is present and automatically refresh when a checkout adds or removes
 it.
 
-When `main/AGENTS.override.md`, `main/.bazelrc.local`, or `main/.beads` exists,
-`project-worktree-init` links the shared local state into each new worktree.
+When `main/AGENTS.override.md`, `main/.bazelrc.cache`, `main/.bazelrc.local`, or
+`main/.beads` exists, `project-worktree-init` links the shared local state into
+each new worktree. `.bazelrc.cache` owns the project's cache location while
+`.bazelrc.local` carries other machine-local Bazel policy, so the home fallback
+can apply to unmanaged repositories without overriding managed placement.
 The main worktree must own `.beads` as a physical directory; sibling links make
 one issue database authoritative without copying or reconciling it. Sibling
 Bazel worktrees keep independent output bases and servers while sharing the
@@ -121,12 +124,12 @@ drifted copies.
 
 Machines with Bazel installed set `BAZEL_CACHE_ROOT` in `~/.shrc.local` to a
 large writable filesystem outside `HOME`. `dotfiles install` generates a
-machine-local `~/.bazelrc` that places default state for every Bazel workspace
-on that filesystem and makes Bazel's default HOME output root read-only.
-Managed projects keep project-specific machine policy in the primary
-worktree's `.bazelrc.local`; `project-worktree-init` links that policy into
-every sibling. `dotfiles doctor` checks both the machine rc and the HOME guard
-and requires the guarded HOME root to contain no Bazel state.
+machine-local `~/.bazelrc` that places unmanaged workspace state on that
+filesystem and makes Bazel's default HOME output root read-only. The home rc
+then imports a managed workspace's `.bazelrc.cache`, when present, so its
+project-specific placement wins without loading the general `.bazelrc.local`
+twice. `dotfiles doctor` checks both the machine rc and the HOME guard and
+requires the guarded HOME root to contain no Bazel state.
 
 ## Optional Infrastructure and Specialized Tools
 

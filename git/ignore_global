@@ -10,6 +10,7 @@
 
 # Primary-worktree-owned local state linked into sibling worktrees.
 AGENTS.override.md
+.bazelrc.cache
 .bazelrc.local
 .beads
 

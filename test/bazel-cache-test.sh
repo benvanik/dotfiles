@@ -57,6 +57,11 @@ MARKER="$DEFAULT_OUTPUT_ROOT/$BAZEL_CACHE_GUARD_MARKER"
 [ "$(cat "$TEST_HOME/.bazelrc")" = \
     "$(bazel_cache_print_home_bazelrc "$CACHE_ROOT")" ] ||
     fail "machine configuration does not contain the configured cache root"
+grep -qxF 'try-import %workspace%/.bazelrc.cache' "$TEST_HOME/.bazelrc" ||
+    fail "machine configuration does not reapply managed cache placement"
+if grep -qF '.bazelrc.local' "$TEST_HOME/.bazelrc"; then
+    fail "machine configuration reimports general workspace policy"
+fi
 [ -d "$EXPECTED_OUTPUT_ROOT/cache/disk" ] ||
     fail "configured disk-cache directory was not created"
 [ ! -w "$DEFAULT_OUTPUT_ROOT" ] ||

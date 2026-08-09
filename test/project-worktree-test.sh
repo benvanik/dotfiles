@@ -56,6 +56,7 @@ git clone -q --branch main "$REMOTE" "$MAIN_WORKTREE"
 # continuously checks out the main branch.
 git -C "$MAIN_WORKTREE" switch -q -c integration/primary-work
 printf 'shared instructions\n' > "$MAIN_WORKTREE/AGENTS.override.md"
+printf 'shared bazel cache configuration\n' > "$MAIN_WORKTREE/.bazelrc.cache"
 printf 'shared bazel configuration\n' > "$MAIN_WORKTREE/.bazelrc.local"
 mkdir "$MAIN_WORKTREE/.beads"
 printf 'shared issue database\n' > "$MAIN_WORKTREE/.beads/state"
@@ -71,6 +72,14 @@ FEATURE_WORKTREE="$PROJECT_ROOT/feature"
     fail "override link does not target the main worktree"
 [ "$(cat "$FEATURE_WORKTREE/AGENTS.override.md")" = "shared instructions" ] || \
     fail "override link does not resolve to shared contents"
+[ -L "$FEATURE_WORKTREE/.bazelrc.cache" ] || \
+    fail "bazel cache configuration link was not created"
+[ "$(readlink "$FEATURE_WORKTREE/.bazelrc.cache")" = \
+    "../main/.bazelrc.cache" ] || \
+    fail "bazel cache configuration link does not target the main worktree"
+[ "$(cat "$FEATURE_WORKTREE/.bazelrc.cache")" = \
+    "shared bazel cache configuration" ] ||
+    fail "bazel cache configuration link does not resolve to shared contents"
 [ -L "$FEATURE_WORKTREE/.bazelrc.local" ] || \
     fail "bazel configuration link was not created"
 [ "$(readlink "$FEATURE_WORKTREE/.bazelrc.local")" = "../main/.bazelrc.local" ] || \
@@ -471,6 +480,7 @@ grep -Fqx "kill-session -t =tmux-only.session" "$TMUX_LOG" ||
     fail "tmux-only cleanup did not kill the exact requested session"
 
 unlink "$MAIN_WORKTREE/AGENTS.override.md"
+unlink "$MAIN_WORKTREE/.bazelrc.cache"
 unlink "$MAIN_WORKTREE/.bazelrc.local"
 unlink "$MAIN_WORKTREE/.beads/state"
 rmdir "$MAIN_WORKTREE/.beads"
@@ -482,6 +492,8 @@ rmdir "$MAIN_WORKTREE/.beads"
 PLAIN_WORKTREE="$PROJECT_ROOT/plain"
 [ ! -e "$PLAIN_WORKTREE/AGENTS.override.md" ] || \
     fail "override link was created without a main override"
+[ ! -e "$PLAIN_WORKTREE/.bazelrc.cache" ] || \
+    fail "bazel cache link was created without a main configuration"
 [ ! -e "$PLAIN_WORKTREE/.bazelrc.local" ] || \
     fail "bazel configuration link was created without a main configuration"
 [ ! -e "$PLAIN_WORKTREE/.beads" ] || \

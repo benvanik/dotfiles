@@ -31,9 +31,10 @@ LAYOUT
     checked-out branch may vary; new branches start from main by default.
     New worktrees are created at <project>/<name>.
 
-    If main/AGENTS.override.md, main/.bazelrc.local, or main/.beads exists, the
-    new worktree receives a relative symlink to that shared local state. The
-    main worktree must own .beads as a physical directory.
+    If main/AGENTS.override.md, main/.bazelrc.cache, main/.bazelrc.local, or
+    main/.beads exists, the new worktree receives a relative symlink to that
+    shared local state. The main worktree must own .beads as a physical
+    directory.
 
     A tracked .envrc is inherited with the branch. The command prints the
     explicit direnv authorization needed before entering the new worktree.

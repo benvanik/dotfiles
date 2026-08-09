@@ -36,6 +36,7 @@ assert_envrc_tools() {
     local actual=""
 
     actual=$(awk '
+        $1 == "use_project_build_tools" { next }
         /^use_[a-z_]+([[:space:]]|$)/ {
             tool = $1
             sub(/^use_/, "", tool)
@@ -510,9 +511,7 @@ cmp -s "$FZF_PROJECT/.envrc.before-cancel" "$FZF_PROJECT/.envrc" ||
 HOME="$ROUNDTRIP_HOME" \
     "$BASH_EXECUTABLE" "$DOTFILES/bin/project-init" \
     --none --yes --no-history "$FZF_PROJECT" >/dev/null
-if grep -q '^use_' "$FZF_PROJECT/.envrc"; then
-    fail "--none retained a tool directive"
-fi
+assert_envrc_tools "$FZF_PROJECT/.envrc" ""
 cp "$FZF_PROJECT/.envrc" "$FZF_PROJECT/.envrc.none"
 if HOME="$ROUNDTRIP_HOME" \
         "$BASH_EXECUTABLE" "$DOTFILES/bin/project-init" \
@@ -624,6 +623,8 @@ XDG_CONFIG_HOME="$TEST_HOME/.config" \
         printf '%s\n' "$1" > "$TEST_ROOT/captured-history-path"
     }
     # shellcheck disable=SC2317  # Invoked by the generated .envrc.
+    use_project_build_tools() { :; }
+    # shellcheck disable=SC2317  # Invoked by the generated .envrc.
     source_local_envrc() { :; }
     # shellcheck source=/dev/null
     . ./.envrc
@@ -642,6 +643,7 @@ XDG_CONFIG_HOME="$TEST_HOME/.config" \
 if "$BASH_EXECUTABLE" -c '
     cd -- "$1"
     use_project_history() { return 42; }
+    use_project_build_tools() { :; }
     source_local_envrc() { :; }
     . ./.envrc
 ' sh "$QUOTED_HISTORY_PROJECT"; then
@@ -651,6 +653,7 @@ fi
 if "$BASH_EXECUTABLE" -c '
     cd -- "$1"
     use_project_history() { :; }
+    use_project_build_tools() { :; }
     source_local_envrc() { return 43; }
     . ./.envrc
 ' sh "$QUOTED_HISTORY_PROJECT"; then
@@ -724,6 +727,47 @@ XDG_DATA_HOME="$TEST_HOME/.local/share" \
     direnv exec "$DIRENV_PROJECT" /bin/sh -c \
     '[ "$CMAKE_ROOT" = "$1" ]' sh "$DIRENV_CMAKE_ROOT" ||
     fail "valid real-direnv activation failed"
+
+# The standard project helper path is conditional and watched. A checkout that
+# gains or loses build_tools/bin must update PATH without rewriting .envrc.
+PROJECT_BUILD_TOOL_NAME=dotfiles-project-build-tool
+PROJECT_BUILD_TOOL_DIRECTORY="$DIRENV_PROJECT/build_tools/bin"
+PROJECT_BUILD_TOOL="$PROJECT_BUILD_TOOL_DIRECTORY/$PROJECT_BUILD_TOOL_NAME"
+# shellcheck disable=SC2016  # Expanded by the child shell under direnv.
+HOME="$TEST_HOME" \
+XDG_CACHE_HOME="$TEST_HOME/.cache" \
+XDG_CONFIG_HOME="$TEST_HOME/.config" \
+XDG_DATA_HOME="$TEST_HOME/.local/share" \
+    direnv exec "$DIRENV_PROJECT" /bin/sh -c \
+    '! command -v "$1" >/dev/null 2>&1' sh "$PROJECT_BUILD_TOOL_NAME" ||
+    fail "missing project build tools directory changed PATH"
+mkdir -p "$PROJECT_BUILD_TOOL_DIRECTORY"
+cat > "$PROJECT_BUILD_TOOL" << 'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod +x "$PROJECT_BUILD_TOOL"
+# shellcheck disable=SC2016  # Expanded by the child shell under direnv.
+HOME="$TEST_HOME" \
+XDG_CACHE_HOME="$TEST_HOME/.cache" \
+XDG_CONFIG_HOME="$TEST_HOME/.config" \
+XDG_DATA_HOME="$TEST_HOME/.local/share" \
+    direnv exec "$DIRENV_PROJECT" /bin/sh -c \
+    '[ "$(command -v "$1")" = "$2" ]' sh \
+    "$PROJECT_BUILD_TOOL_NAME" "$PROJECT_BUILD_TOOL" ||
+    fail "project build tools directory was not added to PATH"
+unlink "$PROJECT_BUILD_TOOL"
+rmdir "$PROJECT_BUILD_TOOL_DIRECTORY"
+rmdir "$DIRENV_PROJECT/build_tools"
+# shellcheck disable=SC2016  # Expanded by the child shell under direnv.
+HOME="$TEST_HOME" \
+XDG_CACHE_HOME="$TEST_HOME/.cache" \
+XDG_CONFIG_HOME="$TEST_HOME/.config" \
+XDG_DATA_HOME="$TEST_HOME/.local/share" \
+    direnv exec "$DIRENV_PROJECT" /bin/sh -c \
+    '! command -v "$1" >/dev/null 2>&1' sh "$PROJECT_BUILD_TOOL_NAME" ||
+    fail "removed project build tools directory remained on PATH"
+
 DIRENV_STATUS_LOG="$TEST_ROOT/direnv-status.log"
 # shellcheck disable=SC2016  # Expanded by the child shell under direnv.
 HOME="$TEST_HOME" \

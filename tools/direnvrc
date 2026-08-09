@@ -250,6 +250,18 @@ use_vulkan_layers() {
     _track_tool "vk-layers" "$variant"
 }
 
+# Add repository-local build helpers when the project follows the common
+# build_tools/bin layout. Watching the path makes a later checkout that creates
+# or removes the directory invalidate direnv's cached environment.
+use_project_build_tools() {
+    local project_build_tools_directory="$PWD/build_tools/bin"
+
+    watch_file "$project_build_tools_directory" || return 1
+    if [ -d "$project_build_tools_directory" ]; then
+        PATH_add "$project_build_tools_directory"
+    fi
+}
+
 # Set per-project history directory.
 # Usage: use_project_history [history_dir]
 #

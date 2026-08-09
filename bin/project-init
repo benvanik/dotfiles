@@ -122,6 +122,7 @@ load_existing_envrc() {
     local tool=""
     local strict_line_count=0
     local local_source_count=0
+    local project_build_tools_count=0
 
     CURRENT_ENVRC_TOOLS=()
     CURRENT_ENVRC_DIRECTIVES=()
@@ -138,6 +139,7 @@ load_existing_envrc() {
             "# A failed import must abort direnv before its source cleanup can"|\
             "# replace the failure status."|\
             "# Per-project shell history (shared across subdirectories)."|\
+            "# Prefer project-local developer tools when present."|\
             "# Load machine-specific overrides if present.")
                 continue
                 ;;
@@ -147,6 +149,10 @@ load_existing_envrc() {
                 ;;
             "source_local_envrc")
                 local_source_count=$((local_source_count + 1))
+                continue
+                ;;
+            "use_project_build_tools")
+                project_build_tools_count=$((project_build_tools_count + 1))
                 continue
                 ;;
         esac
@@ -181,6 +187,7 @@ load_existing_envrc() {
     # Files produced by both merge parents predate the strict line. Their exact
     # generated shape is accepted once and converges to the current form.
     if [ "$strict_line_count" -gt 1 ] ||
+            [ "$project_build_tools_count" -gt 1 ] ||
             [ "$local_source_count" -ne 1 ]; then
         error "$envrc is not a complete project-init environment"
         return 1
@@ -462,6 +469,9 @@ generate_envrc() {
         esac
     done
 
+    echo ""
+    echo "# Prefer project-local developer tools when present."
+    echo "use_project_build_tools"
     echo ""
     echo "# Load machine-specific overrides if present."
     echo "source_local_envrc"

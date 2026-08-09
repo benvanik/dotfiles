@@ -94,7 +94,10 @@ In a new directory named `main`, `project-init` initializes Git on branch
 is the commit boundary Git requires before a sibling worktree can exist.
 Existing repositories keep their history; ordinary directories retain the
 environment-only behavior. `--repository` requires the primary layout and
-`--no-repository` suppresses the inferred bootstrap.
+`--no-repository` suppresses the inferred bootstrap. Generated environments
+put the repository's `build_tools/bin` directory on `PATH` whenever that
+convention is present and automatically refresh when a checkout adds or removes
+it.
 
 When `main/AGENTS.override.md`, `main/.bazelrc.local`, or `main/.beads` exists,
 `project-worktree-init` links the shared local state into each new worktree.

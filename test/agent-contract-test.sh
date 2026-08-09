@@ -65,6 +65,7 @@ CHECKOUT="$TEST_HOME/.dotfiles"
 FAKE_BIN="$TEST_ROOT/fake-bin"
 PUBLICATION_MODULES=(
     agent-contract-publication.sh
+    bazel-cache.sh
     home-publication-transaction.sh
     local-config-publication.sh
     managed-copy-publication.sh

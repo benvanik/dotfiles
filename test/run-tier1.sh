@@ -325,6 +325,17 @@ else
 fi
 
 # ============================================================================
+# Bazel Cache Placement
+# ============================================================================
+section "bazel-cache" "Machine-local Bazel cache placement"
+
+if "$BASH" "$DOTFILES/test/bazel-cache-test.sh"; then
+    pass "machine-local Bazel cache placement"
+else
+    fail "machine-local Bazel cache placement"
+fi
+
+# ============================================================================
 # Tool Environments
 # ============================================================================
 section "tool-env" "Portable tracked tool environments"

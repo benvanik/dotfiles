@@ -116,6 +116,15 @@ new path.
 copies for Codex and Claude; `dotfiles doctor` reports missing, linked, or
 drifted copies.
 
+Machines with Bazel installed set `BAZEL_CACHE_ROOT` in `~/.shrc.local` to a
+large writable filesystem outside `HOME`. `dotfiles install` generates a
+machine-local `~/.bazelrc` that places default state for every Bazel workspace
+on that filesystem and makes Bazel's default HOME output root read-only.
+Managed projects keep project-specific machine policy in the primary
+worktree's `.bazelrc.local`; `project-worktree-init` links that policy into
+every sibling. `dotfiles doctor` checks both the machine rc and the HOME guard
+and requires the guarded HOME root to contain no Bazel state.
+
 ## Optional Infrastructure and Specialized Tools
 
 Some command families are useful only on machines doing GPU or compiler work:

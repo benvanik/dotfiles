@@ -136,6 +136,8 @@ cmd_test() {
 # Install Command
 # ============================================================================
 cmd_install() {
+    local configured_bazel_cache_root=""
+
     # Step 1: Check dependencies (no sudo from here).
     info "Checking dependencies..."
     if ! "$DOTFILES/install-deps.sh" --verify 2>/dev/null; then
@@ -154,25 +156,33 @@ cmd_install() {
     # Step 3: Create ~/.shrc.local template if missing.
     _ensure_shrc_local
 
-    # Step 4: Prompt for identity if needed and interactive.
+    # Step 4: Configure machine-local Bazel placement when requested.
+    if configured_bazel_cache_root=$(bazel_cache_configured_root); then
+        info "Configuring machine-local Bazel cache placement..."
+        bazel_cache_configure "$configured_bazel_cache_root"
+    else
+        warn "BAZEL_CACHE_ROOT is unset; Bazel cache placement was not configured"
+    fi
+
+    # Step 5: Prompt for identity if needed and interactive.
     if _needs_identity && _is_interactive; then
         echo ""
         _prompt_identity
     fi
 
-    # Step 5: Create symlinks.
+    # Step 6: Create symlinks.
     _create_symlinks
 
-    # Step 6: Generate ~/.gitconfig.local.
+    # Step 7: Generate ~/.gitconfig.local.
     _generate_gitconfig_local
 
-    # Step 7: Set up git SSH signing.
+    # Step 8: Set up git SSH signing.
     _setup_git_signing
 
-    # Step 8: Create ~/.secrets template if missing.
+    # Step 9: Create ~/.secrets template if missing.
     _ensure_secrets
 
-    # Step 9: Show summary.
+    # Step 10: Show summary.
     _show_summary
 }
 
@@ -189,6 +199,8 @@ source "$DOTFILES_IMPLEMENTATION_ROOT/lib/managed-copy-publication.sh"
 source "$DOTFILES_IMPLEMENTATION_ROOT/lib/agent-contract-publication.sh"
 # shellcheck source=../lib/local-config-publication.sh
 source "$DOTFILES_IMPLEMENTATION_ROOT/lib/local-config-publication.sh"
+# shellcheck source=../lib/bazel-cache.sh
+source "$DOTFILES_IMPLEMENTATION_ROOT/lib/bazel-cache.sh"
 
 _link() {
     _link_path "$DOTFILES/$1" "$HOME/$2"
@@ -461,6 +473,9 @@ export USER_GITHUB_ID="yourusername"
 # ============================================================================
 # Machine-Specific Paths
 # ============================================================================
+# Put Bazel state on a large writable filesystem outside HOME.
+# export BAZEL_CACHE_ROOT="/path/to/cache/bazel"
+
 # _add_path "/opt/custom-tool/bin"
 # _add_path "/opt/homebrew/bin"  # macOS
 
@@ -630,6 +645,7 @@ cmd_doctor() {
     echo ""
 
     local all_ok=true
+    local configured_bazel_cache_root=""
 
     # Check packages using shared verification.
     if ! _pkg_verify_all "$GREEN" "$YELLOW" "$RED" "$NC" "$BOLD"; then
@@ -662,6 +678,68 @@ cmd_doctor() {
             printf "  %b[MISSING]%b %s (run 'dotfiles install' to create)\n" "$YELLOW" "$NC" "$localfile"
         fi
     done
+    echo ""
+
+    # Bazel must never silently fall back to HOME. The machine rc is loaded
+    # after workspace configuration and owns default cache placement.
+    printf "%bBazel cache placement:%b\n" "$BOLD" "$NC"
+    if ! configured_bazel_cache_root=$(bazel_cache_configured_root); then
+        printf "  %b[MISSING]%b BAZEL_CACHE_ROOT is not configured in ~/.shrc.local\n" \
+            "$RED" "$NC"
+        all_ok=false
+    elif ! bazel_cache_validate_root "$configured_bazel_cache_root"; then
+        printf "  %b[INVALID]%b BAZEL_CACHE_ROOT=%s\n" \
+            "$RED" "$NC" "$configured_bazel_cache_root"
+        all_ok=false
+    else
+        local expected_home_bazelrc=""
+        local default_output_user_root=""
+        local marker_path=""
+        local default_root_state_count=0
+        expected_home_bazelrc=$(
+            bazel_cache_print_home_bazelrc "$configured_bazel_cache_root"
+        )
+        if [ -f "$HOME/.bazelrc" ] && [ ! -L "$HOME/.bazelrc" ] &&
+                [ "$(cat "$HOME/.bazelrc")" = "$expected_home_bazelrc" ]; then
+            printf "  %b[OK]%b ~/.bazelrc -> %s\n" \
+                "$GREEN" "$NC" "$configured_bazel_cache_root"
+        else
+            printf "  %b[DRIFT]%b ~/.bazelrc is not the managed machine configuration\n" \
+                "$RED" "$NC"
+            all_ok=false
+        fi
+
+        default_output_user_root=$(
+            bazel_cache_default_output_user_root
+        )
+        marker_path="$default_output_user_root/$BAZEL_CACHE_GUARD_MARKER"
+        if [ -d "$default_output_user_root" ] &&
+                [ ! -L "$default_output_user_root" ] &&
+                [ ! -w "$default_output_user_root" ] &&
+                [ -f "$marker_path" ] && [ ! -L "$marker_path" ] &&
+                [ "$(cat "$marker_path")" = \
+                    "$(bazel_cache_print_guard_marker \
+                        "$configured_bazel_cache_root")" ]; then
+            printf "  %b[OK]%b protected default root %s\n" \
+                "$GREEN" "$NC" "$default_output_user_root"
+        else
+            printf "  %b[DRIFT]%b default root is not protected: %s\n" \
+                "$RED" "$NC" "$default_output_user_root"
+            all_ok=false
+        fi
+
+        default_root_state_count=$(
+            bazel_cache_default_root_state_count "$default_output_user_root"
+        )
+        if [ "$default_root_state_count" -eq 0 ]; then
+            printf "  %b[OK]%b no Bazel state remains under the default root\n" \
+                "$GREEN" "$NC"
+        else
+            printf "  %b[DRIFT]%b %d unexpected entries remain under the default root\n" \
+                "$RED" "$NC" "$default_root_state_count"
+            all_ok=false
+        fi
+    fi
     echo ""
 
     # Agent clients need regular, current copies because neither client

@@ -353,6 +353,28 @@ quality, or development velocity.
 - Assume the worktree may contain user or agent edits you did not make. Do not
   revert, clean, stash, amend, or otherwise rewrite unrelated work unless the
   user explicitly asks.
+- Create every Git worktree, including temporary, review, and experimental
+  worktrees, with `project-worktree-init <branch> [name]`. Never invoke
+  `git worktree add`, move a worktree manually, or construct a worktree by
+  copying files. The initializer establishes project-local shared state such as
+  `.bazelrc.local`; if the required layout is unsupported, improve the
+  lifecycle tool instead of bypassing it.
+- Treat every worktree as active and valuable unless the user explicitly says
+  to deinitialize that exact worktree. Requests to clean up old, dead, stale,
+  merged, or irrelevant branches or work do not authorize worktree removal.
+  A worktree may contain ignored or untracked `.notes/` state and may have an
+  active agent even when its Git branch is merged or clean.
+- Never invoke `git worktree remove`, `git worktree prune`, `rm`, `rmdir`, or
+  any equivalent filesystem operation to remove a worktree. The only permitted
+  removal mechanism is `project-worktree-deinit <name>`, run from another
+  worktree in the same repository, and only after the user explicitly approves
+  the exact worktree path in the current conversation. Before requesting that
+  approval, inventory the worktree, its branch, Git status, untracked and
+  ignored payload, `.notes/`, and any active agent or process ownership.
+- If `project-worktree-deinit` refuses removal, stop and report the payload it
+  protected. Never bypass it with `--force`, direct Git commands, filesystem
+  deletion, or a manual approximation of the wrapper. Worktree preservation is
+  the contract; removal is not required to complete cleanup.
 - Check actual git state with `git status`, `git diff`, and `git log` before
   making claims about the tree.
 - Commit architecture is part of implementation architecture. Before editing a

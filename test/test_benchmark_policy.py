@@ -168,6 +168,7 @@ class PolicyFixture:
         *,
         gpu_count: int = 1,
         integrated_gpu: bool = False,
+        device_class: str | None = None,
     ) -> None:
         self.test = test
         self.temporary = tempfile.TemporaryDirectory()
@@ -186,7 +187,11 @@ class PolicyFixture:
         self.state_root.mkdir(mode=0o700)
         self.boot_id_path.write_text(f"{_BOOT_ID}\n", encoding="ascii")
         self.identities = tuple(
-            self._create_gpu(index, integrated=integrated_gpu)
+            self._create_gpu(
+                index,
+                integrated=integrated_gpu,
+                device_class=device_class,
+            )
             for index in range(gpu_count)
         )
         self.config = FixedHostPolicyConfig(self.identities)
@@ -204,7 +209,13 @@ class PolicyFixture:
         )
         self.power_profiles = FakePowerProfiles()
 
-    def _create_gpu(self, index: int, *, integrated: bool) -> AmdGpuIdentity:
+    def _create_gpu(
+        self,
+        index: int,
+        *,
+        integrated: bool,
+        device_class: str | None,
+    ) -> AmdGpuIdentity:
         bdf = f"0000:{index + 1:02x}:00.0"
         identity = AmdGpuIdentity(
             bdf=bdf,
@@ -214,7 +225,11 @@ class PolicyFixture:
             subsystem_device=f"0x{0x7901 + index:04x}",
             revision="0xc8",
             unique_id=(None if integrated else f"4610468131039e{index:x}"),
-            device_class="0x038000" if integrated else "0x030000",
+            device_class=(
+                device_class
+                if device_class is not None
+                else "0x038000" if integrated else "0x030000"
+            ),
         )
         device = self.devices_root / f"pci0000:{index + 1:02x}" / bdf
         device.mkdir(parents=True)
@@ -356,6 +371,20 @@ class FixedHostPolicyConfigTest(unittest.TestCase):
             fixture.linux_filesystem.read_gpu_identity(identity.bdf).unique_id,
             "1",
         )
+
+    def test_processing_accelerator_identity_is_managed_as_an_amd_gpu(self) -> None:
+        fixture = PolicyFixture(self, device_class="0x120000")
+        identity = fixture.identities[0]
+
+        self.assertEqual(
+            fixture.linux_filesystem.read_gpu_identity(identity.bdf),
+            identity,
+        )
+        policy = fixture.policy()
+        policy.enter()
+        self.assertEqual(fixture.level(identity), "high")
+        policy.leave()
+        self.assertEqual(fixture.level(identity), "auto")
 
     def test_discrete_gpu_serial_remains_an_exact_identity_constraint(self) -> None:
         fixture = PolicyFixture(self)

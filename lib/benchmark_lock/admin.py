@@ -91,7 +91,7 @@ class GpuIdentityReader(Protocol):
     """Administrator-selected PCI identity discovery boundary."""
 
     def read_gpu_identity(self, bdf: str) -> AmdGpuIdentity:
-        """Read the exact AMD display-controller identity at one PCI BDF."""
+        """Read the exact AMD GPU identity at one PCI BDF."""
 
 
 class SubprocessCommandRunner:

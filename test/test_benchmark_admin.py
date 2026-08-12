@@ -344,6 +344,17 @@ class BenchmarkConfigurationTest(unittest.TestCase):
         self.assertIn(b'"unique_id":null', canonical)
         self.assertEqual(parse_policy_configuration(canonical), config)
 
+    def test_processing_accelerator_configuration_is_canonical(self) -> None:
+        config = parse_policy_configuration(
+            _configuration(device_class="0x120000")
+        )
+
+        self.assertEqual(config.gpus[0].device_class, "0x120000")
+        self.assertEqual(
+            parse_policy_configuration(canonical_policy_configuration(config)),
+            config,
+        )
+
     def test_unknown_duplicate_and_wrong_hardware_fields_are_rejected(self) -> None:
         unknown = json.loads(_configuration())
         unknown["fallback"] = True

@@ -25,7 +25,7 @@ _PCI_BDF_PATTERN = re.compile(r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]")
 _HEX_ID_PATTERN = re.compile(r"0x[0-9a-f]{4}")
 _HEX_REVISION_PATTERN = re.compile(r"0x[0-9a-f]{2}")
 _PCI_CLASS_PATTERN = re.compile(r"0x[0-9a-f]{6}")
-_DISPLAY_CONTROLLER_CLASS_PATTERN = re.compile(r"0x03[0-9a-f]{4}")
+_AMD_GPU_CLASS_PATTERN = re.compile(r"0x(?:03|12)[0-9a-f]{4}")
 _UNIQUE_ID_PATTERN = re.compile(r"[0-9a-f]{1,64}")
 _BOOT_ID_PATTERN = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
@@ -45,7 +45,7 @@ _GPU_LEVELS = frozenset(
     }
 )
 _AMD_VENDOR_ID = "0x1002"
-_DISPLAY_CONTROLLER_CLASS = "0x030000"
+_DEFAULT_GPU_CLASS = "0x030000"
 _HELD_GPU_LEVEL = "high"
 _POWER_PROFILE = "performance"
 _POWER_PROFILE_APPLICATION_ID = "com.benchmark-lock.host-policy"
@@ -64,7 +64,7 @@ def _matches(pattern: re.Pattern[str], value: str) -> bool:
 
 @dataclasses.dataclass(frozen=True)
 class AmdGpuIdentity:
-    """One exact AMD display-controller identity selected by the administrator."""
+    """One exact AMD GPU identity selected by the administrator."""
 
     bdf: str
     vendor: str
@@ -73,7 +73,7 @@ class AmdGpuIdentity:
     subsystem_device: str
     revision: str
     unique_id: str | None
-    device_class: str = _DISPLAY_CONTROLLER_CLASS
+    device_class: str = _DEFAULT_GPU_CLASS
 
     def __post_init__(self) -> None:
         fields_and_patterns = (
@@ -95,8 +95,11 @@ class AmdGpuIdentity:
             raise ValueError("unique_id is not a canonical hardware identity")
         if self.vendor != _AMD_VENDOR_ID:
             raise ValueError("benchmark GPUs must have AMD vendor ID 0x1002")
-        if not _matches(_DISPLAY_CONTROLLER_CLASS_PATTERN, self.device_class):
-            raise ValueError("benchmark GPUs must be PCI display controllers")
+        if not _matches(_AMD_GPU_CLASS_PATTERN, self.device_class):
+            raise ValueError(
+                "benchmark GPUs must be PCI display controllers or "
+                "processing accelerators"
+            )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -540,7 +543,7 @@ class LinuxHostFilesystem:
             ) from error
 
     def read_gpu_identity(self, bdf: str) -> AmdGpuIdentity:
-        """Discover one exact AMD display-controller identity from sysfs."""
+        """Discover one exact AMD GPU identity from sysfs."""
 
         device_path = self._device_path(bdf)
         fields = self._read_gpu_identity_fields(bdf, device_path)

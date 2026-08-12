@@ -96,7 +96,7 @@ Installation is explicit and separate from `dotfiles install` and
 `install-deps.sh`. Select each benchmark GPU by PCI BDF:
 
 ```bash
-lspci -Dnn | grep -Ei 'vga|display'
+lspci -Dnn | grep -Ei 'vga|display|processing accelerator'
 ```
 
 The first installation discovers and validates the complete immutable identity
@@ -109,9 +109,10 @@ sudo ~/.dotfiles/bin/benchmark-admin install \
   --user "$USER"
 ```
 
-Repeat `--gpu BDF` for a multi-GPU benchmark host. Discrete GPUs normally
-contribute a VGA-class identity and a `unique_id`; integrated GPUs may use
-another PCI display subclass and omit that sysfs serial. The administrator
+Repeat `--gpu BDF` for a multi-GPU benchmark host. Discrete graphics GPUs
+normally contribute a VGA-class identity and a `unique_id`; integrated GPUs
+may use another PCI display subclass and omit that sysfs serial. Compute-only
+Instinct GPUs use the PCI processing-accelerator class. The administrator
 preserves those observed facts directly instead of asking the operator to
 transcribe or invent them. An unavailable `unique_id` is recorded as `null`;
 that policy constrains the identity fields the kernel exposed instead of

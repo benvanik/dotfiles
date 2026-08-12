@@ -1,9 +1,10 @@
 """Root-owned, crash-recoverable host policy for benchmark leases.
 
 The policy deliberately accepts hardware identities, not paths or requested
-settings.  Its only GPU mutation is the compiled-in AMD sysfs value ``high``.
-All path selection belongs to the privileged process that constructs the
-filesystem and journal backends.
+settings. Its GPU mutation is a class-specific, compiled-in AMD sysfs value:
+``high`` for display GPUs and ``perf_determinism`` for processing
+accelerators. All path selection belongs to the privileged process that
+constructs the filesystem and journal backends.
 """
 
 from __future__ import annotations
@@ -53,7 +54,7 @@ _GPU_LEVELS = frozenset(
 _AMD_VENDOR_ID = "0x1002"
 _DEFAULT_GPU_CLASS = "0x030000"
 _HELD_DISPLAY_GPU_LEVEL = "high"
-_HELD_PROCESSING_ACCELERATOR_LEVEL = "profile_peak"
+_HELD_PROCESSING_ACCELERATOR_LEVEL = "perf_determinism"
 _POWER_PROFILE = "performance"
 _POWER_PROFILE_APPLICATION_ID = "com.benchmark-lock.host-policy"
 _POWER_PROFILE_REASON = "exclusive benchmark lease"

@@ -22,7 +22,7 @@ pidfds, and the fixed host policy selected by the administrator:
 - one explicit CPU authority: a `power-profiles-daemon` performance hold when
   available, otherwise an already-fixed Linux cpufreq performance baseline;
 - a class-correct AMDGPU profiling level for the exact configured PCI
-  identities: `high` for display GPUs and `profile_peak` for processing
+  identities: `high` for display GPUs and `perf_determinism` for processing
   accelerators;
 - a configured-GPU KFD ownership check immediately before every grant.
 

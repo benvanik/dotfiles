@@ -19,7 +19,8 @@ that process personality; the global kernel ASLR setting is never changed.
 The root broker never launches benchmark commands. It owns only admission,
 pidfds, and the fixed host policy selected by the administrator:
 
-- a `power-profiles-daemon` performance hold;
+- one explicit CPU authority: a `power-profiles-daemon` performance hold when
+  available, otherwise an already-fixed Linux cpufreq performance baseline;
 - `power_dpm_force_performance_level=high` for the exact configured AMD PCI
   identities;
 - a configured-GPU KFD ownership check immediately before every grant.
@@ -43,12 +44,13 @@ socket after a grant does not release a live command, and a dead command cannot
 retain the lease.
 
 Queued closures are stored by systemd as a pidfd, client channel, and sealed
-canonical record. A daemon crash preserves their FIFO order. Because the
-process-lifetime CPU policy hold disappears with the daemon, any command that
+canonical record. A daemon crash preserves their FIFO order. Any command that
 was active across a restart is killed and never silently recertified; queued
-commands resume after host-policy recovery. A clean service stop likewise
-terminates the active command, releases queued requests, and restores the host
-policy before returning.
+commands resume after host-policy recovery. This is required both when a
+process-lifetime PPD hold disappeared and when fixed kernel controls survived
+without a broker left to audit them. A clean service stop likewise terminates
+the active command, releases queued requests, and restores the host policy
+before returning.
 
 There is deliberately no lease TTL. Command lifetime is the lease lifetime.
 
@@ -71,8 +73,11 @@ production boundary requires:
   `gi.repository.Gio` modules. The service runs that system interpreter in
   isolated mode; a user virtual environment is not consulted.
 - `libsystemd.so.0` with `sd_notify_barrier`.
-- `power-profiles-daemon` available on the system bus, exposing a non-degraded
-  `performance` profile and the profile-hold API.
+- `power-profiles-daemon` available on the system bus with the profile-hold API.
+  When it exposes `performance`, that profile must be non-degraded. A host whose
+  platform backend exposes no `performance` profile must instead have every
+  policy under `/sys/devices/system/cpu/cpufreq` already fixed to the
+  `performance` governor.
 - The AMDGPU/KFD sysfs ABI for every configured GPU: immutable PCI display
   identity fields, an optional `unique_id`, a readable and writable
   `power_dpm_force_performance_level`, the PCI-to-GPU-ID topology under
@@ -88,12 +93,17 @@ The current development host reports systemd 257, Linux 6.17, and
 not tighter minimums than the capabilities above.
 
 At admission time the selected PCI identities must still match, the selected
-KFD GPU IDs must have no externally owned queues or resident VRAM, the
-performance profile must not be degraded, and no other PPD profile hold may
-exist. Those conditions are checked again for each grant; an installation
-succeeding does not waive them. Work on another GPU may still contend for CPU,
-memory, or interconnect resources, so a shared-host run is directional evidence
-rather than whole-machine isolation.
+KFD GPU IDs must have no externally owned queues or resident VRAM, and no other
+PPD profile hold may exist. The CPU authority is then selected once for the
+lease epoch. A PPD authority is held and audited as `performance`; a fixed
+cpufreq authority snapshots every policy's driver, governor, frequency limits,
+optional energy preference, and the global boost control. The latter is
+accepted only when every governor is already `performance`, is never mutated by
+the broker, and is re-read as one exact drift boundary while the lease runs.
+Those conditions are checked again for each grant; an installation succeeding
+does not waive them. Work on another GPU may still contend for CPU, memory, or
+interconnect resources, so a shared-host run is directional evidence rather
+than whole-machine isolation.
 
 ## One-time installation
 
@@ -225,10 +235,12 @@ It refuses to remove foreign or modified paths.
 
 ## Baseline pressure
 
-The policy restores what it observes before the first lease. If the machine is
+The policy restores what it mutates after the first lease. If the machine is
 already in the `performance` profile or a GPU is already forced to `high`, that
-is the baseline it will faithfully restore. Put the host in its intended idle
-state before relying on the broker to return it there.
+is the baseline it will faithfully restore. A fixed cpufreq authority is an
+admission constraint rather than a mutation: external changes invalidate the
+lease but are never overwritten during teardown. Put the host in its intended
+idle state before relying on the broker to return it there.
 
 `~/.dotfiles/bin/benchmark-lock --status` reports the active holder, queue
 depth, and policy state. Infrastructure failures return 125; an unexecutable

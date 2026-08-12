@@ -31,6 +31,8 @@ _KFD_NODE_PATTERN = re.compile(r"(?:0|[1-9][0-9]{0,9})")
 _KFD_PROCESS_PATTERN = re.compile(r"[1-9][0-9]{0,9}")
 _KFD_QUEUE_PATTERN = re.compile(r"(?:0|[1-9][0-9]{0,9})")
 _KFD_DECIMAL_PATTERN = re.compile(r"(?:0|[1-9][0-9]{0,19})")
+_CPU_FREQUENCY_POLICY_PATTERN = re.compile(r"policy(?:0|[1-9][0-9]{0,9})")
+_CPU_CONTROL_TOKEN_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 _BOOT_ID_PATTERN = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
     r"[0-9a-f]{4}-[0-9a-f]{12}"
@@ -54,6 +56,8 @@ _HELD_GPU_LEVEL = "high"
 _POWER_PROFILE = "performance"
 _POWER_PROFILE_APPLICATION_ID = "com.benchmark-lock.host-policy"
 _POWER_PROFILE_REASON = "exclusive benchmark lease"
+_CPU_AUTHORITY_POWER_PROFILES_DAEMON = "power-profiles-daemon"
+_CPU_AUTHORITY_FIXED_CPU_FREQUENCY = "fixed-cpu-frequency"
 _JOURNAL_SCHEMA = 1
 _MAX_JOURNAL_BYTES = 1024 * 1024
 _MAX_KFD_PROPERTIES_BYTES = 4096
@@ -146,6 +150,34 @@ class PowerProfileStatus:
     performance_degraded: str
     profiles: tuple[str, ...]
     holds: tuple[PowerProfileHold, ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class CpuFrequencyPolicyStatus:
+    """Performance-relevant state of one Linux cpufreq policy."""
+
+    # Canonical sysfs policy directory name.
+    name: str
+    # Kernel frequency-scaling driver bound to the policy.
+    driver: str
+    # Kernel frequency-scaling governor selected for the policy.
+    governor: str
+    # Configured lower frequency bound, in kHz.
+    minimum_frequency_khz: int
+    # Configured upper frequency bound, in kHz.
+    maximum_frequency_khz: int
+    # Optional driver-specific energy/performance preference.
+    energy_performance_preference: str | None
+
+
+@dataclasses.dataclass(frozen=True)
+class CpuPerformanceStatus:
+    """Exact kernel CPU performance state used as a fixed authority."""
+
+    # CPU frequency policies ordered by their numeric kernel index.
+    policies: tuple[CpuFrequencyPolicyStatus, ...]
+    # Optional global CPU boost control.
+    boost_enabled: bool | None
 
 
 class PowerProfilesBackend(Protocol):
@@ -362,6 +394,9 @@ class HostFilesystem(Protocol):
     def boot_id(self) -> str:
         """Read the current kernel boot identity."""
 
+    def cpu_performance_status(self) -> CpuPerformanceStatus:
+        """Read the exact Linux cpufreq controls relevant to performance."""
+
     def assert_kfd_gpus_unowned(
         self,
         expected: Sequence[AmdGpuIdentity],
@@ -476,6 +511,143 @@ class LinuxHostFilesystem:
                 code="benchmark_policy_unavailable",
             )
         return value
+
+    @classmethod
+    def _read_cpu_control_token(
+        cls,
+        path: pathlib.Path,
+        *,
+        description: str,
+    ) -> str:
+        value = cls._read_single_line(path, description=description)
+        if not _matches(_CPU_CONTROL_TOKEN_PATTERN, value):
+            raise _policy_error(
+                f"{description} is not a canonical control token",
+                code="benchmark_policy_unavailable",
+            )
+        return value
+
+    @classmethod
+    def _read_optional_cpu_control_token(
+        cls,
+        path: pathlib.Path,
+        *,
+        description: str,
+    ) -> str | None:
+        try:
+            return cls._read_cpu_control_token(path, description=description)
+        except BenchmarkLockError as error:
+            if isinstance(error.__cause__, FileNotFoundError):
+                return None
+            raise
+
+    @classmethod
+    def _read_cpu_frequency(
+        cls,
+        path: pathlib.Path,
+        *,
+        description: str,
+    ) -> int:
+        value = cls._read_single_line(path, description=description)
+        if not _matches(_KFD_DECIMAL_PATTERN, value):
+            raise _policy_error(
+                f"{description} is not a canonical decimal integer",
+                code="benchmark_policy_unavailable",
+            )
+        frequency = int(value)
+        if frequency > _MAX_UINT64:
+            raise _policy_error(
+                f"{description} exceeds its kernel representation",
+                code="benchmark_policy_unavailable",
+            )
+        return frequency
+
+    def cpu_performance_status(self) -> CpuPerformanceStatus:
+        policy_root = self._sysfs_root / "devices/system/cpu/cpufreq"
+        try:
+            with os.scandir(policy_root) as iterator:
+                entries = tuple(
+                    entry
+                    for entry in iterator
+                    if _matches(_CPU_FREQUENCY_POLICY_PATTERN, entry.name)
+                )
+        except OSError as error:
+            raise _policy_error(
+                f"cannot inspect CPU frequency policies: {error}",
+                code="benchmark_policy_unavailable",
+            ) from error
+        if not entries:
+            raise _policy_error(
+                "the host exposes no CPU frequency policies",
+                code="benchmark_policy_unavailable",
+            )
+
+        policies: list[CpuFrequencyPolicyStatus] = []
+        for entry in sorted(entries, key=lambda item: int(item.name[6:])):
+            try:
+                is_directory = entry.is_dir(follow_symlinks=False)
+            except OSError as error:
+                raise _policy_error(
+                    f"cannot inspect CPU frequency policy {entry.name}: {error}",
+                    code="benchmark_policy_unavailable",
+                ) from error
+            if not is_directory:
+                raise _policy_error(
+                    f"CPU frequency policy {entry.name} is not a directory",
+                    code="benchmark_policy_unavailable",
+                )
+            path = policy_root / entry.name
+            description = f"CPU frequency policy {entry.name}"
+            minimum_frequency_khz = self._read_cpu_frequency(
+                path / "scaling_min_freq",
+                description=f"{description} minimum frequency",
+            )
+            maximum_frequency_khz = self._read_cpu_frequency(
+                path / "scaling_max_freq",
+                description=f"{description} maximum frequency",
+            )
+            if minimum_frequency_khz > maximum_frequency_khz:
+                raise _policy_error(
+                    f"{description} minimum frequency exceeds its maximum",
+                    code="benchmark_policy_unavailable",
+                )
+            policies.append(
+                CpuFrequencyPolicyStatus(
+                    name=entry.name,
+                    driver=self._read_cpu_control_token(
+                        path / "scaling_driver",
+                        description=f"{description} driver",
+                    ),
+                    governor=self._read_cpu_control_token(
+                        path / "scaling_governor",
+                        description=f"{description} governor",
+                    ),
+                    minimum_frequency_khz=minimum_frequency_khz,
+                    maximum_frequency_khz=maximum_frequency_khz,
+                    energy_performance_preference=(
+                        self._read_optional_cpu_control_token(
+                            path / "energy_performance_preference",
+                            description=(
+                                f"{description} energy performance preference"
+                            ),
+                        )
+                    ),
+                )
+            )
+
+        boost = self._read_optional_single_line(
+            policy_root / "boost",
+            description="CPU frequency boost control",
+        )
+        if boost not in {None, "0", "1"}:
+            raise _policy_error(
+                "CPU frequency boost control is not zero or one",
+                code="benchmark_policy_unavailable",
+            )
+        return CpuPerformanceStatus(
+            policies=tuple(policies),
+            boost_enabled=None if boost is None else boost == "1",
+        )
 
     @classmethod
     def _read_kfd_decimal(
@@ -1262,7 +1434,7 @@ class EpochJournal:
 
 
 class FixedHostPolicy:
-    """Exact PPD plus AMD policy implementing :class:`broker.HostPolicy`."""
+    """Exact CPU authority plus AMD policy implementing broker.HostPolicy."""
 
     def __init__(
         self,
@@ -1279,6 +1451,9 @@ class FixedHostPolicy:
         self._state = "recovery_required" if self._journal.exists() else "idle"
         self._hold_cookie: object | None = None
         self._hold_release_attempted = False
+        self._cpu_authority: str | None = None
+        self._fixed_cpu_baseline: CpuPerformanceStatus | None = None
+        self._fixed_power_profile_baseline: PowerProfileStatus | None = None
 
     @property
     def identity(self) -> str:
@@ -1296,26 +1471,40 @@ class FixedHostPolicy:
             reason=_POWER_PROFILE_REASON,
         )
 
-    def _validate_preflight_profile(
+    def _select_cpu_authority(
         self,
         status: PowerProfileStatus,
-    ) -> None:
-        if _POWER_PROFILE not in status.profiles:
-            raise _policy_error(
-                "power-profiles-daemon does not expose performance",
-                code="benchmark_policy_unavailable",
-            )
-        if status.performance_degraded:
-            raise _policy_error(
-                "the performance power profile is degraded: "
-                f"{status.performance_degraded}",
-                code="benchmark_policy_unavailable",
-            )
+    ) -> tuple[str, CpuPerformanceStatus | None]:
         if status.holds:
             raise _policy_error(
                 "another power profile hold is already active",
                 code="benchmark_external_policy",
             )
+        if _POWER_PROFILE in status.profiles:
+            if status.performance_degraded:
+                raise _policy_error(
+                    "the performance power profile is degraded: "
+                    f"{status.performance_degraded}",
+                    code="benchmark_policy_unavailable",
+                )
+            return _CPU_AUTHORITY_POWER_PROFILES_DAEMON, None
+
+        fixed_status = self._filesystem.cpu_performance_status()
+        non_performance = tuple(
+            policy
+            for policy in fixed_status.policies
+            if policy.governor != _POWER_PROFILE
+        )
+        if non_performance:
+            details = ", ".join(
+                f"{policy.name}={policy.governor}" for policy in non_performance
+            )
+            raise _policy_error(
+                "power-profiles-daemon cannot hold performance and CPU "
+                f"frequency governors are not fixed to performance: {details}",
+                code="benchmark_policy_unavailable",
+            )
+        return _CPU_AUTHORITY_FIXED_CPU_FREQUENCY, fixed_status
 
     def _validate_epoch_matches_config(self, epoch: _PolicyEpoch) -> None:
         if epoch.policy_identity != self.identity:
@@ -1373,6 +1562,32 @@ class FixedHostPolicy:
                 "the durable benchmark policy epoch disappeared",
                 code="benchmark_policy_drift",
             )
+        if self._cpu_authority == _CPU_AUTHORITY_POWER_PROFILES_DAEMON:
+            self._verify_power_profile_held()
+        elif self._cpu_authority == _CPU_AUTHORITY_FIXED_CPU_FREQUENCY:
+            self._verify_fixed_cpu_held()
+        else:
+            raise _policy_error(
+                "the benchmark CPU policy has no selected authority",
+                code="benchmark_policy_drift",
+            )
+
+        for gpu in self._config.gpus:
+            try:
+                self._filesystem.assert_gpu_identity(gpu)
+                level = self._filesystem.read_gpu_level(gpu)
+            except BenchmarkLockError as error:
+                raise _policy_error(
+                    f"cannot audit GPU {gpu.bdf}: {error}",
+                    code="benchmark_policy_drift",
+                ) from error
+            if level != _HELD_GPU_LEVEL:
+                raise _policy_error(
+                    f"GPU {gpu.bdf} drifted to {level!r}",
+                    code="benchmark_policy_drift",
+                )
+
+    def _verify_power_profile_held(self) -> None:
         status = self._power_profiles.status()
         expected_hold = self._own_hold()
         if status.holds != (expected_hold,):
@@ -1391,20 +1606,74 @@ class FixedHostPolicy:
                 f"{status.performance_degraded}",
                 code="benchmark_policy_drift",
             )
-        for gpu in self._config.gpus:
-            try:
-                self._filesystem.assert_gpu_identity(gpu)
-                level = self._filesystem.read_gpu_level(gpu)
-            except BenchmarkLockError as error:
-                raise _policy_error(
-                    f"cannot audit GPU {gpu.bdf}: {error}",
-                    code="benchmark_policy_drift",
-                ) from error
-            if level != _HELD_GPU_LEVEL:
-                raise _policy_error(
-                    f"GPU {gpu.bdf} drifted to {level!r}",
-                    code="benchmark_policy_drift",
-                )
+
+    def _verify_fixed_cpu_held(self) -> None:
+        expected = self._fixed_cpu_baseline
+        expected_power_profile = self._fixed_power_profile_baseline
+        if expected is None or expected_power_profile is None:
+            raise _policy_error(
+                "the fixed CPU frequency authority has no baseline",
+                code="benchmark_policy_drift",
+            )
+        try:
+            observed_power_profile = self._power_profiles.status()
+            observed = self._filesystem.cpu_performance_status()
+        except BenchmarkLockError as error:
+            raise _policy_error(
+                f"cannot audit fixed CPU frequency state: {error}",
+                code="benchmark_policy_drift",
+            ) from error
+        if observed_power_profile != expected_power_profile:
+            raise _policy_error(
+                "power-profiles-daemon state changed while fixed CPU "
+                "frequency controls were authoritative",
+                code="benchmark_policy_drift",
+            )
+        drift = self._describe_fixed_cpu_drift(expected, observed)
+        if drift is not None:
+            raise _policy_error(
+                f"fixed CPU frequency state drifted: {drift}",
+                code="benchmark_policy_drift",
+            )
+
+    @staticmethod
+    def _describe_fixed_cpu_drift(
+        expected: CpuPerformanceStatus,
+        observed: CpuPerformanceStatus,
+    ) -> str | None:
+        expected_names = tuple(policy.name for policy in expected.policies)
+        observed_names = tuple(policy.name for policy in observed.policies)
+        if observed_names != expected_names:
+            return "the CPU frequency policy set changed"
+        controls = (
+            ("driver", "driver"),
+            ("governor", "governor"),
+            ("minimum frequency", "minimum_frequency_khz"),
+            ("maximum frequency", "maximum_frequency_khz"),
+            (
+                "energy performance preference",
+                "energy_performance_preference",
+            ),
+        )
+        for expected_policy, observed_policy in zip(
+            expected.policies,
+            observed.policies,
+            strict=True,
+        ):
+            for label, attribute in controls:
+                expected_value = getattr(expected_policy, attribute)
+                observed_value = getattr(observed_policy, attribute)
+                if observed_value != expected_value:
+                    return (
+                        f"{expected_policy.name} {label} changed from "
+                        f"{expected_value!r} to {observed_value!r}"
+                    )
+        if observed.boost_enabled != expected.boost_enabled:
+            return (
+                "the global boost control changed from "
+                f"{expected.boost_enabled!r} to {observed.boost_enabled!r}"
+            )
+        return None
 
     def preflight(self) -> None:
         """Require unowned configured GPUs immediately before a grant."""
@@ -1438,15 +1707,23 @@ class FixedHostPolicy:
             )
         self.preflight()
         power_profile = self._power_profiles.status()
-        self._validate_preflight_profile(power_profile)
+        cpu_authority, fixed_cpu_baseline = self._select_cpu_authority(power_profile)
         epoch = self._snapshot_epoch(power_profile)
         self._journal.commit(epoch)
+        self._cpu_authority = cpu_authority
+        self._fixed_cpu_baseline = fixed_cpu_baseline
+        self._fixed_power_profile_baseline = (
+            power_profile
+            if cpu_authority == _CPU_AUTHORITY_FIXED_CPU_FREQUENCY
+            else None
+        )
         self._state = "entering"
         try:
-            self._hold_cookie = self._power_profiles.hold_performance(
-                reason=_POWER_PROFILE_REASON,
-                application_id=_POWER_PROFILE_APPLICATION_ID,
-            )
+            if self._cpu_authority == _CPU_AUTHORITY_POWER_PROFILES_DAEMON:
+                self._hold_cookie = self._power_profiles.hold_performance(
+                    reason=_POWER_PROFILE_REASON,
+                    application_id=_POWER_PROFILE_APPLICATION_ID,
+                )
             for gpu in self._config.gpus:
                 self._filesystem.write_gpu_level(gpu, _HELD_GPU_LEVEL)
             self._verify_held()
@@ -1523,11 +1800,39 @@ class FixedHostPolicy:
                 )
             )
 
+    def _release_cpu_authority(
+        self,
+        epoch: _PolicyEpoch,
+        errors: list[BenchmarkLockError],
+    ) -> None:
+        if self._cpu_authority == _CPU_AUTHORITY_FIXED_CPU_FREQUENCY:
+            if self._hold_cookie is not None:
+                errors.append(
+                    _policy_error(
+                        "fixed CPU frequency authority unexpectedly owns a "
+                        "power profile hold",
+                        code="benchmark_policy_restore_failed",
+                    )
+                )
+            return
+        if self._cpu_authority not in {
+            None,
+            _CPU_AUTHORITY_POWER_PROFILES_DAEMON,
+        }:
+            errors.append(
+                _policy_error(
+                    "benchmark CPU policy authority is unknown",
+                    code="benchmark_policy_restore_failed",
+                )
+            )
+            return
+        self._release_power_profile(epoch, errors)
+
     def _restore_epoch(
         self,
         epoch: _PolicyEpoch,
         *,
-        release_power_profile: bool,
+        release_cpu_authority: bool,
     ) -> None:
         self._validate_epoch_matches_config(epoch)
         errors: list[BenchmarkLockError] = []
@@ -1549,8 +1854,8 @@ class FixedHostPolicy:
                         code="benchmark_policy_restore_failed",
                     )
                 )
-        if release_power_profile:
-            self._release_power_profile(epoch, errors)
+        if release_cpu_authority:
+            self._release_cpu_authority(epoch, errors)
         if errors:
             details = "; ".join(str(error) for error in errors)
             raise _policy_error(
@@ -1565,7 +1870,7 @@ class FixedHostPolicy:
     ) -> None:
         self._state = "leaving"
         try:
-            self._restore_epoch(epoch, release_power_profile=True)
+            self._restore_epoch(epoch, release_cpu_authority=True)
             self._journal.delete()
         except BenchmarkLockError as rollback_error:
             self._state = "faulted"
@@ -1574,6 +1879,9 @@ class FixedHostPolicy:
                 f"rollback failed ({rollback_error})",
                 code="benchmark_policy_restore_failed",
             ) from original
+        self._cpu_authority = None
+        self._fixed_cpu_baseline = None
+        self._fixed_power_profile_baseline = None
         self._state = "idle"
         raise original
 
@@ -1594,18 +1902,24 @@ class FixedHostPolicy:
             self._journal.delete()
             self._hold_cookie = None
             self._hold_release_attempted = False
+            self._cpu_authority = None
+            self._fixed_cpu_baseline = None
+            self._fixed_power_profile_baseline = None
             self._state = "idle"
             return
         self._validate_recovery_hardware(epoch)
         self._state = "leaving"
         try:
-            self._restore_epoch(epoch, release_power_profile=False)
+            self._restore_epoch(epoch, release_cpu_authority=False)
             self._journal.delete()
         except BenchmarkLockError:
             self._state = "faulted"
             raise
         self._hold_cookie = None
         self._hold_release_attempted = False
+        self._cpu_authority = None
+        self._fixed_cpu_baseline = None
+        self._fixed_power_profile_baseline = None
         self._state = "idle"
 
     def leave(self) -> None:
@@ -1617,6 +1931,10 @@ class FixedHostPolicy:
                     code="benchmark_policy_restore_failed",
                 )
             self._hold_cookie = None
+            self._hold_release_attempted = False
+            self._cpu_authority = None
+            self._fixed_cpu_baseline = None
+            self._fixed_power_profile_baseline = None
             self._state = "idle"
             return
         epoch = self._journal.load()
@@ -1624,15 +1942,21 @@ class FixedHostPolicy:
             self._journal.delete()
             self._hold_cookie = None
             self._hold_release_attempted = False
+            self._cpu_authority = None
+            self._fixed_cpu_baseline = None
+            self._fixed_power_profile_baseline = None
             self._state = "idle"
             return
         self._state = "leaving"
         try:
-            self._restore_epoch(epoch, release_power_profile=True)
+            self._restore_epoch(epoch, release_cpu_authority=True)
             self._journal.delete()
         except BenchmarkLockError:
             self._state = "faulted"
             raise
         self._hold_cookie = None
         self._hold_release_attempted = False
+        self._cpu_authority = None
+        self._fixed_cpu_baseline = None
+        self._fixed_power_profile_baseline = None
         self._state = "idle"

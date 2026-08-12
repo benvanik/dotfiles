@@ -10,6 +10,7 @@ import unittest
 from benchmark_lock.errors import BenchmarkLockError
 from benchmark_lock.policy import (
     AmdGpuIdentity,
+    CpuPerformanceStatus,
     EpochJournal,
     FixedHostPolicy,
     FixedHostPolicyConfig,
@@ -117,6 +118,9 @@ class RecordingFilesystem:
     def boot_id(self) -> str:
         return self.delegate.boot_id()
 
+    def cpu_performance_status(self) -> CpuPerformanceStatus:
+        return self.delegate.cpu_performance_status()
+
     def assert_kfd_gpus_unowned(
         self,
         expected: tuple[AmdGpuIdentity, ...],
@@ -182,6 +186,7 @@ class PolicyFixture:
         self.pci_links = self.sysfs_root / "bus/pci/devices"
         self.kfd_processes = self.sysfs_root / "class/kfd/kfd/proc"
         self.kfd_nodes = self.sysfs_root / "class/kfd/kfd/topology/nodes"
+        self.cpu_frequency_root = self.sysfs_root / "devices/system/cpu/cpufreq"
         self.boot_id_path = self.root / "boot_id"
         self.state_root = self.root / "state"
         self.journal_path = self.state_root / "active-epoch.json"
@@ -189,6 +194,19 @@ class PolicyFixture:
         self.pci_links.mkdir(parents=True)
         self.kfd_processes.mkdir(parents=True)
         self.kfd_nodes.mkdir(parents=True)
+        self.cpu_frequency_root.mkdir(parents=True)
+        for policy_index in range(2):
+            policy_path = self.cpu_frequency_root / f"policy{policy_index}"
+            policy_path.mkdir()
+            controls = {
+                "scaling_driver": "acpi-cpufreq",
+                "scaling_governor": "performance",
+                "scaling_min_freq": "1500000",
+                "scaling_max_freq": "2400000",
+            }
+            for name, value in controls.items():
+                (policy_path / name).write_text(f"{value}\n", encoding="ascii")
+        (self.cpu_frequency_root / "boost").write_text("1\n", encoding="ascii")
         cpu_node = self.kfd_nodes / "0"
         cpu_node.mkdir()
         (cpu_node / "gpu_id").write_text("0\n", encoding="ascii")
@@ -324,6 +342,17 @@ class PolicyFixture:
 
     def level(self, identity: AmdGpuIdentity) -> str:
         return self.level_path(identity).read_text(encoding="ascii").strip()
+
+    def set_cpu_control(
+        self,
+        policy_index: int,
+        control: str,
+        value: str,
+    ) -> None:
+        (self.cpu_frequency_root / f"policy{policy_index}" / control).write_text(
+            f"{value}\n",
+            encoding="ascii",
+        )
 
     def set_identity_field(
         self,
@@ -509,6 +538,92 @@ class FixedHostPolicyTest(unittest.TestCase):
         self.assertEqual(fixture.power_profiles.active_profile, "balanced")
         self.assertEqual(fixture.power_profiles.release_calls, 1)
         self.assertFalse(fixture.journal_path.exists())
+
+    def test_fixed_cpu_frequency_authority_uses_exact_kernel_baseline(
+        self,
+    ) -> None:
+        fixture = PolicyFixture(self)
+        fixture.power_profiles.profiles = ("power-saver", "balanced")
+        policy = fixture.policy()
+
+        policy.enter()
+
+        self.assertEqual(policy.state, "held")
+        self.assertEqual(fixture.power_profiles.active_profile, "balanced")
+        self.assertEqual(fixture.power_profiles.hold_calls, 0)
+        self.assertEqual(fixture.level(fixture.identities[0]), "high")
+        policy.verify()
+
+        policy.leave()
+
+        self.assertEqual(policy.state, "idle")
+        self.assertEqual(fixture.power_profiles.release_calls, 0)
+        self.assertEqual(fixture.level(fixture.identities[0]), "auto")
+        self.assertFalse(fixture.journal_path.exists())
+
+    def test_fixed_cpu_frequency_authority_requires_performance_governors(
+        self,
+    ) -> None:
+        fixture = PolicyFixture(self)
+        fixture.power_profiles.profiles = ("power-saver", "balanced")
+        fixture.set_cpu_control(1, "scaling_governor", "schedutil")
+        policy = fixture.policy()
+
+        with self.assertRaises(BenchmarkLockError) as raised:
+            policy.enter()
+
+        self.assertEqual(raised.exception.code, "benchmark_policy_unavailable")
+        self.assertIn("policy1=schedutil", str(raised.exception))
+        self.assertEqual(policy.state, "idle")
+        self.assertEqual(fixture.power_profiles.hold_calls, 0)
+        self.assertEqual(fixture.filesystem.writes, [])
+        self.assertFalse(fixture.journal_path.exists())
+
+    def test_fixed_cpu_frequency_drift_invalidates_without_restoring_cpu(
+        self,
+    ) -> None:
+        fixture = PolicyFixture(self)
+        fixture.power_profiles.profiles = ("power-saver", "balanced")
+        policy = fixture.policy()
+        policy.enter()
+        fixture.set_cpu_control(0, "scaling_max_freq", "2200000")
+
+        with self.assertRaises(BenchmarkLockError) as raised:
+            policy.verify()
+
+        self.assertEqual(raised.exception.code, "benchmark_policy_drift")
+        self.assertIn(
+            "policy0 maximum frequency changed from 2400000 to 2200000",
+            str(raised.exception),
+        )
+        self.assertEqual(policy.state, "faulted")
+        policy.leave()
+        self.assertEqual(
+            (
+                fixture.cpu_frequency_root
+                / "policy0/scaling_max_freq"
+            ).read_text(encoding="ascii"),
+            "2200000\n",
+        )
+        self.assertEqual(fixture.level(fixture.identities[0]), "auto")
+        self.assertFalse(fixture.journal_path.exists())
+
+    def test_fixed_cpu_frequency_authority_rejects_ppd_drift(self) -> None:
+        fixture = PolicyFixture(self)
+        fixture.power_profiles.profiles = ("power-saver", "balanced")
+        policy = fixture.policy()
+        policy.enter()
+        fixture.power_profiles.manual_override("power-saver")
+
+        with self.assertRaises(BenchmarkLockError) as raised:
+            policy.verify()
+
+        self.assertEqual(raised.exception.code, "benchmark_policy_drift")
+        self.assertIn("power-profiles-daemon state changed", str(raised.exception))
+        policy.leave()
+        self.assertEqual(fixture.power_profiles.active_profile, "power-saver")
+        self.assertEqual(fixture.power_profiles.release_calls, 0)
+        self.assertEqual(fixture.level(fixture.identities[0]), "auto")
 
     def test_kfd_is_checked_at_preflight_not_during_a_running_lease(self) -> None:
         fixture = PolicyFixture(self)

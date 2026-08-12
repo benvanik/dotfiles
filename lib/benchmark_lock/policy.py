@@ -52,7 +52,8 @@ _GPU_LEVELS = frozenset(
 )
 _AMD_VENDOR_ID = "0x1002"
 _DEFAULT_GPU_CLASS = "0x030000"
-_HELD_GPU_LEVEL = "high"
+_HELD_DISPLAY_GPU_LEVEL = "high"
+_HELD_PROCESSING_ACCELERATOR_LEVEL = "profile_peak"
 _POWER_PROFILE = "performance"
 _POWER_PROFILE_APPLICATION_ID = "com.benchmark-lock.host-policy"
 _POWER_PROFILE_REASON = "exclusive benchmark lease"
@@ -1471,6 +1472,12 @@ class FixedHostPolicy:
             reason=_POWER_PROFILE_REASON,
         )
 
+    @staticmethod
+    def _held_gpu_level(gpu: AmdGpuIdentity) -> str:
+        if gpu.device_class.startswith("0x12"):
+            return _HELD_PROCESSING_ACCELERATOR_LEVEL
+        return _HELD_DISPLAY_GPU_LEVEL
+
     def _select_cpu_authority(
         self,
         status: PowerProfileStatus,
@@ -1581,9 +1588,11 @@ class FixedHostPolicy:
                     f"cannot audit GPU {gpu.bdf}: {error}",
                     code="benchmark_policy_drift",
                 ) from error
-            if level != _HELD_GPU_LEVEL:
+            expected_level = self._held_gpu_level(gpu)
+            if level != expected_level:
                 raise _policy_error(
-                    f"GPU {gpu.bdf} drifted to {level!r}",
+                    f"GPU {gpu.bdf} drifted from {expected_level!r} "
+                    f"to {level!r}",
                     code="benchmark_policy_drift",
                 )
 
@@ -1725,7 +1734,7 @@ class FixedHostPolicy:
                     application_id=_POWER_PROFILE_APPLICATION_ID,
                 )
             for gpu in self._config.gpus:
-                self._filesystem.write_gpu_level(gpu, _HELD_GPU_LEVEL)
+                self._filesystem.write_gpu_level(gpu, self._held_gpu_level(gpu))
             self._verify_held()
         except Exception as error:
             original = self._as_error(

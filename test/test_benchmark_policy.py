@@ -463,7 +463,7 @@ class FixedHostPolicyConfigTest(unittest.TestCase):
         )
         policy = fixture.policy()
         policy.enter()
-        self.assertEqual(fixture.level(identity), "high")
+        self.assertEqual(fixture.level(identity), "profile_peak")
         policy.leave()
         self.assertEqual(fixture.level(identity), "auto")
 

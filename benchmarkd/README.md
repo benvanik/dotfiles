@@ -21,8 +21,9 @@ pidfds, and the fixed host policy selected by the administrator:
 
 - one explicit CPU authority: a `power-profiles-daemon` performance hold when
   available, otherwise an already-fixed Linux cpufreq performance baseline;
-- `power_dpm_force_performance_level=high` for the exact configured AMD PCI
-  identities;
+- a class-correct AMDGPU profiling level for the exact configured PCI
+  identities: `high` for display GPUs and `profile_peak` for processing
+  accelerators;
 - a configured-GPU KFD ownership check immediately before every grant.
 
 The policy baseline is journaled before the first mutation and restored after

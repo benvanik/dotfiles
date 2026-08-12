@@ -27,6 +27,10 @@ _HEX_REVISION_PATTERN = re.compile(r"0x[0-9a-f]{2}")
 _PCI_CLASS_PATTERN = re.compile(r"0x[0-9a-f]{6}")
 _AMD_GPU_CLASS_PATTERN = re.compile(r"0x(?:03|12)[0-9a-f]{4}")
 _UNIQUE_ID_PATTERN = re.compile(r"[0-9a-f]{1,64}")
+_KFD_NODE_PATTERN = re.compile(r"(?:0|[1-9][0-9]{0,9})")
+_KFD_PROCESS_PATTERN = re.compile(r"[1-9][0-9]{0,9}")
+_KFD_QUEUE_PATTERN = re.compile(r"(?:0|[1-9][0-9]{0,9})")
+_KFD_DECIMAL_PATTERN = re.compile(r"(?:0|[1-9][0-9]{0,19})")
 _BOOT_ID_PATTERN = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
     r"[0-9a-f]{4}-[0-9a-f]{12}"
@@ -52,6 +56,10 @@ _POWER_PROFILE_APPLICATION_ID = "com.benchmark-lock.host-policy"
 _POWER_PROFILE_REASON = "exclusive benchmark lease"
 _JOURNAL_SCHEMA = 1
 _MAX_JOURNAL_BYTES = 1024 * 1024
+_MAX_KFD_PROPERTIES_BYTES = 4096
+_MAX_KFD_DECIMAL_BYTES = 21
+_MAX_UINT32 = (1 << 32) - 1
+_MAX_UINT64 = (1 << 64) - 1
 
 
 def _policy_error(message: str, *, code: str) -> BenchmarkLockError:
@@ -354,8 +362,11 @@ class HostFilesystem(Protocol):
     def boot_id(self) -> str:
         """Read the current kernel boot identity."""
 
-    def assert_kfd_clean(self) -> None:
-        """Fail when any KFD process currently owns compute resources."""
+    def assert_kfd_gpus_unowned(
+        self,
+        expected: Sequence[AmdGpuIdentity],
+    ) -> None:
+        """Fail when a KFD process owns a configured GPU."""
 
     def assert_gpu_identity(self, expected: AmdGpuIdentity) -> None:
         """Fail unless the selected BDF still names the exact GPU."""
@@ -380,7 +391,12 @@ class LinuxHostFilesystem:
         self._boot_id_path = pathlib.Path(boot_id_path)
 
     @staticmethod
-    def _read_single_line(path: pathlib.Path, *, description: str) -> str:
+    def _read_bounded_file(
+        path: pathlib.Path,
+        *,
+        maximum_bytes: int,
+        description: str,
+    ) -> bytes:
         flags = os.O_RDONLY | os.O_CLOEXEC
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
@@ -393,19 +409,28 @@ class LinuxHostFilesystem:
             ) from error
         try:
             try:
-                data = os.read(descriptor, 257)
+                payload = os.read(descriptor, maximum_bytes + 1)
             except OSError as error:
                 raise _policy_error(
                     f"cannot read {description}: {error}",
                     code="benchmark_policy_unavailable",
                 ) from error
-            if len(data) > 256:
-                raise _policy_error(
-                    f"{description} exceeds its fixed representation",
-                    code="benchmark_policy_unavailable",
-                )
         finally:
             os.close(descriptor)
+        if len(payload) > maximum_bytes:
+            raise _policy_error(
+                f"{description} exceeds its fixed representation",
+                code="benchmark_policy_unavailable",
+            )
+        return payload
+
+    @classmethod
+    def _read_single_line(cls, path: pathlib.Path, *, description: str) -> str:
+        data = cls._read_bounded_file(
+            path,
+            maximum_bytes=256,
+            description=description,
+        )
         try:
             text = data.decode("ascii")
         except UnicodeDecodeError as error:
@@ -452,7 +477,230 @@ class LinuxHostFilesystem:
             )
         return value
 
-    def assert_kfd_clean(self) -> None:
+    @classmethod
+    def _read_kfd_decimal(
+        cls,
+        path: pathlib.Path,
+        *,
+        maximum: int,
+        description: str,
+    ) -> int:
+        payload = cls._read_bounded_file(
+            path,
+            maximum_bytes=_MAX_KFD_DECIMAL_BYTES,
+            description=description,
+        )
+        try:
+            text = payload.decode("ascii")
+        except UnicodeDecodeError as error:
+            raise _policy_error(
+                f"{description} is not ASCII",
+                code="benchmark_policy_unavailable",
+            ) from error
+        if text.endswith("\n"):
+            text = text[:-1]
+        if not _matches(_KFD_DECIMAL_PATTERN, text):
+            raise _policy_error(
+                f"{description} is not a canonical decimal integer",
+                code="benchmark_policy_unavailable",
+            )
+        value = int(text)
+        if value > maximum:
+            raise _policy_error(
+                f"{description} exceeds its kernel representation",
+                code="benchmark_policy_unavailable",
+            )
+        return value
+
+    @classmethod
+    def _read_optional_kfd_decimal(
+        cls,
+        path: pathlib.Path,
+        *,
+        maximum: int,
+        description: str,
+    ) -> int | None:
+        try:
+            return cls._read_kfd_decimal(
+                path,
+                maximum=maximum,
+                description=description,
+            )
+        except BenchmarkLockError as error:
+            if isinstance(error.__cause__, FileNotFoundError):
+                return None
+            raise
+
+    @classmethod
+    def _read_kfd_node_location(
+        cls,
+        path: pathlib.Path,
+        *,
+        node_name: str,
+    ) -> tuple[int, int]:
+        description = f"KFD topology node {node_name} properties"
+        payload = cls._read_bounded_file(
+            path,
+            maximum_bytes=_MAX_KFD_PROPERTIES_BYTES,
+            description=description,
+        )
+        try:
+            text = payload.decode("ascii")
+        except UnicodeDecodeError as error:
+            raise _policy_error(
+                f"{description} is not ASCII",
+                code="benchmark_policy_unavailable",
+            ) from error
+        if not text.endswith("\n") or "\r" in text:
+            raise _policy_error(
+                f"{description} is not canonical",
+                code="benchmark_policy_unavailable",
+            )
+        values: dict[str, int] = {}
+        for line in text[:-1].split("\n"):
+            key, separator, value_text = line.partition(" ")
+            if key not in {"domain", "location_id"}:
+                continue
+            if (
+                not separator
+                or key in values
+                or not _matches(_KFD_DECIMAL_PATTERN, value_text)
+            ):
+                raise _policy_error(
+                    f"{description} has a malformed {key}",
+                    code="benchmark_policy_unavailable",
+                )
+            value = int(value_text)
+            if value > _MAX_UINT32:
+                raise _policy_error(
+                    f"{description} has an out-of-range {key}",
+                    code="benchmark_policy_unavailable",
+                )
+            values[key] = value
+        if values.keys() != {"domain", "location_id"}:
+            raise _policy_error(
+                f"{description} does not identify a PCI location",
+                code="benchmark_policy_unavailable",
+            )
+        return values["domain"], values["location_id"]
+
+    @staticmethod
+    def _kfd_location(expected: AmdGpuIdentity) -> tuple[int, int]:
+        domain_text, bus_text, device_function = expected.bdf.split(":")
+        device_text, function_text = device_function.split(".")
+        domain = int(domain_text, 16)
+        location = (
+            (int(bus_text, 16) << 8)
+            | (int(device_text, 16) << 3)
+            | int(function_text, 16)
+        )
+        return domain, location
+
+    def _kfd_gpu_ids(
+        self,
+        expected: Sequence[AmdGpuIdentity],
+    ) -> frozenset[int]:
+        expected_locations = {
+            self._kfd_location(identity): identity.bdf for identity in expected
+        }
+        matched_bdfs: set[str] = set()
+        gpu_ids: set[int] = set()
+        topology_root = self._sysfs_root / "class/kfd/kfd/topology/nodes"
+        try:
+            with os.scandir(topology_root) as iterator:
+                entries = tuple(iterator)
+        except OSError as error:
+            raise _policy_error(
+                f"cannot inspect KFD topology: {error}",
+                code="benchmark_policy_unavailable",
+            ) from error
+        for entry in entries:
+            if not _matches(_KFD_NODE_PATTERN, entry.name):
+                raise _policy_error(
+                    "KFD topology contains an unknown node",
+                    code="benchmark_policy_unavailable",
+                )
+            node_path = topology_root / entry.name
+            gpu_id = self._read_kfd_decimal(
+                node_path / "gpu_id",
+                maximum=_MAX_UINT32,
+                description=f"KFD topology node {entry.name} GPU ID",
+            )
+            if gpu_id == 0:
+                continue
+            location = self._read_kfd_node_location(
+                node_path / "properties",
+                node_name=entry.name,
+            )
+            bdf = expected_locations.get(location)
+            if bdf is None:
+                continue
+            matched_bdfs.add(bdf)
+            gpu_ids.add(gpu_id)
+        missing_bdfs = sorted(set(expected_locations.values()) - matched_bdfs)
+        if missing_bdfs:
+            raise _policy_error(
+                "configured PCI GPUs are absent from KFD topology: "
+                + ", ".join(missing_bdfs),
+                code="benchmark_policy_unavailable",
+            )
+        return frozenset(gpu_ids)
+
+    def _kfd_process_uses_gpu(
+        self,
+        process_path: pathlib.Path,
+        *,
+        process_id: str,
+        gpu_ids: frozenset[int],
+    ) -> bool:
+        queues_path = process_path / "queues"
+        try:
+            with os.scandir(queues_path) as iterator:
+                queue_entries = tuple(iterator)
+        except FileNotFoundError:
+            if process_path.exists():
+                raise _policy_error(
+                    f"KFD process {process_id} has no queue ledger",
+                    code="benchmark_policy_unavailable",
+                )
+            return False
+        except OSError as error:
+            raise _policy_error(
+                f"cannot inspect KFD process {process_id} queues: {error}",
+                code="benchmark_policy_unavailable",
+            ) from error
+        for entry in queue_entries:
+            if not _matches(_KFD_QUEUE_PATTERN, entry.name):
+                raise _policy_error(
+                    f"KFD process {process_id} has an unknown queue",
+                    code="benchmark_policy_unavailable",
+                )
+            gpu_id = self._read_optional_kfd_decimal(
+                queues_path / entry.name / "gpuid",
+                maximum=_MAX_UINT32,
+                description=(
+                    f"KFD process {process_id} queue {entry.name} GPU ID"
+                ),
+            )
+            if gpu_id in gpu_ids:
+                return True
+        for gpu_id in gpu_ids:
+            vram_bytes = self._read_optional_kfd_decimal(
+                process_path / f"vram_{gpu_id}",
+                maximum=_MAX_UINT64,
+                description=(
+                    f"KFD process {process_id} GPU {gpu_id} VRAM usage"
+                ),
+            )
+            if vram_bytes:
+                return True
+        return False
+
+    def assert_kfd_gpus_unowned(
+        self,
+        expected: Sequence[AmdGpuIdentity],
+    ) -> None:
+        gpu_ids = self._kfd_gpu_ids(expected)
         process_root = self._sysfs_root / "class/kfd/kfd/proc"
         try:
             with os.scandir(process_root) as iterator:
@@ -462,15 +710,23 @@ class LinuxHostFilesystem:
                 f"cannot inspect KFD process ownership: {error}",
                 code="benchmark_policy_unavailable",
             ) from error
-        if entries:
-            names = tuple(sorted(entry.name for entry in entries))
-            if any(not name.isdecimal() for name in names):
+        owners: list[str] = []
+        for entry in entries:
+            if not _matches(_KFD_PROCESS_PATTERN, entry.name):
                 raise _policy_error(
                     "KFD process ownership contains an unknown entry",
                     code="benchmark_policy_unavailable",
                 )
+            if self._kfd_process_uses_gpu(
+                process_root / entry.name,
+                process_id=entry.name,
+                gpu_ids=gpu_ids,
+            ):
+                owners.append(entry.name)
+        if owners:
             raise _policy_error(
-                "KFD compute is already owned by process IDs " + ", ".join(names),
+                "configured KFD GPUs are already owned by process IDs "
+                + ", ".join(sorted(owners, key=int)),
                 code="benchmark_external_compute",
             )
 
@@ -1151,9 +1407,9 @@ class FixedHostPolicy:
                 )
 
     def preflight(self) -> None:
-        """Require an unowned KFD boundary immediately before a grant."""
+        """Require unowned configured GPUs immediately before a grant."""
 
-        self._filesystem.assert_kfd_clean()
+        self._filesystem.assert_kfd_gpus_unowned(self._config.gpus)
 
     def verify(self) -> None:
         if self._state != "held":

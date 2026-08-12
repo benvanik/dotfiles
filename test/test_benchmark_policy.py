@@ -117,9 +117,12 @@ class RecordingFilesystem:
     def boot_id(self) -> str:
         return self.delegate.boot_id()
 
-    def assert_kfd_clean(self) -> None:
+    def assert_kfd_gpus_unowned(
+        self,
+        expected: tuple[AmdGpuIdentity, ...],
+    ) -> None:
         self.kfd_checks += 1
-        self.delegate.assert_kfd_clean()
+        self.delegate.assert_kfd_gpus_unowned(expected)
 
     def assert_gpu_identity(self, expected: AmdGpuIdentity) -> None:
         self.delegate.assert_gpu_identity(expected)
@@ -178,12 +181,17 @@ class PolicyFixture:
         self.devices_root = self.sysfs_root / "devices"
         self.pci_links = self.sysfs_root / "bus/pci/devices"
         self.kfd_processes = self.sysfs_root / "class/kfd/kfd/proc"
+        self.kfd_nodes = self.sysfs_root / "class/kfd/kfd/topology/nodes"
         self.boot_id_path = self.root / "boot_id"
         self.state_root = self.root / "state"
         self.journal_path = self.state_root / "active-epoch.json"
         self.devices_root.mkdir(parents=True)
         self.pci_links.mkdir(parents=True)
         self.kfd_processes.mkdir(parents=True)
+        self.kfd_nodes.mkdir(parents=True)
+        cpu_node = self.kfd_nodes / "0"
+        cpu_node.mkdir()
+        (cpu_node / "gpu_id").write_text("0\n", encoding="ascii")
         self.state_root.mkdir(mode=0o700)
         self.boot_id_path.write_text(f"{_BOOT_ID}\n", encoding="ascii")
         self.identities = tuple(
@@ -247,7 +255,51 @@ class PolicyFixture:
         for name, value in values.items():
             (device / name).write_text(f"{value}\n", encoding="ascii")
         (self.pci_links / bdf).symlink_to(device)
+        self._create_kfd_node(index + 2, 1000 + index, bdf)
         return identity
+
+    def _create_kfd_node(self, node: int, gpu_id: int, bdf: str) -> None:
+        domain_text, bus_text, device_function = bdf.split(":")
+        device_text, function_text = device_function.split(".")
+        location = (
+            (int(bus_text, 16) << 8)
+            | (int(device_text, 16) << 3)
+            | int(function_text, 16)
+        )
+        node_path = self.kfd_nodes / str(node)
+        node_path.mkdir()
+        (node_path / "gpu_id").write_text(f"{gpu_id}\n", encoding="ascii")
+        (node_path / "properties").write_text(
+            f"cpu_cores_count 0\n"
+            f"location_id {location}\n"
+            f"domain {int(domain_text, 16)}\n",
+            encoding="ascii",
+        )
+
+    def kfd_gpu_id(self, identity: AmdGpuIdentity) -> int:
+        return 1000 + self.identities.index(identity)
+
+    def create_kfd_process(
+        self,
+        process_id: int,
+        *,
+        queue_gpu_ids: tuple[int, ...] = (),
+        vram_by_gpu: dict[int, int] | None = None,
+    ) -> pathlib.Path:
+        process_path = self.kfd_processes / str(process_id)
+        queues_path = process_path / "queues"
+        queues_path.mkdir(parents=True)
+        for queue_id, gpu_id in enumerate(queue_gpu_ids):
+            queue_path = queues_path / str(queue_id)
+            queue_path.mkdir()
+            # KFD's queue gpuid attribute intentionally omits a newline.
+            (queue_path / "gpuid").write_text(str(gpu_id), encoding="ascii")
+        for gpu_id, vram_bytes in (vram_by_gpu or {}).items():
+            (process_path / f"vram_{gpu_id}").write_text(
+                f"{vram_bytes}\n",
+                encoding="ascii",
+            )
+        return process_path
 
     def policy(
         self,
@@ -458,11 +510,14 @@ class FixedHostPolicyTest(unittest.TestCase):
         self.assertEqual(fixture.power_profiles.release_calls, 1)
         self.assertFalse(fixture.journal_path.exists())
 
-    def test_kfd_is_clean_at_preflight_not_during_a_running_lease(self) -> None:
+    def test_kfd_is_checked_at_preflight_not_during_a_running_lease(self) -> None:
         fixture = PolicyFixture(self)
         policy = fixture.policy()
         policy.enter()
-        (fixture.kfd_processes / "1234").mkdir()
+        fixture.create_kfd_process(
+            1234,
+            queue_gpu_ids=(fixture.kfd_gpu_id(fixture.identities[0]),),
+        )
 
         policy.verify()
         with self.assertRaises(BenchmarkLockError) as raised:
@@ -473,7 +528,10 @@ class FixedHostPolicyTest(unittest.TestCase):
 
     def test_kfd_owner_rejects_enter_before_journal_or_mutation(self) -> None:
         fixture = PolicyFixture(self)
-        (fixture.kfd_processes / "321").mkdir()
+        fixture.create_kfd_process(
+            321,
+            queue_gpu_ids=(fixture.kfd_gpu_id(fixture.identities[0]),),
+        )
         policy = fixture.policy()
 
         with self.assertRaises(BenchmarkLockError) as raised:
@@ -484,6 +542,97 @@ class FixedHostPolicyTest(unittest.TestCase):
         self.assertFalse(fixture.journal_path.exists())
         self.assertEqual(fixture.power_profiles.hold_calls, 0)
         self.assertEqual(fixture.filesystem.writes, [])
+
+    def test_kfd_owner_on_unconfigured_gpu_does_not_block_enter(self) -> None:
+        fixture = PolicyFixture(self, gpu_count=2)
+        fixture.config = FixedHostPolicyConfig((fixture.identities[0],))
+        fixture.create_kfd_process(
+            421,
+            queue_gpu_ids=(fixture.kfd_gpu_id(fixture.identities[1]),),
+            vram_by_gpu={fixture.kfd_gpu_id(fixture.identities[1]): 4096},
+        )
+        policy = fixture.policy()
+
+        policy.enter()
+
+        self.assertEqual(policy.state, "held")
+        self.assertEqual(fixture.filesystem.kfd_checks, 1)
+        policy.leave()
+
+    def test_kfd_vram_owner_without_a_queue_blocks_enter(self) -> None:
+        fixture = PolicyFixture(self)
+        gpu_id = fixture.kfd_gpu_id(fixture.identities[0])
+        fixture.create_kfd_process(521, vram_by_gpu={gpu_id: 4096})
+
+        with self.assertRaises(BenchmarkLockError) as raised:
+            fixture.policy().enter()
+
+        self.assertEqual(raised.exception.code, "benchmark_external_compute")
+
+    def test_kfd_zero_vram_without_a_queue_does_not_block_enter(self) -> None:
+        fixture = PolicyFixture(self)
+        gpu_id = fixture.kfd_gpu_id(fixture.identities[0])
+        fixture.create_kfd_process(621, vram_by_gpu={gpu_id: 0})
+        policy = fixture.policy()
+
+        policy.enter()
+
+        self.assertEqual(policy.state, "held")
+        policy.leave()
+
+    def test_kfd_open_without_selected_gpu_resources_does_not_block(self) -> None:
+        fixture = PolicyFixture(self)
+        fixture.create_kfd_process(701)
+        policy = fixture.policy()
+
+        policy.enter()
+
+        self.assertEqual(policy.state, "held")
+        policy.leave()
+
+    def test_kfd_vram_counter_preserves_its_64_bit_kernel_range(self) -> None:
+        fixture = PolicyFixture(self)
+        gpu_id = fixture.kfd_gpu_id(fixture.identities[0])
+        fixture.create_kfd_process(
+            711,
+            vram_by_gpu={gpu_id: (1 << 64) - 1},
+        )
+
+        with self.assertRaises(BenchmarkLockError) as raised:
+            fixture.policy().enter()
+
+        self.assertEqual(raised.exception.code, "benchmark_external_compute")
+
+    def test_every_kfd_partition_at_the_selected_bdf_is_owned(self) -> None:
+        fixture = PolicyFixture(self)
+        partition_gpu_id = 2001
+        fixture._create_kfd_node(
+            3,
+            partition_gpu_id,
+            fixture.identities[0].bdf,
+        )
+        fixture.create_kfd_process(
+            721,
+            queue_gpu_ids=(partition_gpu_id,),
+        )
+
+        with self.assertRaises(BenchmarkLockError) as raised:
+            fixture.policy().enter()
+
+        self.assertEqual(raised.exception.code, "benchmark_external_compute")
+
+    def test_missing_selected_kfd_topology_fails_closed(self) -> None:
+        fixture = PolicyFixture(self)
+        (fixture.kfd_nodes / "2" / "properties").write_text(
+            "location_id 0\ndomain 0\n",
+            encoding="ascii",
+        )
+
+        with self.assertRaises(BenchmarkLockError) as raised:
+            fixture.policy().enter()
+
+        self.assertEqual(raised.exception.code, "benchmark_policy_unavailable")
+        self.assertIn("absent from KFD topology", str(raised.exception))
 
     def test_partial_apply_restores_every_gpu_and_releases_hold(self) -> None:
         fixture = PolicyFixture(self, gpu_count=2)

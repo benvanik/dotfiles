@@ -22,7 +22,7 @@ pidfds, and the fixed host policy selected by the administrator:
 - a `power-profiles-daemon` performance hold;
 - `power_dpm_force_performance_level=high` for the exact configured AMD PCI
   identities;
-- a KFD ownership check immediately before every grant.
+- a configured-GPU KFD ownership check immediately before every grant.
 
 The policy baseline is journaled before the first mutation and restored after
 the last lease. Direct FIFO handoff keeps one policy epoch across adjacent
@@ -31,9 +31,10 @@ GPU identity or restoration ambiguity fails closed and retains the recovery
 journal.
 
 This is a truthful cooperative benchmark boundary, not a global GPU
-reservation. The pre-grant KFD check rejects existing ROCm compute owners, but
-the broker does not evict graphics users or continuously reject expected KFD
-activity created by the running benchmark.
+reservation. The pre-grant KFD check rejects queues or resident VRAM owned on
+the configured GPUs. A process merely holding KFD open, or using another GPU,
+does not block admission. The broker does not evict graphics users or
+continuously reject expected KFD activity created by the running benchmark.
 
 ## Lifetime and recovery
 
@@ -74,8 +75,9 @@ production boundary requires:
   `performance` profile and the profile-hold API.
 - The AMDGPU/KFD sysfs ABI for every configured GPU: immutable PCI display
   identity fields, an optional `unique_id`, a readable and writable
-  `power_dpm_force_performance_level`, and the KFD ownership ledger at
-  `/sys/class/kfd/kfd/proc`.
+  `power_dpm_force_performance_level`, the PCI-to-GPU-ID topology under
+  `/sys/class/kfd/kfd/topology/nodes`, and the queue and VRAM ownership ledger
+  at `/sys/class/kfd/kfd/proc`.
 
 ROCm userspace is not a broker dependency. The broker observes the kernel KFD
 ownership ledger and fixed sysfs nodes directly, so an installation such as
@@ -85,10 +87,13 @@ The current development host reports systemd 257, Linux 6.17, and
 `/usr/bin/python3` 3.13 with both required modules. These are observed versions,
 not tighter minimums than the capabilities above.
 
-At admission time the selected PCI identities must still match, the KFD
-ownership ledger must be empty, the performance profile must not be degraded,
-and no other PPD profile hold may exist. Those conditions are checked again
-for each grant; an installation succeeding does not waive them.
+At admission time the selected PCI identities must still match, the selected
+KFD GPU IDs must have no externally owned queues or resident VRAM, the
+performance profile must not be degraded, and no other PPD profile hold may
+exist. Those conditions are checked again for each grant; an installation
+succeeding does not waive them. Work on another GPU may still contend for CPU,
+memory, or interconnect resources, so a shared-host run is directional evidence
+rather than whole-machine isolation.
 
 ## One-time installation
 

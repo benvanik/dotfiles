@@ -351,8 +351,19 @@ quality, or development velocity.
 ## Git And Shared Worktrees
 
 - Assume the worktree may contain user or agent edits you did not make. Do not
-  revert, clean, stash, amend, or otherwise rewrite unrelated work unless the
-  user explicitly asks.
+  revert, clean, amend, or otherwise rewrite unrelated work unless the user
+  explicitly asks. A named stash is the normal Git mechanism for temporarily
+  isolating known work in the assigned worktree: scope it to the intended paths
+  when possible, record the exact stash it created, verify the resulting tree,
+  perform the operation, then restore that exact stash. Never use an anonymous
+  broad stash or an unqualified `stash pop` whose identity could move in the
+  repository-wide stash stack.
+- Worktrees are expensive, persistent project state, not disposable scratch or
+  commit-isolation machinery. Never create a worktree autonomously to escape a
+  dirty tree, validate a partial index, manufacture a clean build, stage a
+  commit, or run a one-off experiment. Create one only when the user explicitly
+  requests or approves a separate concurrent workstream. Manage ordinary
+  sequencing, validation, and commit archaeology inside the assigned worktree.
 - Create every Git worktree, including temporary, review, and experimental
   worktrees, with `project-worktree-init <branch> [name]`. Never invoke
   `git worktree add`, move a worktree manually, or construct a worktree by
@@ -372,9 +383,11 @@ quality, or development velocity.
   approval, inventory the worktree, its branch, Git status, untracked and
   ignored payload, `.notes/`, and any active agent or process ownership.
 - If `project-worktree-deinit` refuses removal, stop and report the payload it
-  protected. Never bypass it with `--force`, direct Git commands, filesystem
-  deletion, or a manual approximation of the wrapper. Worktree preservation is
-  the contract; removal is not required to complete cleanup.
+  protected. After the user explicitly approves discarding that exact
+  inventoried payload, use the wrapper's `--discard` mode. Never bypass the
+  wrapper with `--force`, direct Git commands, filesystem deletion, or a manual
+  approximation. Worktree preservation is the default contract; removal is not
+  required to complete cleanup without explicit discard approval.
 - Check actual git state with `git status`, `git diff`, and `git log` before
   making claims about the tree.
 - Commit architecture is part of implementation architecture. Before editing a
@@ -403,6 +416,9 @@ quality, or development velocity.
   that hybrid state is possible, finish or relocate the dependent work, make
   the file whole at the commit boundary, or validate an exact index snapshot;
   do not repeatedly retry a hook against an incoherent filesystem view.
+  Relocation means reorganizing already-authorized work or using an existing
+  assigned worktree; it never authorizes creating another worktree. Use a
+  named, scoped stash for temporary isolation in the assigned worktree.
 - Bypassing hooks is not validation. If one hook cannot operate on a partial
   index, bypass only that hook when the tooling permits. Otherwise run every
   skipped policy explicitly and audit the stored commit immediately afterward.

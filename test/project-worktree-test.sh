@@ -378,6 +378,44 @@ EOF
 chmod +x "$TMUX_STUB_DIR/tmux"
 ln -s tmux "$TMUX_STUB_DIR/byobu"
 
+# Explicit discard is reserved for an already-inventoried worktree. Content
+# changing behind the same porcelain status entry while the session stops must
+# invalidate that inventory instead of silently deleting the new bytes.
+(
+    cd "$MAIN_WORKTREE"
+    "$BASH_EXECUTABLE" "$DOTFILES/bin/project-worktree-init" \
+        users/test/discard discard >/dev/null
+)
+DISCARD_WORKTREE="$PROJECT_ROOT/discard"
+DISCARD_PAYLOAD="$DISCARD_WORKTREE/local-state"
+printf 'state before shutdown\n' > "$DISCARD_PAYLOAD"
+if (
+    cd "$MAIN_WORKTREE"
+    PATH="$TMUX_STUB_DIR:$PATH" \
+    TMUX_LOG="$TMUX_LOG" \
+    TMUX_QUIESCE_WRITE_PATH="$DISCARD_PAYLOAD" \
+        "$BASH_EXECUTABLE" "$DOTFILES/bin/project-worktree-deinit" \
+        --discard discard >/dev/null
+) >/dev/null 2>&1; then
+    fail "discard ignored payload content written while quiescing its session"
+fi
+[ "$(cat "$DISCARD_PAYLOAD")" = "state written during session shutdown" ] || \
+    fail "discard content-change fixture did not update its payload"
+[ -L "$DISCARD_WORKTREE/AGENTS.override.md" ] || \
+    fail "discard refusal did not restore the managed override"
+[ -L "$DISCARD_WORKTREE/.bazelrc.local" ] || \
+    fail "discard refusal did not restore the managed bazel configuration"
+[ -L "$DISCARD_WORKTREE/.beads" ] || \
+    fail "discard refusal did not restore the managed beads link"
+(
+    cd "$MAIN_WORKTREE"
+    PATH="$TMUX_STUB_DIR:$PATH" TMUX_LOG="$TMUX_LOG" \
+        "$BASH_EXECUTABLE" "$DOTFILES/bin/project-worktree-deinit" \
+        --discard discard >/dev/null
+)
+[ ! -e "$DISCARD_WORKTREE" ] || \
+    fail "explicit discard did not remove its inventoried worktree"
+
 if (
     cd "$MAIN_WORKTREE"
     PATH="$TMUX_STUB_DIR:$PATH" \

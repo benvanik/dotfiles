@@ -19,13 +19,18 @@ show_help() {
 project-worktree-deinit - Remove a sibling Git worktree
 
 USAGE
-    project-worktree-deinit <name>
+    project-worktree-deinit [--discard] <name>
 
 The command must be run from another worktree in the same repository. Git
 itself can delete ignored payload while removing a worktree, so this wrapper
 refuses modified, untracked, or ignored files, stops the associated tmux
 session, and repeats the full check before removal. No build directories or
 project configuration are removed separately.
+
+    --discard
+        Remove the exact inventoried payload after explicit operator approval.
+        The command still stops the associated session and refuses removal if
+        the payload changes between the initial and final inventories.
 EOF
 }
 
@@ -35,6 +40,12 @@ case "${1:-}" in
         exit 0
         ;;
 esac
+
+DISCARD=false
+if [ "${1:-}" = "--discard" ]; then
+    DISCARD=true
+    shift
+fi
 
 if [ $# -ne 1 ]; then
     show_help >&2
@@ -124,6 +135,63 @@ inspect_worktree_contents() {
     fi
 }
 
+inventory_worktree_contents() {
+    git -C "$WORKTREE_PATH" status \
+        --porcelain=v1 \
+        --untracked-files=all \
+        --ignored=matching
+}
+
+fingerprint_worktree_path() {
+    local relative_path="$1"
+    local absolute_path="$WORKTREE_PATH/$relative_path"
+
+    printf 'path\0%s\0' "$relative_path"
+    if [ -L "$absolute_path" ]; then
+        printf 'symlink\0%s\0' "$(readlink "$absolute_path")"
+    elif [ -f "$absolute_path" ]; then
+        if [ -x "$absolute_path" ]; then
+            printf 'executable\0'
+        else
+            printf 'file\0'
+        fi
+        git -C "$WORKTREE_PATH" hash-object --no-filters -- "$absolute_path"
+    elif [ -e "$absolute_path" ]; then
+        printf 'special\0'
+        LC_ALL=C ls -ldn -- "$absolute_path"
+    else
+        printf 'absent\0'
+    fi
+}
+
+fingerprint_worktree_payload() {
+    local index_tree
+    if ! index_tree=$(git -C "$WORKTREE_PATH" write-tree); then
+        return 1
+    fi
+
+    {
+        # The index may change without changing porcelain's two-character state.
+        printf 'index\0%s\0' "$index_tree"
+
+        # Hash every working-tree file that Git would not reproduce from the
+        # captured index. Keep ignored files explicit even when status presents
+        # their containing directory as one entry.
+        while IFS= read -r -d '' relative_path; do
+            fingerprint_worktree_path "$relative_path"
+        done < <(
+            git -C "$WORKTREE_PATH" ls-files -z \
+                --modified --deleted --others --exclude-standard
+        )
+        while IFS= read -r -d '' relative_path; do
+            fingerprint_worktree_path "$relative_path"
+        done < <(
+            git -C "$WORKTREE_PATH" ls-files -z \
+                --others --ignored --exclude-standard
+        )
+    } | git -C "$WORKTREE_PATH" hash-object --stdin
+}
+
 # The initializer owns these exact symlinks. Remove them before asking Git to
 # evaluate cleanliness, restoring them if any other state blocks removal.
 MANAGED_SHARED_PATHS=()
@@ -139,10 +207,29 @@ done < <(project_worktree_shared_entries)
 # Git's worktree remover ignores ignored files during its cleanliness check
 # and then deletes them recursively. Refuse every remaining payload class so
 # build trees, local issue state, and caches cannot disappear silently.
-if ! inspect_worktree_contents; then
-    restore_managed_links
-    error "Worktree removal stopped; managed state was restored."
-    exit 1
+if [ "$DISCARD" = "true" ]; then
+    if ! INITIAL_WORKTREE_STATUS=$(inventory_worktree_contents); then
+        restore_managed_links
+        error "Could not inspect worktree contents; managed state was restored."
+        exit 1
+    fi
+    if ! INITIAL_WORKTREE_FINGERPRINT=$(fingerprint_worktree_payload); then
+        restore_managed_links
+        error "Could not fingerprint worktree contents; managed state was restored."
+        exit 1
+    fi
+    error "Discarding explicitly approved worktree payload:"
+    if [ -n "$INITIAL_WORKTREE_STATUS" ]; then
+        printf '%s\n' "$INITIAL_WORKTREE_STATUS" >&2
+    else
+        error "No modified, untracked, or ignored payload was found."
+    fi
+else
+    if ! inspect_worktree_contents; then
+        restore_managed_links
+        error "Worktree removal stopped; managed state was restored."
+        exit 1
+    fi
 fi
 
 # Quiesce the exact associated session before the final inspection. A running
@@ -154,13 +241,37 @@ if ! "$SCRIPT_DIR/project-deinit" \
     error "Could not stop the associated session; managed state was restored."
     exit 1
 fi
-if ! inspect_worktree_contents; then
-    restore_managed_links
-    error "Worktree changed while its session stopped; managed state was restored."
-    exit 1
+if [ "$DISCARD" = "true" ]; then
+    if ! FINAL_WORKTREE_STATUS=$(inventory_worktree_contents); then
+        restore_managed_links
+        error "Could not reinspect worktree contents; managed state was restored."
+        exit 1
+    fi
+    if ! FINAL_WORKTREE_FINGERPRINT=$(fingerprint_worktree_payload); then
+        restore_managed_links
+        error "Could not refingerprint worktree contents; managed state was restored."
+        exit 1
+    fi
+    if [ "$FINAL_WORKTREE_STATUS" != "$INITIAL_WORKTREE_STATUS" ] || \
+            [ "$FINAL_WORKTREE_FINGERPRINT" != \
+                "$INITIAL_WORKTREE_FINGERPRINT" ]; then
+        restore_managed_links
+        error "Worktree changed while its session stopped; managed state was restored."
+        exit 1
+    fi
+else
+    if ! inspect_worktree_contents; then
+        restore_managed_links
+        error "Worktree changed while its session stopped; managed state was restored."
+        exit 1
+    fi
 fi
 
-if ! git -C "$MAIN_WORKTREE" worktree remove "$WORKTREE_PATH"; then
+REMOVE_ARGS=()
+if [ "$DISCARD" = "true" ]; then
+    REMOVE_ARGS+=(--force)
+fi
+if ! git -C "$MAIN_WORKTREE" worktree remove "${REMOVE_ARGS[@]}" "$WORKTREE_PATH"; then
     restore_managed_links
     error "Worktree removal failed; worktree contents were preserved."
     exit 1

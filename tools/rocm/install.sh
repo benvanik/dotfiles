@@ -116,7 +116,7 @@ fetch_latest_version() {
         return 1
     }
     selected_name=$(printf '%s' "$index_page" |
-        rg -o "\"name\": \"${prefix}[^\"]+\\.tar\\.gz\"" |
+        rg -o "\"name\": \"${prefix}[0-9][0-9A-Za-z.+-]*\\.tar\\.gz\"" |
         sed 's/^"name": "//; s/"$//' |
         sort -V |
         tail -n 1)

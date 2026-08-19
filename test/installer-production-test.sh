@@ -436,6 +436,7 @@ if [ "$#" -eq 2 ] && [ "$1" = "-fsSL" ]; then
     cat << INDEX
 {"name": "therock-dist-linux-gfx1150-10.1.0a20260818.tar.gz"},
 {"name": "therock-dist-linux-gfx1100-9.99.0a20990101.tar.gz"},
+{"name": "therock-dist-linux-gfx1150-tests-99.0.0a20990101.tar.gz"},
 {"name": "therock-dist-linux-gfx1150-$ROCM_VERSION.tar.gz"}
 INDEX
     exit 0

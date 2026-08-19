@@ -190,7 +190,7 @@ install_fonts() (
     local staged_font
     local missing_font="false"
 
-    # shellcheck disable=SC2317  # Invoked by the EXIT trap below.
+    # shellcheck disable=SC2317,SC2329  # Invoked by the EXIT trap below.
     cleanup_font_staging() {
         local final_status=$?
         trap - EXIT HUP INT TERM

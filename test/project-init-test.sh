@@ -623,13 +623,13 @@ XDG_CONFIG_HOME="$TEST_HOME/.config" \
     fail "custom history path also created the unused default directory"
 (
     cd "$QUOTED_HISTORY_PROJECT"
-    # shellcheck disable=SC2317  # Invoked by the generated .envrc.
+    # shellcheck disable=SC2317,SC2329  # Invoked by the generated .envrc.
     use_project_history() {
         printf '%s\n' "$1" > "$TEST_ROOT/captured-history-path"
     }
-    # shellcheck disable=SC2317  # Invoked by the generated .envrc.
+    # shellcheck disable=SC2317,SC2329  # Invoked by the generated .envrc.
     use_project_build_tools() { :; }
-    # shellcheck disable=SC2317  # Invoked by the generated .envrc.
+    # shellcheck disable=SC2317,SC2329  # Invoked by the generated .envrc.
     source_local_envrc() { :; }
     # shellcheck source=/dev/null
     . ./.envrc
@@ -668,14 +668,14 @@ fi
 # The direnv helper resolves a relative history directory once, after creating
 # it successfully, so later directory changes do not retarget history.
 (
-    # shellcheck disable=SC2317  # Invoked while sourcing direnvrc.
+    # shellcheck disable=SC2317,SC2329  # Invoked while sourcing direnvrc.
     source_env() {
         # shellcheck source=/dev/null
         . "$1"
     }
-    # shellcheck disable=SC2317  # Invoked while sourcing direnvrc.
+    # shellcheck disable=SC2317,SC2329  # Invoked while sourcing direnvrc.
     watch_file() { :; }
-    # shellcheck disable=SC2317  # Invoked by direnvrc on source failure.
+    # shellcheck disable=SC2317,SC2329  # Invoked by direnvrc on source failure.
     log_error() {
         printf '%s\n' "$*" >&2
     }

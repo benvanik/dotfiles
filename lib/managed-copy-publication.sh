@@ -19,7 +19,7 @@ _copy_path() (
     local backup_staging_path=""
     local staging_path=""
     # Invoked indirectly by the signal and EXIT traps below.
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317,SC2329
     cleanup_copy_staging() {
         local exit_status=$?
         local cleanup_failed=false
@@ -273,7 +273,7 @@ _preflight_copy_path() (
     local destination_parent=""
     local preflight_path=""
     # Invoked indirectly by the signal and EXIT traps below.
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317,SC2329
     cleanup_copy_preflight() {
         local exit_status=$?
         local cleanup_failed=false
@@ -403,7 +403,7 @@ _restore_copy_destination() (
     local replacement_path=""
 
     # Invoked indirectly by the signal and EXIT traps below.
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317,SC2329
     cleanup_restore_staging() {
         local exit_status=$?
         local cleanup_failed=false

@@ -143,7 +143,7 @@ with_home_transaction_lock() (
     local lock_open=false
 
     # Invoked indirectly by the EXIT trap below.
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317,SC2329
     close_home_transaction_lock() {
         local exit_status=$?
         trap - EXIT
@@ -618,7 +618,7 @@ configure_signing_locked() (
     local config_change=true
 
     # Invoked indirectly by the EXIT trap below.
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317,SC2329
     cleanup_signing_staging() {
         local exit_status=$?
         local cleanup_path=""

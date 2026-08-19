@@ -151,7 +151,7 @@ chmod 0755 "$APT_FIXTURE"
     install_tpm() {
         :
     }
-    # shellcheck disable=SC2317  # Forces both multiplexer package branches.
+    # shellcheck disable=SC2317,SC2329  # Forces both multiplexer package branches.
     command() {
         if [ "${1:-}" = "-v" ]; then
             case "${2:-}" in

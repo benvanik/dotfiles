@@ -260,7 +260,7 @@ install_linux_libxml2_compat() {
     source_url="https://download.gnome.org/sources/libxml2/2.13/$source_archive"
     (
         build_root=$(mktemp -d "${TMPDIR:-/tmp}/llvm-libxml2-compat.XXXXXXXX")
-        # shellcheck disable=SC2317  # Invoked by the EXIT trap below.
+        # shellcheck disable=SC2317,SC2329  # Invoked by the EXIT trap below.
         cleanup_libxml2_build() {
             local final_status=$?
 
@@ -338,7 +338,7 @@ verify_host_link() (
     local llvm_root="$1"
     local smoke_binary=""
 
-    # shellcheck disable=SC2317  # Invoked by the EXIT trap below.
+    # shellcheck disable=SC2317,SC2329  # Invoked by the EXIT trap below.
     cleanup_smoke_binary() {
         if [ -n "$smoke_binary" ] && [ -e "$smoke_binary" ]; then
             unlink "$smoke_binary"

@@ -972,7 +972,7 @@ _fixup_move_to_shrc_local() (
     local suffix_path=""
 
     # Invoked indirectly by the EXIT trap below.
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317,SC2329
     cleanup_fixup_snapshots() {
         local exit_status=$?
         local snapshot_path=""

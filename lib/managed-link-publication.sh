@@ -294,7 +294,7 @@ _link_path() (
     local committed=false
 
     # Invoked indirectly by the signal and EXIT traps below.
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317,SC2329
     cleanup_link_transaction() {
         local exit_status=$?
         local cleanup_failed=false

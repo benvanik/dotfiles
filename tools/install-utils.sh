@@ -732,7 +732,7 @@ install_pinned_git_checkout() (
     local checkout_status
     local fetched_commit
 
-    # shellcheck disable=SC2317  # Invoked by the EXIT trap below.
+    # shellcheck disable=SC2317,SC2329  # Invoked by the EXIT trap below.
     cleanup_pinned_checkout_staging() {
         local final_status=$?
         trap - EXIT HUP INT TERM
@@ -850,7 +850,7 @@ update_latest() (
     local latest_path="$tool_dir/latest"
     local latest_temporary_link
 
-    # shellcheck disable=SC2317  # Invoked by the EXIT trap below.
+    # shellcheck disable=SC2317,SC2329  # Invoked by the EXIT trap below.
     cleanup_latest_temporary_link() {
         if [ -n "${latest_temporary_link:-}" ] &&
                 { [ -e "$latest_temporary_link" ] ||
@@ -901,7 +901,7 @@ update_command_symlink() (
     local destination_directory
     local command_temporary_link
 
-    # shellcheck disable=SC2317  # Invoked by the EXIT trap below.
+    # shellcheck disable=SC2317,SC2329  # Invoked by the EXIT trap below.
     cleanup_command_temporary_link() {
         if [ -n "${command_temporary_link:-}" ] &&
                 { [ -e "$command_temporary_link" ] ||

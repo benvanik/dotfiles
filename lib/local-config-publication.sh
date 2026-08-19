@@ -13,7 +13,7 @@ _create_local_file_locked() (
     shift 3
 
     # Invoked indirectly by the EXIT trap below.
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317,SC2329
     cleanup_local_file_staging() {
         local exit_status=$?
         trap - EXIT
@@ -127,7 +127,7 @@ _replace_local_file_locked() (
     shift 2
 
     # Invoked indirectly by the EXIT trap below.
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317,SC2329
     cleanup_local_file_replacement() {
         local exit_status=$?
         local cleanup_parent=false

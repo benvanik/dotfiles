@@ -32,7 +32,7 @@ fail() {
 (
     PACKAGE_MANAGER_AVAILABLE="apt-get"
     OSTYPE="linux-fixture"
-    # shellcheck disable=SC2317  # Invoked by _pkg_detect_pm.
+    # shellcheck disable=SC2317,SC2329  # Invoked by _pkg_detect_pm.
     command() {
         if [ "${1:-}" = "-v" ]; then
             [ "${2:-}" = "$PACKAGE_MANAGER_AVAILABLE" ]

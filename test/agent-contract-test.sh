@@ -1,6 +1,6 @@
 #!/bin/bash
 # Managed agent-contract publication and drift detection.
-# shellcheck disable=SC2030,SC2031,SC2317
+# shellcheck disable=SC2030,SC2031,SC2317,SC2329
 
 set -euo pipefail
 

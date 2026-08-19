@@ -147,7 +147,7 @@ _publish_agent_contracts() (
     local committed=false
 
     # Invoked indirectly by the signal and EXIT traps below.
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317,SC2329
     cleanup_agent_contract_transaction() {
         local exit_status=$?
         local cleanup_failed=false

@@ -325,7 +325,7 @@ _with_home_transaction_lock() (
     local lock_open=false
 
     # Invoked indirectly by the EXIT trap below.
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317,SC2329
     close_home_transaction_lock() {
         local exit_status=$?
         trap - EXIT

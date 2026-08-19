@@ -20,7 +20,7 @@ bazel_cache_configured_root() {
         unset BAZEL_CACHE_ROOT
         # Machine configuration may use this normal shell helper for unrelated
         # paths. Cache discovery needs values, not PATH mutation.
-        # shellcheck disable=SC2317
+        # shellcheck disable=SC2317,SC2329
         _add_path() { :; }
         # shellcheck disable=SC1090
         . "$machine_config"
@@ -164,7 +164,7 @@ bazel_cache_configure() (
     local guard_unlocked=false
 
     # Invoked indirectly by the EXIT trap below.
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317,SC2329
     cleanup_bazel_cache_configuration() {
         local exit_status=$?
         trap - EXIT

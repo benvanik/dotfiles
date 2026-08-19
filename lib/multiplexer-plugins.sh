@@ -36,7 +36,7 @@ update_multiplexer_plugins() (
     recover_managed_installation \
         "$plugin_parent" "$plugin_root_name" || return 1
 
-    # shellcheck disable=SC2317  # Invoked by the EXIT trap below.
+    # shellcheck disable=SC2317,SC2329  # Invoked by the EXIT trap below.
     cleanup_plugin_staging() {
         final_status=$?
         trap - EXIT HUP INT TERM

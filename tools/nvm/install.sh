@@ -622,7 +622,7 @@ replace_symlink_atomically() (
     local target="$2"
     local temporary_link=""
 
-    # shellcheck disable=SC2317  # Invoked by the EXIT trap below.
+    # shellcheck disable=SC2317,SC2329  # Invoked by the EXIT trap below.
     cleanup_temporary_link() {
         if [ -n "$temporary_link" ] &&
                 { [ -e "$temporary_link" ] || [ -L "$temporary_link" ]; }; then
@@ -720,7 +720,7 @@ restore_runtime_path() (
     local destination_path="$2"
     local temporary_path=""
 
-    # shellcheck disable=SC2317  # Invoked by the EXIT trap below.
+    # shellcheck disable=SC2317,SC2329  # Invoked by the EXIT trap below.
     cleanup_temporary_path() {
         if [ -n "$temporary_path" ] &&
                 { [ -e "$temporary_path" ] || [ -L "$temporary_path" ]; }; then
@@ -813,7 +813,7 @@ set_recovery_state() (
             return 1
             ;;
     esac
-    # shellcheck disable=SC2317  # Invoked by the EXIT trap below.
+    # shellcheck disable=SC2317,SC2329  # Invoked by the EXIT trap below.
     cleanup_temporary_state() {
         if [ -n "$temporary_state" ] &&
                 { [ -e "$temporary_state" ] ||

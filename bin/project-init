@@ -1277,7 +1277,7 @@ publish_generated_file() (
     local parent
     local staging_path=""
 
-    # shellcheck disable=SC2317  # Invoked by the EXIT trap below.
+    # shellcheck disable=SC2317,SC2329  # Invoked by the EXIT trap below.
     cleanup_generated_file() {
         local final_status=$?
         trap - EXIT HUP INT TERM

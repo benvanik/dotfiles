@@ -485,7 +485,7 @@ export USER_GITHUB_ID="yourusername"
 # ============================================================================
 # Hardware-Specific Settings
 # ============================================================================
-# export ROCM_GPU_TARGET=gfx1100  # RDNA3
+# export ROCM_GPU_TARGET=gfx1150  # Example: use this machine's exact GFX ISA
 EOF
 }
 

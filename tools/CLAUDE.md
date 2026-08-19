@@ -6,7 +6,7 @@
 |---------|---------|
 | `project-init` | Bootstrap a project and its .envrc |
 | `~/.dotfiles/tools/cuda/install.sh 12.9.1` | Install CUDA SDK to ~/tools/cuda/ |
-| `~/.dotfiles/tools/rocm/install.sh 7.14.0a20260612` | Install ROCm to ~/tools/rocm/ |
+| `ROCM_GPU_TARGET=gfx1150 ~/.dotfiles/tools/rocm/install.sh` | Install the latest flattened TheRock SDK |
 | `use_cuda [version]` | In .envrc: load the CUDA SDK |
 | `use_llvm ">=21.0.0"` | In .envrc: require LLVM 21+ |
 | `use_rocm "debug"` | In .envrc: use TheRock debug build |
@@ -81,13 +81,16 @@ Mold (explicit projects only):
 ### Installing Release Versions
 
 ```bash
-~/.dotfiles/tools/rocm/install.sh 7.14.0a20260612
-~/.dotfiles/tools/rocm/install.sh 7.14.0a20260612 gfx90a
+ROCM_GPU_TARGET=gfx1150 ~/.dotfiles/tools/rocm/install.sh
+~/.dotfiles/tools/rocm/install.sh 7.14.0a20260612 gfx1150
 ```
+
+The release installer extracts TheRock's conventional tarball directly into
+`~/tools/rocm/<version>/`. It does not install or retain a Python environment.
 
 Set default GPU target in `~/.shrc.local`:
 ```bash
-export ROCM_GPU_TARGET=gfx1100  # RDNA3
+export ROCM_GPU_TARGET=gfx1150  # Must match this machine's GFX ISA
 ```
 
 ### Development Builds

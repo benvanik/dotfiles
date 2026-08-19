@@ -628,7 +628,13 @@ expect_version_rejected hf ../escape
 expect_version_rejected hf 1.24.0 extra
 expect_version_rejected mold ../escape
 expect_version_rejected rocm ../escape
-expect_version_rejected rocm 7.14.0 gfx1100 extra
+expect_version_rejected rocm 7.14.0a20260612 gfx1150 extra
+expect_version_rejected rocm 7.14.0a20260612 gfx110X-all
+if ROCM_GPU_TARGET='' TOOLS_DIR="$TEST_ROOT/rejected-tools" \
+        bash "$DOTFILES/tools/rocm/install.sh" 7.14.0a20260612 \
+        >/dev/null 2>&1; then
+    fail "ROCm silently selected a default GPU target"
+fi
 
 BAZEL_ROOT_SYMLINK_TOOLS="$TEST_ROOT/bazel-root-symlink/tools"
 mkdir -p "$BAZEL_ROOT_SYMLINK_TOOLS" "$TEST_ROOT/bazel-root-external"
@@ -667,7 +673,7 @@ expect_managed_root_symlink_rejected beads 0.2.19
 expect_managed_root_symlink_rejected hf 1.24.0
 if [ "$(uname -s)" = "Linux" ]; then
     expect_managed_root_symlink_rejected mold 2.40.4
-    expect_managed_root_symlink_rejected rocm 7.14.0 gfx1100
+    expect_managed_root_symlink_rejected rocm 7.14.0a20260612 gfx1150
 fi
 
 BAZEL_SYMLINK_TOOLS="$TEST_ROOT/bazel-symlink/tools"

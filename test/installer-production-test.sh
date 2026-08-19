@@ -388,75 +388,108 @@ if find "$HF_TOOLS/hf" -maxdepth 1 \
     fail "hf committed replay retained abandoned transaction state"
 fi
 
-# The ROCm fixture proves the hardest staging boundary: rocm-sdk returns a root
-# inside the staged venv, materialization uses relative links, and those links
-# remain valid after the entire payload is renamed into its final version.
+# The ROCm fixture proves the flattened archive remains a conventional SDK root
+# after the staged payload is renamed into its final version.
 if [ "$(uname -s)" = "Linux" ]; then
     ROCM_ROOT="$TEST_ROOT/rocm"
+    ROCM_ASSET_ROOT="$ROCM_ROOT/asset-root"
     ROCM_FAKE_BIN="$ROCM_ROOT/bin"
     ROCM_TOOLS="$ROCM_ROOT/tools"
     ROCM_VERSION=7.14.0a20260612
-    mkdir -p "$ROCM_FAKE_BIN"
-    export REAL_PYTHON
-    cat > "$ROCM_FAKE_BIN/python3" << 'EOF'
-#!/bin/bash
-set -e
-if [ "${1:-}" = "-m" ] && [ "${2:-}" = "venv" ]; then
-    for argument in "$@"; do
-        destination="$argument"
+    ROCM_TARGET=gfx1150
+    ROCM_ARCHIVE_NAME="therock-dist-linux-$ROCM_TARGET-$ROCM_VERSION.tar.gz"
+    ROCM_ARCHIVE="$ROCM_ROOT/$ROCM_ARCHIVE_NAME"
+    ROCM_INDEX_LOG="$ROCM_ROOT/index-url"
+    ROCM_DOWNLOAD_LOG="$ROCM_ROOT/download-url"
+    mkdir -p \
+        "$ROCM_ASSET_ROOT/bin" \
+        "$ROCM_ASSET_ROOT/include/hip" \
+        "$ROCM_ASSET_ROOT/lib/cmake/hip" \
+        "$ROCM_ASSET_ROOT/share" \
+        "$ROCM_FAKE_BIN"
+    printf 'fixture hip runtime\n' \
+        > "$ROCM_ASSET_ROOT/include/hip/hip_runtime.h"
+    printf 'fixture hip runtime library\n' \
+        > "$ROCM_ASSET_ROOT/lib/libamdhip64.so"
+    printf 'fixture hip cmake\n' \
+        > "$ROCM_ASSET_ROOT/lib/cmake/hip/hip-config.cmake"
+    for binary in hipcc hipconfig; do
+        printf '#!/bin/sh\nprintf "fixture %s\\n"\n' "$binary" \
+            > "$ROCM_ASSET_ROOT/bin/$binary"
+        chmod 755 "$ROCM_ASSET_ROOT/bin/$binary"
     done
-    mkdir -p "$destination/bin"
-    ln -s "$REAL_PYTHON" "$destination/bin/python"
-    cat > "$destination/bin/pip" << 'INNER'
-#!/bin/sh
-exit 0
-INNER
-    cat > "$destination/bin/rocm-sdk" << 'INNER'
+    tar czf "$ROCM_ARCHIVE" -C "$ROCM_ASSET_ROOT" .
+    ROCM_ARCHIVE_SHA256=$(file_sha256 "$ROCM_ARCHIVE")
+    export \
+        ROCM_ARCHIVE \
+        ROCM_DOWNLOAD_LOG \
+        ROCM_INDEX_LOG \
+        ROCM_VERSION
+    cat > "$ROCM_FAKE_BIN/curl" << 'EOF'
 #!/bin/bash
 set -e
-venv_root="$(cd "$(dirname "$0")/.." && pwd -P)"
-sdk_root="$venv_root/sdk"
-case "$1" in
-    init)
-        mkdir -p \
-            "$sdk_root/bin" \
-            "$sdk_root/include/hip" \
-            "$sdk_root/lib/cmake/hip"
-        printf 'fixture hip runtime\n' > "$sdk_root/include/hip/hip_runtime.h"
-        printf 'fixture hip runtime library\n' > "$sdk_root/lib/libamdhip64.so"
-        printf 'fixture hip cmake\n' > "$sdk_root/lib/cmake/hip/hip-config.cmake"
-        for binary in hipcc hipconfig; do
-            printf '#!/bin/sh\nexit 0\n' > "$sdk_root/bin/$binary"
-            chmod 755 "$sdk_root/bin/$binary"
-        done
-        ;;
-    path)
-        [ "${2:-}" = "--root" ]
-        printf '%s\n' "$sdk_root"
-        ;;
-    *)
-        exit 74
-        ;;
-esac
-INNER
-    chmod 755 "$destination/bin/pip" "$destination/bin/rocm-sdk"
+if [ "$#" -eq 2 ] && [ "$1" = "-fsSL" ]; then
+    printf '%s\n' "$2" > "$ROCM_INDEX_LOG"
+    cat << INDEX
+{"name": "therock-dist-linux-gfx1150-7.14.0a20260611.tar.gz"},
+{"name": "therock-dist-linux-gfx1100-9.99.0a20990101.tar.gz"},
+{"name": "therock-dist-linux-gfx1150-$ROCM_VERSION.tar.gz"}
+INDEX
     exit 0
 fi
-exec "$REAL_PYTHON" "$@"
+
+output=""
+url=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o)
+            shift
+            output="$1"
+            ;;
+        -*) ;;
+        *) url="$1" ;;
+    esac
+    shift
+done
+printf '%s\n' "$url" > "$ROCM_DOWNLOAD_LOG"
+cp "$ROCM_ARCHIVE" "$output"
 EOF
-    chmod 755 "$ROCM_FAKE_BIN/python3"
-    PATH="$ROCM_FAKE_BIN:$PATH" TOOLS_DIR="$ROCM_TOOLS" \
-        bash "$DOTFILES/tools/rocm/install.sh" \
-        "$ROCM_VERSION" gfx1100 >/dev/null ||
+    chmod 755 "$ROCM_FAKE_BIN/curl"
+    ROCM_GPU_TARGET="$ROCM_TARGET" \
+        PATH="$ROCM_FAKE_BIN:$PATH" TOOLS_DIR="$ROCM_TOOLS" \
+        bash "$DOTFILES/tools/rocm/install.sh" >/dev/null ||
         fail "staged ROCm fixture did not install"
     ROCM_INSTALL="$ROCM_TOOLS/rocm/$ROCM_VERSION"
-    [ "$(readlink "$ROCM_INSTALL/include")" = ".venv/sdk/include" ] ||
-        fail "ROCm SDK root was materialized with a stage-bound absolute link"
+    grep -qx 'https://rocm.nightlies.amd.com/tarball/' \
+        "$ROCM_INDEX_LOG" ||
+        fail "ROCm latest lookup did not use the flattened tarball index"
+    grep -qx \
+        "https://rocm.nightlies.amd.com/tarball/$ROCM_ARCHIVE_NAME" \
+        "$ROCM_DOWNLOAD_LOG" ||
+        fail "ROCm did not download the latest exact-target tarball"
+    for directory in bin include lib share; do
+        if [ ! -d "$ROCM_INSTALL/$directory" ] ||
+                [ -L "$ROCM_INSTALL/$directory" ]; then
+            fail "ROCm did not publish an ordinary $directory directory"
+        fi
+    done
+    if [ -e "$ROCM_INSTALL/.venv" ] ||
+            [ -e "$ROCM_INSTALL/pyvenv.cfg" ]; then
+        fail "ROCm retained Python packaging state"
+    fi
     [ -f "$ROCM_INSTALL/include/hip/hip_runtime.h" ] ||
-        fail "ROCm SDK link broke after publication"
-    grep -qx 'gpu_target=gfx1100' \
-        "$ROCM_INSTALL/.dotfiles-install-identity" ||
+        fail "ROCm SDK payload broke after publication"
+    "$ROCM_INSTALL/bin/hipcc" | grep -qx 'fixture hipcc' ||
+        fail "published ROCm compiler is not executable"
+    grep -qx "gpu_target=$ROCM_TARGET" \
+        "$ROCM_INSTALL/.dotfiles-rocm-installation" ||
         fail "ROCm install did not record its GPU-target identity"
+    grep -qx \
+        "sha256=$ROCM_ARCHIVE_SHA256" \
+        "$ROCM_INSTALL/.dotfiles-rocm-installation" ||
+        fail "ROCm install did not record its archive identity"
+    [ "$(readlink "$ROCM_TOOLS/rocm/latest")" = "$ROCM_VERSION" ] ||
+        fail "ROCm latest selector does not name the installed version"
     if PATH="$ROCM_FAKE_BIN:$PATH" TOOLS_DIR="$ROCM_TOOLS" \
             bash "$DOTFILES/tools/rocm/install.sh" \
             "$ROCM_VERSION" gfx90a >/dev/null 2>&1; then
@@ -467,7 +500,7 @@ EOF
         --force "$ROCM_VERSION" gfx90a >/dev/null ||
         fail "ROCm did not transactionally replace a requested GPU target"
     grep -qx 'gpu_target=gfx90a' \
-        "$ROCM_INSTALL/.dotfiles-install-identity" ||
+        "$ROCM_INSTALL/.dotfiles-rocm-installation" ||
         fail "forced ROCm replacement retained the old GPU-target identity"
 fi
 

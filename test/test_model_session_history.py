@@ -430,6 +430,39 @@ class ModelSessionHistoryTest(unittest.TestCase):
                         "invalid_pi_session",
                     )
 
+    def test_json_nesting_bound_ignores_container_tokens_in_strings(self) -> None:
+        nesting = history_module.MAX_SESSION_JSON_NESTING
+        accepted = (
+            b'{"value":'
+            + b"[" * (nesting - 1)
+            + b"0"
+            + b"]" * (nesting - 1)
+            + b"}"
+        )
+        value = history_module._strict_json_object(accepted, 1)["value"]
+        for _level in range(nesting - 1):
+            self.assertIsInstance(value, list)
+            self.assertEqual(len(value), 1)
+            value = value[0]
+        self.assertEqual(value, 0)
+        quoted_tokens = json.dumps({"value": "\\\"[{" * nesting}).encode(
+            "utf-8"
+        )
+        self.assertEqual(
+            history_module._strict_json_object(quoted_tokens, 1)["value"],
+            '\\"[{' * nesting,
+        )
+        rejected = (
+            b'{"value":'
+            + b"[" * nesting
+            + b"0"
+            + b"]" * nesting
+            + b"}"
+        )
+        with self.assertRaises(ModelSessionError) as caught:
+            history_module._strict_json_object(rejected, 1)
+        self.assertEqual(caught.exception.code, "invalid_pi_session")
+
     def test_control_characters_in_a_hostile_filename_never_reach_errors(
         self,
     ) -> None:

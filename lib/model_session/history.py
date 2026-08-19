@@ -27,6 +27,7 @@ from .runs import SessionRun, list_run_ids_from_state
 
 MAX_SESSION_LINE_BYTES = 16 * 1024 * 1024
 MAX_SESSION_FILE_BYTES = 256 * 1024 * 1024
+MAX_SESSION_JSON_NESTING = 128
 MAX_TITLE_CHARACTERS = 96
 HISTORY_DESCRIPTOR_HEADROOM = 64
 
@@ -224,6 +225,26 @@ def _strict_json_object(raw_line: bytes, line_number: int) -> dict[str, Any]:
         )
     try:
         text = raw_line.decode("utf-8")
+        nesting = 0
+        in_string = False
+        escaped = False
+        for character in text:
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == '"':
+                    in_string = False
+                continue
+            if character == '"':
+                in_string = True
+            elif character in "[{":
+                nesting += 1
+                if nesting > MAX_SESSION_JSON_NESTING:
+                    raise ValueError("excessive JSON nesting")
+            elif character in "]}":
+                nesting -= 1
         value = json.loads(
             text,
             object_pairs_hook=unique_object,

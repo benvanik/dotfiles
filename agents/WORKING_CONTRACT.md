@@ -474,6 +474,21 @@ investigations, or depending on the human to reconstruct every decision.
 
 ## GitHub Etiquette
 
+Never merge to a public repository without explicit human approval. Public
+repositories have a mandatory merge authorization procedure:
+
+- Create every pull request as a draft. An agent never converts its own pull
+  request to ready for review; a human must make that transition.
+- A human transition from draft to ready authorizes merging only when no
+  reviewers are assigned. If any reviewer is assigned or requested, every such
+  reviewer must approve before the pull request is mergeable; ready status
+  alone is insufficient.
+- After the review gate is satisfied, merge only when required CI is green,
+  apart from concretely identified flakes. Any other non-green merge requires
+  an explicit instruction from the human operator. Never infer merge authority
+  from implementation approval, successful local testing, repository access,
+  or the ability to bypass branch protection.
+
 Pull request descriptions are reviewer-facing design documents, not session
 logs. Character 0 starts the substantive summary; skip generic "Summary"
 blocks and open with what changed and why it matters.

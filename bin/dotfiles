@@ -264,6 +264,9 @@ _create_symlinks() {
     _link tools/CLAUDE.md tools/CLAUDE.md
     _link tools/README.md tools/README.md
     _link tools/direnvrc .direnvrc
+
+    info "Setting up direnv configuration..."
+    _link direnv/direnv.toml .config/direnv/direnv.toml
 }
 
 _render_gitconfig_local() {
@@ -655,7 +658,13 @@ cmd_doctor() {
 
     # Check symlinks.
     printf "%bSymlinks:%b\n" "$BOLD" "$NC"
-    for link in ~/.zshrc ~/.bashrc ~/.gitconfig ~/.tmux.conf ~/.direnvrc; do
+    for link in \
+            ~/.zshrc \
+            ~/.bashrc \
+            ~/.gitconfig \
+            ~/.tmux.conf \
+            ~/.direnvrc \
+            ~/.config/direnv/direnv.toml; do
         if [ -L "$link" ] && [ -e "$link" ]; then
             printf "  %b[OK]%b %s\n" "$GREEN" "$NC" "$link"
         elif [ -L "$link" ]; then
@@ -772,8 +781,18 @@ cmd_doctor() {
     # Check for broken symlinks.
     printf "%bBroken symlinks:%b\n" "$BOLD" "$NC"
     local broken_count=0
-    for link in ~/.zshrc ~/.bashrc ~/.gitconfig ~/.tmux.conf ~/.direnvrc ~/.shrc \
-                ~/.aliases ~/.profile ~/.p10k.zsh ~/.gitignore_global; do
+    for link in \
+            ~/.zshrc \
+            ~/.bashrc \
+            ~/.gitconfig \
+            ~/.tmux.conf \
+            ~/.direnvrc \
+            ~/.config/direnv/direnv.toml \
+            ~/.shrc \
+            ~/.aliases \
+            ~/.profile \
+            ~/.p10k.zsh \
+            ~/.gitignore_global; do
         if [ -L "$link" ] && [ ! -e "$link" ]; then
             printf "  %b[BROKEN]%b %s -> %s\n" "$RED" "$NC" "$link" "$(readlink "$link")"
             ((++broken_count))

@@ -364,6 +364,9 @@ nvm() {
 node() {
     printf 'v%s\n' "$DOTFILES_NODE_VERSION"
 }
+npm() {
+    printf '11.6.4\n'
+}
 EOF
 (
     NVM_INSTALLER="$FAKE_NVM_INSTALLER"
@@ -377,6 +380,24 @@ grep -qxF "alias default $DOTFILES_NODE_VERSION" "$NVM_CALL_LOG" ||
     fail "NVM bootstrap used a floating default alias"
 grep -qxF "use --silent $DOTFILES_NODE_VERSION" "$NVM_CALL_LOG" ||
     fail "NVM bootstrap did not activate the exact Node version"
+
+# The Tier 1 smoketest establishes the managed default itself. It must not
+# inherit node, npm, NVM_DIR, or shell startup side effects from its caller.
+NVM_SMOKETEST_OUTPUT="$TEST_ROOT/nvm-smoketest-output"
+/usr/bin/env -i \
+    HOME="$HOME" \
+    PATH="/no-ambient-node" \
+    NVM_CALL_LOG="$NVM_CALL_LOG" \
+    DOTFILES_NODE_VERSION="$DOTFILES_NODE_VERSION" \
+    /bin/bash "$DOTFILES/tools/nvm/smoketest.sh" \
+    > "$NVM_SMOKETEST_OUTPUT" ||
+    fail "NVM smoketest depended on ambient shell initialization"
+grep -qxF 'use --silent default' "$NVM_CALL_LOG" ||
+    fail "NVM smoketest did not activate the managed default"
+grep -qxF "  node: v$DOTFILES_NODE_VERSION" "$NVM_SMOKETEST_OUTPUT" ||
+    fail "NVM smoketest did not report the managed Node runtime"
+grep -qxF '  npm: v11.6.4' "$NVM_SMOKETEST_OUTPUT" ||
+    fail "NVM smoketest did not report the managed npm runtime"
 
 # The multiplexer path installs pinned TPM, updates only sibling plugins, and
 # refuses dirty plugin state before invoking any updater.

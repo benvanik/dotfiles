@@ -150,27 +150,31 @@ fi
 # ============================================================================
 # Warn about missing tools once per session.
 
-if [ -n "${PS1:-}" ] && [ -z "${_DOTFILES_TOOLS_CHECKED:-}" ]; then
-    export _DOTFILES_TOOLS_CHECKED=1
+case "$-" in
+    *i*)
+        if [ -z "${_DOTFILES_TOOLS_CHECKED:-}" ]; then
+            export _DOTFILES_TOOLS_CHECKED=1
 
-    # Required tools - warn if missing.
-    _require_tool fzf
-    _require_tool rg
-    _require_tool jq
-    _require_tool git
-    _require_tool node
+            # Required tools - warn if missing.
+            _require_tool fzf
+            _require_tool rg
+            _require_tool jq
+            _require_tool git
+            _require_tool node
 
-    # Recommended tools - subtle hint.
-    if ! _has_tool eza && ! _has_tool exa; then
-        printf '\033[90m[dotfiles]\033[0m Consider: eza (modern ls)\n' >&2
-    fi
-    if ! _has_tool bat && ! _has_tool batcat; then
-        printf '\033[90m[dotfiles]\033[0m Consider: bat (syntax highlighting)\n' >&2
-    fi
-    if ! _has_tool fd && ! _has_tool fdfind; then
-        printf '\033[90m[dotfiles]\033[0m Consider: fd (fast find)\n' >&2
-    fi
-fi
+            # Recommended tools - subtle hint.
+            if ! _has_tool eza && ! _has_tool exa; then
+                printf '\033[90m[dotfiles]\033[0m Consider: eza (modern ls)\n' >&2
+            fi
+            if ! _has_tool bat && ! _has_tool batcat; then
+                printf '\033[90m[dotfiles]\033[0m Consider: bat (syntax highlighting)\n' >&2
+            fi
+            if ! _has_tool fd && ! _has_tool fdfind; then
+                printf '\033[90m[dotfiles]\033[0m Consider: fd (fast find)\n' >&2
+            fi
+        fi
+        ;;
+esac
 
 # ============================================================================
 # Environment Variables

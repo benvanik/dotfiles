@@ -1217,6 +1217,7 @@ if [ -n "$dash_shell" ]; then
     if ! env -i \
             HOME="$SHELL_HOOK_HOME" \
             PATH="$SHELL_HOOK_BIN:/usr/bin:/bin" \
+            PS1="misleading-noninteractive-prompt" \
             DIRENV_HOOK_LOG="$SHELL_HOOK_LOG" \
             "$dash_shell" -c \
             '. "$1"; [ "${DIRENV_LOG_FORMAT+x}" = x ]' \

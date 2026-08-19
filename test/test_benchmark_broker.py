@@ -176,17 +176,24 @@ class FakeAdmissionFence:
     def __init__(self, *, active: bool = False) -> None:
         self.active = active
         self.observation_depth = 0
+        self._observation_released = threading.Event()
+        self._observation_released.set()
 
     def refresh(self) -> bool:
         return self.active
 
     @contextlib.contextmanager
     def hold_observation(self):
+        self._observation_released.clear()
         self.observation_depth += 1
         try:
             yield self.active
         finally:
             self.observation_depth -= 1
+            self._observation_released.set()
+
+    def wait_until_released(self) -> None:
+        self._observation_released.wait()
 
 
 class FenceAssertingScheduler(LeaseScheduler):
@@ -407,6 +414,10 @@ class BenchmarkBrokerTest(unittest.TestCase):
         send_request(connection, AcquireRequest("linearized"))
         self.assertIsInstance(receive_event(connection), QueuedEvent)
         self.assertIsInstance(receive_event(connection), GrantedEvent)
+        # The grant packet is deliberately sent while shared administrator
+        # authority is held. Synchronize with context exit before inspecting
+        # its release instead of racing the broker thread after recvmsg.
+        fence.wait_until_released()
         self.assertTrue(scheduler.admission_observed)
         self.assertTrue(scheduler.activation_observed)
         self.assertEqual(fence.observation_depth, 0)

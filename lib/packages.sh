@@ -1,7 +1,7 @@
 #!/bin/bash
 # ~/.dotfiles/lib/packages.sh - Package definitions and verification.
 # Canonical package names, manager mappings, and verification categories for
-# the core shell environment.
+# the core shell environment and managed source builds.
 # Compatible with the Bash 3.2 shipped by macOS.
 
 # ============================================================================
@@ -13,6 +13,13 @@ REQUIRED_PACKAGES=(zsh git curl fzf rg jq direnv python3)
 
 # Recommended packages - warnings only, install proceeds.
 RECOMMENDED_PACKAGES=(fd bat eza shellcheck)
+
+# Exact external interfaces required by the Linux multiplexer source build.
+# Package-manager plans below install these commands and pkg-config modules.
+MULTIPLEXER_BUILD_COMMANDS=(
+    autoconf automake bison cc curl git make nproc pkg-config python3 stat tar
+)
+MULTIPLEXER_BUILD_PKG_CONFIG_MODULES=(libevent ncurses)
 
 # ============================================================================
 # Package Manager Name Mappings
@@ -94,6 +101,45 @@ _pkg_check() {
     command -v "$bin" &>/dev/null
 }
 
+# Whether this manager targets a platform supported by update-multiplexer.
+_pkg_build_supported() {
+    case "$1" in
+        apt|dnf|pacman) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Verify the exact command and library interfaces consumed by the source build.
+_pkg_verify_build() {
+    local pm
+    pm=$(_pkg_detect_pm) || pm=""
+    _pkg_build_supported "$pm" || return 0
+
+    local missing=()
+    local dependency
+    for dependency in "${MULTIPLEXER_BUILD_COMMANDS[@]}"; do
+        if ! command -v "$dependency" &>/dev/null; then
+            missing+=("command: $dependency")
+        fi
+    done
+    for dependency in "${MULTIPLEXER_BUILD_PKG_CONFIG_MODULES[@]}"; do
+        if ! command -v pkg-config &>/dev/null ||
+                ! pkg-config --exists "$dependency"; then
+            missing+=("pkg-config module: $dependency")
+        fi
+    done
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        echo "Missing multiplexer build dependencies:" >&2
+        for dependency in "${missing[@]}"; do
+            echo "  - $dependency" >&2
+        done
+        echo "  install plan: $(_pkg_get_install_list "$pm" build)" >&2
+        return 1
+    fi
+    return 0
+}
+
 # Verify all required packages are installed.
 # Returns: 0 if all found, 1 if any missing.
 # Side effect: Prints missing packages to stderr.
@@ -108,6 +154,7 @@ _pkg_verify_required() {
         fi
     done
 
+    local all_ok=true
     if [[ ${#missing[@]} -gt 0 ]]; then
         echo "Missing required packages:" >&2
         for pkg in "${missing[@]}"; do
@@ -115,9 +162,12 @@ _pkg_verify_required() {
             actual=$(_pkg_resolve_name "$pm" "$pkg")
             echo "  - $pkg (package: $actual)" >&2
         done
-        return 1
+        all_ok=false
     fi
-    return 0
+    if ! _pkg_verify_build; then
+        all_ok=false
+    fi
+    $all_ok
 }
 
 # Verify recommended packages (warnings only).
@@ -173,6 +223,30 @@ _pkg_verify_all() {
     done
 
     echo ""
+    if _pkg_build_supported "$pm"; then
+        printf "%bMultiplexer build dependencies:%b\n" "$BOLD" "$NC"
+        for pkg in "${MULTIPLEXER_BUILD_COMMANDS[@]}"; do
+            if command -v "$pkg" &>/dev/null; then
+                printf "  %b[OK]%b command: %s\n" "$GREEN" "$NC" "$pkg"
+            else
+                printf "  %b[MISSING]%b command: %s\n" "$RED" "$NC" "$pkg"
+                all_ok=false
+            fi
+        done
+        for pkg in "${MULTIPLEXER_BUILD_PKG_CONFIG_MODULES[@]}"; do
+            if command -v pkg-config &>/dev/null &&
+                    pkg-config --exists "$pkg"; then
+                printf "  %b[OK]%b pkg-config module: %s\n" \
+                    "$GREEN" "$NC" "$pkg"
+            else
+                printf "  %b[MISSING]%b pkg-config module: %s\n" \
+                    "$RED" "$NC" "$pkg"
+                all_ok=false
+            fi
+        done
+        echo ""
+    fi
+
     printf "%bRecommended packages:%b\n" "$BOLD" "$NC"
     for pkg in "${RECOMMENDED_PACKAGES[@]}"; do
         local bin
@@ -192,11 +266,12 @@ _pkg_verify_all() {
 # ============================================================================
 
 # Get list of packages to install for a package manager.
-# Args: pm, category (required|recommended|all)
+# Args: pm, category (required|recommended|build|all)
 # Returns: Space-separated list of package names.
 _pkg_get_install_list() {
     local pm="$1" category="${2:-all}"
     local packages=()
+    local build_packages=()
 
     case "$pm" in
         apt|dnf|pacman|brew) ;;
@@ -217,10 +292,34 @@ _pkg_get_install_list() {
                 packages+=("$(_pkg_resolve_name "$pm" "$pkg")")
             done
             ;;
+        build)
+            case "$pm" in
+                apt)
+                    packages=(
+                        autoconf automake bison build-essential coreutils
+                        pkg-config tar libevent-dev libncurses-dev
+                    )
+                    ;;
+                dnf)
+                    packages=(
+                        autoconf automake bison gcc make coreutils
+                        pkgconf-pkg-config tar libevent-devel ncurses-devel
+                    )
+                    ;;
+                pacman)
+                    packages=(base-devel coreutils tar libevent ncurses)
+                    ;;
+                brew)
+                    packages=()
+                    ;;
+            esac
+            ;;
         all)
             for pkg in "${REQUIRED_PACKAGES[@]}" "${RECOMMENDED_PACKAGES[@]}"; do
                 packages+=("$(_pkg_resolve_name "$pm" "$pkg")")
             done
+            read -r -a build_packages <<< "$(_pkg_get_install_list "$pm" build)"
+            packages+=("${build_packages[@]}")
             ;;
         *)
             echo "Unsupported package category: $category" >&2

@@ -312,6 +312,16 @@ Installed automatically by `install-deps.sh`:
 | shellcheck | Shell static analysis | `apt install shellcheck` | `brew install shellcheck` |
 | zsh-autosuggestions | Fish-style suggestions | `apt install zsh-autosuggestions` | `brew install zsh-autosuggestions` |
 
+## Multiplexer Build Dependencies
+
+On Linux, `install-deps.sh` installs the compiler, Autotools, core utilities,
+and development headers consumed by `dotfiles multiplexer`. The exact plans
+are centralized in `lib/packages.sh`: `build-essential`, `libevent-dev`, and
+`libncurses-dev` on apt; `gcc`, `make`, `libevent-devel`, and
+`ncurses-devel` on dnf; and `base-devel`, `libevent`, and `ncurses` on pacman.
+`dotfiles doctor` verifies the production command and pkg-config interfaces,
+not merely package-manager records.
+
 ## License
 
 Personal configuration - use at your own discretion.

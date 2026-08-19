@@ -58,8 +58,10 @@ run_apt_noninteractive() {
 install_apt() {
     local required_packages=()
     local recommended_packages=()
+    local build_packages=()
     read -r -a required_packages <<< "$(_pkg_get_install_list apt required)"
     read -r -a recommended_packages <<< "$(_pkg_get_install_list apt recommended)"
+    read -r -a build_packages <<< "$(_pkg_get_install_list apt build)"
 
     info "Updating package lists..."
     run_apt_noninteractive update
@@ -75,7 +77,7 @@ install_apt() {
         warn "Some optional packages not available"
 
     info "Installing build tools..."
-    run_apt_noninteractive install -y patchelf
+    run_apt_noninteractive install -y "${build_packages[@]}"
 
     # Debian/Ubuntu use different binary names.
     setup_debian_symlinks
@@ -84,8 +86,10 @@ install_apt() {
 install_dnf() {
     local required_packages=()
     local recommended_packages=()
+    local build_packages=()
     read -r -a required_packages <<< "$(_pkg_get_install_list dnf required)"
     read -r -a recommended_packages <<< "$(_pkg_get_install_list dnf recommended)"
+    read -r -a build_packages <<< "$(_pkg_get_install_list dnf build)"
 
     info "Installing required packages..."
     sudo dnf install -y "${required_packages[@]}"
@@ -95,13 +99,18 @@ install_dnf() {
         "${recommended_packages[@]}" \
         zsh-autosuggestions 2>/dev/null || \
         warn "Some optional packages not available"
+
+    info "Installing build tools..."
+    sudo dnf install -y "${build_packages[@]}"
 }
 
 install_pacman() {
     local required_packages=()
     local recommended_packages=()
+    local build_packages=()
     read -r -a required_packages <<< "$(_pkg_get_install_list pacman required)"
     read -r -a recommended_packages <<< "$(_pkg_get_install_list pacman recommended)"
+    read -r -a build_packages <<< "$(_pkg_get_install_list pacman build)"
 
     info "Installing required packages..."
     sudo pacman -S --needed --noconfirm "${required_packages[@]}"
@@ -110,6 +119,9 @@ install_pacman() {
     sudo pacman -S --needed --noconfirm \
         "${recommended_packages[@]}" \
         zsh-autosuggestions || warn "Some optional packages not available"
+
+    info "Installing build tools..."
+    sudo pacman -S --needed --noconfirm "${build_packages[@]}"
 }
 
 install_brew() {

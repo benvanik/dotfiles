@@ -11,6 +11,8 @@ TOOL_NAME="multiplexer"
 
 # shellcheck source=../lib/bootstrap-pins.sh
 source "$DOTFILES/lib/bootstrap-pins.sh"
+# shellcheck source=../lib/packages.sh
+source "$DOTFILES/lib/packages.sh"
 # shellcheck source=../tools/install-utils.sh
 source "$DOTFILES/tools/install-utils.sh"
 # shellcheck source=../lib/multiplexer-plugins.sh
@@ -99,16 +101,13 @@ if [ "$(uname -s)" != "Linux" ]; then
     exit 1
 fi
 
-required_commands=(
-    autoconf automake bison cc curl git make nproc pkg-config python3 stat tar
-)
-for required_command in "${required_commands[@]}"; do
+for required_command in "${MULTIPLEXER_BUILD_COMMANDS[@]}"; do
     if ! command -v "$required_command" >/dev/null 2>&1; then
         error "Missing build dependency: $required_command"
         exit 1
     fi
 done
-for required_module in libevent ncurses; do
+for required_module in "${MULTIPLEXER_BUILD_PKG_CONFIG_MODULES[@]}"; do
     if ! pkg-config --exists "$required_module"; then
         error "Missing pkg-config module: $required_module"
         exit 1

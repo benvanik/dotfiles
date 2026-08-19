@@ -173,8 +173,11 @@ fi
 sed -n '1p' "$APT_CALL_LOG" |
     grep -qxF 'noninteractive|<update>' ||
     fail "apt update did not use the noninteractive wrapper"
+EXPECTED_APT_BUILD_CALL='noninteractive|<install><-y><autoconf><automake><bison>'\
+'<build-essential><coreutils><pkg-config><tar><libevent-dev>'\
+'<libncurses-dev>'
 sed -n '4p' "$APT_CALL_LOG" |
-    grep -qxF 'noninteractive|<install><-y><patchelf>' ||
+    grep -qxF "$EXPECTED_APT_BUILD_CALL" ||
     fail "apt build-tool transaction bypassed the wrapper"
 sed -n '5p' "$APT_CALL_LOG" |
     grep -qxF 'noninteractive|<install><-y><tmux>' ||

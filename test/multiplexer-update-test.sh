@@ -62,6 +62,7 @@ cp "$DOTFILES/lib/multiplexer-publication.py" \
     "$FIXTURE_DOTFILES/lib/multiplexer-publication.py"
 cp "$DOTFILES/lib/multiplexer-plugins.sh" \
     "$FIXTURE_DOTFILES/lib/multiplexer-plugins.sh"
+cp "$DOTFILES/lib/packages.sh" "$FIXTURE_DOTFILES/lib/packages.sh"
 cp "$DOTFILES/tmux.conf" "$FIXTURE_DOTFILES/tmux.conf"
 
 TMUX_FIXTURE_VERSION="9.8a"

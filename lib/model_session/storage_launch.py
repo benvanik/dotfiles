@@ -22,6 +22,7 @@ from types import TracebackType
 from typing import Self
 
 from model_session.errors import ModelSessionError
+from model_session.ownership import owner_has_private_primary_group
 
 
 SETPRIV_BINARY = pathlib.Path("/usr/bin/setpriv")
@@ -440,7 +441,11 @@ def _open_trusted_source(
         or not stat.S_ISREG(expected.st_mode)
         or expected.st_uid not in {0, os.getuid()}
         or expected.st_nlink != 1
-        or expected.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        or expected.st_mode & stat.S_IWOTH
+        or (
+            expected.st_mode & stat.S_IWGRP
+            and not owner_has_private_primary_group(expected)
+        )
     ):
         _fail(
             f"{label} has an unsafe identity or mode",
@@ -658,7 +663,11 @@ def lock_trusted_namespace_command(
         not stat.S_ISREG(metadata.st_mode)
         or metadata.st_uid not in {0, os.getuid()}
         or metadata.st_nlink != 1
-        or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        or metadata.st_mode & stat.S_IWOTH
+        or (
+            metadata.st_mode & stat.S_IWGRP
+            and not owner_has_private_primary_group(metadata)
+        )
         or helper.resolve() != helper
     ):
         _fail(

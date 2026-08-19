@@ -238,14 +238,63 @@ class StorageLaunchContractTest(unittest.TestCase):
                 "-B",
                 os.fspath(helper),
             )
-            with mock.patch.object(
-                storage_module,
-                "TRUSTED_NAMESPACE_HELPERS",
-                frozenset({helper}),
+            with (
+                mock.patch.object(
+                    storage_module,
+                    "TRUSTED_NAMESPACE_HELPERS",
+                    frozenset({helper}),
+                ),
+                mock.patch.object(
+                    launch_module,
+                    "owner_has_private_primary_group",
+                    return_value=False,
+                ),
             ):
                 with self.assertRaises(ModelSessionError) as caught:
                     storage_module._lock_trusted_namespace_command(command)
         self.assertEqual(caught.exception.code, "invalid_storage_launch")
+
+    def test_trusted_helper_accepts_private_group_writable_source(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="model-session-helper-private-group.",
+            dir="/tmp",
+        ) as temporary:
+            helper = pathlib.Path(temporary) / "checkpoint-helper.py"
+            helper.write_text("raise SystemExit(0)\n", encoding="utf-8")
+            helper.chmod(0o664)
+            command = (
+                os.fspath(PYTHON_BINARY),
+                "-I",
+                "-B",
+                os.fspath(helper),
+            )
+            with (
+                mock.patch.object(
+                    storage_module,
+                    "TRUSTED_NAMESPACE_HELPERS",
+                    frozenset({helper}),
+                ),
+                mock.patch.object(
+                    launch_module,
+                    "owner_has_private_primary_group",
+                    return_value=True,
+                ),
+            ):
+                locked, descriptor = (
+                    storage_module._lock_trusted_namespace_command(command)
+                )
+            try:
+                self.assertEqual(
+                    locked[:3],
+                    (os.fspath(PYTHON_BINARY), "-I", "-B"),
+                )
+                self.assertEqual(locked[3], f"/proc/self/fd/{descriptor}")
+                self.assertEqual(
+                    os.read(descriptor, 64),
+                    b"raise SystemExit(0)\n",
+                )
+            finally:
+                os.close(descriptor)
 
     def test_regular_file_is_not_cgroup_procs_authority(self) -> None:
         with create_storage_namespace(

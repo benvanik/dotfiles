@@ -82,7 +82,7 @@ Mold (explicit projects only):
 
 ```bash
 ROCM_GPU_TARGET=gfx1150 ~/.dotfiles/tools/rocm/install.sh
-~/.dotfiles/tools/rocm/install.sh 7.14.0a20260612 gfx1150
+~/.dotfiles/tools/rocm/install.sh 10.1.0a20260819 gfx1150
 ```
 
 The release installer extracts TheRock's conventional tarball directly into
@@ -109,7 +109,7 @@ therock-setup --symlinks-only
 
 ```bash
 use_rocm                 # Latest release
-use_rocm "7.14.0a20260612" # Specific version
+use_rocm "10.1.0a20260819" # Specific version
 use_rocm "debug"         # TheRock debug build
 use_rocm "release"       # TheRock release build
 ```

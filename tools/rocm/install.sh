@@ -1,5 +1,5 @@
 #!/bin/bash
-# Install a conventional ROCm SDK root from a TheRock nightly tarball.
+# Install a conventional ROCm SDK root from a TheRock multi-arch tarball.
 # Usage: rocm/install.sh [--force] [--prune-old] [version] [gpu-target]
 set -euo pipefail
 
@@ -14,7 +14,7 @@ if [ "$PLATFORM/$ARCH" != "linux/x86_64" ]; then
 fi
 
 ROCM_DIR="$TOOLS_DIR/rocm"
-ROCM_TARBALL_URL="https://rocm.nightlies.amd.com/tarball"
+ROCM_TARBALL_URL="https://rocm.nightlies.amd.com/tarball-multi-arch"
 FORCE=false
 PRUNE_OLD=false
 VERSION=""
@@ -43,7 +43,7 @@ Options:
 
 Examples:
   ROCM_GPU_TARGET=gfx1150 rocm/install.sh
-  rocm/install.sh 7.14.0a20260612 gfx1150
+  rocm/install.sh 10.1.0a20260819 gfx1150
   ROCM_GPU_TARGET=gfx1150 rocm/install.sh --force
 EOF
 }
@@ -156,12 +156,14 @@ payload_valid() {
     [ -d "$root/include" ] || return 1
     [ -d "$root/lib" ] || return 1
     [ -d "$root/share" ] || return 1
+    [ -d "$root/.kpack" ] || return 1
+    [ -n "$(find "$root/.kpack" -mindepth 1 -print -quit)" ] || return 1
     [ ! -e "$root/.venv" ] || return 1
     [ ! -e "$root/pyvenv.cfg" ] || return 1
     [ -e "$root/include/hip/hip_runtime.h" ] || return 1
     [ -e "$root/lib/libamdhip64.so" ] || return 1
     [ -e "$root/lib/cmake/hip/hip-config.cmake" ] || return 1
-    for executable in hipcc hipconfig; do
+    for executable in hipcc hipconfig rocminfo; do
         [ -x "$root/bin/$executable" ] || return 1
         resolved=$(realpath -e "$root/bin/$executable") || return 1
         case "$resolved" in "$root"/*) ;; *) return 1 ;; esac
@@ -175,7 +177,8 @@ payload_valid() {
     [ "$(record_value "$root" archive)" = "$TARBALL" ] || return 1
     [ "$(record_value "$root" source)" = "$ROCM_TARBALL_URL/$TARBALL" ] ||
         return 1
-    [ "$(record_value "$root" layout)" = "therock-flat-v1" ] || return 1
+    [ "$(record_value "$root" layout)" = "therock-multiarch-flat-v1" ] ||
+        return 1
     resolved=$(record_value "$root" sha256)
     [ "${#resolved}" -eq 64 ] && [[ "$resolved" =~ ^[0-9a-f]{64}$ ]]
 }
@@ -191,7 +194,7 @@ write_record() {
         "archive=$TARBALL" \
         "source=$ROCM_TARBALL_URL/$TARBALL" \
         "sha256=$sha256" \
-        "layout=therock-flat-v1" \
+        "layout=therock-multiarch-flat-v1" \
         > "$root/$INSTALLATION_RECORD"
 }
 

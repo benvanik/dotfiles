@@ -395,7 +395,7 @@ if [ "$(uname -s)" = "Linux" ]; then
     ROCM_ASSET_ROOT="$ROCM_ROOT/asset-root"
     ROCM_FAKE_BIN="$ROCM_ROOT/bin"
     ROCM_TOOLS="$ROCM_ROOT/tools"
-    ROCM_VERSION=7.14.0a20260612
+    ROCM_VERSION=10.1.0a20260819
     ROCM_TARGET=gfx1150
     ROCM_ARCHIVE_NAME="therock-dist-linux-$ROCM_TARGET-$ROCM_VERSION.tar.gz"
     ROCM_ARCHIVE="$ROCM_ROOT/$ROCM_ARCHIVE_NAME"
@@ -403,17 +403,20 @@ if [ "$(uname -s)" = "Linux" ]; then
     ROCM_DOWNLOAD_LOG="$ROCM_ROOT/download-url"
     mkdir -p \
         "$ROCM_ASSET_ROOT/bin" \
+        "$ROCM_ASSET_ROOT/.kpack" \
         "$ROCM_ASSET_ROOT/include/hip" \
         "$ROCM_ASSET_ROOT/lib/cmake/hip" \
         "$ROCM_ASSET_ROOT/share" \
         "$ROCM_FAKE_BIN"
+    printf 'fixture device kernels\n' \
+        > "$ROCM_ASSET_ROOT/.kpack/gfx1150.kpack"
     printf 'fixture hip runtime\n' \
         > "$ROCM_ASSET_ROOT/include/hip/hip_runtime.h"
     printf 'fixture hip runtime library\n' \
         > "$ROCM_ASSET_ROOT/lib/libamdhip64.so"
     printf 'fixture hip cmake\n' \
         > "$ROCM_ASSET_ROOT/lib/cmake/hip/hip-config.cmake"
-    for binary in hipcc hipconfig; do
+    for binary in hipcc hipconfig rocminfo; do
         printf '#!/bin/sh\nprintf "fixture %s\\n"\n' "$binary" \
             > "$ROCM_ASSET_ROOT/bin/$binary"
         chmod 755 "$ROCM_ASSET_ROOT/bin/$binary"
@@ -431,7 +434,7 @@ set -e
 if [ "$#" -eq 2 ] && [ "$1" = "-fsSL" ]; then
     printf '%s\n' "$2" > "$ROCM_INDEX_LOG"
     cat << INDEX
-{"name": "therock-dist-linux-gfx1150-7.14.0a20260611.tar.gz"},
+{"name": "therock-dist-linux-gfx1150-10.1.0a20260818.tar.gz"},
 {"name": "therock-dist-linux-gfx1100-9.99.0a20990101.tar.gz"},
 {"name": "therock-dist-linux-gfx1150-$ROCM_VERSION.tar.gz"}
 INDEX
@@ -460,11 +463,11 @@ EOF
         bash "$DOTFILES/tools/rocm/install.sh" >/dev/null ||
         fail "staged ROCm fixture did not install"
     ROCM_INSTALL="$ROCM_TOOLS/rocm/$ROCM_VERSION"
-    grep -qx 'https://rocm.nightlies.amd.com/tarball/' \
+    grep -qx 'https://rocm.nightlies.amd.com/tarball-multi-arch/' \
         "$ROCM_INDEX_LOG" ||
         fail "ROCm latest lookup did not use the flattened tarball index"
     grep -qx \
-        "https://rocm.nightlies.amd.com/tarball/$ROCM_ARCHIVE_NAME" \
+        "https://rocm.nightlies.amd.com/tarball-multi-arch/$ROCM_ARCHIVE_NAME" \
         "$ROCM_DOWNLOAD_LOG" ||
         fail "ROCm did not download the latest exact-target tarball"
     for directory in bin include lib share; do
@@ -477,6 +480,8 @@ EOF
             [ -e "$ROCM_INSTALL/pyvenv.cfg" ]; then
         fail "ROCm retained Python packaging state"
     fi
+    [ -f "$ROCM_INSTALL/.kpack/gfx1150.kpack" ] ||
+        fail "ROCm did not publish its device kernel pack"
     [ -f "$ROCM_INSTALL/include/hip/hip_runtime.h" ] ||
         fail "ROCm SDK payload broke after publication"
     "$ROCM_INSTALL/bin/hipcc" | grep -qx 'fixture hipcc' ||

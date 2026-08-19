@@ -38,12 +38,17 @@ if command -v hipcc &>/dev/null; then
     echo "  hipcc: $(hipcc --version 2>&1 | grep -i 'HIP version' | head -1 || echo 'available')"
 fi
 
-# Check rocminfo if available.
-if command -v rocminfo &>/dev/null; then
-    # Just check it runs, don't need full output.
-    rocminfo >/dev/null 2>&1 || true
-    echo "  rocminfo: available"
+# Runtime initialization must succeed. Executability alone missed crashes in
+# ROCr initialization on otherwise well-formed SDK installations.
+if ! command -v rocminfo &>/dev/null; then
+    echo "  rocminfo: missing" >&2
+    exit 1
 fi
+if ! rocminfo >/dev/null 2>&1; then
+    echo "  rocminfo: runtime initialization failed" >&2
+    exit 1
+fi
+echo "  rocminfo: available"
 
 # Check hip-config if available.
 if command -v hipconfig &>/dev/null; then
